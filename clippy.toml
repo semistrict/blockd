@@ -1,0 +1,12 @@
+doc-valid-idents = ["NVMe", ".."]
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "nondeterministic iteration order; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "nondeterministic iteration order; use BTreeSet" },
+    { path = "std::time::Instant", reason = "wall clock is behind the sim seam; use SimTime" },
+    { path = "std::time::SystemTime", reason = "wall clock is behind the sim seam; use SimTime" },
+]
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "the deterministic core is single-threaded" },
+    { path = "std::thread::sleep", reason = "time is behind the sim seam" },
+]

@@ -1,0 +1,153 @@
+diff --git a/src/firecracker/src/api_server/request/snapshot.rs b/src/firecracker/src/api_server/request/snapshot.rs
+index e6640ac..12e2cc7 100644
+--- a/src/firecracker/src/api_server/request/snapshot.rs
++++ b/src/firecracker/src/api_server/request/snapshot.rs
+@@ -98,6 +98,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
+                 // either `mem_file_path` or `mem_backend` field is always specified.
+                 backend_path: snapshot_config.mem_file_path.unwrap(),
+                 backend_type: MemBackendType::File,
++                shmem_path: None,
+             }
+         }
+     };
+diff --git a/src/vmm/src/persist.rs b/src/vmm/src/persist.rs
+index 5e39a32..10665da 100644
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -466,6 +466,19 @@ pub fn restore_from_snapshot(
+             vm_resources.machine_config.huge_pages,
+         )
+         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
++        MemBackendType::UffdShmem => {
++            if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
++                return Err(RestoreFromSnapshotGuestMemoryError::Uffd(
++                    GuestMemoryFromUffdError::ShmemHugetlbfs,
++                )
++                .into());
++            }
++            let shmem_path = params.mem_backend.shmem_path.as_ref().ok_or(
++                RestoreFromSnapshotGuestMemoryError::Uffd(GuestMemoryFromUffdError::ShmemPath),
++            )?;
++            guest_memory_from_uffd_shmem(mem_backend_path, shmem_path, mem_state, track_dirty_pages)
++                .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
++        }
+     };
+     builder::build_microvm_from_snapshot(
+         instance_info,
+@@ -538,6 +551,10 @@ pub enum GuestMemoryFromUffdError {
+     Connect(#[from] std::io::Error),
+     /// Failed to sends file descriptor: {0}
+     Send(#[from] vmm_sys_util::errno::Error),
++    /// The UffdShmem backend requires `shmem_path`.
++    ShmemPath,
++    /// The UffdShmem backend does not support hugetlbfs guest memory.
++    ShmemHugetlbfs,
+ }
+ 
+ fn guest_memory_from_uffd(
+@@ -574,6 +591,75 @@ fn guest_memory_from_uffd(
+     Ok((guest_memory, Some(uffd)))
+ }
+ 
++/// Guest memory for the `UffdShmem` backend: a MAP_PRIVATE mapping of the
++/// page-fault handler's shared-memory file, registered for MISSING faults.
++/// Pages the handler populates in the file resolve from the shared page
++/// cache (one physical copy across every microVM restored from the same
++/// snapshot); guest writes diverge privately via copy-on-write; pages
++/// absent from the file fault out to the handler, which populates and
++/// wakes. Reclaiming the file (hole punching) makes the next guest touch
++/// fault again — the handler's refill path.
++fn guest_memory_from_uffd_shmem(
++    mem_uds_path: &Path,
++    shmem_path: &Path,
++    mem_state: &GuestMemoryState,
++    track_dirty_pages: bool,
++) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
++    let regions: Vec<_> = mem_state.regions().collect();
++    let memory_size: u64 = regions.iter().map(|&(_, size)| size as u64).sum();
++    let shmem_file = std::fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(shmem_path)
++        .map_err(GuestMemoryFromUffdError::Connect)?;
++    // The handler owns the file; make sure mapping past its current end is
++    // safe (sparse tails are fine — absent pages fault to the handler).
++    let file_size = shmem_file
++        .metadata()
++        .map_err(GuestMemoryFromUffdError::Connect)?
++        .len();
++    if file_size < memory_size {
++        shmem_file
++            .set_len(memory_size)
++            .map_err(GuestMemoryFromUffdError::Connect)?;
++    }
++    let guest_memory = memory::create(
++        regions.into_iter(),
++        libc::MAP_PRIVATE,
++        Some(shmem_file),
++        track_dirty_pages,
++        libc::MADV_NORMAL,
++    )?;
++
++    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
++    let mut offset = 0;
++    for mem_region in guest_memory.iter() {
++        #[allow(deprecated)]
++        backend_mappings.push(GuestRegionUffdMapping {
++            base_host_virt_addr: mem_region.as_ptr() as u64,
++            size: mem_region.size(),
++            offset,
++            page_size: HugePageConfig::None.page_size(),
++            page_size_kib: HugePageConfig::None.page_size(),
++        });
++        offset += mem_region.size() as u64;
++    }
++
++    let uffd = UffdBuilder::new()
++        .close_on_exec(true)
++        .non_blocking(true)
++        .user_mode_only(false)
++        .create()
++        .map_err(GuestMemoryFromUffdError::Create)?;
++    for mem_region in guest_memory.iter() {
++        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
++            .map_err(GuestMemoryFromUffdError::Register)?;
++    }
++    send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
++
++    Ok((guest_memory, Some(uffd)))
++}
++
+ fn create_guest_memory(
+     mem_state: &GuestMemoryState,
+     track_dirty_pages: bool,
+diff --git a/src/vmm/src/vmm_config/snapshot.rs b/src/vmm/src/vmm_config/snapshot.rs
+index 4f312f8..317360c 100644
+--- a/src/vmm/src/vmm_config/snapshot.rs
++++ b/src/vmm/src/vmm_config/snapshot.rs
+@@ -31,6 +31,13 @@ pub enum MemBackendType {
+     File,
+     /// Guest memory will be served through UFFD by a separate process.
+     Uffd,
++    /// Guest memory is a MAP_PRIVATE mapping of a shared-memory file owned
++    /// by the page-fault handler (`shmem_path`), with missing faults served
++    /// through UFFD by that handler. Pages the handler has populated in the
++    /// file are mapped straight from the shared page cache — many microVMs
++    /// restored from one snapshot share ONE physical copy of every clean
++    /// page, and each VM's writes diverge privately via copy-on-write.
++    UffdShmem,
+ }
+ 
+ /// Stores the configuration that will be used for creating a snapshot.
+@@ -130,6 +137,11 @@ pub struct MemBackendConfig {
+     pub backend_path: PathBuf,
+     /// Specifies the guest memory backend type.
+     pub backend_type: MemBackendType,
++    /// For `UffdShmem`: the shared-memory file backing guest memory. The
++    /// page-fault handler owns and populates it; Firecracker maps it
++    /// MAP_PRIVATE.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub shmem_path: Option<PathBuf>,
+ }
+ 
+ /// The microVM state options.

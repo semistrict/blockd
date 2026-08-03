@@ -1,0 +1,285 @@
+//! An in-process object store with an ACCURATE S3 API shape: the exact
+//! operations, conditions, and semantics blockd uses in production —
+//! `PutObject` with `If-None-Match: *` / `If-Match: <etag>` conditional
+//! writes (the R6.3 CAS instrument), `GetObject` with HTTP `Range`
+//! headers, idempotent `DeleteObject`, and paginated `ListObjectsV2`.
+//! Bodies and errors follow S3's contract (opaque quoted `ETags`, 412
+//! `PreconditionFailed`, `NoSuchKey`, 416 `InvalidRange`); only the wire
+//! is elided.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum S3Error {
+    /// 404 `NoSuchKey`.
+    NoSuchKey,
+    /// 412 `PreconditionFailed`: the `If-Match`/`If-None-Match` condition
+    /// did not hold.
+    PreconditionFailed,
+    /// 416 `InvalidRange`: the requested range starts past the object.
+    InvalidRange,
+}
+
+#[derive(Clone, Debug)]
+struct Object {
+    etag: String,
+    body: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListObjectsV2Output {
+    /// (key, size, etag) — `Contents`, lexicographic like S3.
+    pub contents: Vec<(String, usize, String)>,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
+}
+
+/// The bucket.
+pub struct S3Sim {
+    objects: Mutex<BTreeMap<String, Object>>,
+    /// Monotone counter making every `ETag` unique (S3 `ETags` are opaque;
+    /// equal-content puts still produce distinct entity tags across
+    /// versions of a key here, which is the conservative shape).
+    etag_seq: Mutex<u64>,
+}
+
+impl Default for S3Sim {
+    fn default() -> S3Sim {
+        S3Sim::new()
+    }
+}
+
+impl S3Sim {
+    pub fn new() -> S3Sim {
+        S3Sim {
+            objects: Mutex::new(BTreeMap::new()),
+            etag_seq: Mutex::new(0),
+        }
+    }
+
+    fn mint_etag(&self, body: &[u8]) -> String {
+        let mut seq = self.etag_seq.lock().expect("lock");
+        *seq += 1;
+        // FNV-1a over the body, mixed with the sequence: opaque, unique,
+        // quoted — the shape of a real ETag.
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &b in body {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("\"{h:016x}{:08x}\"", *seq)
+    }
+
+    /// `PutObject`. `if_none_match_any` models `If-None-Match: *` (create
+    /// only); `if_match` models `If-Match: <etag>` (replace exactly this
+    /// version). Both `None`/`false` is a plain last-writer-wins put.
+    /// Returns the new `ETag`.
+    pub fn put_object(
+        &self,
+        key: &str,
+        body: Vec<u8>,
+        if_match: Option<&str>,
+        if_none_match_any: bool,
+    ) -> Result<String, S3Error> {
+        let etag = self.mint_etag(&body);
+        let mut objects = self.objects.lock().expect("lock");
+        let current = objects.get(key);
+        if if_none_match_any && current.is_some() {
+            return Err(S3Error::PreconditionFailed);
+        }
+        if let Some(expected) = if_match {
+            match current {
+                Some(object) if object.etag == expected => {}
+                _ => return Err(S3Error::PreconditionFailed),
+            }
+        }
+        objects.insert(
+            key.to_owned(),
+            Object {
+                etag: etag.clone(),
+                body,
+            },
+        );
+        Ok(etag)
+    }
+
+    /// `GetObject`, optionally with a `Range: bytes=first-last` header
+    /// (inclusive, per HTTP). A range beyond the end is truncated like S3
+    /// truncates; a range starting past the end is 416.
+    pub fn get_object(
+        &self,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<(String, Vec<u8>), S3Error> {
+        let objects = self.objects.lock().expect("lock");
+        let object = objects.get(key).ok_or(S3Error::NoSuchKey)?;
+        let Some((first, last)) = range else {
+            return Ok((object.etag.clone(), object.body.clone()));
+        };
+        let len = object.body.len() as u64;
+        if first >= len || first > last {
+            return Err(S3Error::InvalidRange);
+        }
+        let end = usize::try_from((last + 1).min(len)).expect("fits");
+        let start = usize::try_from(first).expect("fits");
+        Ok((object.etag.clone(), object.body[start..end].to_vec()))
+    }
+
+    /// `DeleteObject`: 204 regardless of existence, like S3.
+    pub fn delete_object(&self, key: &str) {
+        self.objects.lock().expect("lock").remove(key);
+    }
+
+    /// `ListObjectsV2` with prefix and pagination.
+    pub fn list_objects_v2(
+        &self,
+        prefix: &str,
+        continuation_token: Option<&str>,
+        max_keys: usize,
+    ) -> ListObjectsV2Output {
+        let objects = self.objects.lock().expect("lock");
+        let start_after = continuation_token.unwrap_or("");
+        let mut contents = Vec::new();
+        let mut truncated = false;
+        for (key, object) in objects.range::<str, _>((
+            std::ops::Bound::Excluded(start_after),
+            std::ops::Bound::Unbounded,
+        )) {
+            if !key.starts_with(prefix) {
+                if key.as_str() > prefix && !prefix.is_empty() {
+                    break; // past the prefix range entirely
+                }
+                continue;
+            }
+            if contents.len() == max_keys {
+                truncated = true;
+                break;
+            }
+            contents.push((key.clone(), object.body.len(), object.etag.clone()));
+        }
+        let next = truncated.then(|| contents.last().expect("nonempty").0.clone());
+        ListObjectsV2Output {
+            contents,
+            is_truncated: truncated,
+            next_continuation_token: next,
+        }
+    }
+}
+
+/// The seam adapter: blockd-core speaks (key, u64 version) CAS; S3 speaks
+/// `ETags`. Every writer derives versions the same way — by counting a
+/// key's successful puts — so the u64 the daemon sees is just a name for
+/// an `ETag`. Shared by every host against the same bucket.
+/// Per-key registry entry: (current version, version → etag).
+type KeyVersions = (u64, BTreeMap<u64, String>);
+
+pub struct S3Store {
+    pub s3: S3Sim,
+    registry: Mutex<BTreeMap<String, KeyVersions>>,
+}
+
+impl Default for S3Store {
+    fn default() -> S3Store {
+        S3Store::new()
+    }
+}
+
+pub type GetResult = Result<Option<(u64, Vec<u8>)>, blockd_core::seam::StoreFault>;
+
+impl S3Store {
+    pub fn new() -> S3Store {
+        S3Store {
+            s3: S3Sim::new(),
+            registry: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn record_put(&self, key: &str, etag: String) -> u64 {
+        let mut registry = self.registry.lock().expect("lock");
+        let entry = registry
+            .entry(key.to_owned())
+            .or_insert_with(|| (0, BTreeMap::new()));
+        entry.0 += 1;
+        entry.1.insert(entry.0, etag);
+        entry.0
+    }
+
+    fn version_of(&self, key: &str, etag: &str) -> u64 {
+        let registry = self.registry.lock().expect("lock");
+        let (_, versions) = registry.get(key).expect("every write went through us");
+        *versions
+            .iter()
+            .find(|(_, e)| e.as_str() == etag)
+            .expect("etag minted by this bucket")
+            .0
+    }
+
+    fn current_version(&self, key: &str) -> Option<u64> {
+        let registry = self.registry.lock().expect("lock");
+        registry.get(key).map(|(v, _)| *v)
+    }
+
+    /// Unconditional put (segments, manifests, resume sets).
+    pub fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, blockd_core::seam::StoreFault> {
+        let etag = self
+            .s3
+            .put_object(key, bytes, None, false)
+            .expect("unconditional puts cannot fail");
+        Ok(self.record_put(key, etag))
+    }
+
+    /// Conditional put (the head CAS, R6.3): `expected: None` is
+    /// `If-None-Match: *`; `Some(v)` is `If-Match` on v's `ETag`.
+    pub fn put_cas(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<u64, blockd_core::seam::StoreFault> {
+        let result = match expected {
+            None => self.s3.put_object(key, bytes, None, true),
+            Some(version) => {
+                let etag = {
+                    let registry = self.registry.lock().expect("lock");
+                    registry
+                        .get(key)
+                        .and_then(|(_, versions)| versions.get(&version).cloned())
+                };
+                match etag {
+                    Some(etag) => self.s3.put_object(key, bytes, Some(&etag), false),
+                    // The daemon expects a version this bucket never
+                    // minted: the condition cannot hold.
+                    None => Err(S3Error::PreconditionFailed),
+                }
+            }
+        };
+        match result {
+            Ok(etag) => Ok(self.record_put(key, etag)),
+            Err(S3Error::PreconditionFailed) => Err(blockd_core::seam::StoreFault::CasConflict {
+                actual: self.current_version(key),
+            }),
+            Err(other) => panic!("unexpected S3 error on put: {other:?}"),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> GetResult {
+        match self.s3.get_object(key, None) {
+            Ok((etag, body)) => Ok(Some((self.version_of(key, &etag), body))),
+            Err(S3Error::NoSuchKey) => Ok(None),
+            Err(other) => panic!("unexpected S3 error on get: {other:?}"),
+        }
+    }
+
+    pub fn get_range(&self, key: &str, offset: u64, len: u64) -> GetResult {
+        match self.s3.get_object(key, Some((offset, offset + len - 1))) {
+            Ok((etag, body)) => Ok(Some((self.version_of(key, &etag), body))),
+            Err(S3Error::NoSuchKey | S3Error::InvalidRange) => Ok(None),
+            Err(other) => panic!("unexpected S3 error on get_range: {other:?}"),
+        }
+    }
+
+    pub fn delete(&self, key: &str) {
+        self.s3.delete_object(key);
+    }
+}

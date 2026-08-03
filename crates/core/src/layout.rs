@@ -1,0 +1,232 @@
+//! The exact naming of every durable artifact — local blob names and object
+//! store keys. This *is* the production layout; the simulation and a real
+//! deployment use these byte-for-byte.
+//!
+//! Every segment and manifest is namespaced by the writer's **fence** — the
+//! head record's CAS version at claim time (R6.3). A fenced former holder
+//! keeps its own namespace, and since only the head record (updated by CAS)
+//! makes state reachable, nothing a fenced holder writes can ever fork
+//! durable state (R6.4): its keys simply dangle.
+//!
+//! Local blobs (relative to the daemon's data root):
+//! - `v/<vset:016x>/j/<fence:016x>-<seq:016x>.rec` — journal record
+//!   (framed, R10.2)
+//! - `v/<vset:016x>/s/<fence:016x>-<seg:016x>.seg` — segment of compressed
+//!   page entries
+//!
+//! Object store keys (relative to the cluster's bucket + prefix, R9.1):
+//! - `v/<vset:016x>/head`  — head record: CAS assignment authority (R6.3)
+//!   and pointer to the newest backed-up manifest
+//! - `v/<vset:016x>/m/<fence:016x>-<seq:016x>` — manifest: the journal
+//!   record's bytes, verbatim
+//! - `v/<vset:016x>/s/<fence:016x>-<seg:016x>` — segment: the local blob's
+//!   bytes, verbatim (R8.4: transfers move stored bytes unchanged)
+//! - `b/<base:016x>/…` — bases (lineage milestone)
+
+use crate::types::{JournalSeq, SegId, VsetId};
+
+pub fn journal_blob(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
+    format!("v/{:016x}/j/{fence:016x}-{:016x}.rec", vset.0, seq.0)
+}
+
+pub fn segment_blob(vset: VsetId, fence: u64, seg: SegId) -> String {
+    format!("v/{:016x}/s/{fence:016x}-{:016x}.seg", vset.0, seg.0)
+}
+
+pub fn head_key(vset: VsetId) -> String {
+    format!("v/{:016x}/head", vset.0)
+}
+
+/// The vset's recorded resume set (R6.2): what the last resume touched
+/// first, so the next restore can prefetch it. Overwritten in place; best
+/// effort — a missing or stale set only costs demand faults.
+pub fn resume_set_key(vset: VsetId) -> String {
+    format!("v/{:016x}/rs", vset.0)
+}
+
+pub fn manifest_key(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
+    format!("v/{:016x}/m/{fence:016x}-{:016x}", vset.0, seq.0)
+}
+
+pub fn segment_key(vset: VsetId, fence: u64, seg: SegId) -> String {
+    format!("v/{:016x}/s/{fence:016x}-{:016x}", vset.0, seg.0)
+}
+
+/// Prefix under which every object of one vset lives (R4.4 audits, GC).
+pub fn vset_prefix(vset: VsetId) -> String {
+    format!("v/{:016x}/", vset.0)
+}
+
+/// A base's record: a manifest kept alive until explicit delete (R5.2).
+pub fn base_record_key(base: u64) -> String {
+    format!("b/{base:016x}/rec")
+}
+
+/// A base's segments: copied store-side at keep time, shared by every fork
+/// (R5.3: the base is stored once, forever, regardless of fork count).
+pub fn base_segment_key(base: u64, fence: u64, seg: SegId) -> String {
+    format!("b/{base:016x}/s/{fence:016x}-{:016x}", seg.0)
+}
+
+/// The local outbound-handoff marker (R7.2): its durable presence means
+/// this host gave the vset away and may only serve peer fetches for it.
+pub fn handoff_blob(vset: VsetId) -> String {
+    format!("v/{:016x}/handoff", vset.0)
+}
+
+/// Parse an object-store key back into its meaning (GC's mark phase).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreKey {
+    Head {
+        vset: VsetId,
+    },
+    Manifest {
+        vset: VsetId,
+        fence: u64,
+        seq: JournalSeq,
+    },
+    Segment {
+        vset: VsetId,
+        fence: u64,
+        seg: SegId,
+    },
+    BaseRecord {
+        base: u64,
+    },
+    BaseSegment {
+        base: u64,
+        fence: u64,
+        seg: SegId,
+    },
+}
+
+pub fn parse_key(key: &str) -> Option<StoreKey> {
+    if let Some(rest) = key.strip_prefix("v/") {
+        let (vset_hex, rest) = rest.split_once('/')?;
+        let vset = VsetId(u64::from_str_radix(vset_hex, 16).ok()?);
+        if rest == "head" {
+            return Some(StoreKey::Head { vset });
+        }
+        if let Some(body) = rest.strip_prefix("m/") {
+            let (fence_hex, seq_hex) = body.split_once('-')?;
+            return Some(StoreKey::Manifest {
+                vset,
+                fence: u64::from_str_radix(fence_hex, 16).ok()?,
+                seq: JournalSeq(u64::from_str_radix(seq_hex, 16).ok()?),
+            });
+        }
+        if let Some(body) = rest.strip_prefix("s/") {
+            let (fence_hex, seg_hex) = body.split_once('-')?;
+            return Some(StoreKey::Segment {
+                vset,
+                fence: u64::from_str_radix(fence_hex, 16).ok()?,
+                seg: SegId(u64::from_str_radix(seg_hex, 16).ok()?),
+            });
+        }
+        return None;
+    }
+    if let Some(rest) = key.strip_prefix("b/") {
+        let (base_hex, rest) = rest.split_once('/')?;
+        let base = u64::from_str_radix(base_hex, 16).ok()?;
+        if rest == "rec" {
+            return Some(StoreKey::BaseRecord { base });
+        }
+        if let Some(body) = rest.strip_prefix("s/") {
+            let (fence_hex, seg_hex) = body.split_once('-')?;
+            return Some(StoreKey::BaseSegment {
+                base,
+                fence: u64::from_str_radix(fence_hex, 16).ok()?,
+                seg: SegId(u64::from_str_radix(seg_hex, 16).ok()?),
+            });
+        }
+        return None;
+    }
+    None
+}
+
+/// Parse a local blob name back into its meaning (recovery scan).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlobName {
+    Journal {
+        vset: VsetId,
+        fence: u64,
+        seq: JournalSeq,
+    },
+    Segment {
+        vset: VsetId,
+        fence: u64,
+        seg: SegId,
+    },
+    Handoff {
+        vset: VsetId,
+    },
+}
+
+pub fn parse_blob(name: &str) -> Option<BlobName> {
+    let rest = name.strip_prefix("v/")?;
+    let (vset_hex, rest) = rest.split_once('/')?;
+    let vset = VsetId(u64::from_str_radix(vset_hex, 16).ok()?);
+    if let Some(body) = rest.strip_prefix("j/").and_then(|r| r.strip_suffix(".rec")) {
+        let (fence_hex, seq_hex) = body.split_once('-')?;
+        let fence = u64::from_str_radix(fence_hex, 16).ok()?;
+        let seq = JournalSeq(u64::from_str_radix(seq_hex, 16).ok()?);
+        return Some(BlobName::Journal { vset, fence, seq });
+    }
+    if let Some(body) = rest.strip_prefix("s/").and_then(|r| r.strip_suffix(".seg")) {
+        let (fence_hex, seg_hex) = body.split_once('-')?;
+        let fence = u64::from_str_radix(fence_hex, 16).ok()?;
+        let seg = SegId(u64::from_str_radix(seg_hex, 16).ok()?);
+        return Some(BlobName::Segment { vset, fence, seg });
+    }
+    if rest == "handoff" {
+        return Some(BlobName::Handoff { vset });
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_pinned_and_parse_back() {
+        let vset = VsetId(0x0BAD_CAFE);
+        assert_eq!(
+            journal_blob(vset, 2, JournalSeq(0x1F)),
+            "v/000000000badcafe/j/0000000000000002-000000000000001f.rec"
+        );
+        assert_eq!(
+            segment_blob(vset, 2, SegId(3)),
+            "v/000000000badcafe/s/0000000000000002-0000000000000003.seg"
+        );
+        assert_eq!(head_key(vset), "v/000000000badcafe/head");
+        assert_eq!(
+            manifest_key(vset, 2, JournalSeq(5)),
+            "v/000000000badcafe/m/0000000000000002-0000000000000005"
+        );
+        assert_eq!(
+            segment_key(vset, 2, SegId(3)),
+            "v/000000000badcafe/s/0000000000000002-0000000000000003"
+        );
+        assert_eq!(vset_prefix(vset), "v/000000000badcafe/");
+        assert_eq!(
+            parse_blob("v/000000000badcafe/j/0000000000000002-000000000000001f.rec"),
+            Some(BlobName::Journal {
+                vset,
+                fence: 2,
+                seq: JournalSeq(0x1F)
+            })
+        );
+        assert_eq!(
+            parse_blob("v/000000000badcafe/s/0000000000000002-0000000000000003.seg"),
+            Some(BlobName::Segment {
+                vset,
+                fence: 2,
+                seg: SegId(3)
+            })
+        );
+        assert_eq!(parse_blob("garbage"), None);
+        assert_eq!(parse_blob("v/000000000badcafe/s/junk.seg"), None);
+        assert_eq!(parse_blob("v/000000000badcafe/j/junk.rec"), None);
+    }
+}
