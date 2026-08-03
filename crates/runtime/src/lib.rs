@@ -23,4 +23,4 @@ mod s3;
 #[cfg(target_os = "linux")]
 pub use host::{Runtime, RuntimeConfig};
 #[cfg(target_os = "linux")]
-pub use s3::{ListObjectsV2Output, S3Error, S3Sim, S3Store};
+pub use s3::{ListObjectsV2Output, S3Error, S3LatencyModel, S3Sim, S3Stats, S3Store};

@@ -9,6 +9,81 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// Injected request latency, for performance testing against realistic
+/// object-store behavior. The `same_region` preset uses typical published
+/// same-region S3 figures: small-object GET time-to-first-byte ~12 ms,
+/// PUT ~20 ms, LIST ~30 ms, DELETE ~15 ms, ~90 MB/s streaming.
+#[derive(Clone, Copy, Debug)]
+pub struct S3LatencyModel {
+    pub get_first_byte: Duration,
+    pub put_first_byte: Duration,
+    pub list: Duration,
+    pub delete: Duration,
+    /// Streaming cost per mebibyte transferred, on top of first-byte.
+    pub per_mib: Duration,
+}
+
+impl S3LatencyModel {
+    pub fn same_region() -> S3LatencyModel {
+        S3LatencyModel {
+            get_first_byte: Duration::from_millis(12),
+            put_first_byte: Duration::from_millis(20),
+            list: Duration::from_millis(30),
+            delete: Duration::from_millis(15),
+            per_mib: Duration::from_millis(11), // ~90 MB/s
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)] // presentation math, test scale
+    fn transfer(self, first_byte: Duration, bytes: usize) -> Duration {
+        first_byte + self.per_mib.mul_f64(bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Request statistics by S3 operation type — what a bill and a rate-limit
+/// conversation are made of.
+#[derive(Debug, Default)]
+pub struct S3Stats {
+    pub get_object: AtomicU64,
+    pub get_object_range: AtomicU64,
+    pub put_object: AtomicU64,
+    pub put_object_conditional: AtomicU64,
+    pub precondition_failures: AtomicU64,
+    pub delete_object: AtomicU64,
+    pub list_objects_v2: AtomicU64,
+    pub bytes_downloaded: AtomicU64,
+    pub bytes_uploaded: AtomicU64,
+}
+
+impl S3Stats {
+    #[allow(clippy::cast_precision_loss)] // presentation math, test scale
+    pub fn report(&self) -> String {
+        format!(
+            "GetObject {} (+{} ranged)  PutObject {} (+{} conditional, {} 412s)               DeleteObject {}  ListObjectsV2 {}  down {:.1} MiB  up {:.1} MiB",
+            self.get_object.load(Ordering::SeqCst),
+            self.get_object_range.load(Ordering::SeqCst),
+            self.put_object.load(Ordering::SeqCst),
+            self.put_object_conditional.load(Ordering::SeqCst),
+            self.precondition_failures.load(Ordering::SeqCst),
+            self.delete_object.load(Ordering::SeqCst),
+            self.list_objects_v2.load(Ordering::SeqCst),
+            self.bytes_downloaded.load(Ordering::SeqCst) as f64 / (1024.0 * 1024.0),
+            self.bytes_uploaded.load(Ordering::SeqCst) as f64 / (1024.0 * 1024.0),
+        )
+    }
+
+    pub fn total_requests(&self) -> u64 {
+        self.get_object.load(Ordering::SeqCst)
+            + self.get_object_range.load(Ordering::SeqCst)
+            + self.put_object.load(Ordering::SeqCst)
+            + self.put_object_conditional.load(Ordering::SeqCst)
+            + self.delete_object.load(Ordering::SeqCst)
+            + self.list_objects_v2.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum S3Error {
@@ -42,6 +117,10 @@ pub struct S3Sim {
     /// equal-content puts still produce distinct entity tags across
     /// versions of a key here, which is the conservative shape).
     etag_seq: Mutex<u64>,
+    /// Injected per-request latency (perf testing); `None` = instant.
+    latency: Option<S3LatencyModel>,
+    /// Request counts and bytes by operation type.
+    pub stats: S3Stats,
 }
 
 impl Default for S3Sim {
@@ -55,6 +134,19 @@ impl S3Sim {
         S3Sim {
             objects: Mutex::new(BTreeMap::new()),
             etag_seq: Mutex::new(0),
+            latency: None,
+            stats: S3Stats::default(),
+        }
+    }
+
+    /// Inject a request-latency model (performance testing).
+    pub fn set_latency(&mut self, model: S3LatencyModel) {
+        self.latency = Some(model);
+    }
+
+    fn delay(&self, base: impl Fn(S3LatencyModel) -> Duration, bytes: usize) {
+        if let Some(model) = self.latency {
+            std::thread::sleep(model.transfer(base(model), bytes));
         }
     }
 
@@ -82,16 +174,35 @@ impl S3Sim {
         if_match: Option<&str>,
         if_none_match_any: bool,
     ) -> Result<String, S3Error> {
+        if if_match.is_some() || if_none_match_any {
+            self.stats
+                .put_object_conditional
+                .fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.stats.put_object.fetch_add(1, Ordering::SeqCst);
+        }
+        self.stats
+            .bytes_uploaded
+            .fetch_add(body.len() as u64, Ordering::SeqCst);
+        self.delay(|m| m.put_first_byte, body.len());
         let etag = self.mint_etag(&body);
         let mut objects = self.objects.lock().expect("lock");
         let current = objects.get(key);
         if if_none_match_any && current.is_some() {
+            self.stats
+                .precondition_failures
+                .fetch_add(1, Ordering::SeqCst);
             return Err(S3Error::PreconditionFailed);
         }
         if let Some(expected) = if_match {
             match current {
                 Some(object) if object.etag == expected => {}
-                _ => return Err(S3Error::PreconditionFailed),
+                _ => {
+                    self.stats
+                        .precondition_failures
+                        .fetch_add(1, Ordering::SeqCst);
+                    return Err(S3Error::PreconditionFailed);
+                }
             }
         }
         objects.insert(
@@ -112,10 +223,22 @@ impl S3Sim {
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<(String, Vec<u8>), S3Error> {
+        if range.is_some() {
+            self.stats.get_object_range.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.stats.get_object.fetch_add(1, Ordering::SeqCst);
+        }
         let objects = self.objects.lock().expect("lock");
         let object = objects.get(key).ok_or(S3Error::NoSuchKey)?;
         let Some((first, last)) = range else {
-            return Ok((object.etag.clone(), object.body.clone()));
+            let body = object.body.clone();
+            let etag = object.etag.clone();
+            drop(objects);
+            self.stats
+                .bytes_downloaded
+                .fetch_add(body.len() as u64, Ordering::SeqCst);
+            self.delay(|m| m.get_first_byte, body.len());
+            return Ok((etag, body));
         };
         let len = object.body.len() as u64;
         if first >= len || first > last {
@@ -123,11 +246,20 @@ impl S3Sim {
         }
         let end = usize::try_from((last + 1).min(len)).expect("fits");
         let start = usize::try_from(first).expect("fits");
-        Ok((object.etag.clone(), object.body[start..end].to_vec()))
+        let body = object.body[start..end].to_vec();
+        let etag = object.etag.clone();
+        drop(objects);
+        self.stats
+            .bytes_downloaded
+            .fetch_add(body.len() as u64, Ordering::SeqCst);
+        self.delay(|m| m.get_first_byte, body.len());
+        Ok((etag, body))
     }
 
     /// `DeleteObject`: 204 regardless of existence, like S3.
     pub fn delete_object(&self, key: &str) {
+        self.stats.delete_object.fetch_add(1, Ordering::SeqCst);
+        self.delay(|m| m.delete, 0);
         self.objects.lock().expect("lock").remove(key);
     }
 
@@ -138,6 +270,8 @@ impl S3Sim {
         continuation_token: Option<&str>,
         max_keys: usize,
     ) -> ListObjectsV2Output {
+        self.stats.list_objects_v2.fetch_add(1, Ordering::SeqCst);
+        self.delay(|m| m.list, 0);
         let objects = self.objects.lock().expect("lock");
         let start_after = continuation_token.unwrap_or("");
         let mut contents = Vec::new();

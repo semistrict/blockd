@@ -22,7 +22,23 @@ use blockd_hostmem::{PAGE_SIZE, Uffd, recv_with_fd};
 
 /// One HTTP request over the Firecracker API socket.
 fn api_request(sock: &Path, method: &str, path: &str, body: &str) -> (u16, String) {
-    let mut stream = UnixStream::connect(sock).expect("api socket");
+    // The socket file appears at bind time, a beat before Firecracker
+    // listens — connect with retry instead of racing it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match UnixStream::connect(sock) {
+            Ok(stream) => break stream,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) && Instant::now() < deadline =>
+            {
+                thread::park_timeout(Duration::from_millis(5));
+            }
+            Err(e) => panic!("api socket: {e}"),
+        }
+    };
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -368,6 +384,8 @@ pub struct ShmemServer {
     pub filled: Arc<AtomicU64>,
     /// Faults answered (fills + wakes of already-populated pages).
     pub faults: Arc<AtomicU64>,
+    /// Per-fault service time in microseconds (the fault-latency profile).
+    pub fault_micros: Arc<Mutex<Vec<u64>>>,
     shmem: Arc<std::fs::File>,
 }
 
@@ -391,32 +409,90 @@ impl ShmemServer {
             populated: Arc::new(Mutex::new(BTreeSet::new())),
             filled: Arc::new(AtomicU64::new(0)),
             faults: Arc::new(AtomicU64::new(0)),
+            fault_micros: Arc::new(Mutex::new(Vec::new())),
             shmem: Arc::new(shmem),
         };
-        let (populated, filled, faults, shmem) = (
-            server.populated.clone(),
-            server.filled.clone(),
-            server.faults.clone(),
-            server.shmem.clone(),
+        server.accept_loop(
+            listener,
+            Arc::new(Filler::File(source_mem)),
+            PAGE_SIZE as u64,
+        );
+        server
+    }
+
+    /// The cold-tier variant: fills come from the S3-shaped store at
+    /// segment granularity — a fault on any page of a `part_bytes` part
+    /// fetches the whole part object with one `GetObject` (the store tier
+    /// of R2.3: segment-granular, never per-page round trips).
+    pub fn start_s3(
+        listener: UnixListener,
+        store: Arc<crate::s3::S3Store>,
+        prefix: String,
+        part_bytes: u64,
+        shmem_path: &Path,
+        mem_bytes: u64,
+    ) -> ShmemServer {
+        let shmem = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(shmem_path)
+            .expect("shmem file");
+        shmem.set_len(mem_bytes).expect("shmem size");
+        let server = ShmemServer {
+            populated: Arc::new(Mutex::new(BTreeSet::new())),
+            filled: Arc::new(AtomicU64::new(0)),
+            faults: Arc::new(AtomicU64::new(0)),
+            fault_micros: Arc::new(Mutex::new(Vec::new())),
+            shmem: Arc::new(shmem),
+        };
+        server.accept_loop(
+            listener,
+            Arc::new(Filler::Store {
+                store,
+                prefix,
+                part_bytes,
+            }),
+            part_bytes,
+        );
+        server
+    }
+
+    fn accept_loop(&self, listener: UnixListener, filler: Arc<Filler>, granule: u64) {
+        let (page_set, fill_count, fault_count, latencies, backing) = (
+            self.populated.clone(),
+            self.filled.clone(),
+            self.faults.clone(),
+            self.fault_micros.clone(),
+            self.shmem.clone(),
         );
         thread::spawn(move || {
             loop {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
-                let (populated, filled, faults, shmem, source_mem) = (
-                    populated.clone(),
-                    filled.clone(),
-                    faults.clone(),
-                    shmem.clone(),
-                    source_mem.clone(),
+                let (page_set, fill_count, fault_count, latencies, backing, filler) = (
+                    page_set.clone(),
+                    fill_count.clone(),
+                    fault_count.clone(),
+                    latencies.clone(),
+                    backing.clone(),
+                    filler.clone(),
                 );
                 thread::spawn(move || {
-                    serve_one_shmem(&stream, &source_mem, &shmem, &populated, &filled, &faults);
+                    serve_one_shmem(
+                        &stream,
+                        &filler,
+                        &backing,
+                        &page_set,
+                        &fill_count,
+                        &fault_count,
+                        &latencies,
+                        granule,
+                    );
                 });
             }
         });
-        server
     }
 
     /// Physical bytes the shared base holds right now.
@@ -432,24 +508,66 @@ impl ShmemServer {
     }
 }
 
+/// Where a shmem fill's bytes come from: the snapshot memory file (warm
+/// local tier, page granules) or the S3-shaped store (cold tier,
+/// `part_bytes` segment-object granules).
+enum Filler {
+    File(PathBuf),
+    Store {
+        store: Arc<crate::s3::S3Store>,
+        prefix: String,
+        part_bytes: u64,
+    },
+}
+
+impl Filler {
+    /// Fill the granule containing `offset` into the shmem file.
+    fn fill(&self, shmem: &std::fs::File, offset: u64, granule: u64) {
+        use std::os::unix::fs::FileExt;
+        let base = offset / granule * granule;
+        match self {
+            Filler::File(path) => {
+                let source = std::fs::File::open(path).expect("source mem");
+                let mut bytes = vec![0u8; usize::try_from(granule).expect("fits")];
+                source.read_exact_at(&mut bytes, base).expect("source read");
+                shmem.write_all_at(&bytes, base).expect("populate");
+            }
+            Filler::Store {
+                store,
+                prefix,
+                part_bytes,
+            } => {
+                let part = base / part_bytes;
+                let key = format!("{prefix}/{part:08}");
+                let (_, bytes) = store
+                    .get(&key)
+                    .expect("store up")
+                    .expect("part object exists");
+                shmem.write_all_at(&bytes, base).expect("populate");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn serve_one_shmem(
     stream: &UnixStream,
-    source_mem: &Path,
+    filler: &Filler,
     shmem: &std::fs::File,
-    populated: &Mutex<BTreeSet<u64>>,
-    filled: &AtomicU64,
-    faults: &AtomicU64,
+    page_set: &Mutex<BTreeSet<u64>>,
+    fill_count: &AtomicU64,
+    fault_count: &AtomicU64,
+    latencies: &Mutex<Vec<u64>>,
+    granule: u64,
 ) {
-    use std::os::unix::fs::FileExt;
     let mut buf = vec![0u8; 65536];
     let (n, fd) = recv_with_fd(stream, &mut buf).expect("recv uffd");
     let body = String::from_utf8_lossy(&buf[..n]).into_owned();
     let regions = parse_regions(&body);
     assert!(!regions.is_empty(), "no regions in handshake: {body}");
     let uffd = Uffd::from_fd(fd.expect("uffd fd"));
-    let source = std::fs::File::open(source_mem).expect("source mem");
-    let mut page = vec![0u8; PAGE_SIZE];
     while let Ok(event) = uffd.read_event() {
+        let started = Instant::now();
         let addr = event.address as u64 & !(PAGE_SIZE as u64 - 1);
         let region = regions
             .iter()
@@ -457,20 +575,42 @@ fn serve_one_shmem(
             .expect("fault outside every region");
         let offset = addr - region.base_host_virt_addr + region.offset;
         {
-            let mut populated = populated.lock().expect("lock");
-            if !populated.contains(&offset) {
-                // ONE fill serves every fork: the page lands in the shared
-                // page cache, where all MAP_PRIVATE mappers find it.
-                source
-                    .read_exact_at(&mut page, offset)
-                    .expect("source read");
-                shmem.write_all_at(&page, offset).expect("populate");
-                populated.insert(offset);
-                filled.fetch_add(1, Ordering::SeqCst);
+            let mut page_set = page_set.lock().expect("lock");
+            let base = offset / granule * granule;
+            if !page_set.contains(&base) {
+                // ONE fill serves every fork: the granule lands in the
+                // shared page cache, where all MAP_PRIVATE mappers find it.
+                filler.fill(shmem, offset, granule);
+                page_set.insert(base);
+                fill_count.fetch_add(granule / PAGE_SIZE as u64, Ordering::SeqCst);
             }
         }
-        faults.fetch_add(1, Ordering::SeqCst);
+        fault_count.fetch_add(1, Ordering::SeqCst);
         uffd.wake(usize::try_from(addr).expect("fits"), PAGE_SIZE)
             .expect("wake");
+        latencies
+            .lock()
+            .expect("lock")
+            .push(u64::try_from(started.elapsed().as_micros()).expect("fits"));
     }
+}
+
+/// Upload a snapshot memory file into the store as `part_bytes`-sized
+/// segment objects under `prefix` (each well inside the 64 MiB object
+/// contract, R4.6). Returns the part count.
+pub fn upload_mem_parts(
+    store: &crate::s3::S3Store,
+    mem_path: &Path,
+    prefix: &str,
+    part_bytes: u64,
+) -> u64 {
+    let bytes = std::fs::read(mem_path).expect("mem file");
+    let mut part = 0u64;
+    for chunk in bytes.chunks(usize::try_from(part_bytes).expect("fits")) {
+        store
+            .put(&format!("{prefix}/{part:08}"), chunk.to_vec())
+            .expect("upload part");
+        part += 1;
+    }
+    part
 }

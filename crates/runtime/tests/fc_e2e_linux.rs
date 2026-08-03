@@ -11,6 +11,7 @@
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::cast_precision_loss)] // presentation math in profiles
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +39,10 @@ fn artifacts(tag: &str) -> Artifacts {
             dir.display()
         );
     }
-    let scratch = std::env::temp_dir().join(format!("blockd-fc-{tag}-{}", std::process::id()));
+    // Real disk, never tmpfs: snapshot memory files are large, and a
+    // tmpfs scratch would silently consume RAM (and fill under a
+    // concurrent suite). Fixed names self-clean on rerun.
+    let scratch = PathBuf::from(format!("/var/tmp/blockd-scratch/fc-{tag}"));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("scratch");
     Artifacts {
@@ -47,6 +51,15 @@ fn artifacts(tag: &str) -> Artifacts {
         initrd: dir.join("initramfs.cpio"),
         scratch,
     }
+}
+
+/// The `UffdShmem` backing file must live on a REAL shmem mount: guest
+/// memory is RAM, and uffd registration of a private file mapping is only
+/// supported for shmem. Disk scratch is for snapshots and sockets.
+fn shmem_path(tag: &str) -> PathBuf {
+    let path = PathBuf::from(format!("/dev/shm/blockd-{tag}.shmem"));
+    let _ = std::fs::remove_file(&path);
+    path
 }
 
 fn boot_vm(art: &Artifacts, name: &str) -> FcVm {
@@ -249,7 +262,7 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     // The handler owns the (sparse) shared base; every fork maps it.
     let mem_bytes = u64::from(MEM_MIB) * 1024 * 1024;
     let uffd_sock = art.scratch.join("shmem.sock");
-    let shmem = art.scratch.join("base.shmem");
+    let shmem = shmem_path("fork-base");
     let listener = std::os::unix::net::UnixListener::bind(&uffd_sock).expect("bind");
     let server = ShmemServer::start(listener, mem.clone(), &shmem, mem_bytes);
 
@@ -332,6 +345,107 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     assert!(
         server.filled.load(Ordering::SeqCst) > filled_before_refill,
         "reclaim did not cause refills — nothing was actually freed"
+    );
+    for fork in forks {
+        fork.kill();
+    }
+}
+
+/// The R1.3/R5.3 fleet economics on REAL Firecracker: MANY forks of one
+/// worked snapshot, each doing a LITTLE work — and the measured memory
+/// bill is one base plus a small per-fork marginal, never nominal × N.
+#[test]
+fn many_forks_each_do_small_work_and_memory_stays_marginal() {
+    use blockd_runtime::fc::{ShmemServer, rss_pss_of_pid};
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+
+    const FORKS: usize = 12;
+    let art = artifacts("manyforks");
+    let mut vm = boot_vm(&art, "base");
+    vm.wait_line("READY");
+    vm.cmd("fill 7 4096", "FILLED ");
+    let base_sum = vm.cmd("sum 4096", "SUM ");
+    let snap = art.scratch.join("base.vmstate");
+    let mem = art.scratch.join("base.mem");
+    vm.pause();
+    vm.snapshot(&snap, &mem);
+    vm.kill();
+
+    let mem_bytes = u64::from(MEM_MIB) * 1024 * 1024;
+    let uffd_sock = art.scratch.join("many.sock");
+    let shmem = shmem_path("many-forks");
+    let listener = std::os::unix::net::UnixListener::bind(&uffd_sock).expect("bind");
+    let server = ShmemServer::start(listener, mem, &shmem, mem_bytes);
+
+    // Boot storm: N concurrent microVMs from ONE snapshot.
+    let storm = Instant::now();
+    let mut forks: Vec<FcVm> = (0..FORKS)
+        .map(|n| {
+            let fork = FcVm::spawn(&art.fc, &art.scratch.join(format!("many{n}.sock")));
+            fork.load_snapshot_shmem(&snap, &uffd_sock, &shmem);
+            fork
+        })
+        .collect();
+    for fork in &mut forks {
+        fork.cmd("ping", "PONG");
+    }
+    let storm_elapsed = storm.elapsed();
+
+    // A LITTLE work in each fork: one mark + a 64 KiB private refill,
+    // verified by the guest's own checksum.
+    for (n, fork) in forks.iter_mut().enumerate() {
+        fork.cmd(&format!("mark 0 {}", 5000 + n), "MARKED");
+        let refilled = fork.cmd(&format!("fill {} 16", 300 + n), "FILLED ");
+        assert_eq!(fork.cmd("sum 16", "SUM "), refilled);
+    }
+    // Isolation across the whole fleet: full-arena sums pairwise distinct
+    // (every fork carries the base plus exactly its own writes).
+    let mut sums = Vec::new();
+    for fork in &mut forks {
+        sums.push(fork.cmd("sum 4096", "SUM "));
+    }
+    for (n, sum) in sums.iter().enumerate() {
+        assert_ne!(sum, &base_sum, "fork {n} did not diverge");
+        for (m, other) in sums.iter().enumerate().skip(n + 1) {
+            assert_ne!(sum, other, "forks {n} and {m} share written state");
+        }
+    }
+
+    // THE BILL. Unique fills stayed one-base-sized (shared by all 12) …
+    let filled_pages = server.filled.load(Ordering::SeqCst);
+    let base_resident = server.resident_bytes();
+    assert_eq!(
+        base_resident,
+        usize::try_from(filled_pages).expect("fits") * 4096,
+        "base holds more than one copy per filled page"
+    );
+    assert!(
+        filled_pages < 2 * 4096 + 4096,
+        "unique fills scaled with the fleet: {filled_pages} pages for {FORKS} forks"
+    );
+    // … and the per-fork marginal memory is a small fraction of the
+    // 128 MiB nominal guest — the overcommit is real, measured on real
+    // VMM processes. (Pss splits shared pages, so the fleet total is the
+    // honest physical bill.)
+    let (_, pss_first) = rss_pss_of_pid(forks[0].pid());
+    let fleet_pss: usize = forks.iter().map(|f| rss_pss_of_pid(f.pid()).1).sum();
+    let marginal = (fleet_pss - pss_first) / (FORKS - 1);
+    eprintln!(
+        "── MANY-FORKS BILL: {FORKS} forks in {storm_elapsed:.1?}; base {base_resident} B \
+         ({filled_pages} pages, filled once); fleet Pss {:.1} MiB; \
+         per-fork marginal {:.1} MiB (vs {MEM_MIB} MiB nominal) ──",
+        fleet_pss as f64 / (1024.0 * 1024.0),
+        marginal as f64 / (1024.0 * 1024.0),
+    );
+    let nominal = usize::try_from(mem_bytes).expect("fits");
+    assert!(
+        fleet_pss < nominal + FORKS * nominal / 4,
+        "fleet costs like full copies: {fleet_pss} bytes for {FORKS} forks"
+    );
+    assert!(
+        marginal < nominal / 4,
+        "per-fork marginal {marginal} bytes is not marginal against {nominal}"
     );
     for fork in forks {
         fork.kill();
