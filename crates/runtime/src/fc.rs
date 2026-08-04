@@ -6,7 +6,7 @@
 //! `/snapshot/load` with a `Uffd` backend it hands us the guest-memory
 //! userfaultfd over a unix socket, and every guest touch becomes OUR fill.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -378,15 +378,11 @@ fn libc_exist() -> i32 {
 /// involved. Hole-punching the file is backing reclaim; the next touch
 /// faults back here and refills.
 pub struct ShmemServer {
-    /// Offsets currently populated in the shmem file.
-    populated: Arc<Mutex<BTreeSet<u64>>>,
-    /// Pages filled from the source (unique work — the R5.3 measure).
-    pub filled: Arc<AtomicU64>,
+    parts: Arc<PartTable>,
     /// Faults answered (fills + wakes of already-populated pages).
     pub faults: Arc<AtomicU64>,
     /// Per-fault service time in microseconds (the fault-latency profile).
     pub fault_micros: Arc<Mutex<Vec<u64>>>,
-    shmem: Arc<std::fs::File>,
 }
 
 impl ShmemServer {
@@ -398,32 +394,17 @@ impl ShmemServer {
         shmem_path: &Path,
         mem_bytes: u64,
     ) -> ShmemServer {
-        let shmem = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(shmem_path)
-            .expect("shmem file");
-        shmem.set_len(mem_bytes).expect("shmem size");
-        let server = ShmemServer {
-            populated: Arc::new(Mutex::new(BTreeSet::new())),
-            filled: Arc::new(AtomicU64::new(0)),
-            faults: Arc::new(AtomicU64::new(0)),
-            fault_micros: Arc::new(Mutex::new(Vec::new())),
-            shmem: Arc::new(shmem),
-        };
-        server.accept_loop(
-            listener,
-            Arc::new(Filler::File(source_mem)),
-            PAGE_SIZE as u64,
-        );
-        server
+        let parts = PartTable::local(source_mem, &create_shmem(shmem_path, mem_bytes), mem_bytes);
+        ShmemServer::accepting(listener, parts)
     }
 
     /// The cold-tier variant: fills come from the S3-shaped store at
     /// segment granularity — a fault on any page of a `part_bytes` part
     /// fetches the whole part object with one `GetObject` (the store tier
-    /// of R2.3: segment-granular, never per-page round trips).
+    /// of R2.3: segment-granular, never per-page round trips). Distinct
+    /// parts fetch concurrently, concurrent faults on one part share one
+    /// fetch, and each demand fault keeps the next `readahead_parts` parts
+    /// in flight ahead of a sequential reader.
     pub fn start_s3(
         listener: UnixListener,
         store: Arc<crate::s3::S3Store>,
@@ -431,81 +412,72 @@ impl ShmemServer {
         part_bytes: u64,
         shmem_path: &Path,
         mem_bytes: u64,
+        readahead_parts: u64,
     ) -> ShmemServer {
-        let shmem = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(shmem_path)
-            .expect("shmem file");
-        shmem.set_len(mem_bytes).expect("shmem size");
-        let server = ShmemServer {
-            populated: Arc::new(Mutex::new(BTreeSet::new())),
-            filled: Arc::new(AtomicU64::new(0)),
-            faults: Arc::new(AtomicU64::new(0)),
-            fault_micros: Arc::new(Mutex::new(Vec::new())),
-            shmem: Arc::new(shmem),
-        };
-        server.accept_loop(
-            listener,
-            Arc::new(Filler::Store {
-                store,
-                prefix,
-                part_bytes,
-            }),
+        let parts = PartTable::store(
+            store,
+            prefix,
             part_bytes,
+            &create_shmem(shmem_path, mem_bytes),
+            mem_bytes,
+            readahead_parts,
         );
-        server
+        ShmemServer::accepting(listener, parts)
     }
 
-    fn accept_loop(&self, listener: UnixListener, filler: Arc<Filler>, granule: u64) {
-        let (page_set, fill_count, fault_count, latencies, backing) = (
-            self.populated.clone(),
-            self.filled.clone(),
-            self.faults.clone(),
-            self.fault_micros.clone(),
-            self.shmem.clone(),
+    fn accepting(listener: UnixListener, parts: Arc<PartTable>) -> ShmemServer {
+        let server = ShmemServer {
+            parts,
+            faults: Arc::new(AtomicU64::new(0)),
+            fault_micros: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (parts, fault_count, latencies) = (
+            server.parts.clone(),
+            server.faults.clone(),
+            server.fault_micros.clone(),
         );
         thread::spawn(move || {
             loop {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
-                let (page_set, fill_count, fault_count, latencies, backing, filler) = (
-                    page_set.clone(),
-                    fill_count.clone(),
-                    fault_count.clone(),
-                    latencies.clone(),
-                    backing.clone(),
-                    filler.clone(),
-                );
+                let (parts, fault_count, latencies) =
+                    (parts.clone(), fault_count.clone(), latencies.clone());
                 thread::spawn(move || {
-                    serve_one_shmem(
-                        &stream,
-                        &filler,
-                        &backing,
-                        &page_set,
-                        &fill_count,
-                        &fault_count,
-                        &latencies,
-                        granule,
-                    );
+                    serve_one_shmem(&stream, &parts, &fault_count, &latencies);
                 });
             }
         });
+        server
+    }
+
+    /// Pages filled from the source (unique work — the R5.3 measure).
+    pub fn filled(&self) -> u64 {
+        self.parts.filled.load(Ordering::SeqCst)
     }
 
     /// Physical bytes the shared base holds right now.
     pub fn resident_bytes(&self) -> usize {
-        blockd_hostmem::file_resident_bytes(&self.shmem).expect("fstat")
+        blockd_hostmem::file_resident_bytes(&self.parts.shmem).expect("fstat")
     }
 
     /// Backing reclaim (R2.7): free the whole base file. Forks' private
     /// copy-on-write pages survive; clean pages will refault and refill.
     pub fn reclaim_all(&self, mem_bytes: u64) {
-        self.populated.lock().expect("lock").clear();
-        blockd_hostmem::punch_hole_file(&self.shmem, 0, mem_bytes).expect("punch");
+        self.parts.states.lock().expect("lock").clear();
+        blockd_hostmem::punch_hole_file(&self.parts.shmem, 0, mem_bytes).expect("punch");
     }
+}
+
+fn create_shmem(shmem_path: &Path, mem_bytes: u64) -> Arc<std::fs::File> {
+    let shmem = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(shmem_path)
+        .expect("shmem file");
+    shmem.set_len(mem_bytes).expect("shmem size");
+    Arc::new(shmem)
 }
 
 /// Where a shmem fill's bytes come from: the snapshot memory file (warm
@@ -521,10 +493,9 @@ enum Filler {
 }
 
 impl Filler {
-    /// Fill the granule containing `offset` into the shmem file.
-    fn fill(&self, shmem: &std::fs::File, offset: u64, granule: u64) {
+    /// Fill the granule starting at `base` into the shmem file.
+    fn fill(&self, shmem: &std::fs::File, base: u64, granule: u64) {
         use std::os::unix::fs::FileExt;
-        let base = offset / granule * granule;
         match self {
             Filler::File(path) => {
                 let source = std::fs::File::open(path).expect("source mem");
@@ -549,23 +520,202 @@ impl Filler {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One fetch granule's state.
+enum PartState {
+    /// A fetch is in flight; late faulters park on it.
+    Fetching(Arc<Fetch>),
+    Ready,
+}
+
+/// A parked fault's wake action.
+type Waker = Box<dyn FnOnce() + Send>;
+
+/// An in-flight part fetch. Waiters are the wake actions of every fault
+/// parked on it; `None` marks completion, so a faulter that raced the
+/// finish wakes itself inline instead of parking forever.
+struct Fetch {
+    waiters: Mutex<Option<Vec<Waker>>>,
+}
+
+impl Fetch {
+    fn new() -> Arc<Fetch> {
+        Arc::new(Fetch {
+            waiters: Mutex::new(Some(Vec::new())),
+        })
+    }
+
+    /// Park `waker` until the fetch completes — or run it now if it
+    /// already has.
+    fn park(&self, waker: impl FnOnce() + Send + 'static) {
+        let mut waiters = self.waiters.lock().expect("lock");
+        if let Some(waiters) = waiters.as_mut() {
+            waiters.push(Box::new(waker));
+        } else {
+            drop(waiters);
+            waker();
+        }
+    }
+
+    /// Complete: every parked waker runs, late parkers run inline.
+    fn finish(&self) {
+        let wakers = self
+            .waiters
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("finished once");
+        for waker in wakers {
+            waker();
+        }
+    }
+}
+
+/// The part-fetch engine behind [`ShmemServer`]: the cold path must never
+/// serialize on the store's latency. Concurrent faults on one part share a
+/// single in-flight fetch (one `GetObject` no matter how many forks storm
+/// it); distinct parts fetch concurrently on their own threads; and each
+/// demand fault keeps the next `readahead` parts in flight, so a
+/// sequential reader streams at transfer speed instead of stalling
+/// per-part. Fault callers hand over a wake action and never block —
+/// a VM's uffd reader stays free to serve its other faults.
+pub struct PartTable {
+    granule: u64,
+    mem_bytes: u64,
+    /// Parts to keep in flight ahead of each demand fault (0 = none).
+    readahead: u64,
+    filler: Filler,
+    shmem: Arc<std::fs::File>,
+    /// Pages filled from the source (unique work — the R5.3 measure).
+    pub filled: Arc<AtomicU64>,
+    states: Mutex<BTreeMap<u64, PartState>>,
+}
+
+impl PartTable {
+    /// Warm local tier: page-granular fills from the snapshot memory file.
+    /// Fills cost microseconds, so they run inline under the table lock —
+    /// exactly one fill per page across every faulting fork.
+    pub fn local(
+        source_mem: PathBuf,
+        shmem: &Arc<std::fs::File>,
+        mem_bytes: u64,
+    ) -> Arc<PartTable> {
+        Arc::new(PartTable {
+            granule: PAGE_SIZE as u64,
+            mem_bytes,
+            readahead: 0,
+            filler: Filler::File(source_mem),
+            shmem: shmem.clone(),
+            filled: Arc::new(AtomicU64::new(0)),
+            states: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Cold store tier: `part_bytes`-granular fetches, concurrent and
+    /// deduplicated, with demand-triggered readahead.
+    pub fn store(
+        store: Arc<crate::s3::S3Store>,
+        prefix: String,
+        part_bytes: u64,
+        shmem: &Arc<std::fs::File>,
+        mem_bytes: u64,
+        readahead: u64,
+    ) -> Arc<PartTable> {
+        Arc::new(PartTable {
+            granule: part_bytes,
+            mem_bytes,
+            readahead,
+            filler: Filler::Store {
+                store,
+                prefix,
+                part_bytes,
+            },
+            shmem: shmem.clone(),
+            filled: Arc::new(AtomicU64::new(0)),
+            states: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// A demand fault at `offset`: run `waker` once the containing part is
+    /// populated — inline if it already is. Never blocks on a fetch.
+    pub fn fault(self: &Arc<PartTable>, offset: u64, waker: impl FnOnce() + Send + 'static) {
+        let base = offset / self.granule * self.granule;
+        if matches!(self.filler, Filler::File(_)) {
+            // Local fills are microseconds: fill under the lock, like a
+            // page-cache hit path. ONE fill serves every fork — the page
+            // lands in the shared cache where all MAP_PRIVATE mappers
+            // find it.
+            let mut states = self.states.lock().expect("lock");
+            if !matches!(states.get(&base), Some(PartState::Ready)) {
+                self.filler.fill(&self.shmem, base, self.granule);
+                self.filled.fetch_add(1, Ordering::SeqCst);
+                states.insert(base, PartState::Ready);
+            }
+            drop(states);
+            waker();
+            return;
+        }
+        match self.state_of(base) {
+            None => waker(),
+            Some(fetch) => fetch.park(waker),
+        }
+        // Demand-triggered readahead (never chained off readahead fills:
+        // that would eagerly stream the whole memory).
+        for ahead in 1..=self.readahead {
+            let next = base + ahead * self.granule;
+            if next < self.mem_bytes {
+                self.state_of(next);
+            }
+        }
+    }
+
+    /// The part's fetch to park on (`None` = already populated), starting
+    /// one on a fresh thread if this is the first fault to reach it.
+    fn state_of(self: &Arc<PartTable>, base: u64) -> Option<Arc<Fetch>> {
+        let mut states = self.states.lock().expect("lock");
+        if let Some(state) = states.get(&base) {
+            return match state {
+                PartState::Ready => None,
+                PartState::Fetching(fetch) => Some(fetch.clone()),
+            };
+        }
+        let fetch = Fetch::new();
+        states.insert(base, PartState::Fetching(fetch.clone()));
+        drop(states);
+        let (table, started) = (self.clone(), fetch.clone());
+        thread::spawn(move || table.fetch(base, &started));
+        Some(fetch)
+    }
+
+    /// Fetch one part (on its own thread) and wake everyone parked on it.
+    fn fetch(self: &Arc<PartTable>, base: u64, fetch: &Arc<Fetch>) {
+        self.filler.fill(&self.shmem, base, self.granule);
+        self.filled
+            .fetch_add(self.granule / PAGE_SIZE as u64, Ordering::SeqCst);
+        {
+            let mut states = self.states.lock().expect("lock");
+            // A reclaim may have cleared the table mid-fetch: the punched
+            // part must not be marked Ready (waking is still safe — a
+            // still-missing page just refaults).
+            if let Some(state @ PartState::Fetching(_)) = states.get_mut(&base) {
+                *state = PartState::Ready;
+            }
+        }
+        fetch.finish();
+    }
+}
+
 fn serve_one_shmem(
     stream: &UnixStream,
-    filler: &Filler,
-    shmem: &std::fs::File,
-    page_set: &Mutex<BTreeSet<u64>>,
-    fill_count: &AtomicU64,
+    parts: &Arc<PartTable>,
     fault_count: &AtomicU64,
-    latencies: &Mutex<Vec<u64>>,
-    granule: u64,
+    latencies: &Arc<Mutex<Vec<u64>>>,
 ) {
     let mut buf = vec![0u8; 65536];
     let (n, fd) = recv_with_fd(stream, &mut buf).expect("recv uffd");
     let body = String::from_utf8_lossy(&buf[..n]).into_owned();
     let regions = parse_regions(&body);
     assert!(!regions.is_empty(), "no regions in handshake: {body}");
-    let uffd = Uffd::from_fd(fd.expect("uffd fd"));
+    let uffd = Arc::new(Uffd::from_fd(fd.expect("uffd fd")));
     while let Ok(event) = uffd.read_event() {
         let started = Instant::now();
         let addr = event.address as u64 & !(PAGE_SIZE as u64 - 1);
@@ -574,24 +724,16 @@ fn serve_one_shmem(
             .find(|r| addr >= r.base_host_virt_addr && addr < r.base_host_virt_addr + r.size)
             .expect("fault outside every region");
         let offset = addr - region.base_host_virt_addr + region.offset;
-        {
-            let mut page_set = page_set.lock().expect("lock");
-            let base = offset / granule * granule;
-            if !page_set.contains(&base) {
-                // ONE fill serves every fork: the granule lands in the
-                // shared page cache, where all MAP_PRIVATE mappers find it.
-                filler.fill(shmem, offset, granule);
-                page_set.insert(base);
-                fill_count.fetch_add(granule / PAGE_SIZE as u64, Ordering::SeqCst);
-            }
-        }
         fault_count.fetch_add(1, Ordering::SeqCst);
-        uffd.wake(usize::try_from(addr).expect("fits"), PAGE_SIZE)
-            .expect("wake");
-        latencies
-            .lock()
-            .expect("lock")
-            .push(u64::try_from(started.elapsed().as_micros()).expect("fits"));
+        let (uffd, latencies) = (uffd.clone(), latencies.clone());
+        parts.fault(offset, move || {
+            uffd.wake(usize::try_from(addr).expect("fits"), PAGE_SIZE)
+                .expect("wake");
+            latencies
+                .lock()
+                .expect("lock")
+                .push(u64::try_from(started.elapsed().as_micros()).expect("fits"));
+        });
     }
 }
 

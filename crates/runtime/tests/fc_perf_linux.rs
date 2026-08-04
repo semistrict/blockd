@@ -157,7 +157,7 @@ fn profile_restore_file_vs_uffdshmem() {
     eprintln!(
         "  UffdShmem faults  {}  (pages filled {})",
         fault_profile(&server.fault_micros),
-        server.filled.load(Ordering::SeqCst),
+        server.filled(),
     );
     // Shape assertions: both restored correctly (checked above) and within
     // generous sanity bounds for a shared CI-class VM.
@@ -189,7 +189,9 @@ fn profile_cold_restore_from_simulated_s3() {
     assert_eq!(puts_after_upload, parts, "one PutObject per part");
 
     // Cold restore: every byte the guest touches is fetched from "S3" by
-    // the handler, one GetObject per touched part.
+    // the handler, one GetObject per touched part. Readahead is OFF so the
+    // bill below stays exactly demand-shaped (the readahead machinery is
+    // pinned by tests/part_fetch_linux.rs).
     let uffd_sock = art.scratch.join("s3.sock");
     let shmem = shmem_path("perf-s3cold");
     let listener = std::os::unix::net::UnixListener::bind(&uffd_sock).expect("bind");
@@ -200,6 +202,7 @@ fn profile_cold_restore_from_simulated_s3() {
         PART_BYTES,
         &shmem,
         u64::from(MEM_MIB) * 1024 * 1024,
+        0,
     );
     let started = Instant::now();
     let mut vm = FcVm::spawn(&art.fc, &art.scratch.join("s3vm.sock"));
@@ -254,9 +257,12 @@ fn profile_cold_restore_from_simulated_s3() {
         "download bytes must equal fetched parts exactly"
     );
     // Demand paging under same-region latency still resumes promptly: the
-    // guest answered within a handful of part fetches.
+    // guest answered within a handful of part fetches (~0.6s in
+    // isolation; the bound leaves room for full-suite scheduling on a
+    // loaded CI-class VM — a per-page-fetching regression would blow the
+    // GetObject-count asserts above and take minutes, not seconds).
     assert!(
-        first_response < Duration::from_secs(2),
+        first_response < Duration::from_secs(4),
         "first response took {first_response:?}"
     );
 }

@@ -282,7 +282,7 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     // ONE physical copy: three forks touched ≥4096 arena pages each, yet
     // unique fills stayed far below 2× the arena — and the shmem file
     // holds exactly the filled pages, once.
-    let filled = server.filled.load(Ordering::SeqCst);
+    let filled = server.filled();
     let faults = server.faults.load(Ordering::SeqCst);
     assert!(filled >= 4096, "the arena was not demand-filled: {filled}");
     assert!(
@@ -303,7 +303,7 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
 
     // Divergence: private work per fork, isolated pairwise…
     let resident_before_divergence = server.resident_bytes();
-    let filled_before_divergence = server.filled.load(Ordering::SeqCst);
+    let filled_before_divergence = server.filled();
     let mut fork_sums = Vec::new();
     for (n, fork) in forks.iter_mut().enumerate() {
         fork.cmd(&format!("mark 0 {}", 2000 + n), "MARKED");
@@ -321,7 +321,7 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     // fault on a never-touched page populates the base once before CoW),
     // never by copies of diverged data. Three forks each rewrote 4 MiB
     // (3072 pages of divergence) — none of it landed here.
-    let new_fills = server.filled.load(Ordering::SeqCst) - filled_before_divergence;
+    let new_fills = server.filled() - filled_before_divergence;
     assert_eq!(
         server.resident_bytes(),
         resident_before_divergence + usize::try_from(new_fills).expect("fits") * 4096,
@@ -338,12 +338,12 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     // Every fork still has its exact diverged state: dirty CoW pages
     // survived the punch; clean pages refaulted and refilled through the
     // handler.
-    let filled_before_refill = server.filled.load(Ordering::SeqCst);
+    let filled_before_refill = server.filled();
     for (fork, expected) in forks.iter_mut().zip(&fork_sums) {
         assert_eq!(&fork.cmd("sum 4096", "SUM "), expected);
     }
     assert!(
-        server.filled.load(Ordering::SeqCst) > filled_before_refill,
+        server.filled() > filled_before_refill,
         "reclaim did not cause refills — nothing was actually freed"
     );
     for fork in forks {
@@ -357,7 +357,6 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
 #[test]
 fn many_forks_each_do_small_work_and_memory_stays_marginal() {
     use blockd_runtime::fc::{ShmemServer, rss_pss_of_pid};
-    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     const FORKS: usize = 12;
@@ -413,7 +412,7 @@ fn many_forks_each_do_small_work_and_memory_stays_marginal() {
     }
 
     // THE BILL. Unique fills stayed one-base-sized (shared by all 12) …
-    let filled_pages = server.filled.load(Ordering::SeqCst);
+    let filled_pages = server.filled();
     let base_resident = server.resident_bytes();
     assert_eq!(
         base_resident,
