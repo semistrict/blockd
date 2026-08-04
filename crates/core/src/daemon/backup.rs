@@ -51,16 +51,38 @@ impl Daemon {
         if !newer {
             return;
         }
+        // Segments the record references: its overlay's, plus those of
+        // every local leaf it points at (a pending leaf came FROM the
+        // store, so its segments are already backed).
         let mut segs_todo: Vec<(u64, SegId)> = record
-            .pages
+            .overlay
             .values()
             .filter(|(_, loc)| loc.base == 0) // base segments are shared, kept by their base
             .map(|(_, loc)| (loc.fence, loc.seg))
+            .chain(
+                record
+                    .leaves
+                    .values()
+                    .filter(|ptr| ptr.base == 0)
+                    .filter_map(|ptr| state.leaf_blobs.get(ptr))
+                    .flat_map(|(_, segs)| segs.iter().copied()),
+            )
             .filter(|key| !state.backed_segs.contains(key))
             .collect();
         segs_todo.sort_unstable();
         segs_todo.dedup();
-        state.publish = Some(Publish { record, segs_todo });
+        let leaves_todo: Vec<(u64, u64)> = record
+            .leaves
+            .values()
+            .filter(|ptr| ptr.base == 0)
+            .map(|ptr| (ptr.fence, ptr.id))
+            .filter(|key| !state.backed_leaves.contains(key))
+            .collect();
+        state.publish = Some(Publish {
+            record,
+            segs_todo,
+            leaves_todo,
+        });
         self.publish_step(vset_id, out);
     }
 
@@ -85,6 +107,22 @@ impl Daemon {
             out.push(Effect::BlobRead {
                 io,
                 name: layout::segment_blob(vset_id, fence, seg),
+            });
+            return;
+        }
+        if let Some(&(fence, id)) = publish.leaves_todo.last() {
+            let io = self.io();
+            self.pending.insert(
+                io,
+                Pending::PubLeafRead {
+                    vset: vset_id,
+                    fence,
+                    id,
+                },
+            );
+            out.push(Effect::BlobRead {
+                io,
+                name: layout::leaf_blob(vset_id, fence, id),
             });
             return;
         }
@@ -148,6 +186,46 @@ impl Daemon {
         });
     }
 
+    /// Local read of a map leaf headed for the store.
+    pub(super) fn pub_leaf_read_done(
+        &mut self,
+        vset_id: VsetId,
+        fence: u64,
+        id: u64,
+        bytes: Option<Vec<u8>>,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(state) = self.vsets.get_mut(&vset_id) else {
+            return;
+        };
+        if state.publish.is_none() {
+            return;
+        }
+        // Verify before upload (R8.1 in both directions).
+        let intact = bytes
+            .as_deref()
+            .is_some_and(|b| crate::mapleaf::MapLeaf::decode(vset_id, fence, id, b).is_ok());
+        let Some(blob) = bytes.filter(|_| intact) else {
+            state.publish = None;
+            self.backup_backoff(vset_id, out);
+            return;
+        };
+        let io = self.io();
+        self.pending.insert(
+            io,
+            Pending::PubLeafPut {
+                vset: vset_id,
+                fence,
+                id,
+            },
+        );
+        out.push(Effect::StorePut {
+            io,
+            key: layout::leaf_key(vset_id, fence, id),
+            bytes: blob,
+        });
+    }
+
     /// A store write of the publish pipeline completed.
     #[allow(clippy::needless_pass_by_value)]
     pub(super) fn pub_put_done(
@@ -165,6 +243,19 @@ impl Daemon {
                     state.backed_segs.insert((fence, seg));
                     if let Some(publish) = &mut state.publish {
                         publish.segs_todo.retain(|&k| k != (fence, seg));
+                    }
+                    self.publish_step(vset, out);
+                }
+                Err(_) => self.backup_fault(vset, out),
+            },
+            Pending::PubLeafPut { vset, fence, id } => match result {
+                Ok(_) => {
+                    let Some(state) = self.vsets.get_mut(&vset) else {
+                        return;
+                    };
+                    state.backed_leaves.insert((fence, id));
+                    if let Some(publish) = &mut state.publish {
+                        publish.leaves_todo.retain(|&k| k != (fence, id));
                     }
                     self.publish_step(vset, out);
                 }
@@ -396,19 +487,45 @@ impl Daemon {
                 key: layout::manifest_key(vset_id, key.0, key.1),
             });
         }
-        let referenced: std::collections::BTreeSet<(u64, SegId)> = state
+        let Some(record) = state
             .best_record
             .as_ref()
             .filter(|r| (r.capture_seq, r.seq) == (current.capture_seq, current.seq))
-            .map(|r| {
-                r.pages
-                    .values()
-                    .map(|(_, loc)| (loc.fence, loc.seg))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if referenced.is_empty() {
+        else {
             return;
+        };
+        // The backed manifest's references: overlay segments, its leaves,
+        // and the segments those leaves hold (from the local copies).
+        let mut referenced: std::collections::BTreeSet<(u64, SegId)> = record
+            .overlay
+            .values()
+            .map(|(_, loc)| (loc.fence, loc.seg))
+            .collect();
+        let leaf_refs: std::collections::BTreeSet<(u64, u64)> = record
+            .leaves
+            .values()
+            .filter(|ptr| ptr.base == 0)
+            .map(|ptr| (ptr.fence, ptr.id))
+            .collect();
+        for ptr in record.leaves.values() {
+            if let Some((_, segs)) = state.leaf_blobs.get(ptr) {
+                referenced.extend(segs.iter().copied());
+            }
+        }
+        if referenced.is_empty() && leaf_refs.is_empty() {
+            return;
+        }
+        let dead_leaves: Vec<(u64, u64)> = state
+            .backed_leaves
+            .iter()
+            .copied()
+            .filter(|key| !leaf_refs.contains(key))
+            .collect();
+        for (fence, id) in dead_leaves {
+            state.backed_leaves.remove(&(fence, id));
+            out.push(Effect::StoreDelete {
+                key: layout::leaf_key(vset_id, fence, id),
+            });
         }
         // In-flight store fetches pin their segment, exactly like local
         // cleanup does for local fetches.

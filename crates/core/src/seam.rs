@@ -102,6 +102,18 @@ pub enum PeerMsg {
     /// Peer fetch response: raw stored bytes, damage included (the reader
     /// verifies, R8.1). `None` = the peer no longer has it.
     Page { io: IoId, bytes: Option<Vec<u8>> },
+    /// Fetch one map leaf blob from a peer (post-copy hydration of a
+    /// migrated vset's map, R7.1). `base` is 0 for the vset's own
+    /// namespace, else the base whose leaf this is.
+    FetchLeaf {
+        io: IoId,
+        vset: VsetId,
+        base: u64,
+        fence: u64,
+        id: u64,
+    },
+    /// Leaf fetch response: the blob's raw bytes, damage included.
+    Leaf { io: IoId, bytes: Option<Vec<u8>> },
     /// The destination holds every byte it needs: the source may reclaim
     /// the vset's local state.
     Released { vset: VsetId },
@@ -223,6 +235,9 @@ pub enum TimerId {
     /// Retry a restore whose store operations hit an outage (R8.3: outages
     /// queue work, they never fail it).
     RestoreRetry(VsetId),
+    /// Re-issue store fetches for map leaves still pending after a fault
+    /// (lazy hydration never gives up on a transient outage).
+    LeafRetry(VsetId),
 }
 
 /// Everything that can happen to the daemon.

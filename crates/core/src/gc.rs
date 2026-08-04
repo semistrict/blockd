@@ -17,12 +17,13 @@ use std::collections::BTreeSet;
 use crate::head::HeadRecord;
 use crate::journal::JournalRecord;
 use crate::layout::{self, StoreKey};
+use crate::mapleaf::MapLeaf;
 use crate::types::{SimTime, VsetId};
 
 /// Compute the deletion list for one GC pass over a bucket listing.
 /// `objects` is the full LIST (key, last-write time, bytes); reads of
-/// manifests and base records happen from these bytes exactly as the real
-/// process would GET them.
+/// manifests, base records and map leaves happen from these bytes exactly
+/// as the real process would GET them.
 pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) -> Vec<String> {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let find = |key: &str| objects.iter().find(|(k, _, _)| k == key);
@@ -53,16 +54,7 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
                 if let Some((_, _, manifest_bytes)) = find(&manifest_key)
                     && let Ok(record) = JournalRecord::decode(vset, manifest_bytes)
                 {
-                    for (_, loc) in record.pages.values() {
-                        let seg_key = if loc.base != 0 {
-                            layout::base_segment_key(loc.base, loc.fence, loc.seg)
-                        } else {
-                            layout::segment_key(vset, loc.fence, loc.seg)
-                        };
-                        if let Some((k, _, _)) = find(&seg_key) {
-                            keep.insert(k);
-                        }
-                    }
+                    mark_record(objects, &mut keep, &record, Namespace::Vset(vset));
                 }
             }
             Some(StoreKey::BaseRecord { base }) => {
@@ -70,14 +62,9 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
                 let Ok(record) = JournalRecord::decode(VsetId(base), bytes) else {
                     continue;
                 };
-                for (_, loc) in record.pages.values() {
-                    // A base's own pages carry its id; inherited pages carry
-                    // an ancestor base's (flattened chains).
-                    let seg_key = layout::base_segment_key(loc.base, loc.fence, loc.seg);
-                    if let Some((k, _, _)) = find(&seg_key) {
-                        keep.insert(k);
-                    }
-                }
+                // A base's own artifacts live in its namespace; inherited
+                // ones carry an ancestor base's id (flattened chains).
+                mark_record(objects, &mut keep, &record, Namespace::Base(base));
             }
             _ => {}
         }
@@ -92,4 +79,62 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
         })
         .map(|(key, _, _)| key.clone())
         .collect()
+}
+
+/// Whose namespace a record's `base == 0` references resolve into.
+#[derive(Clone, Copy)]
+enum Namespace {
+    Vset(VsetId),
+    Base(u64),
+}
+
+/// Mark one record's reachable set: its overlay's segments, its leaf
+/// objects, and the segments those leaves hold.
+fn mark_record<'a>(
+    objects: &'a [(String, SimTime, Vec<u8>)],
+    keep: &mut BTreeSet<&'a str>,
+    record: &JournalRecord,
+    namespace: Namespace,
+) {
+    let find = |key: &str| objects.iter().find(|(k, _, _)| k == key);
+    let seg_key = |loc: &crate::segment::PageLoc| {
+        if loc.base != 0 {
+            return layout::base_segment_key(loc.base, loc.fence, loc.seg);
+        }
+        match namespace {
+            Namespace::Vset(vset) => layout::segment_key(vset, loc.fence, loc.seg),
+            Namespace::Base(base) => layout::base_segment_key(base, loc.fence, loc.seg),
+        }
+    };
+    for (_, loc) in record.overlay.values() {
+        if let Some((k, _, _)) = find(&seg_key(loc)) {
+            keep.insert(k);
+        }
+    }
+    for ptr in record.leaves.values() {
+        let (leaf_key, owner) = if ptr.base != 0 {
+            (
+                layout::base_leaf_key(ptr.base, ptr.fence, ptr.id),
+                VsetId(ptr.base),
+            )
+        } else {
+            match namespace {
+                Namespace::Vset(vset) => (layout::leaf_key(vset, ptr.fence, ptr.id), vset),
+                Namespace::Base(base) => {
+                    (layout::base_leaf_key(base, ptr.fence, ptr.id), VsetId(base))
+                }
+            }
+        };
+        let Some((k, _, leaf_bytes)) = find(&leaf_key) else {
+            continue;
+        };
+        keep.insert(k);
+        if let Ok(leaf) = MapLeaf::decode(owner, ptr.fence, ptr.id, leaf_bytes) {
+            for (_, _, _, loc) in &leaf.entries {
+                if let Some((seg, _, _)) = find(&seg_key(loc)) {
+                    keep.insert(seg);
+                }
+            }
+        }
+    }
 }

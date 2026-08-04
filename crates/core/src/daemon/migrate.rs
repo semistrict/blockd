@@ -273,6 +273,41 @@ impl Daemon {
                 });
             }
             PeerMsg::Page { io, bytes } => self.peer_fill_done(io, bytes, out),
+            PeerMsg::FetchLeaf {
+                io,
+                vset,
+                base,
+                fence,
+                id,
+            } => {
+                // Serve leaves like ranges: from local storage, verbatim.
+                let our_io = self.io();
+                self.pending.insert(
+                    our_io,
+                    Pending::PeerLeafRead {
+                        requester: from,
+                        peer_io: io,
+                    },
+                );
+                let name = if base == 0 {
+                    layout::leaf_blob(vset, fence, id)
+                } else {
+                    layout::base_leaf_blob(vset, base, fence, id)
+                };
+                out.push(Effect::BlobRead { io: our_io, name });
+            }
+            PeerMsg::Leaf { io, bytes } => {
+                match self.pending.remove(&io) {
+                    Some(Pending::PeerLeafFetch { vset, span, ptr }) => {
+                        self.leaf_arrived(vset, span, ptr, bytes, out);
+                    }
+                    Some(other) => {
+                        self.pending.insert(io, other);
+                    }
+                    // Stale reply to a re-issued fetch: ignore.
+                    None => {}
+                }
+            }
             PeerMsg::Released { vset } => {
                 // The destination holds everything: reclaim the vset's
                 // local state (R4.5: explicit). Always ack — a duplicate
@@ -336,18 +371,24 @@ impl Daemon {
         state.durable_watermark = record.synced_through;
         state.next_seq = record.seq.0 + 1;
         state.next_gen = record
-            .pages
+            .overlay
             .values()
             .map(|(g, _)| g.0 + 1)
             .max()
             .unwrap_or(0);
-        state.page_locs = record.pages.clone();
+        // The map hydrates lazily from the source: overlay serves now,
+        // every leaf span parks its faults until fetched (post-copy is
+        // already the contract — a parked fault is just a further page).
+        state.page_locs = record.overlay.clone();
+        state.overlay = record.overlay.clone();
+        state.leaf_table = record.leaves.clone();
+        state.pending_leaves = record.leaves.clone();
         state.best = Some((record.capture_seq, record.seq));
-        state.best_pages = record.pages.clone();
         state.best_record = Some(record);
         state.peer_source = Some(from);
         state.migrated_verdict = Some(Verdict::Resume { epoch, vmstate });
         self.vsets.insert(vset, state);
+        self.request_pending_leaves(vset, out);
         // The first local record IS the acceptance; `finalize_record`
         // replies and sends the accept once it is durable.
         self.start_record_only_capture(vset, out);
@@ -411,6 +452,32 @@ impl Daemon {
             return; // released and acked: hydration is over
         };
         let fence = state.fence;
+        // The MAP hydrates before the data: guests park on unhydrated
+        // spans, so leaves are the wider blocker — and the tick doubles as
+        // the retry for their lost fetches (drop stale in-flight entries;
+        // arrival is idempotent).
+        if !state.pending_leaves.is_empty() {
+            let in_flight: Vec<crate::seam::IoId> = self
+                .pending
+                .iter()
+                .filter(|(_, p)| {
+                    matches!(p, Pending::PeerLeafFetch { vset: owner, .. } if *owner == vset)
+                })
+                .map(|(&io, _)| io)
+                .collect();
+            for io in in_flight {
+                self.pending.remove(&io);
+            }
+            self.request_pending_leaves(vset, out);
+            out.push(Effect::SetTimer {
+                timer: TimerId::Hydrate(vset),
+                after: HYDRATE_TICK,
+            });
+            return;
+        }
+        let Some(state) = self.vsets.get(&vset) else {
+            return;
+        };
         // The tail: pages whose durable home is still a source segment
         // (base-origin pages live in the store, not on the source).
         let foreign: Vec<(PageId, Gen, PageLoc)> = state

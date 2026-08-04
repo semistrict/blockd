@@ -34,6 +34,7 @@ fn base_config() -> HarnessConfig {
         checkpoint_interval: None,
         faults: FaultPlan::none(),
         sabotage: None,
+        guest_sync_share: None,
     }
 }
 
@@ -117,9 +118,11 @@ fn oracle_catches_a_source_that_skips_the_durable_handoff() {
         peer_dup: (0, 1),
         store_outage: None,
         rot_resume_set_at: None,
+        rot_leaves_at: None,
         race_restore: false,
         migrate_at: Some((millis(1500), blockd_core::types::VsetId(1), 1)),
         sabotage: Some(Sabotage::EagerHandoffAck),
+        guest_sync_share: None,
     };
     let report = blockd_sim::cluster::run(7, config);
     // The migration itself completed — that is what makes the sabotage

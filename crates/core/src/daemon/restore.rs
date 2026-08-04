@@ -5,10 +5,13 @@
 //! number of racing hosts wins; the losers get a conflict and nothing else
 //! happens. The winner's new head version is its fence.
 
+use std::collections::BTreeSet;
+
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::head::{HeadRecord, ManifestPtr};
 use crate::journal::{JournalRecord, RecordKind};
 use crate::layout;
+use crate::mapleaf::{LeafPtr, MapLeaf};
 use crate::seam::{AdminReply, Effect, ReqId, StoreFault, TimerId, Verdict};
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
@@ -220,7 +223,14 @@ impl Daemon {
             };
             Verdict::Resume { epoch, vmstate }
         } else {
-            chosen.pages.retain(|page, _| !page.volume.idx.is_memory());
+            // Memory is invalid on cold boot (R3.7): its overlay entries
+            // drop, and its spans' leaves are never even fetched.
+            chosen
+                .overlay
+                .retain(|page, _| !page.volume.idx.is_memory());
+            chosen
+                .leaves
+                .retain(|span, _| !crate::mapleaf::span_is_memory(*span));
             Verdict::ColdBoot
         };
 
@@ -240,18 +250,24 @@ impl Daemon {
         state.next_seq = chosen.seq.0 + 1;
         state.next_seg = 0; // fresh fence namespace: no collisions possible
         state.next_gen = chosen
-            .pages
+            .overlay
             .values()
             .map(|(g, _)| g.0 + 1)
             .max()
             .unwrap_or(0);
-        state.page_locs = chosen.pages.clone();
+        // The map hydrates lazily: the overlay serves immediately, every
+        // span with a leaf is pending until its object lands (faults into
+        // it park), and next_gen advances as leaves reveal their gens.
+        state.page_locs = chosen.overlay.clone();
+        state.overlay = chosen.overlay.clone();
+        state.leaf_table = chosen.leaves.clone();
+        state.pending_leaves = chosen.leaves.clone();
         state.best = Some((chosen.capture_seq, chosen.seq));
-        state.best_pages = chosen.pages.clone();
         state.backed = Some(ptr);
         state.backed_segs = chosen
-            .pages
+            .overlay
             .values()
+            .filter(|(_, loc)| loc.base == 0)
             .map(|(_, loc)| (loc.fence, loc.seg))
             .collect();
         state.store_manifests.insert((ptr.fence, ptr.seq));
@@ -263,6 +279,7 @@ impl Daemon {
             vset,
             verdict,
         }));
+        self.request_pending_leaves(vset, out);
         // R6.2: reach the first instruction on the verdict alone; prefetch
         // the recorded resume set concurrently, and record a fresh one from
         // what this start actually touches. Cold boots carry no latency
@@ -274,6 +291,185 @@ impl Daemon {
             io,
             key: layout::resume_set_key(vset),
         });
+    }
+
+    // ── lazy leaf hydration (restore, migration, forks) ─────────────────
+
+    /// Issue fetches for every span still pending — at adoption and on
+    /// retries. Source: the migration peer if one serves us, else the
+    /// store. Arrival is idempotent; in-flight spans are skipped.
+    pub(super) fn request_pending_leaves(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get(&vset) else {
+            return;
+        };
+        let peer = state.peer_source;
+        let pending: Vec<(u32, LeafPtr)> = state
+            .pending_leaves
+            .iter()
+            .map(|(&span, &ptr)| (span, ptr))
+            .collect();
+        for (span, ptr) in pending {
+            let in_flight = self.pending.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::LeafGet { vset: v, span: s, .. }
+                    | Pending::PeerLeafFetch { vset: v, span: s, .. }
+                        if *v == vset && *s == span
+                )
+            });
+            if in_flight {
+                continue;
+            }
+            let io = self.io();
+            if let Some(source) = peer {
+                self.pending
+                    .insert(io, Pending::PeerLeafFetch { vset, span, ptr });
+                out.push(Effect::PeerSend {
+                    to: source,
+                    msg: crate::seam::PeerMsg::FetchLeaf {
+                        io,
+                        vset,
+                        base: ptr.base,
+                        fence: ptr.fence,
+                        id: ptr.id,
+                    },
+                });
+            } else {
+                self.pending
+                    .insert(io, Pending::LeafGet { vset, span, ptr });
+                let key = if ptr.base == 0 {
+                    layout::leaf_key(vset, ptr.fence, ptr.id)
+                } else {
+                    layout::base_leaf_key(ptr.base, ptr.fence, ptr.id)
+                };
+                out.push(Effect::StoreGet { io, key });
+            }
+        }
+    }
+
+    /// A store leaf fetch resolved.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn leaf_get_done(
+        &mut self,
+        vset: VsetId,
+        span: u32,
+        ptr: LeafPtr,
+        result: Result<Option<(u64, Vec<u8>)>, StoreFault>,
+        out: &mut Vec<Effect>,
+    ) {
+        if let Ok(found) = result {
+            self.leaf_arrived(vset, span, ptr, found.map(|(_, b)| b), out);
+            return;
+        }
+        // Transient outage: retry — hydration never gives up (R8.3).
+        let Some(state) = self.vsets.get_mut(&vset) else {
+            return;
+        };
+        if !state.leaf_retrying {
+            state.leaf_retrying = true;
+            out.push(Effect::SetTimer {
+                timer: TimerId::LeafRetry(vset),
+                after: self.config.backup_retry,
+            });
+        }
+    }
+
+    pub(super) fn leaf_retry(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        if let Some(state) = self.vsets.get_mut(&vset) {
+            state.leaf_retrying = false;
+            self.request_pending_leaves(vset, out);
+        }
+    }
+
+    /// A leaf's bytes arrived (store or peer): verify, keep a local
+    /// verbatim copy (recovery must find every leaf its records name),
+    /// merge into the serving map, and wake the span's parked faults.
+    /// Missing or corrupt = the span is dead and its pages fail loudly
+    /// (R8.1).
+    pub(super) fn leaf_arrived(
+        &mut self,
+        vset_id: VsetId,
+        span: u32,
+        ptr: LeafPtr,
+        bytes: Option<Vec<u8>>,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(state) = self.vsets.get_mut(&vset_id) else {
+            return;
+        };
+        if state.pending_leaves.get(&span) != Some(&ptr) {
+            return; // stale reply to a span already resolved
+        }
+        let owner = if ptr.base == 0 {
+            vset_id
+        } else {
+            VsetId(ptr.base)
+        };
+        let leaf = bytes
+            .as_deref()
+            .and_then(|b| MapLeaf::decode(owner, ptr.fence, ptr.id, b).ok())
+            .filter(|leaf| leaf.span == span);
+        let Some(leaf) = leaf else {
+            state.pending_leaves.remove(&span);
+            state.dead_spans.insert(span);
+            let waiters = state.leaf_waiters.remove(&span).unwrap_or_default();
+            for (page, _) in waiters {
+                self.counters.faults_unservable += 1;
+                out.push(Effect::FillFailed { page });
+            }
+            return;
+        };
+        let blob = bytes.expect("decoded from bytes");
+        let segs: BTreeSet<(u64, crate::types::SegId)> = leaf
+            .entries
+            .iter()
+            .filter(|(_, _, _, loc)| loc.base == 0)
+            .map(|&(_, _, _, loc)| (loc.fence, loc.seg))
+            .collect();
+        // Own-namespace leaves fetched from the store are, by definition,
+        // already backed — as are the segments they reference.
+        let backed = state.config.backed_up && state.peer_source.is_none() && ptr.base == 0;
+        if backed {
+            state.backed_leaves.insert((ptr.fence, ptr.id));
+            state.backed_segs.extend(segs.iter().copied());
+        }
+        state.leaf_blobs.insert(ptr, (blob.len() as u64, segs));
+        for &(idx, page_no, generation, loc) in &leaf.entries {
+            let page = PageId {
+                volume: VolumeId { vset: vset_id, idx },
+                page: page_no,
+            };
+            if !state.config.contains(page) {
+                continue;
+            }
+            if state
+                .page_locs
+                .get(&page)
+                .is_none_or(|(g, _)| *g < generation)
+            {
+                state.page_locs.insert(page, (generation, loc));
+            }
+            state.next_gen = state.next_gen.max(generation.0 + 1);
+        }
+        state.pending_leaves.remove(&span);
+        let waiters = state.leaf_waiters.remove(&span).unwrap_or_default();
+        let name = if ptr.base == 0 {
+            layout::leaf_blob(vset_id, ptr.fence, ptr.id)
+        } else {
+            layout::base_leaf_blob(vset_id, ptr.base, ptr.fence, ptr.id)
+        };
+        self.local_bytes += blob.len() as u64;
+        self.counters.leaf_fills += 1;
+        let io = self.io();
+        self.pending.insert(io, Pending::LeafCopyWrite);
+        out.push(Effect::BlobWrite {
+            io,
+            name,
+            bytes: blob,
+        });
+        for (page, write) in waiters {
+            self.fault(page, write, out);
+        }
     }
 
     // ── resume sets (R6.2) ──────────────────────────────────────────────

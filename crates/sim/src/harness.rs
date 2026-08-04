@@ -86,6 +86,8 @@ pub struct HarnessConfig {
     pub faults: FaultPlan,
     /// Negative-test hook; `None` in every honest run.
     pub sabotage: Option<Sabotage>,
+    /// Override the guests' sync share of the op mix (`None` = default).
+    pub guest_sync_share: Option<crate::rng::Ppm>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -108,6 +110,13 @@ pub struct RunReport {
     pub restores: u64,
     /// Every object key in the store at the end of the run (R4.4 audits).
     pub store_keys: Vec<String>,
+    /// Total bytes of page-map metadata written locally across the run —
+    /// journal records and map leaves. The cost of remembering where pages
+    /// live must track the DELTA, not the vset size.
+    pub map_bytes_written: u64,
+    /// The largest single journal record ever written: bounded by the
+    /// overlay cap regardless of vset size (leaves carry the bulk).
+    pub max_record_blob_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -396,6 +405,17 @@ impl Harness {
                 Effect::SyncOk { req } => self.sync_done(req, true),
                 Effect::SyncFailed { req } => self.sync_done(req, false),
                 Effect::BlobWrite { io, name, bytes } => {
+                    // Blob names are lowercase by construction; this is a
+                    // suffix check on our own layout, not a file extension.
+                    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+                    let (rec, map) = (name.ends_with(".rec"), name.ends_with(".map"));
+                    if rec || map {
+                        self.report.map_bytes_written += bytes.len() as u64;
+                    }
+                    if rec {
+                        self.report.max_record_blob_bytes =
+                            self.report.max_record_blob_bytes.max(bytes.len() as u64);
+                    }
                     let now = self.kernel.now();
                     let (bdev_io, at) = self.bdev.submit_write(now, self.kernel.rng(), name, bytes);
                     self.kernel.schedule_at(
@@ -882,7 +902,9 @@ impl Harness {
                 let config = self.vset_config_for(vset);
                 self.oracle.register(vset, config);
                 self.mems.insert(vset, VsetMem::default());
-                self.guests.insert(vset, Guest::new(vset, config));
+                let mut guest = Guest::new(vset, config);
+                guest.sync_share = self.config.guest_sync_share;
+                self.guests.insert(vset, guest);
                 self.schedule_guest(vset);
                 if let Some(interval) = self.config.checkpoint_interval {
                     let at = self.next_after(interval);

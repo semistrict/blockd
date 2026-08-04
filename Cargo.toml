@@ -20,3 +20,13 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+# The simulation processes millions of virtual-time events per test; the
+# daemon and sim kernel run optimized even in dev/test builds (pure
+# integer state machines — optimization cannot change behavior, and the
+# determinism suite would catch it if it somehow did).
+[profile.dev.package.blockd-core]
+opt-level = 2
+
+[profile.dev.package.blockd-sim]
+opt-level = 2

@@ -44,6 +44,7 @@ use crate::cache::Cache;
 use crate::head::ManifestPtr;
 use crate::journal::{JournalRecord, VsetConfig};
 use crate::layout;
+use crate::mapleaf::LeafPtr;
 use crate::seam::{Effect, Event, HostMap, IoId, ReqId, TimerId};
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
@@ -109,6 +110,11 @@ pub struct Counters {
     pub hydrate_fills: u64,
     /// Peer fetches re-issued after going unanswered (lossy channel).
     pub peer_retries: u64,
+    /// Map spans rolled into fresh leaf blobs (the amortized half of the
+    /// map's write cost; records carry only the overlay).
+    pub leaf_rolls: u64,
+    /// Map leaves hydrated lazily (restore/migration/fork adoption).
+    pub leaf_fills: u64,
 }
 
 /// The page→location map of one consistency point.
@@ -122,12 +128,20 @@ struct Capture {
     capture_seq: u64,
     /// `Some` for checkpoints: (new epoch, vmstate, requester).
     checkpoint: Option<(Epoch, u64, ReqId)>,
-    /// The full page map at the capture instant.
-    pages: PageMap,
-    /// Pages this capture flushed (they get `end_flush` on segment
-    /// durability), empty for record-only captures.
-    flushed: Vec<PageId>,
-    seg_done: bool,
+    /// The map at the capture instant: bounded overlay + one leaf per
+    /// span. The record is exactly these two.
+    overlay: PageMap,
+    leaf_table: BTreeMap<u32, LeafPtr>,
+    /// The content generations of the leaves this capture ROLLED — what
+    /// lets the finalize shrink the vset's overlay to entries genuinely
+    /// newer than the adopted leaves.
+    rolled_gens: BTreeMap<PageId, Gen>,
+    /// The fresh locations this capture's segment holds. Their pages get
+    /// `end_flush` on segment durability and merge into the serving map;
+    /// empty for record-only captures.
+    new_locs: Vec<(PageId, (Gen, PageLoc))>,
+    /// Blob writes (segment + rolled leaves) the record still waits on.
+    writes_pending: usize,
     /// The watermark this capture's record carries; fixed when the record
     /// write is issued.
     synced_through: u64,
@@ -142,9 +156,33 @@ enum Pending {
         vset: VsetId,
         seq: JournalSeq,
     },
+    /// A rolled map leaf on its way to disk, gating its capture's record.
+    LeafWrite {
+        vset: VsetId,
+        seq: JournalSeq,
+    },
+    /// A hydrated leaf's local verbatim copy (no capture waits on it).
+    LeafCopyWrite,
     RecordWrite {
         vset: VsetId,
         seq: JournalSeq,
+    },
+    /// Lazy hydration: a leaf object fetch from the store.
+    LeafGet {
+        vset: VsetId,
+        span: u32,
+        ptr: LeafPtr,
+    },
+    /// Serving a peer's leaf fetch from local storage.
+    PeerLeafRead {
+        requester: HostId,
+        peer_io: IoId,
+    },
+    /// Lazy hydration: a leaf fetch from the migration source.
+    PeerLeafFetch {
+        vset: VsetId,
+        span: u32,
+        ptr: LeafPtr,
     },
     Fetch {
         page: PageId,
@@ -171,6 +209,18 @@ enum Pending {
         vset: VsetId,
         fence: u64,
         seg: SegId,
+    },
+    /// Backup pipeline: local read of a map leaf on its way to the store.
+    PubLeafRead {
+        vset: VsetId,
+        fence: u64,
+        id: u64,
+    },
+    /// Backup pipeline: leaf object write.
+    PubLeafPut {
+        vset: VsetId,
+        fence: u64,
+        id: u64,
     },
     /// Backup pipeline: manifest object write.
     PubManifestPut {
@@ -219,6 +269,18 @@ enum Pending {
         vset: VsetId,
         fence: u64,
         seg: SegId,
+    },
+    /// Base keep: local read of a map leaf on its way to the base.
+    KeepLeafRead {
+        vset: VsetId,
+        fence: u64,
+        id: u64,
+    },
+    /// Base keep: base-namespace leaf write (content re-homed).
+    KeepLeafPut {
+        vset: VsetId,
+        fence: u64,
+        id: u64,
     },
     /// Base keep: the base record write.
     KeepRecordPut {
@@ -283,10 +345,32 @@ struct Vset {
     /// fault or write-intent fill); sync barriers and capture instants.
     mutation_seq: u64,
     /// Serving map: every written page's newest durable location.
+    /// Invariant: `page_locs = materialize(leaf_table) ⊕ overlay`, except
+    /// for spans still in `pending_leaves` (their leaf half is unknown).
     page_locs: PageMap,
-    /// Newest durable record: `(capture_seq, seq)` and its page map.
+    /// The durable map's sharded half: one leaf per span, as the newest
+    /// record references it.
+    leaf_table: BTreeMap<u32, LeafPtr>,
+    /// Entries newer than their span's leaf; what the next record carries
+    /// inline. Bounded by the roll rule (plus pending spans, transiently).
+    overlay: PageMap,
+    /// Spans whose leaf content is not yet local (lazy hydration): faults
+    /// into them park until the leaf arrives.
+    pending_leaves: BTreeMap<u32, LeafPtr>,
+    /// Parked faults per pending span.
+    leaf_waiters: BTreeMap<u32, Vec<(PageId, bool)>>,
+    /// Spans whose leaf is missing or corrupt everywhere: their pages are
+    /// unservable (R8.1's loud failure).
+    dead_spans: BTreeSet<u32>,
+    /// A store fault deferred some leaf fetches; the retry timer is armed.
+    leaf_retrying: bool,
+    /// Local leaf blobs: ptr → (bytes, segments its entries reference).
+    leaf_blobs: BTreeMap<LeafPtr, (u64, BTreeSet<(u64, SegId)>)>,
+    /// Own-namespace leaves already durable in the store.
+    backed_leaves: BTreeSet<(u64, u64)>,
+    next_leaf: u64,
+    /// Newest durable record: `(capture_seq, seq)`.
     best: Option<(u64, JournalSeq)>,
-    best_pages: PageMap,
     /// Pinned checkpoint record (its blobs are never reclaimed) — the
     /// material a base keep publishes (R5.2).
     pinned: Option<JournalRecord>,
@@ -358,6 +442,8 @@ struct Vset {
 struct Publish {
     record: JournalRecord,
     segs_todo: Vec<(u64, SegId)>,
+    /// Own-namespace leaves the record references and the store lacks.
+    leaves_todo: Vec<(u64, u64)>,
 }
 
 impl Vset {
@@ -371,7 +457,15 @@ impl Vset {
             mutation_seq: 0,
             page_locs: BTreeMap::new(),
             best: None,
-            best_pages: BTreeMap::new(),
+            leaf_table: BTreeMap::new(),
+            overlay: BTreeMap::new(),
+            pending_leaves: BTreeMap::new(),
+            leaf_waiters: BTreeMap::new(),
+            dead_spans: BTreeSet::new(),
+            leaf_retrying: false,
+            leaf_blobs: BTreeMap::new(),
+            backed_leaves: BTreeSet::new(),
+            next_leaf: 0,
             pinned: None,
             captures: BTreeMap::new(),
             commit_running: false,
@@ -476,6 +570,7 @@ impl Daemon {
             Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, &mut out),
             Event::Timer(TimerId::Hydrate(vset)) => self.hydrate_tick(vset, &mut out),
             Event::Timer(TimerId::RestoreRetry(vset)) => self.restore_retry(vset, &mut out),
+            Event::Timer(TimerId::LeafRetry(vset)) => self.leaf_retry(vset, &mut out),
             Event::Timer(TimerId::Writeback) => {
                 // MGLRU-mirrored aging (R2.6) rides the writeback cadence,
                 // as reclaim-driven aging rides kswapd in the kernel.
@@ -502,11 +597,16 @@ impl Daemon {
         match self.pending.remove(&io) {
             Some(
                 p @ (Pending::PubSegPut { .. }
+                | Pending::PubLeafPut { .. }
                 | Pending::PubManifestPut { .. }
                 | Pending::PubHeadCas { .. }),
             ) => self.pub_put_done(p, result, out),
             Some(Pending::HeadCreate { vset }) => self.head_create_done(vset, result, out),
-            Some(p @ (Pending::KeepSegPut { .. } | Pending::KeepRecordPut { .. })) => {
+            Some(
+                p @ (Pending::KeepSegPut { .. }
+                | Pending::KeepLeafPut { .. }
+                | Pending::KeepRecordPut { .. }),
+            ) => {
                 self.keep_put_done(p, result, out);
             }
             Some(Pending::RestoreClaim { req, vset, ptr }) => {
@@ -544,6 +644,9 @@ impl Daemon {
                 generation,
                 loc,
             }) => self.store_fill_done(page, write, generation, loc, result, out),
+            Some(Pending::LeafGet { vset, span, ptr }) => {
+                self.leaf_get_done(vset, span, ptr, result, out);
+            }
             Some(Pending::ForkBaseGet { vset, base }) => {
                 self.fork_base_done(vset, base, result, out);
             }
@@ -573,8 +676,20 @@ impl Daemon {
             Some(Pending::KeepSegRead { vset, fence, seg }) => {
                 self.keep_seg_read_done(vset, fence, seg, bytes, out);
             }
+            Some(Pending::KeepLeafRead { vset, fence, id }) => {
+                self.keep_leaf_read_done(vset, fence, id, bytes.as_deref(), out);
+            }
             Some(Pending::PeerRead { requester, peer_io }) => {
                 Self::peer_read_done(requester, peer_io, bytes, out);
+            }
+            Some(Pending::PubLeafRead { vset, fence, id }) => {
+                self.pub_leaf_read_done(vset, fence, id, bytes, out);
+            }
+            Some(Pending::PeerLeafRead { requester, peer_io }) => {
+                out.push(Effect::PeerSend {
+                    to: requester,
+                    msg: crate::seam::PeerMsg::Leaf { io: peer_io, bytes },
+                });
             }
             _ => out.push(Effect::Abort {
                 reason: "blob read completion for unknown or non-read io",
@@ -637,10 +752,22 @@ impl Daemon {
             let mut pinned: std::collections::BTreeSet<(u64, SegId)> =
                 std::collections::BTreeSet::new();
             for capture in state.captures.values() {
-                pinned.extend(capture.pages.values().map(|(_, l)| (l.fence, l.seg)));
+                pinned.extend(capture.overlay.values().map(|(_, l)| (l.fence, l.seg)));
+                for ptr in capture.leaf_table.values() {
+                    if let Some((_, segs)) = state.leaf_blobs.get(ptr) {
+                        pinned.extend(segs.iter().copied());
+                    }
+                }
             }
             if let Some(publish) = &state.publish {
-                pinned.extend(publish.record.pages.values().map(|(_, l)| (l.fence, l.seg)));
+                pinned.extend(
+                    publish
+                        .record
+                        .overlay
+                        .values()
+                        .map(|(_, l)| (l.fence, l.seg)),
+                );
+                pinned.extend(publish.segs_todo.iter().copied());
             }
             for p in self.pending.values() {
                 if let Pending::Fetch { page, loc, .. } = p

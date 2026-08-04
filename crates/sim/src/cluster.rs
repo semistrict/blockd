@@ -61,12 +61,18 @@ pub struct ClusterConfig {
     /// Flip a bit in every stored resume-set object at this instant
     /// (R6.2's prefetch is a bet — a rotten one must cost nothing).
     pub rot_resume_set_at: Option<u64>,
+    /// Flip a bit in every stored map-leaf object at this instant. The
+    /// affected vsets' next adopter has dead spans: faults into them die
+    /// loudly (R8.1) — a sanctioned, injected loss.
+    pub rot_leaves_at: Option<u64>,
     /// Send the restore of each orphaned vset to TWO hosts (CAS race).
     pub race_restore: bool,
     /// Migrate a vset to a destination host at an instant (R7).
     pub migrate_at: Option<(u64, VsetId, u16)>,
     /// Deliberately break one protocol rule (negative tests).
     pub sabotage: Option<Sabotage>,
+    /// Override the guests' sync share of the op mix (`None` = default).
+    pub guest_sync_share: Option<crate::rng::Ppm>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -102,6 +108,8 @@ pub struct ClusterReport {
     pub migrations_refused: u64,
     /// Tail pages hydrated in the background across all live daemons.
     pub hydrate_fills: u64,
+    /// Map leaves hydrated lazily across all live daemons.
+    pub leaf_fills: u64,
     /// Blobs left on each host's device at the end of the run.
     pub blobs_per_host: Vec<usize>,
 }
@@ -174,6 +182,7 @@ enum Ev {
     RestartHost(u16),
     StoreOutage(bool),
     RotResumeSets,
+    RotLeaves,
     /// Nemesis ticks: a random crash / a random migration, self-scheduling.
     CrashNemesis,
     MigrateNemesis,
@@ -306,6 +315,12 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
         .filter_map(|h| h.daemon.as_ref())
         .map(|d| d.counters.hydrate_fills)
         .sum();
+    c.report.leaf_fills = c
+        .hosts
+        .iter()
+        .filter_map(|h| h.daemon.as_ref())
+        .map(|d| d.counters.leaf_fills)
+        .sum();
     c.report.blobs_per_host = c.hosts.iter().map(|h| h.bdev.blob_count()).collect();
     c.report
 }
@@ -338,6 +353,9 @@ impl Cluster {
         }
         if let Some(at) = self.config.rot_resume_set_at {
             self.kernel.schedule_at(SimTime(at), Ev::RotResumeSets);
+        }
+        if let Some(at) = self.config.rot_leaves_at {
+            self.kernel.schedule_at(SimTime(at), Ev::RotLeaves);
         }
         // First nemesis fire waits a full mean interval: vset creation
         // must finish before hosts start dying under it.
@@ -710,6 +728,7 @@ impl Cluster {
             Ev::RestartHost(host) => self.restart_host(host),
             Ev::StoreOutage(out) => self.store.set_outage(out),
             Ev::RotResumeSets => self.rot_resume_sets(),
+            Ev::RotLeaves => self.rot_leaves(),
             Ev::CrashNemesis => {
                 self.random_crash();
                 if self.kernel.now().nanos() <= self.config.horizon {
@@ -782,6 +801,33 @@ impl Cluster {
                     msg: blockd_core::seam::PeerMsg::Page { io, bytes: None },
                 },
             );
+        }
+    }
+
+    /// Injected store damage: flip a bit in every leaf object; the
+    /// losses it causes are sanctioned for the vsets whose leaves rot.
+    fn rot_leaves(&mut self) {
+        let keys: Vec<String> = self
+            .store
+            .snapshot()
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .filter(|k| {
+                matches!(
+                    blockd_core::layout::parse_key(k),
+                    Some(blockd_core::layout::StoreKey::Leaf { .. })
+                )
+            })
+            .collect();
+        for key in keys {
+            if let Some(flipped) = self
+                .store
+                .flip_random_bit_where(self.kernel.rng(), |k| k == key)
+                && let Some(blockd_core::layout::StoreKey::Leaf { vset, .. }) =
+                    blockd_core::layout::parse_key(&flipped)
+            {
+                self.doomed.insert(vset);
+            }
         }
     }
 
@@ -1291,7 +1337,9 @@ impl Cluster {
                 self.hosts[usize::from(host)]
                     .mems
                     .insert(vset, VsetMem::default());
-                self.guests.insert(vset, Guest::new(vset, config));
+                let mut guest = Guest::new(vset, config);
+                guest.sync_share = self.config.guest_sync_share;
+                self.guests.insert(vset, guest);
                 self.schedule_guest(vset);
                 if let Some(interval) = self.config.checkpoint_interval {
                     let delay = self.kernel.rng().range(1, 2 * interval);

@@ -1,13 +1,14 @@
 //! Recovery (R8.2): rebuild a daemon from durable state alone, with an
 //! explicit per-vset verdict.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Daemon, DaemonConfig, Vset};
 use crate::journal::{JournalRecord, RecordKind};
 use crate::layout::{self, BlobName};
+use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
 use crate::seam::{Effect, Verdict};
-use crate::types::{JournalSeq, SegId, VsetId};
+use crate::types::{JournalSeq, PageId, SegId, VolumeId, VsetId};
 
 impl Daemon {
     /// Rebuild a daemon from a scan of the local device. Only journal blobs
@@ -23,8 +24,11 @@ impl Daemon {
             records: Vec<JournalRecord>,
             journal_names: Vec<(u64, JournalSeq)>,
             seg_names: Vec<(u64, SegId, u64)>,
+            /// Intact leaf blobs: ptr → (size, decoded content).
+            leaves: BTreeMap<LeafPtr, (u64, MapLeaf)>,
             max_seq: u64,
             max_seg: u64,
+            max_leaf: u64,
             handoff: Option<crate::types::HostId>,
         }
         let mut found: BTreeMap<VsetId, Found> = BTreeMap::new();
@@ -35,14 +39,18 @@ impl Daemon {
             let vset = match parsed {
                 BlobName::Journal { vset, .. }
                 | BlobName::Segment { vset, .. }
+                | BlobName::Leaf { vset, .. }
+                | BlobName::BaseLeaf { vset, .. }
                 | BlobName::Handoff { vset } => vset,
             };
             let f = found.entry(vset).or_insert_with(|| Found {
                 records: Vec::new(),
                 journal_names: Vec::new(),
                 seg_names: Vec::new(),
+                leaves: BTreeMap::new(),
                 max_seq: 0,
                 max_seg: 0,
+                max_leaf: 0,
                 handoff: None,
             });
             match parsed {
@@ -60,6 +68,23 @@ impl Daemon {
                     f.seg_names.push((fence, seg, bytes.len() as u64));
                     f.max_seg = f.max_seg.max(seg.0 + 1);
                 }
+                BlobName::Leaf { fence, id, .. } => {
+                    f.max_leaf = f.max_leaf.max(id + 1);
+                    // A damaged leaf simply is not there: any record that
+                    // needs it becomes unusable and recovery falls back.
+                    if let Ok(leaf) = MapLeaf::decode(vset, fence, id, bytes) {
+                        let ptr = LeafPtr { base: 0, fence, id };
+                        f.leaves.insert(ptr, (bytes.len() as u64, leaf));
+                    }
+                }
+                BlobName::BaseLeaf {
+                    base, fence, id, ..
+                } => {
+                    if let Ok(leaf) = MapLeaf::decode(VsetId(base), fence, id, bytes) {
+                        let ptr = LeafPtr { base, fence, id };
+                        f.leaves.insert(ptr, (bytes.len() as u64, leaf));
+                    }
+                }
                 BlobName::Handoff { .. } => {
                     // An intact marker means the handoff committed (R7.2);
                     // a torn one means it never did — recover normally.
@@ -74,10 +99,16 @@ impl Daemon {
         let mut verdicts = BTreeMap::new();
         let mut recovered_bytes: u64 = 0;
         for (vset_id, f) in found {
-            // Cold-boot candidate: newest intact consistency point.
+            // Cold-boot candidate: newest intact consistency point whose
+            // every referenced leaf also decoded intact — a record with a
+            // missing or damaged leaf is unusable, exactly like a torn
+            // record, and recovery falls back to the next-best.
+            let usable =
+                |r: &&JournalRecord| r.leaves.values().all(|ptr| f.leaves.contains_key(ptr));
             let cold = f
                 .records
                 .iter()
+                .filter(usable)
                 .max_by_key(|r| (r.capture_seq, r.seq))
                 .cloned();
             let Some(cold) = cold else {
@@ -106,6 +137,7 @@ impl Daemon {
             state.ready = true;
             state.next_seq = f.max_seq;
             state.next_seg = f.max_seg;
+            state.next_leaf = f.max_leaf;
             state.durable_watermark = watermark;
 
             let (verdict, chosen) = if let Some(c) = resume {
@@ -117,22 +149,51 @@ impl Daemon {
                 (Verdict::Resume { epoch, vmstate }, c)
             } else {
                 // Disk-only recovery point: memory is invalid (R3.7) — its
-                // pages are dropped and reclaimed.
+                // entries are dropped and reclaimed, leaf spans included.
                 let mut c = cold;
-                c.pages.retain(|page, _| !page.volume.idx.is_memory());
+                c.overlay.retain(|page, _| !page.volume.idx.is_memory());
+                c.leaves.retain(|span, _| !span_is_memory(*span));
                 (Verdict::ColdBoot, c)
             };
             state.fence = chosen.fence;
             state.mutation_seq = chosen.capture_seq;
-            state.next_gen = chosen
-                .pages
-                .values()
-                .map(|(g, _)| g.0 + 1)
-                .max()
-                .unwrap_or(0);
-            state.page_locs = chosen.pages.clone();
+            // Materialize the serving map: leaves first, overlay wins.
+            let mut locs = super::PageMap::new();
+            for ptr in chosen.leaves.values() {
+                let (_, leaf) = &f.leaves[ptr];
+                for &(idx, page_no, generation, loc) in &leaf.entries {
+                    let page = PageId {
+                        volume: VolumeId { vset: vset_id, idx },
+                        page: page_no,
+                    };
+                    if chosen.config.contains(page) {
+                        locs.insert(page, (generation, loc));
+                    }
+                }
+            }
+            for (page, entry) in &chosen.overlay {
+                locs.insert(*page, *entry);
+            }
+            state.next_gen = locs.values().map(|(g, _)| g.0 + 1).max().unwrap_or(0);
+            state.page_locs = locs;
+            state.overlay = chosen.overlay.clone();
+            state.leaf_table = chosen.leaves.clone();
+            // Every intact local leaf blob is tracked (cleanup reclaims the
+            // unreferenced); its own-namespace segments pin against reclaim.
+            state.leaf_blobs = f
+                .leaves
+                .iter()
+                .map(|(&ptr, (size, leaf))| {
+                    let segs: BTreeSet<(u64, SegId)> = leaf
+                        .entries
+                        .iter()
+                        .filter(|(_, _, _, loc)| loc.base == 0)
+                        .map(|&(_, _, _, loc)| (loc.fence, loc.seg))
+                        .collect();
+                    (ptr, (*size, segs))
+                })
+                .collect();
             state.best = Some((chosen.capture_seq, chosen.seq));
-            state.best_pages = chosen.pages.clone();
             state.durable_watermark = watermark.max(chosen.synced_through);
             // Every on-disk record name, with its watermark where intact
             // (corrupt records contribute nothing and are reclaimable).
@@ -149,6 +210,7 @@ impl Daemon {
                 })
                 .collect();
             recovered_bytes += f.seg_names.iter().map(|&(_, _, size)| size).sum::<u64>();
+            recovered_bytes += f.leaves.values().map(|(size, _)| size).sum::<u64>();
             state.seg_blobs = f.seg_names;
             state.best_record = Some(chosen);
             if let Some(to) = f.handoff {

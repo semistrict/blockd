@@ -1,16 +1,35 @@
 //! Captures and the durable write path: writeback commits, sync commits,
 //! checkpoints, journal records, and reclamation.
+//!
+//! The map's durable shape (R3.3/R3.4): each capture carries a bounded
+//! inline OVERLAY plus one leaf pointer per span. Fresh locations join the
+//! overlay; when a span's overlay share crosses [`ROLL_THRESHOLD`] — or
+//! the whole overlay crosses [`OVERLAY_MAX`] — that span ROLLS: its full
+//! content (from the serving map) is written as a fresh leaf blob, and
+//! the record waits on it exactly as it waits on its segment. Metadata
+//! cost per capture is O(delta), never O(vset).
 
-use super::{Capture, Daemon, Pending, Vset};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{Capture, Daemon, PageMap, Pending, Vset};
 use crate::journal::{JournalRecord, RecordKind};
 use crate::layout;
+use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_of};
 use crate::seam::{AdminCmd, AdminReply, Effect, HostMap, IoId, ReqId};
 use crate::segment::{PageLoc, SegmentBuilder};
-use crate::types::{Epoch, Gen, JournalSeq, PageId, SegId, VsetId};
+use crate::types::{Epoch, Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
 
 /// Remembered checkpoint outcomes per vset (R3.5 idempotence). Old entries
 /// age out FIFO so eternal checkpointing accrues no memory debt (R3.4).
 const CKPT_DONE_KEPT: usize = 128;
+
+/// A record carries at most this many inline map entries (plus, only
+/// transiently, entries of spans still hydrating — those cannot roll).
+pub(super) const OVERLAY_MAX: usize = 2048;
+
+/// A span rolls into a fresh leaf once this many of its entries sit in
+/// the overlay: one leaf write (≤ ~180 KB) per this many page updates.
+const ROLL_THRESHOLD: usize = 256;
 
 impl Daemon {
     // ── admin ───────────────────────────────────────────────────────────
@@ -146,22 +165,27 @@ impl Daemon {
         out.push(Effect::ResumeGuest { vset });
     }
 
-    /// A capture with no pages (vset creation): straight to the record.
+    /// A capture with no pages to flush (vset creation, migrate-in):
+    /// straight to the record — the map passes through as it stands,
+    /// pending leaf pointers included.
     pub(super) fn start_record_only_capture(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
         let state = self.vsets.get_mut(&vset_id).expect("known vset");
         let seq = JournalSeq(state.next_seq);
         state.next_seq += 1;
         state.commit_running = true;
         let capture_seq = state.mutation_seq;
-        let pages = state.page_locs.clone();
+        let overlay = state.overlay.clone();
+        let leaf_table = state.leaf_table.clone();
         state.captures.insert(
             seq,
             Capture {
                 capture_seq,
                 checkpoint: None,
-                pages,
-                flushed: Vec::new(),
-                seg_done: true,
+                overlay,
+                leaf_table,
+                rolled_gens: BTreeMap::new(),
+                new_locs: Vec::new(),
+                writes_pending: 0,
                 synced_through: 0,
                 record: None,
             },
@@ -169,9 +193,111 @@ impl Daemon {
         self.write_record(vset_id, seq, out);
     }
 
+    /// The capture-instant map: the vset's overlay plus this capture's
+    /// fresh locations, with over-threshold spans ROLLED into fresh leaf
+    /// blobs (returned for writing; the record waits on them). Spans still
+    /// hydrating cannot roll — their content is unknown — so the overlay
+    /// bound is transiently `OVERLAY_MAX` plus their entries.
+    #[allow(clippy::type_complexity)]
+    fn shard_map(
+        state: &mut Vset,
+        vset_id: VsetId,
+        new_locs: &[(PageId, (Gen, PageLoc))],
+    ) -> (
+        PageMap,
+        BTreeMap<u32, LeafPtr>,
+        BTreeMap<PageId, Gen>,
+        Vec<(LeafPtr, Vec<u8>, BTreeSet<(u64, SegId)>)>,
+    ) {
+        let mut overlay = state.overlay.clone();
+        for &(page, entry) in new_locs {
+            if overlay.get(&page).is_none_or(|(g, _)| *g < entry.0) {
+                overlay.insert(page, entry);
+            }
+        }
+        let mut leaf_table = state.leaf_table.clone();
+        let mut span_counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for page in overlay.keys() {
+            *span_counts.entry(span_of(*page)).or_default() += 1;
+        }
+        let mut to_roll: BTreeSet<u32> = span_counts
+            .iter()
+            .filter(|&(span, &n)| n >= ROLL_THRESHOLD && !state.pending_leaves.contains_key(span))
+            .map(|(&span, _)| span)
+            .collect();
+        // Overlay-cap pressure: roll the fattest spans until back under.
+        let mut remaining =
+            overlay.len() - to_roll.iter().map(|span| span_counts[span]).sum::<usize>();
+        while remaining > OVERLAY_MAX {
+            let fattest = span_counts
+                .iter()
+                .filter(|(span, _)| {
+                    !to_roll.contains(span) && !state.pending_leaves.contains_key(span)
+                })
+                .max_by_key(|&(span, &n)| (n, *span));
+            let Some((&span, &n)) = fattest else {
+                break; // everything left is hydrating: transient overshoot
+            };
+            to_roll.insert(span);
+            remaining -= n;
+        }
+
+        let mut rolled_gens = BTreeMap::new();
+        let mut writes = Vec::new();
+        for span in to_roll {
+            // Full span content: the serving map ⊕ this capture's locs.
+            let lo_key = u64::from(span) * LEAF_SPAN;
+            let idx = VolumeIdx(u8::try_from(lo_key >> 32).expect("volume index"));
+            let page_of = |n: u64| PageId {
+                volume: VolumeId { vset: vset_id, idx },
+                page: PageNo(u32::try_from(n & 0xFFFF_FFFF).expect("page number")),
+            };
+            let lo = page_of(lo_key);
+            let hi = page_of(lo_key + LEAF_SPAN - 1);
+            let mut content: BTreeMap<PageId, (Gen, PageLoc)> = state
+                .page_locs
+                .range(lo..=hi)
+                .map(|(page, entry)| (*page, *entry))
+                .collect();
+            for &(page, entry) in new_locs {
+                if span_of(page) == span && content.get(&page).is_none_or(|(g, _)| *g < entry.0) {
+                    content.insert(page, entry);
+                }
+            }
+            let id = state.next_leaf;
+            state.next_leaf += 1;
+            let ptr = LeafPtr {
+                base: 0,
+                fence: state.fence,
+                id,
+            };
+            let entries: Vec<_> = content
+                .iter()
+                .map(|(page, &(generation, loc))| (page.volume.idx, page.page, generation, loc))
+                .collect();
+            // Own-namespace segments only: this set feeds local cleanup
+            // pinning and the backup's upload list (base segments are
+            // shared and kept by their base, R5.3).
+            let segs: BTreeSet<(u64, SegId)> = content
+                .values()
+                .filter(|(_, loc)| loc.base == 0)
+                .map(|&(_, loc)| (loc.fence, loc.seg))
+                .collect();
+            for (page, &(generation, _)) in &content {
+                rolled_gens.insert(*page, generation);
+                overlay.remove(page);
+            }
+            let bytes = MapLeaf { span, entries }.encode(vset_id, state.fence, id);
+            leaf_table.insert(span, ptr);
+            writes.push((ptr, bytes, segs));
+        }
+        (overlay, leaf_table, rolled_gens, writes)
+    }
+
     /// Begin a capture of the vset's exact current state, reading dirty page
     /// contents straight from the shared mapping and re-arming write
     /// protection on them.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn start_capture(
         &mut self,
         vset_id: VsetId,
@@ -196,58 +322,60 @@ impl Daemon {
         let to_flush = self.cache.unstable_pages_of(vset_id);
         let to_protect = self.cache.dirty_pages_of(vset_id);
         let state = self.vsets.get_mut(&vset_id).expect("just seen");
-        let mut pages = state.page_locs.clone();
+
+        let mut new_locs: Vec<(PageId, (Gen, PageLoc))> = Vec::new();
+        let mut seg_blob: Option<(SegId, Vec<u8>)> = None;
         let mut flushed = Vec::new();
-        if to_flush.is_empty() {
-            state.captures.insert(
-                seq,
-                Capture {
-                    capture_seq,
-                    checkpoint,
-                    pages,
-                    flushed,
-                    seg_done: true,
-                    synced_through: 0,
-                    record: None,
-                },
-            );
-            self.write_record(vset_id, seq, out);
-            return;
+        if !to_flush.is_empty() {
+            let seg = SegId(state.next_seg);
+            state.next_seg += 1;
+            let fence = state.fence;
+            let mut builder = SegmentBuilder::new(vset_id, fence, seg);
+            let mut gens = Vec::new();
+            for page in &to_flush {
+                let generation = Gen(state.next_gen);
+                state.next_gen += 1;
+                gens.push((*page, generation));
+            }
+            for (page, generation) in &gens {
+                let bytes = mem.read_page(*page);
+                builder.add(*page, *generation, &bytes);
+                self.cache.begin_flush(*page);
+                flushed.push(*page);
+            }
+            if !to_protect.is_empty() {
+                out.push(Effect::WriteProtect { pages: to_protect });
+            }
+            let (blob, locs) = builder.finish();
+            for (page, generation, loc) in locs {
+                new_locs.push((page, (generation, loc)));
+            }
+            seg_blob = Some((seg, blob));
         }
 
-        let seg = SegId(state.next_seg);
-        state.next_seg += 1;
-        let fence = state.fence;
-        let mut builder = SegmentBuilder::new(vset_id, fence, seg);
-        let mut gens = Vec::new();
-        for page in &to_flush {
-            let generation = Gen(state.next_gen);
-            state.next_gen += 1;
-            gens.push((*page, generation));
-        }
-        for (page, generation) in &gens {
-            let bytes = mem.read_page(*page);
-            builder.add(*page, *generation, &bytes);
-            self.cache.begin_flush(*page);
-            flushed.push(*page);
-        }
-        if !to_protect.is_empty() {
-            out.push(Effect::WriteProtect { pages: to_protect });
-        }
-        let (blob, locs) = builder.finish();
-        for (page, generation, loc) in locs {
-            pages.insert(page, (generation, loc));
-        }
+        let state = self.vsets.get_mut(&vset_id).expect("just seen");
+        let leaves_before = state.next_leaf;
+        let (overlay, leaf_table, rolled_gens, leaf_writes) =
+            Self::shard_map(state, vset_id, &new_locs);
+
         // R2.7: no room even after reclaim ⇒ the capture is deferred — the
         // coupled stall. Dirty pages stay dirty; the writeback timer
         // retries; syncs wait; nothing corrupts, nothing dies.
         self.nvme_reclaim(out);
-        if !self.disk_has_room(blob.len() as u64) {
+        let bytes_needed = seg_blob.as_ref().map_or(0, |(_, b)| b.len() as u64)
+            + leaf_writes
+                .iter()
+                .map(|(_, b, _)| b.len() as u64)
+                .sum::<u64>();
+        if !self.disk_has_room(bytes_needed) {
             self.counters.nvme_stalls += 1;
             let state = self.vsets.get_mut(&vset_id).expect("just seen");
             state.next_seq = state.next_seq.saturating_sub(1);
-            state.next_seg = state.next_seg.saturating_sub(1);
-            state.next_gen = state.next_gen.saturating_sub(gens.len() as u64);
+            state.next_gen = state.next_gen.saturating_sub(new_locs.len() as u64);
+            state.next_leaf = leaves_before;
+            if seg_blob.is_some() {
+                state.next_seg = state.next_seg.saturating_sub(1);
+            }
             if checkpoint.is_none() {
                 state.commit_running = false;
             } else {
@@ -259,30 +387,56 @@ impl Daemon {
             }
             return;
         }
-        self.local_bytes += blob.len() as u64;
+
+        self.local_bytes += bytes_needed;
+        let mut writes_pending = 0;
+        let fence = self.vsets[&vset_id].fence;
+        if let Some((seg, blob)) = seg_blob {
+            let state = self.vsets.get_mut(&vset_id).expect("just seen");
+            state.seg_blobs.push((fence, seg, blob.len() as u64));
+            self.counters.pages_flushed += new_locs.len() as u64;
+            let io = self.io();
+            self.pending
+                .insert(io, Pending::SegWrite { vset: vset_id, seq });
+            out.push(Effect::BlobWrite {
+                io,
+                name: layout::segment_blob(vset_id, fence, seg),
+                bytes: blob,
+            });
+            writes_pending += 1;
+        }
+        for (ptr, bytes, segs) in leaf_writes {
+            let state = self.vsets.get_mut(&vset_id).expect("just seen");
+            state.leaf_blobs.insert(ptr, (bytes.len() as u64, segs));
+            self.counters.leaf_rolls += 1;
+            let io = self.io();
+            self.pending
+                .insert(io, Pending::LeafWrite { vset: vset_id, seq });
+            out.push(Effect::BlobWrite {
+                io,
+                name: layout::leaf_blob(vset_id, ptr.fence, ptr.id),
+                bytes,
+            });
+            writes_pending += 1;
+        }
         let state = self.vsets.get_mut(&vset_id).expect("just seen");
-        state.seg_blobs.push((fence, seg, blob.len() as u64));
         state.captures.insert(
             seq,
             Capture {
                 capture_seq,
                 checkpoint,
-                pages,
-                flushed,
-                seg_done: false,
+                overlay,
+                leaf_table,
+                rolled_gens,
+                new_locs,
+                writes_pending,
                 synced_through: 0,
                 record: None,
             },
         );
-        self.counters.pages_flushed += gens.len() as u64;
-        let io = self.io();
-        self.pending
-            .insert(io, Pending::SegWrite { vset: vset_id, seq });
-        out.push(Effect::BlobWrite {
-            io,
-            name: layout::segment_blob(vset_id, fence, seg),
-            bytes: blob,
-        });
+        if writes_pending == 0 {
+            self.write_record(vset_id, seq, out);
+        }
     }
 
     /// The capture's data is durable: write its journal record. The
@@ -311,7 +465,8 @@ impl Daemon {
             },
             capture_seq: capture.capture_seq,
             synced_through: capture.synced_through,
-            pages: capture.pages.clone(),
+            overlay: capture.overlay.clone(),
+            leaves: capture.leaf_table.clone(),
         };
         state
             .record_ws
@@ -341,24 +496,49 @@ impl Daemon {
                     return;
                 };
                 let capture = state.captures.get_mut(&seq).expect("capture exists");
-                capture.seg_done = true;
+                capture.writes_pending -= 1;
+                let done = capture.writes_pending == 0;
                 // The segment is durable: its pages are current-and-durable,
-                // so they become clean/evictable and serve refaults.
-                let flushed = capture.flushed.clone();
-                let new_locs: Vec<(PageId, (Gen, PageLoc))> =
-                    flushed.iter().map(|p| (*p, capture.pages[p])).collect();
-                for (page, (generation, loc)) in new_locs {
-                    let current = state.page_locs.get(&page);
-                    if current.is_none_or(|(g, _)| *g < generation) {
+                // so they become clean/evictable and serve refaults. The
+                // serving map AND the overlay adopt the fresh locations
+                // (the overlay half holds them until a roll re-homes them
+                // into a leaf and the finalize adopts it).
+                let new_locs = capture.new_locs.clone();
+                for &(page, (generation, loc)) in &new_locs {
+                    if state
+                        .page_locs
+                        .get(&page)
+                        .is_none_or(|(g, _)| *g < generation)
+                    {
                         state.page_locs.insert(page, (generation, loc));
                     }
+                    if state
+                        .overlay
+                        .get(&page)
+                        .is_none_or(|(g, _)| *g < generation)
+                    {
+                        state.overlay.insert(page, (generation, loc));
+                    }
                 }
-                for page in flushed {
+                for (page, _) in new_locs {
                     self.cache.end_flush(page);
                 }
-                self.write_record(vset, seq, out);
+                if done {
+                    self.write_record(vset, seq, out);
+                }
                 self.drain_waiters(out);
             }
+            Some(Pending::LeafWrite { vset, seq }) => {
+                let Some(state) = self.vsets.get_mut(&vset) else {
+                    return;
+                };
+                let capture = state.captures.get_mut(&seq).expect("capture exists");
+                capture.writes_pending -= 1;
+                if capture.writes_pending == 0 {
+                    self.write_record(vset, seq, out);
+                }
+            }
+            Some(Pending::LeafCopyWrite) => {}
             Some(Pending::RecordWrite { vset, seq }) => self.finalize_record(vset, seq, mem, out),
             Some(Pending::HandoffWrite { vset }) => self.handoff_written(vset, out),
             Some(_) => out.push(Effect::Abort {
@@ -385,8 +565,17 @@ impl Daemon {
             .is_none_or(|(c, s)| (capture.capture_seq, seq) > (c, s))
         {
             state.best = Some((capture.capture_seq, seq));
-            state.best_pages = capture.pages.clone();
             state.best_record.clone_from(&capture.record);
+            // Adopt the record's map shape: the leaf table advances, and
+            // the overlay shrinks to entries genuinely newer than the
+            // rolled leaves' content.
+            state.leaf_table = capture.leaf_table.clone();
+            state.overlay.retain(|page, (generation, _)| {
+                capture
+                    .rolled_gens
+                    .get(page)
+                    .is_none_or(|rolled| generation.0 > rolled.0)
+            });
         }
         self.counters.records_written += 1;
 
@@ -466,7 +655,18 @@ impl Daemon {
         }
 
         self.cleanup(vset_id, out);
-        self.maybe_start_commit(vset_id, mem, out);
+        // Chain a commit immediately only for waiting syncs (R3.8 wants
+        // their record now); plain dirtiness waits for the writeback tick —
+        // its interval IS the capture cadence (R2.4), and chaining on it
+        // would re-write the record (and its overlay) at I/O latency
+        // instead, for nothing.
+        if self
+            .vsets
+            .get(&vset_id)
+            .is_some_and(|s| !s.pending_syncs.is_empty())
+        {
+            self.maybe_start_commit(vset_id, mem, out);
+        }
         self.maybe_start_checkpoint(vset_id, out);
         // Backup flows continuously as records finalize (R4.2), never gated
         // on checkpoints (R3.2).
@@ -479,6 +679,8 @@ impl Daemon {
     /// with checkpoint count). Everything referenced by the best record, the
     /// pinned checkpoint, the serving map, any in-flight capture or fetch,
     /// or the watermark anchor stays.
+    // One keep-set per artifact class; splitting would scatter the rule.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn cleanup(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
@@ -515,25 +717,58 @@ impl Daemon {
             keep_records.push(anchor);
         }
 
-        let mut keep_segs: Vec<(u64, SegId)> = Vec::new();
-        let maps = [&state.best_pages, &state.page_locs];
-        for map in maps {
-            keep_segs.extend(map.values().map(|(_, loc)| (loc.fence, loc.seg)));
+        // Leaves stay while any kept record (or the serving table, or an
+        // in-flight capture/publish) references them.
+        let mut keep_leaves: BTreeSet<LeafPtr> = state.leaf_table.values().copied().collect();
+        if let Some(best) = &state.best_record {
+            keep_leaves.extend(best.leaves.values());
         }
         if let Some(pinned) = &state.pinned {
-            keep_segs.extend(pinned.pages.values().map(|(_, loc)| (loc.fence, loc.seg)));
+            keep_leaves.extend(pinned.leaves.values());
         }
         for capture in state.captures.values() {
-            keep_segs.extend(capture.pages.values().map(|(_, loc)| (loc.fence, loc.seg)));
+            keep_leaves.extend(capture.leaf_table.values());
+        }
+        if let Some(publish) = &state.publish {
+            keep_leaves.extend(publish.record.leaves.values());
+        }
+
+        let mut keep_segs: Vec<(u64, SegId)> = Vec::new();
+        keep_segs.extend(
+            state
+                .page_locs
+                .values()
+                .map(|(_, loc)| (loc.fence, loc.seg)),
+        );
+        keep_segs.extend(state.overlay.values().map(|(_, loc)| (loc.fence, loc.seg)));
+        if let Some(best) = &state.best_record {
+            keep_segs.extend(best.overlay.values().map(|(_, loc)| (loc.fence, loc.seg)));
+        }
+        if let Some(pinned) = &state.pinned {
+            keep_segs.extend(pinned.overlay.values().map(|(_, loc)| (loc.fence, loc.seg)));
+        }
+        for capture in state.captures.values() {
+            keep_segs.extend(
+                capture
+                    .overlay
+                    .values()
+                    .map(|(_, loc)| (loc.fence, loc.seg)),
+            );
         }
         if let Some(publish) = &state.publish {
             keep_segs.extend(
                 publish
                     .record
-                    .pages
+                    .overlay
                     .values()
                     .map(|(_, loc)| (loc.fence, loc.seg)),
             );
+        }
+        // Every kept leaf pins the segments its entries reference.
+        for ptr in &keep_leaves {
+            if let Some((_, segs)) = state.leaf_blobs.get(ptr) {
+                keep_segs.extend(segs.iter().copied());
+            }
         }
         // In-flight fetches pin their segment: deleting one under a read
         // would turn a served page into a loud failure for nothing.
@@ -560,6 +795,15 @@ impl Daemon {
             .drain(..)
             .partition(|&(f, sg, _)| keep_segs.contains(&(f, sg)));
         state.seg_blobs = kept_s;
+        let dead_l: Vec<(LeafPtr, u64)> = state
+            .leaf_blobs
+            .iter()
+            .filter(|(ptr, _)| !keep_leaves.contains(ptr))
+            .map(|(&ptr, &(size, _))| (ptr, size))
+            .collect();
+        for (ptr, _) in &dead_l {
+            state.leaf_blobs.remove(ptr);
+        }
 
         for (seq, fence) in dead_r {
             self.counters.blobs_deleted += 1;
@@ -573,6 +817,16 @@ impl Daemon {
             out.push(Effect::BlobDelete {
                 name: layout::segment_blob(vset_id, fence, seg),
             });
+        }
+        for (ptr, size) in dead_l {
+            self.counters.blobs_deleted += 1;
+            self.local_bytes = self.local_bytes.saturating_sub(size);
+            let name = if ptr.base == 0 {
+                layout::leaf_blob(vset_id, ptr.fence, ptr.id)
+            } else {
+                layout::base_leaf_blob(vset_id, ptr.base, ptr.fence, ptr.id)
+            };
+            out.push(Effect::BlobDelete { name });
         }
     }
 }

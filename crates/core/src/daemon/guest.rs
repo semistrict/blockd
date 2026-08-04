@@ -38,6 +38,23 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     pub(super) fn missing_fault(&mut self, page: PageId, write: bool, out: &mut Vec<Effect>) {
         let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
+        // Lazy hydration: a page whose span's leaf is not local yet has an
+        // UNKNOWN location — absent-from-map means zero-fill only once the
+        // span is materialized. Park until the leaf arrives; a span dead
+        // everywhere is the loud R8.1 failure.
+        let span = crate::mapleaf::span_of(page);
+        if vset.pending_leaves.contains_key(&span) {
+            vset.leaf_waiters
+                .entry(span)
+                .or_default()
+                .push((page, write));
+            return;
+        }
+        if vset.dead_spans.contains(&span) && !vset.page_locs.contains_key(&page) {
+            self.counters.faults_unservable += 1;
+            out.push(Effect::FillFailed { page });
+            return;
+        }
         let loc = vset.page_locs.get(&page).copied();
         // Post-resume recording window (R6.2): what faults now is what the
         // next restore should prefetch. Zero fills cost no fetch and so

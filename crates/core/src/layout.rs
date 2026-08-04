@@ -33,6 +33,21 @@ pub fn segment_blob(vset: VsetId, fence: u64, seg: SegId) -> String {
     format!("v/{:016x}/s/{fence:016x}-{:016x}.seg", vset.0, seg.0)
 }
 
+/// A map leaf in the vset's own namespace (local blob).
+pub fn leaf_blob(vset: VsetId, fence: u64, id: u64) -> String {
+    format!("v/{:016x}/l/{fence:016x}-{id:016x}.map", vset.0)
+}
+
+/// A local copy of a base-namespace map leaf, held under the vset that
+/// references it (base ids and fences share a numeric space, so the name
+/// carries the base discriminator).
+pub fn base_leaf_blob(vset: VsetId, base: u64, fence: u64, id: u64) -> String {
+    format!(
+        "v/{:016x}/lb/{base:016x}-{fence:016x}-{id:016x}.map",
+        vset.0
+    )
+}
+
 pub fn head_key(vset: VsetId) -> String {
     format!("v/{:016x}/head", vset.0)
 }
@@ -50,6 +65,17 @@ pub fn manifest_key(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
 
 pub fn segment_key(vset: VsetId, fence: u64, seg: SegId) -> String {
     format!("v/{:016x}/s/{fence:016x}-{:016x}", vset.0, seg.0)
+}
+
+/// A map leaf in the store, the local blob's bytes verbatim (R8.4).
+pub fn leaf_key(vset: VsetId, fence: u64, id: u64) -> String {
+    format!("v/{:016x}/l/{fence:016x}-{id:016x}", vset.0)
+}
+
+/// A base's map leaves: copied store-side at keep time, referenced (never
+/// copied) by every fork's records (R5.1/R5.3).
+pub fn base_leaf_key(base: u64, fence: u64, id: u64) -> String {
+    format!("b/{base:016x}/l/{fence:016x}-{id:016x}")
 }
 
 /// Prefix under which every object of one vset lives (R4.4 audits, GC).
@@ -90,6 +116,11 @@ pub enum StoreKey {
         fence: u64,
         seg: SegId,
     },
+    Leaf {
+        vset: VsetId,
+        fence: u64,
+        id: u64,
+    },
     BaseRecord {
         base: u64,
     },
@@ -97,6 +128,11 @@ pub enum StoreKey {
         base: u64,
         fence: u64,
         seg: SegId,
+    },
+    BaseLeaf {
+        base: u64,
+        fence: u64,
+        id: u64,
     },
 }
 
@@ -123,6 +159,14 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
                 seg: SegId(u64::from_str_radix(seg_hex, 16).ok()?),
             });
         }
+        if let Some(body) = rest.strip_prefix("l/") {
+            let (fence_hex, id_hex) = body.split_once('-')?;
+            return Some(StoreKey::Leaf {
+                vset,
+                fence: u64::from_str_radix(fence_hex, 16).ok()?,
+                id: u64::from_str_radix(id_hex, 16).ok()?,
+            });
+        }
         return None;
     }
     if let Some(rest) = key.strip_prefix("b/") {
@@ -137,6 +181,14 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
                 base,
                 fence: u64::from_str_radix(fence_hex, 16).ok()?,
                 seg: SegId(u64::from_str_radix(seg_hex, 16).ok()?),
+            });
+        }
+        if let Some(body) = rest.strip_prefix("l/") {
+            let (fence_hex, id_hex) = body.split_once('-')?;
+            return Some(StoreKey::BaseLeaf {
+                base,
+                fence: u64::from_str_radix(fence_hex, 16).ok()?,
+                id: u64::from_str_radix(id_hex, 16).ok()?,
             });
         }
         return None;
@@ -156,6 +208,17 @@ pub enum BlobName {
         vset: VsetId,
         fence: u64,
         seg: SegId,
+    },
+    Leaf {
+        vset: VsetId,
+        fence: u64,
+        id: u64,
+    },
+    BaseLeaf {
+        vset: VsetId,
+        base: u64,
+        fence: u64,
+        id: u64,
     },
     Handoff {
         vset: VsetId,
@@ -177,6 +240,27 @@ pub fn parse_blob(name: &str) -> Option<BlobName> {
         let fence = u64::from_str_radix(fence_hex, 16).ok()?;
         let seg = SegId(u64::from_str_radix(seg_hex, 16).ok()?);
         return Some(BlobName::Segment { vset, fence, seg });
+    }
+    if let Some(body) = rest.strip_prefix("l/").and_then(|r| r.strip_suffix(".map")) {
+        let (fence_hex, id_hex) = body.split_once('-')?;
+        let fence = u64::from_str_radix(fence_hex, 16).ok()?;
+        let id = u64::from_str_radix(id_hex, 16).ok()?;
+        return Some(BlobName::Leaf { vset, fence, id });
+    }
+    if let Some(body) = rest
+        .strip_prefix("lb/")
+        .and_then(|r| r.strip_suffix(".map"))
+    {
+        let mut parts = body.splitn(3, '-');
+        let base = u64::from_str_radix(parts.next()?, 16).ok()?;
+        let fence = u64::from_str_radix(parts.next()?, 16).ok()?;
+        let id = u64::from_str_radix(parts.next()?, 16).ok()?;
+        return Some(BlobName::BaseLeaf {
+            vset,
+            base,
+            fence,
+            id,
+        });
     }
     if rest == "handoff" {
         return Some(BlobName::Handoff { vset });
@@ -209,6 +293,57 @@ mod tests {
             "v/000000000badcafe/s/0000000000000002-0000000000000003"
         );
         assert_eq!(vset_prefix(vset), "v/000000000badcafe/");
+        assert_eq!(
+            leaf_blob(vset, 2, 7),
+            "v/000000000badcafe/l/0000000000000002-0000000000000007.map"
+        );
+        assert_eq!(
+            base_leaf_blob(vset, 9, 2, 7),
+            "v/000000000badcafe/lb/0000000000000009-0000000000000002-0000000000000007.map"
+        );
+        assert_eq!(
+            leaf_key(vset, 2, 7),
+            "v/000000000badcafe/l/0000000000000002-0000000000000007"
+        );
+        assert_eq!(
+            base_leaf_key(9, 2, 7),
+            "b/0000000000000009/l/0000000000000002-0000000000000007"
+        );
+        assert_eq!(
+            parse_blob("v/000000000badcafe/l/0000000000000002-0000000000000007.map"),
+            Some(BlobName::Leaf {
+                vset,
+                fence: 2,
+                id: 7
+            })
+        );
+        assert_eq!(
+            parse_blob(
+                "v/000000000badcafe/lb/0000000000000009-0000000000000002-0000000000000007.map"
+            ),
+            Some(BlobName::BaseLeaf {
+                vset,
+                base: 9,
+                fence: 2,
+                id: 7
+            })
+        );
+        assert_eq!(
+            parse_key("v/000000000badcafe/l/0000000000000002-0000000000000007"),
+            Some(StoreKey::Leaf {
+                vset,
+                fence: 2,
+                id: 7
+            })
+        );
+        assert_eq!(
+            parse_key("b/0000000000000009/l/0000000000000002-0000000000000007"),
+            Some(StoreKey::BaseLeaf {
+                base: 9,
+                fence: 2,
+                id: 7
+            })
+        );
         assert_eq!(
             parse_blob("v/000000000badcafe/j/0000000000000002-000000000000001f.rec"),
             Some(BlobName::Journal {

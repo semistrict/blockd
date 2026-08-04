@@ -107,6 +107,10 @@ pub struct Guest {
     pub fsck: VecDeque<PageId>,
     /// True while verifying a cold boot (fsck fills infer recovered state).
     pub cold_booting: bool,
+    /// Override for the sync share of the op mix (`None` = the default
+    /// sync-heavy mix). Each sync buys a durable consistency point, so
+    /// workload-cost tests tune this to what they mean to measure.
+    pub sync_share: Option<Ppm>,
 }
 
 impl Guest {
@@ -120,6 +124,7 @@ impl Guest {
             completed: 0,
             fsck: VecDeque::new(),
             cold_booting: false,
+            sync_share: None,
         }
     }
 
@@ -169,6 +174,25 @@ impl Guest {
         assert_eq!(self.state, GuestState::Idle, "one outstanding op only");
         if let Some(page) = self.fsck.pop_front() {
             return Ok(PendingOp::Fsck { page });
+        }
+        if let Some(share) = self.sync_share {
+            if rng.hit(share) {
+                let idx = VolumeIdx(
+                    u8::try_from(rng.range(1, u64::from(self.config.disk_volumes))).expect("fits"),
+                );
+                return Err(VolumeId {
+                    vset: self.vset,
+                    idx,
+                });
+            }
+            let page = self.random_page(rng);
+            if rng.hit(Ppm::percent(60)) {
+                return Ok(PendingOp::Write {
+                    page,
+                    vol_seq: next_vol_seq(page.volume),
+                });
+            }
+            return Ok(PendingOp::Read { page });
         }
         if rng.hit(Ppm::percent(50)) {
             let page = self.random_page(rng);

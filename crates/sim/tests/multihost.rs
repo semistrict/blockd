@@ -5,8 +5,9 @@
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::types::{HostId, VsetId, millis, secs};
+use blockd_core::types::{HostId, VsetId, micros, millis, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, run};
+use blockd_sim::rng::Ppm;
 use blockd_sim::world::blobdev::BlobDevConfig;
 use blockd_sim::world::store::StoreConfig;
 
@@ -42,9 +43,11 @@ fn base_config() -> ClusterConfig {
         peer_dup: (0, 1),
         store_outage: None,
         rot_resume_set_at: None,
+        rot_leaves_at: None,
         race_restore: true,
         migrate_at: None,
         sabotage: None,
+        guest_sync_share: None,
     }
 }
 
@@ -63,7 +66,7 @@ fn host_death_restores_orphans_elsewhere_with_racing_claims() {
     // The recovered point was exactly the head's manifest at death (R4.3).
     assert_eq!(report.loss_bound_verified, 1);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, 4498);
+    assert_eq!(report.completed_ops, 4809);
 }
 
 #[test]
@@ -105,7 +108,7 @@ fn migration_moves_a_nonbacked_vset_losslessly() {
     // non-backed vset wrote nothing to the store (R4.4), so zero restores.
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, 1450);
+    assert_eq!(report.completed_ops, 1735);
     // R7.1: the guest-observed pause — source pause through destination
     // resume — stays far inside the 500 ms budget.
     assert!(
@@ -131,7 +134,7 @@ fn source_death_mid_drain_costs_the_nonbacked_vset_loudly() {
     // The destination's guest died at its first peer fetch the dead source
     // could not answer (the sanctioned R7.3 loss).
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, 562);
+    assert_eq!(report.completed_ops, 652);
 }
 
 /// R6.2: a restore onto a host with none of the vset's bytes reaches its
@@ -220,7 +223,7 @@ fn hydration_drains_the_tail_and_releases_the_source() {
     // The post-release crash recovers a daemon with nothing to say — and
     // the two-runners check stays silent.
     assert_eq!(report.recoveries, 1);
-    assert_eq!(report.completed_ops, 1464);
+    assert_eq!(report.completed_ops, 1606);
 }
 
 /// The recovery side of the two-sided handoff (R7.2): a source that
@@ -242,7 +245,7 @@ fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
     // released and reclaimed.
     assert_eq!(report.releases, 1);
     assert_eq!(report.blobs_per_host[0], 0);
-    assert_eq!(report.completed_ops, 1419);
+    assert_eq!(report.completed_ops, 1576);
 }
 
 /// A crash that tears the handoff marker means the migration never
@@ -251,9 +254,9 @@ fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
 #[test]
 fn torn_handoff_marker_means_the_migration_never_happened() {
     let config = ClusterConfig {
-        // The marker write is submitted at ~1500.74ms on this seed: crash
+        // The marker write is submitted at ~1500.27ms on this seed: crash
         // while it is in flight, so the device crash tears it.
-        crash_hosts_at: vec![(1_500_800_000, 0)],
+        crash_hosts_at: vec![(1_500_330_000, 0)],
         ..migrate_config()
     };
     let report = run(7, config);
@@ -264,7 +267,7 @@ fn torn_handoff_marker_means_the_migration_never_happened() {
     assert_eq!(report.recoveries, 1);
     // The vset still lives on the source: its blobs are there.
     assert!(report.blobs_per_host[0] > 0);
-    assert_eq!(report.completed_ops, 1538);
+    assert_eq!(report.completed_ops, 1687);
 }
 
 /// R7.3's mirror: the DESTINATION crashing mid-drain loses its volatile
@@ -285,7 +288,7 @@ fn dest_crash_mid_drain_dies_loudly_not_silently() {
     assert_eq!(report.recoveries, 1);
     // Never released: the source keeps the tail.
     assert!(report.blobs_per_host[0] > 0);
-    assert_eq!(report.completed_ops, 571);
+    assert_eq!(report.completed_ops, 662);
 }
 
 /// Migration completes losslessly over a channel that drops a quarter of
@@ -311,7 +314,7 @@ fn migration_survives_a_lossy_duplicating_peer_channel() {
         report.peer_drops,
         report.peer_dups
     );
-    assert_eq!(report.completed_ops, 1491);
+    assert_eq!(report.completed_ops, 1711);
 }
 
 #[test]
@@ -402,7 +405,7 @@ fn restore_waits_out_a_store_outage() {
         "restore finished during the outage: {} ns",
         report.max_restore_ns
     );
-    assert_eq!(report.completed_ops, 4319);
+    assert_eq!(report.completed_ops, 4457);
 }
 
 /// R6.2's prefetch is a bet, and a rotten resume-set object must cost
@@ -433,5 +436,106 @@ fn a_rotten_resume_set_is_ignored_not_fatal() {
         report.max_restore_ns
     );
     assert_eq!(report.prefetch_fills, 0);
-    assert_eq!(report.completed_ops, 673);
+    assert_eq!(report.completed_ops, 776);
+}
+
+/// A vset large enough that its map genuinely shards into leaves. Low
+/// sync share and a warm cache: these tests exercise the map machinery,
+/// not sync torture or thrash.
+fn multi_leaf_config() -> ClusterConfig {
+    ClusterConfig {
+        daemon: DaemonConfig {
+            cache_pages: 16_384,
+            ..base_config().daemon
+        },
+        vset_count: 1,
+        // Just past the span size, so each disk volume shards into two
+        // leaves — the smallest genuinely multi-leaf shape.
+        vset_config: VsetConfig {
+            disk_volumes: 2,
+            pages_per_volume: 5_000,
+            backed_up: true,
+        },
+        think: (micros(20), micros(100)),
+        guest_sync_share: Some(Ppm(1_000)),
+        race_restore: false,
+        kill_hosts_at: vec![],
+        horizon: secs(2),
+        ..base_config()
+    }
+}
+
+/// Restore of a multi-leaf vset: the verdict is three small objects no
+/// matter the map size; the leaves hydrate lazily from the store while
+/// faults into unhydrated spans park — and every byte still verifies.
+#[test]
+fn restores_hydrate_multi_leaf_maps_lazily() {
+    let config = ClusterConfig {
+        kill_hosts_at: vec![(millis(1200), 0)],
+        ..multi_leaf_config()
+    };
+    let report = run(11, config);
+    assert_clean(&report);
+    assert_eq!(report.restores, 1);
+    assert_eq!(report.guest_deaths, 0);
+    // R6.2, strengthened by lazy hydration: the verdict never waits for
+    // the map, whatever the vset size.
+    assert!(
+        report.max_restore_ns < millis(200),
+        "R6.2: restore took {} ns",
+        report.max_restore_ns
+    );
+    // The map really was sharded, and really hydrated span by span.
+    assert!(report.leaf_fills > 0, "no leaves hydrated");
+    assert_eq!(report.completed_ops, 25_916);
+}
+
+/// Migration of a multi-leaf vset: the offer stays small, the destination
+/// hydrates the map from the SOURCE (leaves before data), and the release
+/// still fires once nothing references it.
+#[test]
+fn migration_hydrates_multi_leaf_maps_from_the_source() {
+    let config = ClusterConfig {
+        hosts: 2,
+        vset_config: VsetConfig {
+            disk_volumes: 2,
+            pages_per_volume: 5_000,
+            backed_up: false,
+        },
+        migrate_at: Some((millis(1200), VsetId(1), 1)),
+        ..multi_leaf_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert!(report.leaf_fills > 0, "no leaves hydrated from the source");
+    // The data tail also drains (though a working set this size outlives
+    // the horizon at the current hydration budget — release timing is a
+    // throughput concern, not a correctness one, and is asserted by the
+    // small-map release tests).
+    assert!(report.hydrate_fills > 0);
+    assert_eq!(report.completed_ops, 28_939);
+}
+
+/// A leaf object rotten in the store makes exactly its span unservable:
+/// the restore still reaches its verdict, hydration marks the span dead,
+/// and the first fault into it dies loudly (R8.1) — one guest, no
+/// silent corruption, nothing else touched.
+#[test]
+fn a_rotten_leaf_kills_its_span_loudly_and_nothing_else() {
+    let config = ClusterConfig {
+        // Rot lands just before the kill: the manifest the restore will
+        // choose already references these leaves, and no fresh upload can
+        // replace them in the 1 ms left.
+        rot_leaves_at: Some(1_199_000_000),
+        kill_hosts_at: vec![(millis(1200), 0)],
+        ..multi_leaf_config()
+    };
+    let report = run(11, config);
+    assert_clean(&report);
+    assert_eq!(report.restores, 1);
+    // The reborn guest's verification pass hit the dead span: loud death.
+    assert_eq!(report.guest_deaths, 1);
+    assert_eq!(report.completed_ops, 25_555);
 }
