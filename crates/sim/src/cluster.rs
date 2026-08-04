@@ -1363,11 +1363,15 @@ impl Cluster {
                 self.vset_restored(host, req, vset, verdict);
             }
             AdminReply::MigratedOut { req, .. } => {
+                // Bookkeeping only: the source's ack can be swallowed by a
+                // crash after the handoff is already decided, so completed
+                // migrations are counted at the DESTINATION's adoption —
+                // the ground truth of who runs the vset.
                 self.admin_reqs.remove(&req);
                 self.migrate_reqs.remove(&req);
-                self.report.migrations += 1;
             }
             AdminReply::VsetMigratedIn { vset, verdict } => {
+                self.report.migrations += 1;
                 // R7.1: the guest-observed pause spans the source's pause
                 // to the destination coming up ready to serve.
                 if let Some(paused) = self.paused_at.get(&vset) {

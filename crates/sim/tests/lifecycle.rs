@@ -37,6 +37,8 @@ fn base_config() -> HarnessConfig {
         sabotage: None,
         guest_sync_share: None,
         guest_hot_pages: None,
+        rot_records_at: vec![],
+        crash_at: vec![],
     }
 }
 
@@ -178,6 +180,31 @@ fn bit_rot_kills_loudly_and_only_where_injected() {
     assert_eq!(report.counters.faults_unservable, 3);
 }
 
+/// Adversarial rot, not Poisson luck: flip a bit in the NEWEST record —
+/// the sole carrier of its newly-acked syncs — and crash before any newer
+/// record can cover for it; later in the run, the same against the MIRROR
+/// copy. Recovery must land at-or-past every acked sync both times
+/// (R3.8): surviving this is exactly what the record's second copy
+/// exists for — a single-copy journal provably fails it, and the hazard
+/// originally surfaced only by an unlucky seed. Never again by luck.
+#[test]
+fn rot_on_either_record_copy_never_rolls_back_acked_syncs() {
+    let mut config = base_config();
+    config.vset_count = 1;
+    config.horizon = secs(3);
+    // Crash 50µs behind each flip — inside the window where the rotted
+    // record is still the newest, before another record covers its syncs.
+    config.rot_records_at = vec![(millis(900), false), (millis(1800), true)];
+    config.crash_at = vec![millis(900) + micros(50), millis(1800) + micros(50)];
+    let report = run(9, config);
+    assert_clean(&report);
+    assert_eq!(report.bitflips, 2, "both targeted flips must land");
+    assert_eq!(report.crashes, 2);
+    assert_eq!(report.guest_deaths, 0);
+    assert_eq!(report.cold_boots, 2);
+    assert_eq!(report.completed_ops, 687);
+}
+
 #[test]
 fn full_chaos_stays_consistent() {
     let mut config = base_config();
@@ -235,7 +262,7 @@ fn scale_run_hosts_many_overcommitted_vsets() {
 /// belongs in this list, forever.
 #[test]
 fn chaos_seed_corpus_stays_consistent() {
-    for seed in [3, 8, 21, 47, 90] {
+    for seed in [3, 8, 21, 29, 47, 63, 77, 90, 104, 131] {
         let mut config = base_config();
         config.horizon = secs(3);
         config.checkpoint_interval = Some(millis(300));

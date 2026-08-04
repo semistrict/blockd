@@ -91,6 +91,14 @@ pub struct HarnessConfig {
     /// Guest access skew (`None` = uniform): (share, N) sends that share
     /// of page picks to each volume's first N pages.
     pub guest_hot_pages: Option<(crate::rng::Ppm, u32)>,
+    /// Targeted rot (adversarial, not Poisson): at each instant, flip one
+    /// bit in the NEWEST journal record's primary (`false`) or mirror
+    /// (`true`) copy. The newest record is the single carrier of its
+    /// newly-acked syncs — exactly the copy whose loss must be survivable.
+    pub rot_records_at: Vec<(u64, bool)>,
+    /// Scheduled daemon crashes at exact instants (besides the Poisson
+    /// plan) — what lets a test crash inside a specific protocol window.
+    pub crash_at: Vec<u64>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -154,6 +162,8 @@ enum Ev {
     RestartDaemon,
     Bitflip,
     JournalBitflip,
+    /// Targeted rot: the newest record's primary or mirror (`true`) copy.
+    RotNewestRecord(bool),
     StoreOutage(bool),
 }
 
@@ -216,6 +226,34 @@ struct Harness {
     report: RunReport,
 }
 
+/// Arm the run's fault plan: Poisson streams, the outage window, and the
+/// scheduled adversarial instants (targeted rot, exact crashes).
+fn schedule_faults(h: &mut Harness) {
+    if h.config.faults.crash_mean_interval > 0 {
+        let at = h.next_after(h.config.faults.crash_mean_interval);
+        h.kernel.schedule_at(at, Ev::CrashDaemon);
+    }
+    if h.config.faults.bitflip_mean_interval > 0 {
+        let at = h.next_after(h.config.faults.bitflip_mean_interval);
+        h.kernel.schedule_at(at, Ev::Bitflip);
+    }
+    if h.config.faults.journal_bitflip_mean_interval > 0 {
+        let at = h.next_after(h.config.faults.journal_bitflip_mean_interval);
+        h.kernel.schedule_at(at, Ev::JournalBitflip);
+    }
+    if let Some((begin, end)) = h.config.faults.store_outage {
+        h.kernel.schedule_at(SimTime(begin), Ev::StoreOutage(true));
+        h.kernel.schedule_at(SimTime(end), Ev::StoreOutage(false));
+    }
+    for &(at, mirror) in &h.config.rot_records_at {
+        h.kernel
+            .schedule_at(SimTime(at), Ev::RotNewestRecord(mirror));
+    }
+    for &at in &h.config.crash_at {
+        h.kernel.schedule_at(SimTime(at), Ev::CrashDaemon);
+    }
+}
+
 pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
     let kernel = Kernel::new(seed);
     let (daemon, effects) = Daemon::new(config.daemon.clone());
@@ -254,22 +292,7 @@ pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
         };
         h.step_daemon(Event::Admin(cmd));
     }
-    if h.config.faults.crash_mean_interval > 0 {
-        let at = h.next_after(h.config.faults.crash_mean_interval);
-        h.kernel.schedule_at(at, Ev::CrashDaemon);
-    }
-    if h.config.faults.bitflip_mean_interval > 0 {
-        let at = h.next_after(h.config.faults.bitflip_mean_interval);
-        h.kernel.schedule_at(at, Ev::Bitflip);
-    }
-    if h.config.faults.journal_bitflip_mean_interval > 0 {
-        let at = h.next_after(h.config.faults.journal_bitflip_mean_interval);
-        h.kernel.schedule_at(at, Ev::JournalBitflip);
-    }
-    if let Some((begin, end)) = h.config.faults.store_outage {
-        h.kernel.schedule_at(SimTime(begin), Ev::StoreOutage(true));
-        h.kernel.schedule_at(SimTime(end), Ev::StoreOutage(false));
-    }
+    schedule_faults(&mut h);
 
     let end = SimTime(h.config.horizon + 2 * millis(1000));
     while let Some((at, event)) = h.kernel.pop() {
@@ -652,6 +675,29 @@ impl Harness {
                 if self.within_horizon() && self.config.faults.journal_bitflip_mean_interval > 0 {
                     let at = self.next_after(self.config.faults.journal_bitflip_mean_interval);
                     self.kernel.schedule_at(at, Ev::JournalBitflip);
+                }
+            }
+            Ev::RotNewestRecord(mirror) => {
+                // The newest record by (fence, seq), in the chosen copy —
+                // the adversarial target: it alone carries its newly-acked
+                // syncs, so its loss is the rollback hazard.
+                let target = self
+                    .bdev
+                    .scan()
+                    .filter_map(|(name, _)| {
+                        let parsed = layout::parse_blob(name)?;
+                        let BlobName::Journal { fence, seq, .. } = parsed else {
+                            return None;
+                        };
+                        let is_mirror = std::path::Path::new(name)
+                            .extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("recm"));
+                        (is_mirror == mirror).then(|| (fence, seq, name.clone()))
+                    })
+                    .max();
+                if let Some((_, _, name)) = target {
+                    self.bdev
+                        .flip_random_bit_where(self.kernel.rng(), |n| n == name);
                 }
             }
             Ev::StoreOutage(out) => self.store.set_outage(out),

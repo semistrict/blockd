@@ -37,6 +37,8 @@ fn base_config() -> HarnessConfig {
         sabotage: None,
         guest_sync_share: None,
         guest_hot_pages: None,
+        rot_records_at: vec![],
+        crash_at: vec![],
     }
 }
 

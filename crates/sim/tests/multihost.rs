@@ -201,6 +201,80 @@ fn cluster_seed_corpus_stays_consistent() {
     }
 }
 
+/// The two-sided handoff must hold at EVERY crash instant, not at one
+/// hand-tuned nanosecond: sweep source crashes across the whole handoff
+/// window on a fixed grid, and at every offset demand the binary outcome —
+/// the migration either never happened (the vset lives on the recovered
+/// source, blobs intact) or completed exactly once (drained, released,
+/// source reclaimed to zero) — with the oracle's two-runners and
+/// byte-exactness checks standing throughout. The grid is finer than the
+/// device's write latency, so every torn-write window is visited by
+/// construction; no timing re-derivation when traces shift.
+#[test]
+fn a_source_crash_at_every_handoff_instant_resolves_to_exactly_one_runner() {
+    let (mut never_happened, mut completed) = (0, 0);
+    for step in 0..40u64 {
+        let at = millis(1500) + step * 50_000; // 50µs grid across 2ms
+        let config = ClusterConfig {
+            crash_hosts_at: vec![(at, 0)],
+            ..migrate_config()
+        };
+        let report = run(7, config);
+        assert_eq!(
+            report.violations,
+            Vec::<String>::new(),
+            "crash at {at}ns violated an invariant"
+        );
+        assert_eq!(report.guest_deaths, 0, "crash at {at}ns");
+        // A release happens exactly when a migration completed.
+        assert_eq!(report.releases, report.migrations, "crash at {at}ns");
+        match report.migrations {
+            0 => {
+                assert!(
+                    report.blobs_per_host[0] > 0,
+                    "crash at {at}ns: unmigrated vset lost its blobs"
+                );
+                never_happened += 1;
+            }
+            1 => {
+                assert_eq!(
+                    report.blobs_per_host[0], 0,
+                    "crash at {at}ns: released source kept blobs"
+                );
+                completed += 1;
+            }
+            n => panic!("crash at {at}ns: {n} migrations of one vset"),
+        }
+    }
+    // Coverage guard: the sweep must straddle the commit point, or it
+    // proved nothing about the interesting instants.
+    assert!(
+        never_happened > 0 && completed > 0,
+        "sweep never straddled the handoff ({never_happened} never, {completed} completed)"
+    );
+}
+
+/// Wider corpus over the kill+racing-claims config, oracle-only: safety
+/// must hold on seeds whose exact outcome shape varies (a takeover inside
+/// the R6.4 window can make both claims "win" — that is legal; a lost
+/// vset or a double-run is not).
+#[test]
+fn cluster_wide_seed_corpus_stays_safe() {
+    for seed in [3, 5, 19, 52, 88, 101] {
+        let report = run(seed, base_config());
+        assert_eq!(
+            report.violations,
+            Vec::<String>::new(),
+            "seed {seed} violated an invariant"
+        );
+        assert!(
+            report.restores >= 1,
+            "seed {seed}: the orphan never came back"
+        );
+        assert_eq!(report.guest_deaths, 0, "seed {seed}");
+    }
+}
+
 /// The drain completes without the guest's help: hydration pulls the tail
 /// in the background, the destination releases the source, and the source
 /// reclaims every byte (R4.5: explicit). A later crash of the source then
@@ -355,7 +429,7 @@ fn migration_chaos_config() -> ClusterConfig {
 fn migration_chaos_corpus_stays_consistent() {
     let mut migrations = 0;
     let mut drops = 0;
-    for seed in [7, 13, 31, 44, 71] {
+    for seed in [7, 13, 19, 31, 44, 52, 71, 88] {
         let report = run(seed, migration_chaos_config());
         assert_eq!(
             report.violations,
