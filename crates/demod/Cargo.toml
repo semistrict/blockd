@@ -1,0 +1,17 @@
+[package]
+name = "blockd-demod"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "demod"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+blockd-core = { path = "../core" }
+blockd-runtime = { path = "../runtime" }

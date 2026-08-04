@@ -13,6 +13,7 @@
 // time are the implementation, not a hazard.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+pub mod fakegcs;
 #[cfg(target_os = "linux")]
 pub mod fc;
 mod gcs;

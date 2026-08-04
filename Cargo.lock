@@ -16,6 +16,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blockd-demod"
+version = "0.1.0"
+dependencies = [
+ "blockd-core",
+ "blockd-runtime",
+]
+
+[[package]]
 name = "blockd-fc-guest"
 version = "0.1.0"
 dependencies = [
