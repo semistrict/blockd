@@ -36,6 +36,7 @@ fn base_config() -> HarnessConfig {
         faults: FaultPlan::none(),
         sabotage: None,
         guest_sync_share: None,
+        guest_hot_pages: None,
     }
 }
 
@@ -49,11 +50,11 @@ fn quiet_run_serves_and_syncs_without_incident() {
     assert_clean(&report);
     assert_eq!(report.crashes, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, 1980);
+    assert_eq!(report.completed_ops, 1947);
     assert_eq!(report.counters.faults_unservable, 0);
     assert_eq!(report.counters.pressure_waits, 0);
     assert_eq!(report.counters.checkpoints_done, 0);
-    assert_eq!(report.counters.syncs_acked, 277);
+    assert_eq!(report.counters.syncs_acked, 274);
     assert_eq!(report.counters.guest_rejected, 0);
 }
 
@@ -89,12 +90,12 @@ fn crash_storm_with_checkpoints_resumes() {
     };
     let report = run(3, config);
     assert_clean(&report);
-    assert_eq!(report.crashes, 9);
-    assert_eq!(report.resumes, 0);
-    assert_eq!(report.cold_boots, 27);
+    assert_eq!(report.crashes, 12);
+    assert_eq!(report.resumes, 11);
+    assert_eq!(report.cold_boots, 25);
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, 4185);
+    assert_eq!(report.completed_ops, 3388);
 }
 
 #[test]
@@ -112,11 +113,11 @@ fn crash_storm_without_checkpoints_cold_boots_at_sync_consistency() {
     };
     let report = run(4, config);
     assert_clean(&report);
-    assert_eq!(report.crashes, 10);
+    assert_eq!(report.crashes, 9);
     assert_eq!(report.resumes, 0);
-    assert_eq!(report.cold_boots, 30);
+    assert_eq!(report.cold_boots, 27);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, 3422);
+    assert_eq!(report.completed_ops, 2987);
 }
 
 #[test]
@@ -128,15 +129,15 @@ fn repeated_checkpoints_accrue_no_storage_debt() {
     config.checkpoint_interval = Some(millis(50));
     let report = run(5, config);
     assert_clean(&report);
-    assert_eq!(report.counters.checkpoints_done, 243);
+    assert_eq!(report.counters.checkpoints_done, 240);
     // R3.1: the guest-visible pause is the VMM pause round-trip only —
     // capture and persistence never extend it. Far under the 250 ms budget.
-    assert_eq!(report.max_pause_ns, 199_220);
-    assert_eq!(report.counters.records_written, 1659);
+    assert_eq!(report.max_pause_ns, 199_414);
+    assert_eq!(report.counters.records_written, 1630);
     // Bounded by live data: at worst ~one segment per live page plus two
     // records per vset (48 pages × 3 vsets ⇒ well under 150), an order of
     // magnitude below records_written — not growing with checkpoint count.
-    assert_eq!(report.blob_count, 92);
+    assert_eq!(report.blob_count, 57);
 }
 
 #[test]
@@ -150,9 +151,9 @@ fn pressure_slows_guests_but_never_kills() {
     let report = run(6, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.counters.pressure_waits, 299);
+    assert_eq!(report.counters.pressure_waits, 259);
     let progressed: Vec<u64> = report.per_guest_completed.values().copied().collect();
-    assert_eq!(progressed, [532, 537, 530, 529]);
+    assert_eq!(progressed, [536, 542, 524, 528]);
 }
 
 #[test]
@@ -172,7 +173,7 @@ fn bit_rot_kills_loudly_and_only_where_injected() {
     };
     let report = run(7, config);
     assert_clean(&report);
-    assert_eq!(report.bitflips, 22);
+    assert_eq!(report.bitflips, 16);
     assert_eq!(report.guest_deaths, 3);
     assert_eq!(report.counters.faults_unservable, 3);
 }
@@ -200,7 +201,7 @@ fn full_chaos_stays_consistent() {
             report.guest_deaths,
             report.completed_ops,
         ),
-        (10, 12, 18, 0, 8, 4183)
+        (10, 17, 13, 0, 20, 3000)
     );
 }
 
@@ -306,9 +307,11 @@ fn big_maps_cost_deltas_not_size() {
         report.max_record_blob_bytes
     );
     // Amortized write cost: bounded per-record overhead plus a bounded
-    // per-flushed-page cost. A full-map encoding blows this budget because
-    // every record costs the whole map over again.
-    let budget = 720 * report.counters.pages_flushed + 8_192 * report.counters.records_written;
+    // per-flushed-page cost (records are written twice — the rot mirror —
+    // so an overlay entry costs ~90 B per record it rides in, and a leaf
+    // amortizes ~720 B per rolled page). A full-map encoding blows this
+    // budget because every record costs the whole map over again.
+    let budget = 900 * report.counters.pages_flushed + 16_384 * report.counters.records_written;
     assert!(
         report.map_bytes_written < budget,
         "map metadata cost {} bytes ({} flushed pages, {} records; budget {budget}) — \
@@ -316,5 +319,82 @@ fn big_maps_cost_deltas_not_size() {
         report.map_bytes_written,
         report.counters.pages_flushed,
         report.counters.records_written,
+    );
+}
+
+/// R2.7/R4.5: disk space tracks LIVE data, not write history. The workload
+/// is the pathological shape for write-once segments: a small hot set
+/// churns every interval (its old entries die immediately) while cold
+/// pages arrive once and survive — so every segment ends up mostly dead
+/// but pinned by its few cold survivors. Without compaction the device
+/// accumulates one mostly-dead segment per capture, unbounded in the
+/// horizon; with it, dead bytes are bounded by a constant factor of live.
+#[test]
+fn steady_overwrites_dont_amplify_disk_space() {
+    let config = HarnessConfig {
+        daemon: DaemonConfig {
+            cache_pages: 8_192,
+            ..base_config().daemon
+        },
+        vset_count: 1,
+        vset_config: VsetConfig {
+            disk_volumes: 2,
+            pages_per_volume: 4_096,
+            backed_up: false,
+        },
+        think: (micros(10), micros(50)),
+        horizon: secs(2),
+        checkpoint_interval: None,
+        // Writeback-shaped (syncs rare), 90% of picks in a 32-page hot
+        // set: each capture's segment is mostly hot pages that the next
+        // capture supersedes, plus a few cold survivors that pin it.
+        guest_sync_share: Some(Ppm(1_000)),
+        guest_hot_pages: Some((Ppm::percent(90), 32)),
+        ..base_config()
+    };
+    let report = run(43, config);
+    assert_clean(&report);
+    assert_eq!(report.guest_deaths, 0);
+    // The workload genuinely has the pathological shape: many captures,
+    // far more bytes written than the working set holds.
+    assert!(
+        report.counters.records_written > 50,
+        "{} records",
+        report.counters.records_written
+    );
+    assert!(
+        report.counters.pages_flushed > 10_000,
+        "only {} pages flushed — not enough churn to expose amplification",
+        report.counters.pages_flushed
+    );
+    // The structural bound compaction buys: every surviving segment is
+    // majority-live, so disk ≤ 2 × live plus the not-yet-compacted tail.
+    // History (≈7 MB of segment writes per simulated second) must NOT
+    // accumulate — without compaction this run ends at 20.6 MB and grows
+    // linearly with the horizon.
+    assert!(
+        report.seg_bytes_end < 2 * report.seg_live_bytes_end + 1_500_000,
+        "{} segment bytes on disk for {} live — space amplifying with history",
+        report.seg_bytes_end,
+        report.seg_live_bytes_end
+    );
+    // And the daemon's live accounting can't be excusing the bound: the
+    // whole vset is 3 volumes × 4096 pages at ≤ ~700 compressed-framed
+    // bytes each ≈ 8.6 MB ceiling, and the measured end state sits well
+    // under it (live 4.7 MB, disk 7.2 MB at seed 43).
+    assert!(
+        report.seg_live_bytes_end < 5_500_000,
+        "{} live bytes — accounting inflated past the working set",
+        report.seg_live_bytes_end
+    );
+    assert!(
+        report.seg_bytes_end < 9_000_000,
+        "{} segment bytes on disk at end",
+        report.seg_bytes_end
+    );
+    // Compaction did the reclaiming, not luck.
+    assert!(
+        report.counters.segs_compacted > 0,
+        "no segment was ever compacted"
     );
 }

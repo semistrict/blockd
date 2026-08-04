@@ -35,6 +35,7 @@ fn base_config() -> HarnessConfig {
         faults: FaultPlan::none(),
         sabotage: None,
         guest_sync_share: None,
+        guest_hot_pages: None,
     }
 }
 

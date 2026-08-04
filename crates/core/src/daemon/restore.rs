@@ -259,6 +259,7 @@ impl Daemon {
         // span with a leaf is pending until its object lands (faults into
         // it park), and next_gen advances as leaves reveal their gens.
         state.page_locs = chosen.overlay.clone();
+        state.rebuild_seg_live();
         state.overlay = chosen.overlay.clone();
         state.leaf_table = chosen.leaves.clone();
         state.pending_leaves = chosen.leaves.clone();
@@ -442,13 +443,7 @@ impl Daemon {
             if !state.config.contains(page) {
                 continue;
             }
-            if state
-                .page_locs
-                .get(&page)
-                .is_none_or(|(g, _)| *g < generation)
-            {
-                state.page_locs.insert(page, (generation, loc));
-            }
+            state.map_adopt(page, generation, loc);
             state.next_gen = state.next_gen.max(generation.0 + 1);
         }
         state.pending_leaves.remove(&span);

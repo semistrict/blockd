@@ -10,7 +10,10 @@
 //!
 //! Local blobs (relative to the daemon's data root):
 //! - `v/<vset:016x>/j/<fence:016x>-<seq:016x>.rec` — journal record
-//!   (framed, R10.2)
+//!   (framed, R10.2), plus a byte-identical `.recm` mirror: the newest
+//!   record is the sole carrier of its newly-acked sync watermark, and a
+//!   bit rotting it after the ack would silently roll acked syncs back
+//!   (R3.8) — recovery accepts whichever copy decodes intact
 //! - `v/<vset:016x>/s/<fence:016x>-<seg:016x>.seg` — segment of compressed
 //!   page entries
 //!
@@ -27,6 +30,11 @@ use crate::types::{JournalSeq, SegId, VsetId};
 
 pub fn journal_blob(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
     format!("v/{:016x}/j/{fence:016x}-{:016x}.rec", vset.0, seq.0)
+}
+
+/// The record's byte-identical mirror (rot redundancy, R3.8/R8.1).
+pub fn journal_mirror_blob(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
+    format!("v/{:016x}/j/{fence:016x}-{:016x}.recm", vset.0, seq.0)
 }
 
 pub fn segment_blob(vset: VsetId, fence: u64, seg: SegId) -> String {
@@ -229,7 +237,12 @@ pub fn parse_blob(name: &str) -> Option<BlobName> {
     let rest = name.strip_prefix("v/")?;
     let (vset_hex, rest) = rest.split_once('/')?;
     let vset = VsetId(u64::from_str_radix(vset_hex, 16).ok()?);
-    if let Some(body) = rest.strip_prefix("j/").and_then(|r| r.strip_suffix(".rec")) {
+    // A mirror parses as the same journal record: recovery accepts
+    // whichever copy decodes intact.
+    if let Some(body) = rest
+        .strip_prefix("j/")
+        .and_then(|r| r.strip_suffix(".recm").or_else(|| r.strip_suffix(".rec")))
+    {
         let (fence_hex, seq_hex) = body.split_once('-')?;
         let fence = u64::from_str_radix(fence_hex, 16).ok()?;
         let seq = JournalSeq(u64::from_str_radix(seq_hex, 16).ok()?);

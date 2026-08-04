@@ -386,6 +386,7 @@ impl Daemon {
         state.durable_watermark = 0;
         state.next_gen = overlay.values().map(|(g, _)| g.0 + 1).max().unwrap_or(0);
         state.page_locs = overlay.clone();
+        state.rebuild_seg_live();
         state.overlay = overlay;
         state.leaf_table = leaves.clone();
         state.pending_leaves = leaves;

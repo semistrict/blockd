@@ -107,10 +107,115 @@ impl Daemon {
             return;
         }
         let has_dirty = self.cache.has_dirty_of(vset);
-        // Any pending sync needs a record whose watermark covers it.
-        if has_dirty || !state.pending_syncs.is_empty() {
+        // Any pending sync needs a record whose watermark covers it; a
+        // compaction rescue needs a capture to carry it home.
+        if has_dirty || !state.pending_syncs.is_empty() || !state.compact_stash.is_empty() {
             self.start_capture(vset, None, mem, out);
         }
+    }
+
+    /// Read back local segments past the amplification threshold — at
+    /// least half their bytes superseded — deadest first; their live
+    /// pages ride the next capture into a fresh segment, releasing the
+    /// victims to cleanup. Batched on the writeback cadence (churn
+    /// creates up to one mostly-dead segment per tick, so reclaim must
+    /// outpace one per tick). The bound this buys: every surviving
+    /// segment is majority-live, so disk stays within ~2× live data plus
+    /// the uncompacted tail — and each rewritten byte reclaims at least
+    /// one dead one.
+    pub(super) fn maybe_start_compact(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
+        const COMPACT_BATCH: usize = 8;
+        let Some(state) = self.vsets.get(&vset_id) else {
+            return;
+        };
+        if !state.ready
+            || state.outbound.is_some()
+            || state.migrate.is_some()
+            || !state.pending_leaves.is_empty()
+            || state.compacting.len() >= COMPACT_BATCH
+        {
+            return;
+        }
+        let mut victims: Vec<(u64, u64, SegId)> = state
+            .seg_blobs
+            .iter()
+            .filter_map(|&(fence, seg, size)| {
+                let live = state.seg_live.get(&(fence, seg)).copied().unwrap_or(0);
+                (live > 0 && live * 2 <= size && !state.compacting.contains(&(fence, seg)))
+                    .then_some((live * 1_000_000 / size, fence, seg))
+            })
+            .collect();
+        victims.sort_unstable();
+        victims.truncate(COMPACT_BATCH - state.compacting.len());
+        for (_, fence, seg) in victims {
+            let state = self.vsets.get_mut(&vset_id).expect("just seen");
+            state.compacting.insert((fence, seg));
+            let io = self.io();
+            self.pending.insert(
+                io,
+                Pending::CompactRead {
+                    vset: vset_id,
+                    fence,
+                    seg,
+                },
+            );
+            out.push(Effect::BlobRead {
+                io,
+                name: layout::segment_blob(vset_id, fence, seg),
+            });
+        }
+    }
+
+    /// The victim segment's bytes are back: keep exactly the entries the
+    /// serving map still points at (identity, generation AND location
+    /// verified against the blob's own checksummed frames) for the next
+    /// capture to rewrite. Anything superseded meanwhile is dropped;
+    /// a vanished or corrupt blob rescues nothing — the fill path owns
+    /// loud failure for pages that exist nowhere intact.
+    pub(super) fn compact_read_done(
+        &mut self,
+        vset_id: VsetId,
+        fence: u64,
+        seg: SegId,
+        bytes: Option<Vec<u8>>,
+    ) {
+        let Some(state) = self.vsets.get_mut(&vset_id) else {
+            return;
+        };
+        if !state.compacting.remove(&(fence, seg)) {
+            return;
+        }
+        let Some(bytes) = bytes else {
+            return;
+        };
+        let Ok((owner, blob_fence, blob_seg, entries)) = crate::segment::scan_segment(&bytes)
+        else {
+            return;
+        };
+        if (owner, blob_fence, blob_seg) != (vset_id, fence, seg) {
+            return;
+        }
+        let mut rescued = Vec::new();
+        for (page, generation, loc) in entries {
+            let live = state
+                .page_locs
+                .get(&page)
+                .is_some_and(|&(g, l)| g == generation && l == loc);
+            if !live {
+                continue;
+            }
+            let start = loc.offset as usize;
+            let Ok((_, _, raw)) =
+                crate::segment::open_entry(vset_id, &bytes[start..start + loc.len as usize])
+            else {
+                return; // damaged mid-blob: rescue nothing, fills decide
+            };
+            rescued.push((page, generation, raw));
+        }
+        if rescued.is_empty() {
+            return;
+        }
+        state.compact_stash.push(((fence, seg), rescued));
     }
 
     pub(super) fn maybe_start_checkpoint(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
@@ -185,7 +290,9 @@ impl Daemon {
                 leaf_table,
                 rolled_gens: BTreeMap::new(),
                 new_locs: Vec::new(),
+                flushes: Vec::new(),
                 writes_pending: 0,
+                record_writes: 0,
                 synced_through: 0,
                 record: None,
             },
@@ -198,11 +305,15 @@ impl Daemon {
     /// blobs (returned for writing; the record waits on them). Spans still
     /// hydrating cannot roll — their content is unknown — so the overlay
     /// bound is transiently `OVERLAY_MAX` plus their entries.
+    /// `force_rolls` spans roll regardless of their overlay share:
+    /// compaction re-homes pages whose old locations live in leaves, and
+    /// the leaf must stop referencing the dying segment.
     #[allow(clippy::type_complexity)]
     fn shard_map(
         state: &mut Vset,
         vset_id: VsetId,
         new_locs: &[(PageId, (Gen, PageLoc))],
+        force_rolls: &BTreeSet<u32>,
     ) -> (
         PageMap,
         BTreeMap<u32, LeafPtr>,
@@ -222,7 +333,10 @@ impl Daemon {
         }
         let mut to_roll: BTreeSet<u32> = span_counts
             .iter()
-            .filter(|&(span, &n)| n >= ROLL_THRESHOLD && !state.pending_leaves.contains_key(span))
+            .filter(|&(span, &n)| {
+                (n >= ROLL_THRESHOLD || force_rolls.contains(span))
+                    && !state.pending_leaves.contains_key(span)
+            })
             .map(|(&span, _)| span)
             .collect();
         // Overlay-cap pressure: roll the fattest spans until back under.
@@ -323,10 +437,29 @@ impl Daemon {
         let to_protect = self.cache.dirty_pages_of(vset_id);
         let state = self.vsets.get_mut(&vset_id).expect("just seen");
 
+        // Compaction's rescues ride this capture: entries still current
+        // (not superseded, and not re-flushed fresh from the guest above).
+        let flush_set: BTreeSet<PageId> = to_flush.iter().copied().collect();
+        let mut compact_victims: BTreeSet<(u64, SegId)> = BTreeSet::new();
+        let mut compact_pages: Vec<(PageId, Gen, Vec<u8>)> = Vec::new();
+        for (victim, entries) in std::mem::take(&mut state.compact_stash) {
+            let before = compact_pages.len();
+            compact_pages.extend(entries.into_iter().filter(|(page, generation, _)| {
+                !flush_set.contains(page)
+                    && state
+                        .page_locs
+                        .get(page)
+                        .is_some_and(|(g, _)| g == generation)
+            }));
+            if compact_pages.len() > before {
+                compact_victims.insert(victim);
+            }
+        }
+
         let mut new_locs: Vec<(PageId, (Gen, PageLoc))> = Vec::new();
         let mut seg_blob: Option<(SegId, Vec<u8>)> = None;
         let mut flushed = Vec::new();
-        if !to_flush.is_empty() {
+        if !to_flush.is_empty() || !compact_pages.is_empty() {
             let seg = SegId(state.next_seg);
             state.next_seg += 1;
             let fence = state.fence;
@@ -337,6 +470,14 @@ impl Daemon {
                 state.next_gen += 1;
                 gens.push((*page, generation));
             }
+            // Rewrites get fresh generations too — the serving map re-homes
+            // on durability, the victim's live count drains to zero, and
+            // cleanup reclaims it.
+            let mut compact_gens = Vec::new();
+            for _ in &compact_pages {
+                compact_gens.push(Gen(state.next_gen));
+                state.next_gen += 1;
+            }
             for (page, generation) in &gens {
                 let bytes = mem.read_page(*page);
                 builder.add(*page, *generation, &bytes);
@@ -346,6 +487,9 @@ impl Daemon {
             if !to_protect.is_empty() {
                 out.push(Effect::WriteProtect { pages: to_protect });
             }
+            for ((page, _, bytes), generation) in compact_pages.iter().zip(&compact_gens) {
+                builder.add(*page, *generation, bytes);
+            }
             let (blob, locs) = builder.finish();
             for (page, generation, loc) in locs {
                 new_locs.push((page, (generation, loc)));
@@ -354,9 +498,26 @@ impl Daemon {
         }
 
         let state = self.vsets.get_mut(&vset_id).expect("just seen");
+        // Every leaf still referencing a victim segment — via live
+        // entries (all in the rescue) or stale ones — must rotate, or the
+        // leaf keeps the dying segment pinned.
+        let force_rolls: BTreeSet<u32> = if compact_victims.is_empty() {
+            BTreeSet::new()
+        } else {
+            state
+                .leaf_table
+                .iter()
+                .filter(|(_, ptr)| {
+                    state.leaf_blobs.get(ptr).is_some_and(|(_, segs)| {
+                        segs.iter().any(|seg| compact_victims.contains(seg))
+                    })
+                })
+                .map(|(&span, _)| span)
+                .collect()
+        };
         let leaves_before = state.next_leaf;
         let (overlay, leaf_table, rolled_gens, leaf_writes) =
-            Self::shard_map(state, vset_id, &new_locs);
+            Self::shard_map(state, vset_id, &new_locs, &force_rolls);
 
         // R2.7: no room even after reclaim ⇒ the capture is deferred — the
         // coupled stall. Dirty pages stay dirty; the writeback timer
@@ -394,7 +555,9 @@ impl Daemon {
         if let Some((seg, blob)) = seg_blob {
             let state = self.vsets.get_mut(&vset_id).expect("just seen");
             state.seg_blobs.push((fence, seg, blob.len() as u64));
-            self.counters.pages_flushed += new_locs.len() as u64;
+            self.counters.pages_flushed += flushed.len() as u64;
+            self.counters.segs_compacted += compact_victims.len() as u64;
+            self.counters.pages_compacted += compact_pages.len() as u64;
             let io = self.io();
             self.pending
                 .insert(io, Pending::SegWrite { vset: vset_id, seq });
@@ -429,7 +592,9 @@ impl Daemon {
                 leaf_table,
                 rolled_gens,
                 new_locs,
+                flushes: flushed,
                 writes_pending,
+                record_writes: 0,
                 synced_through: 0,
                 record: None,
             },
@@ -472,17 +637,26 @@ impl Daemon {
             .record_ws
             .insert(seq, (state.fence, capture.synced_through));
         capture.record = Some(record.clone());
+        capture.record_writes = 2;
         let fence = state.fence;
         let bytes = record.encode(vset_id);
-        self.local_bytes += bytes.len() as u64;
-        let io = self.io();
-        self.pending
-            .insert(io, Pending::RecordWrite { vset: vset_id, seq });
-        out.push(Effect::BlobWrite {
-            io,
-            name: layout::journal_blob(vset_id, fence, seq),
-            bytes,
-        });
+        self.local_bytes += 2 * bytes.len() as u64;
+        // Primary and mirror: the newest record is the sole carrier of its
+        // newly-acked sync watermark, so one rotten bit must not be able
+        // to roll acked syncs back (R3.8) — recovery accepts either copy.
+        for name in [
+            layout::journal_blob(vset_id, fence, seq),
+            layout::journal_mirror_blob(vset_id, fence, seq),
+        ] {
+            let io = self.io();
+            self.pending
+                .insert(io, Pending::RecordWrite { vset: vset_id, seq });
+            out.push(Effect::BlobWrite {
+                io,
+                name,
+                bytes: bytes.clone(),
+            });
+        }
     }
 
     pub(super) fn blob_write_done(&mut self, io: IoId, mem: &dyn HostMap, out: &mut Vec<Effect>) {
@@ -504,14 +678,9 @@ impl Daemon {
                 // (the overlay half holds them until a roll re-homes them
                 // into a leaf and the finalize adopts it).
                 let new_locs = capture.new_locs.clone();
+                let flushes = capture.flushes.clone();
                 for &(page, (generation, loc)) in &new_locs {
-                    if state
-                        .page_locs
-                        .get(&page)
-                        .is_none_or(|(g, _)| *g < generation)
-                    {
-                        state.page_locs.insert(page, (generation, loc));
-                    }
+                    state.map_adopt(page, generation, loc);
                     if state
                         .overlay
                         .get(&page)
@@ -520,7 +689,7 @@ impl Daemon {
                         state.overlay.insert(page, (generation, loc));
                     }
                 }
-                for (page, _) in new_locs {
+                for page in flushes {
                     self.cache.end_flush(page);
                 }
                 if done {
@@ -539,7 +708,16 @@ impl Daemon {
                 }
             }
             Some(Pending::LeafCopyWrite) => {}
-            Some(Pending::RecordWrite { vset, seq }) => self.finalize_record(vset, seq, mem, out),
+            Some(Pending::RecordWrite { vset, seq }) => {
+                let Some(state) = self.vsets.get_mut(&vset) else {
+                    return;
+                };
+                let capture = state.captures.get_mut(&seq).expect("capture exists");
+                capture.record_writes -= 1;
+                if capture.record_writes == 0 {
+                    self.finalize_record(vset, seq, mem, out);
+                }
+            }
             Some(Pending::HandoffWrite { vset }) => self.handoff_written(vset, out),
             Some(_) => out.push(Effect::Abort {
                 reason: "blob write completion for a non-write io",
@@ -809,6 +987,9 @@ impl Daemon {
             self.counters.blobs_deleted += 1;
             out.push(Effect::BlobDelete {
                 name: layout::journal_blob(vset_id, fence, seq),
+            });
+            out.push(Effect::BlobDelete {
+                name: layout::journal_mirror_blob(vset_id, fence, seq),
             });
         }
         for (fence, seg, size) in dead_s {

@@ -36,6 +36,7 @@ fn base_config() -> HarnessConfig {
         faults: FaultPlan::none(),
         sabotage: None,
         guest_sync_share: None,
+        guest_hot_pages: None,
     }
 }
 
@@ -69,7 +70,7 @@ fn backup_flows_continuously_and_unbacked_vsets_write_nothing() {
         .filter(|k| k.starts_with(&format!("{backed_prefix}m/")))
         .count();
     assert_eq!(manifests, 1, "superseded manifests are reclaimed (R4.5)");
-    assert_eq!(report.store_keys.len(), 33);
+    assert_eq!(report.store_keys.len(), 17);
 }
 
 #[test]
@@ -81,8 +82,8 @@ fn store_outage_queues_backups_and_drains_after() {
     config.faults.store_outage = Some((millis(500), millis(1800)));
     let report = run(12, config);
     assert_clean(&report);
-    assert_eq!(report.counters.store_retries, 28);
-    assert_eq!(report.counters.manifests_published, 5);
+    assert_eq!(report.counters.store_retries, 34);
+    assert_eq!(report.counters.manifests_published, 6);
     assert_eq!(report.counters.fenced, 0);
     // Local durability was untouched throughout (R8.3): guests progressed.
     assert_eq!(report.completed_ops, 1938);
@@ -109,7 +110,7 @@ fn journal_rot_is_survived_via_restore_from_backup() {
     assert_eq!(report.crashes, 7);
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, 1296);
+    assert_eq!(report.completed_ops, 1353);
 }
 
 #[test]
@@ -144,9 +145,9 @@ fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
     let report = run(14, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.counters.nvme_reclaims, 26);
-    assert_eq!(report.counters.nvme_stalls, 53);
-    assert_eq!(report.completed_ops, 355);
+    assert_eq!(report.counters.nvme_reclaims, 36);
+    assert_eq!(report.counters.nvme_stalls, 50);
+    assert_eq!(report.completed_ops, 306);
 }
 
 #[test]
@@ -163,7 +164,7 @@ fn nvme_exhaustion_without_backup_stalls_loudly_and_kills_nothing() {
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.counters.nvme_reclaims, 0, "nothing is droppable");
-    assert_eq!(report.counters.nvme_stalls, 181);
-    assert_eq!(report.completed_ops, 131);
+    assert_eq!(report.counters.nvme_stalls, 184);
+    assert_eq!(report.completed_ops, 115);
     assert_eq!(report.store_keys.len(), 0, "R4.4 holds under pressure too");
 }

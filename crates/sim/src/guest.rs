@@ -111,6 +111,11 @@ pub struct Guest {
     /// sync-heavy mix). Each sync buys a durable consistency point, so
     /// workload-cost tests tune this to what they mean to measure.
     pub sync_share: Option<Ppm>,
+    /// Access skew override (`None` = uniform): this share of page picks
+    /// lands in the first N pages of the volume (the hot set), the rest
+    /// spread over the cold remainder. Hot churn plus cold survivors is
+    /// what makes space amplification measurable.
+    pub hot_pages: Option<(Ppm, u32)>,
 }
 
 impl Guest {
@@ -125,6 +130,7 @@ impl Guest {
             fsck: VecDeque::new(),
             cold_booting: false,
             sync_share: None,
+            hot_pages: None,
         }
     }
 
@@ -152,14 +158,19 @@ impl Guest {
         let idx = VolumeIdx(
             u8::try_from(rng.below(u64::from(self.config.disk_volumes) + 1)).expect("fits"),
         );
+        let page = match self.hot_pages {
+            Some((share, hot)) if rng.hit(share) => rng.below(u64::from(hot)),
+            Some((_, hot)) => {
+                u64::from(hot) + rng.below(u64::from(self.config.pages_per_volume - hot))
+            }
+            None => rng.below(u64::from(self.config.pages_per_volume)),
+        };
         PageId {
             volume: VolumeId {
                 vset: self.vset,
                 idx,
             },
-            page: PageNo(
-                u32::try_from(rng.below(u64::from(self.config.pages_per_volume))).expect("fits"),
-            ),
+            page: PageNo(u32::try_from(page).expect("fits")),
         }
     }
 

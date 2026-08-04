@@ -34,14 +34,24 @@ daemon buys ops separation, not safety.
 
 ### Records, not layer chains
 
-Every capture writes one journal record carrying the vset's **full
-page→location map** at that instant, plus one write-once segment holding
-the flushed pages. Reads never walk a chain; recovery never replays a log;
-there is no compaction — superseded blobs are reclaimed once a newer
-committed record replaces them (R4.5). The record is the atomic
-consistency point (R3.5), and its monotone `synced_through` watermark is
-what makes sync ordering survive record reclamation (R3.8) — a bare
-covers-sync flag provably loses it; the simulation found this.
+Every capture writes one journal record carrying the vset's
+page→location map as a **bounded inline overlay plus one pointer per
+4096-page span**, whose contents live in write-once leaf blobs — record
+size is O(delta), never O(vset), and forks reference base leaves in
+place. One write-once segment holds the flushed pages. Reads never walk
+a chain; recovery reads the newest record whose leaves are intact — it
+never replays a log. Superseded blobs are reclaimed once a newer
+committed record replaces them (R4.5), and **minimal compaction** keeps
+that honest for long-lived vsets: a segment at least half dead has its
+live pages rewritten forward on the writeback cadence, so disk stays
+within ~2× live data and each rewritten byte reclaims at least one. The
+record is the atomic consistency point (R3.5), and its monotone
+`synced_through` watermark is what makes sync ordering survive record
+reclamation (R3.8) — a bare covers-sync flag provably loses it; the
+simulation found this. Each record is written twice (`.rec` + `.recm`):
+the newest record is the sole carrier of its newly-acked syncs, and the
+simulation showed one rotten bit rolling acked syncs back silently —
+recovery accepts whichever copy decodes.
 
 ### Fenced namespaces
 

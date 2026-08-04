@@ -309,25 +309,9 @@ impl Daemon {
                 }
             }
             PeerMsg::Released { vset } => {
-                // The destination holds everything: reclaim the vset's
-                // local state (R4.5: explicit). Always ack — a duplicate
-                // release after reclamation must still stop the sender.
-                if let Some(state) = self.vsets.remove(&vset) {
-                    for (fence, seg, _) in state.seg_blobs {
-                        out.push(Effect::BlobDelete {
-                            name: layout::segment_blob(vset, fence, seg),
-                        });
-                    }
-                    for (&seq, &(fence, _)) in &state.record_ws {
-                        out.push(Effect::BlobDelete {
-                            name: layout::journal_blob(vset, fence, seq),
-                        });
-                    }
-                    out.push(Effect::BlobDelete {
-                        name: layout::handoff_blob(vset),
-                    });
-                    self.purge_vset_pages(vset, out);
-                }
+                self.released(vset, out);
+                // Always ack — a duplicate release after reclamation must
+                // still stop the sender.
                 out.push(Effect::PeerSend {
                     to: from,
                     msg: PeerMsg::ReleasedAck { vset },
@@ -341,6 +325,40 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// The destination holds everything: reclaim the released vset's
+    /// local state — segments, both record copies, leaves, the handoff
+    /// marker (R4.5: explicit).
+    fn released(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.remove(&vset) else {
+            return;
+        };
+        for (fence, seg, _) in state.seg_blobs {
+            out.push(Effect::BlobDelete {
+                name: layout::segment_blob(vset, fence, seg),
+            });
+        }
+        for (&seq, &(fence, _)) in &state.record_ws {
+            out.push(Effect::BlobDelete {
+                name: layout::journal_blob(vset, fence, seq),
+            });
+            out.push(Effect::BlobDelete {
+                name: layout::journal_mirror_blob(vset, fence, seq),
+            });
+        }
+        for ptr in state.leaf_blobs.keys() {
+            let name = if ptr.base == 0 {
+                layout::leaf_blob(vset, ptr.fence, ptr.id)
+            } else {
+                layout::base_leaf_blob(vset, ptr.base, ptr.fence, ptr.id)
+            };
+            out.push(Effect::BlobDelete { name });
+        }
+        out.push(Effect::BlobDelete {
+            name: layout::handoff_blob(vset),
+        });
+        self.purge_vset_pages(vset, out);
     }
 
     /// Destination: the offer's record becomes this host's vset, durably,
@@ -380,6 +398,7 @@ impl Daemon {
         // every leaf span parks its faults until fetched (post-copy is
         // already the contract — a parked fault is just a further page).
         state.page_locs = record.overlay.clone();
+        state.rebuild_seg_live();
         state.overlay = record.overlay.clone();
         state.leaf_table = record.leaves.clone();
         state.pending_leaves = record.leaves.clone();

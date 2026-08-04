@@ -176,6 +176,7 @@ impl Daemon {
             }
             state.next_gen = locs.values().map(|(g, _)| g.0 + 1).max().unwrap_or(0);
             state.page_locs = locs;
+            state.rebuild_seg_live();
             state.overlay = chosen.overlay.clone();
             state.leaf_table = chosen.leaves.clone();
             // Every intact local leaf blob is tracked (cleanup reclaims the

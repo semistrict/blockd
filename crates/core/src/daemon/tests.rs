@@ -96,9 +96,13 @@ fn checkpoint_retries_replay_their_outcome() {
         [
             Effect::ResumeGuest { vset: VSET },
             done.clone(),
-            // The creation record is superseded and reclaimed (R4.5).
+            // The creation record is superseded and reclaimed (R4.5),
+            // both copies.
             Effect::BlobDelete {
                 name: layout::journal_blob(VSET, 1, JournalSeq(0)),
+            },
+            Effect::BlobDelete {
+                name: layout::journal_mirror_blob(VSET, 1, JournalSeq(0)),
             },
         ]
     );

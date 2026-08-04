@@ -88,6 +88,9 @@ pub struct HarnessConfig {
     pub sabotage: Option<Sabotage>,
     /// Override the guests' sync share of the op mix (`None` = default).
     pub guest_sync_share: Option<crate::rng::Ppm>,
+    /// Guest access skew (`None` = uniform): (share, N) sends that share
+    /// of page picks to each volume's first N pages.
+    pub guest_hot_pages: Option<(crate::rng::Ppm, u32)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -117,6 +120,12 @@ pub struct RunReport {
     /// The largest single journal record ever written: bounded by the
     /// overlay cap regardless of vset size (leaves carry the bulk).
     pub max_record_blob_bytes: u64,
+    /// Total bytes of segment blobs left on the device at the end: the
+    /// space-amplification measure — bounded by live data, not by history.
+    pub seg_bytes_end: u64,
+    /// Bytes the serving maps still reference at the end (the daemon's
+    /// own live accounting, R9.2) — what `seg_bytes_end` is bounded by.
+    pub seg_live_bytes_end: u64,
 }
 
 #[derive(Debug)]
@@ -279,6 +288,28 @@ pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
     h.report.per_guest_completed = h.guests.iter().map(|(v, g)| (v.0, g.completed)).collect();
     h.report.bitflips = h.bdev.counters.bitflips;
     h.report.blob_count = h.bdev.blob_count();
+    h.report.seg_bytes_end = h
+        .bdev
+        .scan()
+        .filter(|(name, _)| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("seg"))
+        })
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum();
+    h.report.seg_live_bytes_end = h.daemon.as_ref().map_or(0, |d| d.seg_space().0);
+    if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
+        let mut blobs: Vec<(usize, &String)> = h
+            .bdev
+            .scan()
+            .map(|(name, bytes)| (bytes.len(), name))
+            .collect();
+        blobs.sort_unstable_by(|a, b| b.cmp(a));
+        for (size, name) in blobs.iter().take(80) {
+            eprintln!("BLOB {size:>9} {name}");
+        }
+    }
     let now = h.kernel.now();
     h.store.set_outage(false);
     let (_, keys) = h.store.list_prefix(now, h.kernel.rng(), "");
@@ -405,7 +436,10 @@ impl Harness {
                     // Blob names are lowercase by construction; this is a
                     // suffix check on our own layout, not a file extension.
                     #[allow(clippy::case_sensitive_file_extension_comparisons)]
-                    let (rec, map) = (name.ends_with(".rec"), name.ends_with(".map"));
+                    let (rec, map) = (
+                        name.ends_with(".rec") || name.ends_with(".recm"),
+                        name.ends_with(".map"),
+                    );
                     if rec || map {
                         self.report.map_bytes_written += bytes.len() as u64;
                     }
@@ -901,6 +935,7 @@ impl Harness {
                 self.mems.insert(vset, VsetMem::default());
                 let mut guest = Guest::new(vset, config);
                 guest.sync_share = self.config.guest_sync_share;
+                guest.hot_pages = self.config.guest_hot_pages;
                 self.guests.insert(vset, guest);
                 self.schedule_guest(vset);
                 if let Some(interval) = self.config.checkpoint_interval {

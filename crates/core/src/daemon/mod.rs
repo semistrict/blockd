@@ -115,10 +115,18 @@ pub struct Counters {
     pub leaf_rolls: u64,
     /// Map leaves hydrated lazily (restore/migration/fork adoption).
     pub leaf_fills: u64,
+    /// Mostly-dead segments whose live pages were rewritten forward, so
+    /// the segment could be reclaimed (the space-amplification bound).
+    pub segs_compacted: u64,
+    /// Live pages rewritten forward by compaction.
+    pub pages_compacted: u64,
 }
 
 /// The page→location map of one consistency point.
 type PageMap = BTreeMap<PageId, (Gen, PageLoc)>;
+
+/// One entry rescued by compaction: identity, generation at read, bytes.
+type Rescue = (PageId, Gen, Vec<u8>);
 
 /// One in-flight capture: a consistency point on its way to durability.
 // `capture_seq` deliberately matches the JournalRecord field it becomes.
@@ -136,12 +144,19 @@ struct Capture {
     /// lets the finalize shrink the vset's overlay to entries genuinely
     /// newer than the adopted leaves.
     rolled_gens: BTreeMap<PageId, Gen>,
-    /// The fresh locations this capture's segment holds. Their pages get
-    /// `end_flush` on segment durability and merge into the serving map;
-    /// empty for record-only captures.
+    /// The fresh locations this capture's segment holds — guest flushes
+    /// and compaction rewrites alike. They merge into the serving map on
+    /// segment durability; empty for record-only captures.
     new_locs: Vec<(PageId, (Gen, PageLoc))>,
+    /// The subset of `new_locs` pages read out of the cache (dirty or
+    /// mid-flush): exactly these get `end_flush` on segment durability.
+    /// Compaction rewrites are not cache-resident and are not here.
+    flushes: Vec<PageId>,
     /// Blob writes (segment + rolled leaves) the record still waits on.
     writes_pending: usize,
+    /// Record copies (primary + mirror) still in flight; the consistency
+    /// point exists — and syncs ack — only when both are durable.
+    record_writes: u8,
     /// The watermark this capture's record carries; fixed when the record
     /// write is issued.
     synced_through: u64,
@@ -183,6 +198,14 @@ enum Pending {
         vset: VsetId,
         span: u32,
         ptr: LeafPtr,
+    },
+    /// Compaction: a mostly-dead segment read back whole so its live
+    /// pages can ride the next capture into a fresh home. Does not pin —
+    /// a concurrently deleted blob just yields nothing to rescue.
+    CompactRead {
+        vset: VsetId,
+        fence: u64,
+        seg: SegId,
     },
     Fetch {
         page: PageId,
@@ -348,6 +371,17 @@ struct Vset {
     /// Invariant: `page_locs = materialize(leaf_table) ⊕ overlay`, except
     /// for spans still in `pending_leaves` (their leaf half is unknown).
     page_locs: PageMap,
+    /// Live bytes per own-namespace segment, tracking every supersession
+    /// in the serving map — what compaction selects mostly-dead victims
+    /// on. Maintained only through [`Vset::map_adopt`] and
+    /// [`Vset::rebuild_seg_live`].
+    seg_live: BTreeMap<(u64, SegId), u64>,
+    /// In-flight compaction reads: mostly-dead segments being read back.
+    compacting: BTreeSet<(u64, SegId)>,
+    /// Compaction's rescues, riding the next capture into a fresh
+    /// segment: per victim, its live entries. Volatile — a crash or
+    /// stall just re-runs the compaction.
+    compact_stash: Vec<((u64, SegId), Vec<Rescue>)>,
     /// The durable map's sharded half: one leaf per span, as the newest
     /// record references it.
     leaf_table: BTreeMap<u32, LeafPtr>,
@@ -456,6 +490,9 @@ impl Vset {
             epoch: Epoch(0),
             mutation_seq: 0,
             page_locs: BTreeMap::new(),
+            seg_live: BTreeMap::new(),
+            compacting: BTreeSet::new(),
+            compact_stash: Vec::new(),
             best: None,
             leaf_table: BTreeMap::new(),
             overlay: BTreeMap::new(),
@@ -500,6 +537,39 @@ impl Vset {
             migrated_verdict: None,
         }
     }
+
+    /// The one door for serving-map adoption (newest generation wins).
+    /// Every supersession moves the old location's bytes from live to
+    /// dead in its segment's accounting — the signal compaction reads.
+    fn map_adopt(&mut self, page: PageId, generation: Gen, loc: PageLoc) {
+        match self.page_locs.get(&page).copied() {
+            Some((have, _)) if have >= generation => return,
+            Some((_, old)) if old.base == 0 => {
+                if let Some(live) = self.seg_live.get_mut(&(old.fence, old.seg)) {
+                    *live = live.saturating_sub(u64::from(old.len));
+                    if *live == 0 {
+                        self.seg_live.remove(&(old.fence, old.seg));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if loc.base == 0 {
+            *self.seg_live.entry((loc.fence, loc.seg)).or_insert(0) += u64::from(loc.len);
+        }
+        self.page_locs.insert(page, (generation, loc));
+    }
+
+    /// Rebuild the live accounting after a wholesale map replacement
+    /// (restore, migration, fork, recovery, cold-boot trimming).
+    fn rebuild_seg_live(&mut self) {
+        self.seg_live.clear();
+        for (_, loc) in self.page_locs.values() {
+            if loc.base == 0 {
+                *self.seg_live.entry((loc.fence, loc.seg)).or_insert(0) += u64::from(loc.len);
+            }
+        }
+    }
 }
 
 pub struct Daemon {
@@ -520,6 +590,19 @@ pub struct Daemon {
 }
 
 impl Daemon {
+    /// Segment-space observability (R9.2): summed over resident vsets,
+    /// (live bytes still referenced by serving maps, local segment blob
+    /// bytes on disk). The gap between the two is reclaimable dead space;
+    /// compaction holds it under roughly one live-set's worth.
+    pub fn seg_space(&self) -> (u64, u64) {
+        self.vsets.values().fold((0, 0), |(live, disk), s| {
+            (
+                live + s.seg_live.values().sum::<u64>(),
+                disk + s.seg_blobs.iter().map(|&(_, _, b)| b).sum::<u64>(),
+            )
+        })
+    }
+
     pub fn new(config: DaemonConfig) -> (Daemon, Vec<Effect>) {
         let cache = Cache::new(config.cache_pages);
         let daemon = Daemon {
@@ -578,6 +661,7 @@ impl Daemon {
                 let vsets: Vec<VsetId> = self.vsets.keys().copied().collect();
                 for vset in vsets {
                     self.maybe_start_commit(vset, mem, &mut out);
+                    self.maybe_start_compact(vset, &mut out);
                 }
                 out.push(Effect::SetTimer {
                     timer: TimerId::Writeback,
@@ -670,6 +754,9 @@ impl Daemon {
                 generation,
                 loc,
             }) => self.fill_read_done(page, write, generation, loc, bytes, out),
+            Some(Pending::CompactRead { vset, fence, seg }) => {
+                self.compact_read_done(vset, fence, seg, bytes);
+            }
             Some(Pending::PubSegRead { vset, fence, seg }) => {
                 self.pub_seg_read_done(vset, fence, seg, bytes, out);
             }
