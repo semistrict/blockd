@@ -130,15 +130,12 @@ impl HostMap for MemView<'_> {
         self.0[&page.volume.vset].pages[&page].clone()
     }
 
-    fn harvest_accessed(&self, resident: &[PageId]) -> Vec<PageId> {
-        resident
-            .iter()
-            .filter(|page| {
-                self.0
-                    .get(&page.volume.vset)
-                    .is_some_and(|mem| mem.accessed.borrow_mut().remove(page))
-            })
-            .copied()
+    fn harvest_accessed(&self) -> Vec<PageId> {
+        // One-shot: drain every guest's touch record. `mems` is a BTreeMap
+        // and each set is ordered, so the result is deterministic.
+        self.0
+            .values()
+            .flat_map(|mem| mem.accessed.take())
             .collect()
     }
 }

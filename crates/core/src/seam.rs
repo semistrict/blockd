@@ -55,15 +55,16 @@ impl fmt::Debug for ReqId {
 pub trait HostMap {
     fn read_page(&self, page: PageId) -> Vec<u8>;
 
-    /// The accessed-bit harvest behind MGLRU-mirrored aging (R2.6): of the
-    /// given resident pages, which were touched since the last harvest?
-    /// Production reads and clears hardware accessed bits (idle page
-    /// tracking — the daemon runs as root, R9.1); the simulation answers
-    /// from the guests' true access history. The default sees nothing —
-    /// aging then relies on the inline write-protect-fault promotions
-    /// alone.
-    fn harvest_accessed(&self, resident: &[PageId]) -> Vec<PageId> {
-        let _ = resident;
+    /// The accessed-bit harvest behind MGLRU-mirrored aging (R2.6): which
+    /// pages were touched since the last harvest? Reporting is one-shot
+    /// (each access is returned once) and may include pages no longer
+    /// resident — the cache skips those. The cost contract matters: a
+    /// harvest is O(touched), never O(resident); production reads and
+    /// clears hardware accessed bits (idle page tracking — the daemon runs
+    /// as root, R9.1), the simulation answers from the guests' true access
+    /// history. The default sees nothing — aging then relies on the inline
+    /// write-protect-fault promotions alone.
+    fn harvest_accessed(&self) -> Vec<PageId> {
         Vec::new()
     }
 }

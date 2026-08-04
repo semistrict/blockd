@@ -574,7 +574,7 @@ impl Daemon {
             Event::Timer(TimerId::Writeback) => {
                 // MGLRU-mirrored aging (R2.6) rides the writeback cadence,
                 // as reclaim-driven aging rides kswapd in the kernel.
-                self.cache.age(|resident| mem.harvest_accessed(resident));
+                self.cache.age(|| mem.harvest_accessed());
                 let vsets: Vec<VsetId> = self.vsets.keys().copied().collect();
                 for vset in vsets {
                     self.maybe_start_commit(vset, mem, &mut out);
