@@ -20,12 +20,15 @@ use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, Tim
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, PAGE_SIZE, Uffd, UffdFeatures};
 
-use crate::s3::S3Store;
+use crate::peer::{PeerConfig, PeerNet};
+use crate::store::ObjectStore;
 
 pub struct RuntimeConfig {
     pub daemon: DaemonConfig,
     /// The local blob device: a real directory on real disk.
     pub blob_dir: PathBuf,
+    /// Peer transport (`None` = a host that never migrates).
+    pub peer: Option<PeerConfig>,
 }
 
 /// One vset's guest memory on this host: the region (daemon view), the
@@ -99,7 +102,7 @@ impl VsetHost {
     }
 }
 
-enum Msg {
+pub(crate) enum Msg {
     Ev(Event),
     /// A guest reached an op boundary with a pause pending.
     Quiesced(VsetId),
@@ -112,6 +115,8 @@ struct Shared {
     /// `VsetFenced` / `FillFailed` and friends: anything the tests must know
     /// went wrong (asserted empty in healthy scenarios).
     incidents: Mutex<Vec<String>>,
+    /// The daemon's counters, copied out after every step (R9.2).
+    counters: Mutex<blockd_core::daemon::Counters>,
     next_req: AtomicU64,
 }
 
@@ -139,14 +144,14 @@ pub struct Runtime {
     shared: Arc<Shared>,
     admin_rx: Mutex<Receiver<AdminReply>>,
     admin_backlog: Mutex<VecDeque<AdminReply>>,
-    store: Arc<S3Store>,
     blob_dir: PathBuf,
+    peers: Option<Arc<PeerNet>>,
     loop_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Runtime {
     /// A fresh daemon on an empty (or to-be-ignored) blob directory.
-    pub fn new(config: &RuntimeConfig, store: Arc<S3Store>) -> Runtime {
+    pub fn new(config: &RuntimeConfig, store: Arc<dyn ObjectStore>) -> Runtime {
         let (daemon, effects) = Daemon::new(config.daemon.clone());
         Runtime::start(daemon, effects, BTreeMap::new(), config, store)
     }
@@ -159,7 +164,7 @@ impl Runtime {
     /// refresh.
     pub fn recover(
         config: &RuntimeConfig,
-        store: Arc<S3Store>,
+        store: Arc<dyn ObjectStore>,
         vset_configs: &BTreeMap<VsetId, VsetConfig>,
     ) -> (Runtime, BTreeMap<VsetId, Verdict>) {
         let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
@@ -186,7 +191,7 @@ impl Runtime {
         boot_effects: Vec<Effect>,
         hosts: BTreeMap<VsetId, Arc<VsetHost>>,
         config: &RuntimeConfig,
-        store: Arc<S3Store>,
+        store: Arc<dyn ObjectStore>,
     ) -> Runtime {
         std::fs::create_dir_all(&config.blob_dir).expect("blob dir");
         let (tx, rx) = channel::<Msg>();
@@ -195,7 +200,15 @@ impl Runtime {
             vsets: Mutex::new(hosts),
             sync_waiters: Mutex::new(BTreeMap::new()),
             incidents: Mutex::new(Vec::new()),
+            counters: Mutex::new(blockd_core::daemon::Counters::default()),
             next_req: AtomicU64::new(1),
+        });
+
+        let peers = config.peer.as_ref().map(|p| {
+            let tx = tx.clone();
+            PeerNet::start(p, config.daemon.host, move |from, msg| {
+                let _ = tx.send(Msg::Ev(Event::PeerDelivered { from, msg }));
+            })
         });
 
         // Timer thread: real clock, feeding Timer events back in.
@@ -208,15 +221,25 @@ impl Runtime {
         // The event loop: the daemon lives here.
         let loop_thread = {
             let shared = shared.clone();
-            let store = store.clone();
             let blob_dir = config.blob_dir.clone();
             let tx = tx.clone();
+            let peers = peers.clone();
+            let self_id = config.daemon.host;
             thread::spawn(move || {
                 let mut local: VecDeque<Event> = VecDeque::new();
                 let apply = |effects: Vec<Effect>, local: &mut VecDeque<Event>| {
                     for effect in effects {
                         apply_effect(
-                            effect, &shared, &store, &blob_dir, &timer_tx, &admin_tx, &tx, local,
+                            effect,
+                            &shared,
+                            &store,
+                            &blob_dir,
+                            &timer_tx,
+                            &admin_tx,
+                            &tx,
+                            local,
+                            peers.as_ref(),
+                            self_id,
                         );
                     }
                 };
@@ -245,6 +268,7 @@ impl Runtime {
                         let vsets = shared.vsets.lock().expect("lock");
                         daemon.step(event, &MapView { vsets: &vsets })
                     };
+                    *shared.counters.lock().expect("lock") = daemon.counters;
                     apply(effects, &mut local);
                 }
             })
@@ -255,10 +279,18 @@ impl Runtime {
             shared,
             admin_rx: Mutex::new(admin_rx),
             admin_backlog: Mutex::new(VecDeque::new()),
-            store,
             blob_dir: config.blob_dir.clone(),
+            peers,
             loop_thread: Some(loop_thread),
         }
+    }
+
+    /// Peer frames dropped on the floor so far (queue full or peer down)
+    /// — the retry timers' workload, visible.
+    pub fn peer_dropped_sends(&self) -> u64 {
+        self.peers.as_ref().map_or(0, |p| {
+            p.dropped_sends.load(std::sync::atomic::Ordering::SeqCst)
+        })
     }
 
     fn spawn_fault_reader(&self, vset: VsetId, host: Arc<VsetHost>) {
@@ -375,12 +407,55 @@ impl Runtime {
         })
     }
 
-    pub fn incidents(&self) -> Vec<String> {
-        self.shared.incidents.lock().expect("lock").clone()
+    /// Pre-create guest memory for a vset about to migrate IN. Must run on
+    /// the destination BEFORE the source's `migrate_out`: the offer's
+    /// effects (fills, the eventual resume) index this host's vsets and
+    /// would find nothing otherwise.
+    pub fn expect_migration(&self, vset: VsetId, config: VsetConfig) {
+        let host = VsetHost::new(config);
+        self.shared
+            .vsets
+            .lock()
+            .expect("lock")
+            .insert(vset, host.clone());
+        self.spawn_fault_reader(vset, host);
     }
 
-    pub fn store(&self) -> &S3Store {
-        &self.store
+    /// Hand a non-backed vset off to `to` (R7.2): pauses, captures, makes
+    /// the handoff durable on both sides, then serves the post-copy drain.
+    /// Returns once this side's `MigratedOut` lands.
+    pub fn migrate_out(&self, vset: VsetId, to: blockd_core::types::HostId) {
+        let req = self.req();
+        self.tx
+            .send(Msg::Ev(Event::Admin(AdminCmd::MigrateOut {
+                req,
+                vset,
+                to,
+            })))
+            .expect("send");
+        self.wait_admin(|reply| match reply {
+            AdminReply::MigratedOut { req: r, .. } if *r == req => Some(()),
+            AdminReply::AdminFailed { req: r } if *r == req => panic!("migrate out failed"),
+            _ => None,
+        });
+    }
+
+    /// Destination side: wait for the inbound migration's verdict (the
+    /// moment this host's first record is durable and the vset runs here).
+    pub fn wait_migrated_in(&self, vset: VsetId) -> Verdict {
+        self.wait_admin(|reply| match reply {
+            AdminReply::VsetMigratedIn { vset: v, verdict } if *v == vset => Some(*verdict),
+            _ => None,
+        })
+    }
+
+    /// The daemon's own counters (R9.2), as of the last step.
+    pub fn counters(&self) -> blockd_core::daemon::Counters {
+        *self.shared.counters.lock().expect("lock")
+    }
+
+    pub fn incidents(&self) -> Vec<String> {
+        self.shared.incidents.lock().expect("lock").clone()
     }
 
     pub fn blob_dir(&self) -> &Path {
@@ -480,12 +555,14 @@ impl Drop for Runtime {
 fn apply_effect(
     effect: Effect,
     shared: &Arc<Shared>,
-    store: &Arc<S3Store>,
+    store: &Arc<dyn ObjectStore>,
     blob_dir: &Path,
     timer_tx: &Sender<(TimerId, u64)>,
     admin_tx: &Sender<AdminReply>,
     tx: &Sender<Msg>,
     local: &mut VecDeque<Event>,
+    peers: Option<&Arc<PeerNet>>,
+    self_id: blockd_core::types::HostId,
 ) {
     match effect {
         Effect::Fill {
@@ -648,7 +725,14 @@ fn apply_effect(
         Effect::Admin(reply) => {
             let _ = admin_tx.send(reply);
         }
-        Effect::PeerSend { .. } => unreachable!("peers are not wired in e2e v1"),
+        Effect::PeerSend { to, msg } => match peers {
+            Some(net) => net.send(self_id, to, &msg),
+            None => shared
+                .incidents
+                .lock()
+                .expect("lock")
+                .push(format!("peer send to {to:?} with no peer config")),
+        },
         Effect::Abort { reason } => {
             eprintln!("FATAL: daemon abort: {reason}");
             std::process::abort();

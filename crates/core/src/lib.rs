@@ -12,6 +12,7 @@ pub mod head;
 pub mod journal;
 pub mod layout;
 pub mod mapleaf;
+pub mod peer;
 pub mod seam;
 pub mod segment;
 pub mod types;

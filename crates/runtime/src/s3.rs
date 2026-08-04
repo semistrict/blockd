@@ -417,3 +417,30 @@ impl S3Store {
         self.s3.delete_object(key);
     }
 }
+
+impl crate::store::ObjectStore for S3Store {
+    fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, blockd_core::seam::StoreFault> {
+        S3Store::put(self, key, bytes)
+    }
+
+    fn put_cas(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<u64, blockd_core::seam::StoreFault> {
+        S3Store::put_cas(self, key, expected, bytes)
+    }
+
+    fn get(&self, key: &str) -> crate::store::GetResult {
+        S3Store::get(self, key)
+    }
+
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::store::GetResult {
+        S3Store::get_range(self, key, offset, len)
+    }
+
+    fn delete(&self, key: &str) {
+        S3Store::delete(self, key);
+    }
+}

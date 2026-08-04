@@ -15,12 +15,20 @@
 
 #[cfg(target_os = "linux")]
 pub mod fc;
+mod gcs;
 #[cfg(target_os = "linux")]
 mod host;
 #[cfg(target_os = "linux")]
+mod peer;
+#[cfg(target_os = "linux")]
 mod s3;
+mod store;
 
+pub use gcs::{GcsConfig, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
 pub use host::{Runtime, RuntimeConfig};
 #[cfg(target_os = "linux")]
+pub use peer::{PeerConfig, PeerNet};
+#[cfg(target_os = "linux")]
 pub use s3::{ListObjectsV2Output, S3Error, S3LatencyModel, S3Sim, S3Stats, S3Store};
+pub use store::{GetResult, ObjectStore};

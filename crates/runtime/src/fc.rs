@@ -407,7 +407,7 @@ impl ShmemServer {
     /// in flight ahead of a sequential reader.
     pub fn start_s3(
         listener: UnixListener,
-        store: Arc<crate::s3::S3Store>,
+        store: Arc<dyn crate::store::ObjectStore>,
         prefix: String,
         part_bytes: u64,
         shmem_path: &Path,
@@ -486,7 +486,7 @@ fn create_shmem(shmem_path: &Path, mem_bytes: u64) -> Arc<std::fs::File> {
 enum Filler {
     File(PathBuf),
     Store {
-        store: Arc<crate::s3::S3Store>,
+        store: Arc<dyn crate::store::ObjectStore>,
         prefix: String,
         part_bytes: u64,
     },
@@ -613,7 +613,7 @@ impl PartTable {
     /// Cold store tier: `part_bytes`-granular fetches, concurrent and
     /// deduplicated, with demand-triggered readahead.
     pub fn store(
-        store: Arc<crate::s3::S3Store>,
+        store: Arc<dyn crate::store::ObjectStore>,
         prefix: String,
         part_bytes: u64,
         shmem: &Arc<std::fs::File>,
@@ -741,7 +741,7 @@ fn serve_one_shmem(
 /// segment objects under `prefix` (each well inside the 64 MiB object
 /// contract, R4.6). Returns the part count.
 pub fn upload_mem_parts(
-    store: &crate::s3::S3Store,
+    store: &dyn crate::store::ObjectStore,
     mem_path: &Path,
     prefix: &str,
     part_bytes: u64,

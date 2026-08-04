@@ -49,6 +49,7 @@ fn runtime_config(tag: &str, cache_pages: usize) -> RuntimeConfig {
             disk_headroom: 0,
         },
         blob_dir: temp_dir(tag),
+        peer: None,
     }
 }
 

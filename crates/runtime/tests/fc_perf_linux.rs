@@ -182,7 +182,7 @@ fn profile_cold_restore_from_simulated_s3() {
 
     // Backup: the snapshot memory as segment objects (R4.6-sized parts).
     let t = Instant::now();
-    let parts = upload_mem_parts(&store, &mem, "v/0000000000000001/mem", PART_BYTES);
+    let parts = upload_mem_parts(store.as_ref(), &mem, "v/0000000000000001/mem", PART_BYTES);
     let upload_time = t.elapsed();
     assert_eq!(parts, u64::from(MEM_MIB) * 1024 * 1024 / PART_BYTES);
     let puts_after_upload = store.s3.stats.put_object.load(Ordering::SeqCst);
