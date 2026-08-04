@@ -311,6 +311,12 @@ impl Daemon {
                     len: loc.len,
                 },
             });
+            // The channel is lossy and the source may be down: a guest is
+            // blocked on this, so re-issue until answered.
+            out.push(Effect::SetTimer {
+                timer: crate::seam::TimerId::PeerRetry(io),
+                after: super::migrate::PEER_RETRY,
+            });
             return;
         }
         let backed = self

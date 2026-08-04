@@ -155,8 +155,11 @@ impl Daemon {
                 // Handed off before the crash (R7.2): this vset now exists
                 // only to serve the destination's post-copy fetches. No
                 // verdict, no cleanup (every segment may still be fetched),
-                // and the guest gate (`outbound`) never opens.
-                state.outbound = Some(to);
+                // and the guest gate (`outbound`) never opens. Re-offer:
+                // the crash may have eaten the offer or its accept, and
+                // without a re-send the vset would be stranded — outbound
+                // here, unknown there.
+                super::Daemon::recovered_outbound(&mut state, vset_id, to, &mut effects);
                 daemon.vsets.insert(vset_id, state);
                 continue;
             }

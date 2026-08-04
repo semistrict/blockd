@@ -346,6 +346,25 @@ impl Cache {
             .iter()
             .any(|(p, e)| p.volume.vset == vset && e.dirty)
     }
+
+    /// Drop every resident page of one vset. A removed vset (fenced,
+    /// released, failed creation) must leave nothing behind: a stale entry
+    /// would satisfy `is_resident` for a later incarnation of the same
+    /// vset on this host and vouch for bytes the host no longer maps.
+    pub fn purge_vset(&mut self, vset: VsetId) -> Vec<PageId> {
+        let pages: Vec<PageId> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|p| p.volume.vset == vset)
+            .collect();
+        for page in &pages {
+            let entry = self.entries.remove(page).expect("listed");
+            self.unlink(*page, &entry);
+            self.count_remove(*page, entry.generation);
+        }
+        pages
+    }
 }
 
 #[cfg(test)]

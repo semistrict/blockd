@@ -301,6 +301,7 @@ impl Daemon {
                 // never reused, R6.5 — this is a control-plane defect).
                 let req = state.create_req.take();
                 self.vsets.remove(&vset_id);
+                self.purge_vset_pages(vset_id, out);
                 if let Some(req) = req {
                     out.push(Effect::Admin(crate::seam::AdminReply::AdminFailed { req }));
                 }

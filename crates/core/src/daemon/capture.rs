@@ -393,7 +393,8 @@ impl Daemon {
         if !state.ready {
             state.ready = true;
             if let Some(verdict) = state.migrated_verdict.take() {
-                // Inbound migration durable: accept + serve (R7.2 dest side).
+                // Inbound migration durable: accept + serve (R7.2 dest side),
+                // and start draining the tail off the source (R7.1).
                 let source = state.peer_source.expect("offer sender recorded");
                 out.push(Effect::PeerSend {
                     to: source,
@@ -403,6 +404,10 @@ impl Daemon {
                     vset: vset_id,
                     verdict,
                 }));
+                out.push(Effect::SetTimer {
+                    timer: crate::seam::TimerId::Hydrate(vset_id),
+                    after: super::migrate::HYDRATE_TICK,
+                });
             } else if let Some(req) = state.create_req.take() {
                 if let Some(verdict) = state.fork_verdict.take() {
                     out.push(Effect::Admin(AdminReply::VsetForked {

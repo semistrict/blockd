@@ -248,10 +248,20 @@ impl ObjectStore {
     /// Bit rot: flip one random bit of one random object's payload. Returns
     /// the victim key for the oracle.
     pub fn flip_random_bit(&mut self, rng: &mut Pcg64) -> Option<String> {
+        self.flip_random_bit_where(rng, |_| true)
+    }
+
+    /// Flip one random bit in a random object whose key satisfies the
+    /// predicate — targeted rot injection.
+    pub fn flip_random_bit_where(
+        &mut self,
+        rng: &mut Pcg64,
+        pred: impl Fn(&str) -> bool,
+    ) -> Option<String> {
         let candidates: Vec<&String> = self
             .objects
             .iter()
-            .filter(|(_, (_, _, b))| !b.is_empty())
+            .filter(|(k, (_, _, b))| !b.is_empty() && pred(k))
             .map(|(k, _)| k)
             .collect();
         if candidates.is_empty() {

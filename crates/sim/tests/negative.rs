@@ -78,3 +78,56 @@ fn oracle_catches_dropped_write_protection() {
         "stale captures from dropped write protection went unnoticed"
     );
 }
+
+/// The two-sided handoff is not vacuous either: a source that ACTS on a
+/// handoff durability it does not have (the marker write acked but never
+/// persisted) recovers its vset RUNNABLE after a crash — while the
+/// destination is already running it. The harness's ground-truth
+/// two-runners check must catch the double-run R7.2 forbids.
+#[test]
+fn oracle_catches_a_source_that_skips_the_durable_handoff() {
+    let config = blockd_sim::cluster::ClusterConfig {
+        hosts: 2,
+        vset_count: 1,
+        vset_config: VsetConfig {
+            disk_volumes: 2,
+            pages_per_volume: 16,
+            backed_up: false,
+        },
+        nonbacked_vsets: 0,
+        daemon: DaemonConfig {
+            host: HostId(0),
+            cache_pages: 128,
+            writeback_interval: millis(20),
+            backup_retry: millis(100),
+            disk_capacity: None,
+            disk_headroom: 0,
+        },
+        bdev: BlobDevConfig::nvme(),
+        store: StoreConfig::s3(),
+        horizon: secs(4),
+        think: (millis(1), millis(5)),
+        checkpoint_interval: Some(millis(300)),
+        kill_hosts_at: vec![],
+        crash_hosts_at: vec![(millis(1510), 0)],
+        restart_delay: (millis(50), millis(200)),
+        crash_mean_interval: 0,
+        migrate_mean_interval: 0,
+        peer_drop: (0, 1),
+        peer_dup: (0, 1),
+        store_outage: None,
+        rot_resume_set_at: None,
+        race_restore: false,
+        migrate_at: Some((millis(1500), blockd_core::types::VsetId(1), 1)),
+        sabotage: Some(Sabotage::EagerHandoffAck),
+    };
+    let report = blockd_sim::cluster::run(7, config);
+    // The migration itself completed — that is what makes the sabotage
+    // dangerous rather than merely broken.
+    assert_eq!(report.migrations, 1);
+    assert!(
+        report.violations.iter().any(|v| v.contains("two runners")),
+        "the double-run went uncaught: {:?}",
+        report.violations
+    );
+}

@@ -29,12 +29,22 @@ fn base_config() -> ClusterConfig {
             pages_per_volume: 16,
             backed_up: true,
         },
+        nonbacked_vsets: 0,
         horizon: secs(4),
         think: (millis(1), millis(5)),
         checkpoint_interval: Some(millis(300)),
         kill_hosts_at: vec![(millis(1500), 0)],
+        crash_hosts_at: vec![],
+        restart_delay: (millis(50), millis(200)),
+        crash_mean_interval: 0,
+        migrate_mean_interval: 0,
+        peer_drop: (0, 1),
+        peer_dup: (0, 1),
+        store_outage: None,
+        rot_resume_set_at: None,
         race_restore: true,
         migrate_at: None,
+        sabotage: None,
     }
 }
 
@@ -95,7 +105,7 @@ fn migration_moves_a_nonbacked_vset_losslessly() {
     // non-backed vset wrote nothing to the store (R4.4), so zero restores.
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, 1487);
+    assert_eq!(report.completed_ops, 1450);
     // R7.1: the guest-observed pause — source pause through destination
     // resume — stays far inside the 500 ms budget.
     assert!(
@@ -121,7 +131,7 @@ fn source_death_mid_drain_costs_the_nonbacked_vset_loudly() {
     // The destination's guest died at its first peer fetch the dead source
     // could not answer (the sanctioned R7.3 loss).
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, 555);
+    assert_eq!(report.completed_ops, 562);
 }
 
 /// R6.2: a restore onto a host with none of the vset's bytes reaches its
@@ -186,4 +196,242 @@ fn cluster_seed_corpus_stays_consistent() {
         assert_eq!(report.restores, 1, "seed {seed}");
         assert_eq!(report.claims_lost, 1, "seed {seed}");
     }
+}
+
+/// The drain completes without the guest's help: hydration pulls the tail
+/// in the background, the destination releases the source, and the source
+/// reclaims every byte (R4.5: explicit). A later crash of the source then
+/// finds nothing and costs nothing.
+#[test]
+fn hydration_drains_the_tail_and_releases_the_source() {
+    let config = ClusterConfig {
+        crash_hosts_at: vec![(millis(3000), 0)],
+        ..migrate_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert_eq!(report.releases, 1);
+    assert!(report.hydrate_fills > 0, "the tail never hydrated");
+    // Released: the source deleted the vset's segments, journal records
+    // and handoff marker — its device ends the run empty.
+    assert_eq!(report.blobs_per_host[0], 0);
+    // The post-release crash recovers a daemon with nothing to say — and
+    // the two-runners check stays silent.
+    assert_eq!(report.recoveries, 1);
+    assert_eq!(report.completed_ops, 1464);
+}
+
+/// The recovery side of the two-sided handoff (R7.2): a source that
+/// crashes mid-drain restarts as OUTBOUND — it re-offers idempotently,
+/// serves fetches, and never runs the guest. The migrated vset never
+/// notices beyond latency: the drain still completes and releases.
+#[test]
+fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
+    let config = ClusterConfig {
+        crash_hosts_at: vec![(millis(1520), 0)],
+        ..migrate_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report); // includes the two-runners check
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert_eq!(report.recoveries, 1);
+    // The restarted source served the drain to completion and was
+    // released and reclaimed.
+    assert_eq!(report.releases, 1);
+    assert_eq!(report.blobs_per_host[0], 0);
+    assert_eq!(report.completed_ops, 1419);
+}
+
+/// A crash that tears the handoff marker means the migration never
+/// happened (R7.2): the source recovers the vset RUNNABLE and resumes it;
+/// the destination never hears of it and no release ever fires.
+#[test]
+fn torn_handoff_marker_means_the_migration_never_happened() {
+    let config = ClusterConfig {
+        // The marker write is submitted at ~1500.74ms on this seed: crash
+        // while it is in flight, so the device crash tears it.
+        crash_hosts_at: vec![(1_500_800_000, 0)],
+        ..migrate_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 0);
+    assert_eq!(report.releases, 0);
+    assert_eq!(report.guest_deaths, 0);
+    assert_eq!(report.recoveries, 1);
+    // The vset still lives on the source: its blobs are there.
+    assert!(report.blobs_per_host[0] > 0);
+    assert_eq!(report.completed_ops, 1538);
+}
+
+/// R7.3's mirror: the DESTINATION crashing mid-drain loses its volatile
+/// peer link, so the undrained tail is unreachable after its restart. The
+/// vset dies loudly at its first unservable page — and the source stays
+/// outbound forever, never running the guest (no silent double-run).
+#[test]
+fn dest_crash_mid_drain_dies_loudly_not_silently() {
+    let config = ClusterConfig {
+        crash_hosts_at: vec![(millis(1520), 1)],
+        ..migrate_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 1);
+    assert_eq!(report.releases, 0);
+    assert_eq!(report.recoveries, 1);
+    // Never released: the source keeps the tail.
+    assert!(report.blobs_per_host[0] > 0);
+    assert_eq!(report.completed_ops, 571);
+}
+
+/// Migration completes losslessly over a channel that drops a quarter of
+/// its messages and duplicates an eighth: offer, accept, fetch, page and
+/// release are all at-least-once with idempotent handlers.
+#[test]
+fn migration_survives_a_lossy_duplicating_peer_channel() {
+    let config = ClusterConfig {
+        peer_drop: (1, 4),
+        peer_dup: (1, 8),
+        ..migrate_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert_eq!(report.releases, 1);
+    assert_eq!(report.blobs_per_host[0], 0);
+    // Non-vacuous: the channel really misbehaved.
+    assert!(
+        report.peer_drops > 0 && report.peer_dups > 0,
+        "channel unexercised: {} drops, {} dups",
+        report.peer_drops,
+        report.peer_dups
+    );
+    assert_eq!(report.completed_ops, 1491);
+}
+
+#[test]
+fn lossy_migration_replays_byte_for_byte() {
+    let config = || ClusterConfig {
+        peer_drop: (1, 4),
+        peer_dup: (1, 8),
+        crash_hosts_at: vec![(millis(1520), 0)],
+        ..migrate_config()
+    };
+    let a = run(7, config());
+    let b = run(7, config());
+    assert_eq!(a, b, "lossy migration run diverged on replay");
+}
+
+fn migration_chaos_config() -> ClusterConfig {
+    ClusterConfig {
+        hosts: 3,
+        vset_count: 4,
+        nonbacked_vsets: 2,
+        migrate_mean_interval: millis(400),
+        crash_mean_interval: millis(1100),
+        restart_delay: (millis(50), millis(200)),
+        peer_drop: (1, 8),
+        peer_dup: (1, 8),
+        store_outage: Some((millis(1800), millis(2600))),
+        kill_hosts_at: vec![],
+        race_restore: false,
+        ..base_config()
+    }
+}
+
+/// Randomized composition: migrations keep firing while hosts crash and
+/// restart under a lossy peer channel and a mid-run store outage. Every
+/// seed must stay oracle-clean — the only sanctioned deaths are a
+/// destination crashing mid-drain (its tail dies with its peer link).
+#[test]
+fn migration_chaos_corpus_stays_consistent() {
+    let mut migrations = 0;
+    let mut drops = 0;
+    for seed in [7, 13, 31, 44, 71] {
+        let report = run(seed, migration_chaos_config());
+        assert_eq!(
+            report.violations,
+            Vec::<String>::new(),
+            "seed {seed} violated an invariant"
+        );
+        assert!(report.recoveries > 0, "seed {seed}: no crash recovered");
+        migrations += report.migrations;
+        drops += report.peer_drops;
+    }
+    // Coverage across the corpus: the nemesis really migrated and the
+    // channel really lost messages.
+    assert!(migrations > 0, "corpus never completed a migration");
+    assert!(drops > 0, "corpus never dropped a peer message");
+}
+
+#[test]
+fn migration_chaos_replays_byte_for_byte() {
+    let a = run(31, migration_chaos_config());
+    let b = run(31, migration_chaos_config());
+    assert_eq!(a, b, "chaos run diverged on replay");
+}
+
+/// R8.3: a restore that lands inside a store outage parks and retries —
+/// it never fails. The outage also SERIALIZES the racing claimants: their
+/// retry timers fire apart, so the second claimant's fresh head read sees
+/// the first winner and its claim fences it — a takeover inside R6.4's
+/// bounded double-run window, converging to exactly one runner. Both
+/// claims "succeed"; the loser is the fenced first winner, not a CAS
+/// conflict.
+#[test]
+fn restore_waits_out_a_store_outage() {
+    let config = ClusterConfig {
+        store_outage: Some((millis(1200), millis(2200))),
+        ..base_config()
+    };
+    let report = run(31, config);
+    assert_clean(&report);
+    assert_eq!(report.restores, 2);
+    assert_eq!(report.claims_lost, 0);
+    assert_eq!(report.loss_bound_verified, 1);
+    assert_eq!(report.guest_deaths, 0);
+    // Neither restore beat the outage: the kill was at 1500ms, the window
+    // lifted at 2200ms — the first verdict took at least the difference.
+    assert!(
+        report.max_restore_ns > millis(700),
+        "restore finished during the outage: {} ns",
+        report.max_restore_ns
+    );
+    assert_eq!(report.completed_ops, 4319);
+}
+
+/// R6.2's prefetch is a bet, and a rotten resume-set object must cost
+/// exactly the warmth: the second restore still meets its budget and
+/// nobody dies — nothing is prefetched, that is all.
+#[test]
+fn a_rotten_resume_set_is_ignored_not_fatal() {
+    let config = ClusterConfig {
+        vset_count: 1,
+        vset_config: VsetConfig {
+            disk_volumes: 2,
+            pages_per_volume: 16,
+            backed_up: true,
+        },
+        race_restore: false,
+        kill_hosts_at: vec![(millis(1500), 0), (millis(2800), 1)],
+        rot_resume_set_at: Some(millis(2700)),
+        horizon: secs(4),
+        ..base_config()
+    };
+    let report = run(11, config);
+    assert_clean(&report);
+    assert_eq!(report.restores, 2);
+    assert_eq!(report.guest_deaths, 0);
+    assert!(
+        report.max_restore_ns < millis(200),
+        "R6.2: restore took {} ns",
+        report.max_restore_ns
+    );
+    assert_eq!(report.prefetch_fills, 0);
+    assert_eq!(report.completed_ops, 673);
 }

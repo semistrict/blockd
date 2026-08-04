@@ -19,12 +19,29 @@
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::journal::JournalRecord;
 use crate::layout;
-use crate::seam::{AdminReply, Effect, PeerMsg, ReqId, Verdict};
-use crate::types::{Epoch, HostId, VsetId};
+use crate::seam::{AdminReply, Effect, PeerMsg, ReqId, TimerId, Verdict};
+use crate::segment::PageLoc;
+use crate::types::{Epoch, Gen, HostId, PageId, VsetId, millis};
 
 use super::{Daemon, Pending, Vset};
 
 pub const MAGIC_HANDOFF: u32 = u32::from_le_bytes(*b"BHF1");
+
+/// The peer channel is at-least-once: offers and releases re-send on this
+/// cadence until acknowledged (every handler is idempotent).
+pub(super) const OFFER_RETRY: u64 = millis(5);
+/// An unanswered peer fetch re-issues after this long — peer RTT is
+/// microseconds, so this only fires across losses and source downtime.
+pub(super) const PEER_RETRY: u64 = millis(5);
+/// Background tail-drain cadence and per-tick fetch budget (R7.1): the
+/// destination pulls the source-homed remainder until nothing references
+/// the source, then releases it.
+pub(super) const HYDRATE_TICK: u64 = millis(10);
+const HYDRATE_BATCH: usize = 8;
+
+/// The synthetic request id of a re-offer started by crash recovery — it
+/// has no admin caller to answer.
+const RECOVERED_REQ: ReqId = ReqId(u64::MAX);
 
 /// The durable outbound marker (R7.2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -77,11 +94,14 @@ impl Daemon {
         };
         // V1 migrates the mode that has no other way to move (R7.2);
         // backed-up vsets relocate via restore. One migration at a time;
-        // outbound vsets are already gone.
+        // outbound vsets are already gone; a vset still draining its OWN
+        // tail off a source may not chain-migrate — its record would point
+        // the new destination at segments the middle host never had.
         if !state.ready
             || state.config.backed_up
             || state.outbound.is_some()
             || state.migrate.is_some()
+            || state.peer_source.is_some()
             || state.ckpt_pausing.is_some()
         {
             out.push(Effect::Admin(AdminReply::AdminFailed { req }));
@@ -142,6 +162,72 @@ impl Daemon {
                 record: record.encode(vset),
             },
         });
+        out.push(Effect::SetTimer {
+            timer: TimerId::MigrateOffer(vset),
+            after: OFFER_RETRY,
+        });
+    }
+
+    /// Re-send the offer until the destination's accept arrives (the take
+    /// of `migrate` on accept is what stops this).
+    pub(super) fn migrate_offer_tick(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get(&vset) else {
+            return; // released and reclaimed
+        };
+        let (Some(migrate), Some(to)) = (&state.migrate, state.outbound) else {
+            return; // accepted, or the handoff never became durable
+        };
+        let record = migrate
+            .record
+            .clone()
+            .or_else(|| state.best_record.clone())
+            .expect("an outbound vset has its final record");
+        out.push(Effect::PeerSend {
+            to,
+            msg: PeerMsg::MigrateOffer {
+                vset,
+                record: record.encode(vset),
+            },
+        });
+        out.push(Effect::SetTimer {
+            timer: TimerId::MigrateOffer(vset),
+            after: OFFER_RETRY,
+        });
+    }
+
+    /// Crash recovery of an outbound vset: the crash may have eaten the
+    /// offer or its accept, which would strand the vset — the source can
+    /// never run it (R7.2) and the destination may not know it exists. The
+    /// marker names the destination, so recovery re-offers the final
+    /// record; duplicates are re-acked, staleness is impossible (the
+    /// record was durable before the marker was written).
+    pub(super) fn recovered_outbound(
+        state: &mut Vset,
+        vset: VsetId,
+        to: HostId,
+        effects: &mut Vec<Effect>,
+    ) {
+        state.outbound = Some(to);
+        state.migrate = Some(MigrateOut {
+            req: RECOVERED_REQ,
+            to,
+            record: None,
+        });
+        let record = state
+            .best_record
+            .clone()
+            .expect("an outbound vset has its final record");
+        effects.push(Effect::PeerSend {
+            to,
+            msg: PeerMsg::MigrateOffer {
+                vset,
+                record: record.encode(vset),
+            },
+        });
+        effects.push(Effect::SetTimer {
+            timer: TimerId::MigrateOffer(vset),
+            after: OFFER_RETRY,
+        });
     }
 
     /// A peer message arrived (authenticated cluster member, R11.1).
@@ -152,7 +238,9 @@ impl Daemon {
                 let Some(state) = self.vsets.get_mut(&vset) else {
                     return;
                 };
-                if let Some(migrate) = state.migrate.take() {
+                if let Some(migrate) = state.migrate.take()
+                    && migrate.req != RECOVERED_REQ
+                {
                     out.push(Effect::Admin(AdminReply::MigratedOut {
                         req: migrate.req,
                         vset,
@@ -187,7 +275,8 @@ impl Daemon {
             PeerMsg::Page { io, bytes } => self.peer_fill_done(io, bytes, out),
             PeerMsg::Released { vset } => {
                 // The destination holds everything: reclaim the vset's
-                // local state (R4.5: explicit).
+                // local state (R4.5: explicit). Always ack — a duplicate
+                // release after reclamation must still stop the sender.
                 if let Some(state) = self.vsets.remove(&vset) {
                     for (fence, seg, _) in state.seg_blobs {
                         out.push(Effect::BlobDelete {
@@ -202,6 +291,18 @@ impl Daemon {
                     out.push(Effect::BlobDelete {
                         name: layout::handoff_blob(vset),
                     });
+                    self.purge_vset_pages(vset, out);
+                }
+                out.push(Effect::PeerSend {
+                    to: from,
+                    msg: PeerMsg::ReleasedAck { vset },
+                });
+            }
+            PeerMsg::ReleasedAck { vset } => {
+                // The source is gone as a tier; hydration's next tick sees
+                // no source and stops.
+                if let Some(state) = self.vsets.get_mut(&vset) {
+                    state.peer_source = None;
                 }
             }
         }
@@ -210,8 +311,17 @@ impl Daemon {
     /// Destination: the offer's record becomes this host's vset, durably,
     /// before the guest resumes (the destination's handoff side, R7.2).
     fn migrate_in(&mut self, from: HostId, vset: VsetId, record: &[u8], out: &mut Vec<Effect>) {
-        if self.vsets.contains_key(&vset) {
-            return; // duplicate offer (message duplication is normal)
+        if let Some(existing) = self.vsets.get(&vset) {
+            // Duplicate offer (retries and duplication are normal). Re-ack
+            // once this side is durable — before that, silence: the accept
+            // MEANS "my first record is durable" (R7.2).
+            if existing.peer_source == Some(from) && existing.ready {
+                out.push(Effect::PeerSend {
+                    to: from,
+                    msg: PeerMsg::MigrateAccept { vset },
+                });
+            }
+            return;
         }
         let Ok(record) = JournalRecord::decode(vset, record) else {
             return; // damaged in flight: the source will keep serving
@@ -250,17 +360,159 @@ impl Daemon {
         bytes: Option<Vec<u8>>,
         out: &mut Vec<Effect>,
     ) {
-        let Some(Pending::PeerFetch {
+        match self.pending.remove(&io) {
+            Some(Pending::PeerFetch {
+                page,
+                write,
+                generation,
+                loc,
+            }) => self.peer_fetch_resolved(page, write, generation, loc, bytes, out),
+            Some(Pending::HydrateFetch { page, generation }) => {
+                self.hydrate_fetch_done(page, generation, bytes, out);
+            }
+            Some(other) => {
+                // Io ids are never reused, so a `Page` can only name a peer
+                // fetch — but keep foreign entries untouched regardless.
+                self.pending.insert(io, other);
+            }
+            // Stale reply to a retried or resolved fetch: ignore.
+            None => {}
+        }
+    }
+
+    /// A peer fetch went unanswered (lost message or source downtime):
+    /// re-run the fill ladder for the page, which re-issues the fetch with
+    /// a fresh io — stale replies to the old io fall into the ignore path.
+    pub(super) fn peer_retry(&mut self, io: crate::seam::IoId, out: &mut Vec<Effect>) {
+        let Some(&Pending::PeerFetch {
             page,
             write,
             generation,
             loc,
-        }) = self.pending.remove(&io)
+        }) = self.pending.get(&io)
         else {
-            // Not ours / already resolved: ignore (duplicates are normal).
+            return; // answered in time
+        };
+        self.pending.remove(&io);
+        self.counters.peer_retries += 1;
+        self.fill_read_done(page, write, generation, loc, None, out);
+    }
+
+    // ── hydration: the post-copy tail drain (R7.1) ──────────────────────
+
+    /// One hydration tick: pull a bounded batch of source-homed pages, and
+    /// once nothing references the source, release it. The tick is also
+    /// the retry for its own lost fetches and lost releases.
+    pub(super) fn hydrate_tick(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get(&vset) else {
             return;
         };
-        self.peer_fetch_resolved(page, write, generation, loc, bytes, out);
+        let Some(source) = state.peer_source else {
+            return; // released and acked: hydration is over
+        };
+        let fence = state.fence;
+        // The tail: pages whose durable home is still a source segment
+        // (base-origin pages live in the store, not on the source).
+        let foreign: Vec<(PageId, Gen, PageLoc)> = state
+            .page_locs
+            .iter()
+            .filter(|&(_, &(_, loc))| loc.base == 0 && loc.fence < fence)
+            .map(|(&page, &(generation, loc))| (page, generation, loc))
+            .collect();
+        if foreign.is_empty() {
+            out.push(Effect::PeerSend {
+                to: source,
+                msg: PeerMsg::Released { vset },
+            });
+            out.push(Effect::SetTimer {
+                timer: TimerId::Hydrate(vset),
+                after: HYDRATE_TICK,
+            });
+            return;
+        }
+        let mut issued = 0;
+        for (page, generation, loc) in foreign {
+            if self.cache.is_resident(page) {
+                // The bytes are already in guest memory: dirtying the page
+                // is enough — writeback re-homes it into our own segment.
+                if !self.cache.is_dirty(page) {
+                    self.cache.mark_dirty(page);
+                }
+                continue;
+            }
+            if issued >= HYDRATE_BATCH {
+                break;
+            }
+            let in_flight = self.pending.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::Fetch { page: q, .. }
+                    | Pending::StoreFetch { page: q, .. }
+                    | Pending::PeerFetch { page: q, .. }
+                    | Pending::HydrateFetch { page: q, .. } if *q == page
+                )
+            });
+            if in_flight {
+                continue;
+            }
+            let io = self.io();
+            self.pending
+                .insert(io, Pending::HydrateFetch { page, generation });
+            out.push(Effect::PeerSend {
+                to: source,
+                msg: PeerMsg::FetchRange {
+                    io,
+                    vset,
+                    fence: loc.fence,
+                    seg: loc.seg,
+                    offset: loc.offset,
+                    len: loc.len,
+                },
+            });
+            issued += 1;
+        }
+        out.push(Effect::SetTimer {
+            timer: TimerId::Hydrate(vset),
+            after: HYDRATE_TICK,
+        });
+    }
+
+    /// A hydration fetch arrived: install it like a prefetch — never evict
+    /// for it, lose races gracefully (the tick retries) — and mark it
+    /// dirty so writeback re-homes it locally.
+    fn hydrate_fetch_done(
+        &mut self,
+        page: PageId,
+        generation: Gen,
+        bytes: Option<Vec<u8>>,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(raw) = Self::verify_entry(page, generation, bytes) else {
+            return; // damaged or missing: the next tick re-issues
+        };
+        let in_flight = self.pending.values().any(|p| {
+            matches!(
+                p,
+                Pending::Fetch { page: q, .. }
+                | Pending::StoreFetch { page: q, .. }
+                | Pending::PeerFetch { page: q, .. } if *q == page
+            )
+        });
+        if self.cache.is_resident(page) || in_flight {
+            return;
+        }
+        if !self.cache.reserve_if_free() {
+            return; // pressure: hydration never evicts anyone
+        }
+        self.cache.fill_slot_cold(page);
+        self.cache.mark_dirty(page);
+        self.counters.hydrate_fills += 1;
+        out.push(Effect::Fill {
+            page,
+            bytes: raw,
+            writable: false,
+            share: None,
+        });
     }
 
     /// A peer read completed locally: answer the requester.

@@ -58,6 +58,11 @@ pub enum Sabotage {
     /// Silently drop `WriteProtect` effects: the daemon misses re-dirtied
     /// pages and captures stale state.
     DropWriteProtect,
+    /// Acknowledge the migration handoff marker's write without persisting
+    /// it (cluster harness only): the source offers before its side of the
+    /// two-sided handoff is durable — a crash then recovers it runnable
+    /// while the destination also runs (the double-run R7.2 forbids).
+    EagerHandoffAck,
 }
 
 #[derive(Clone, Debug)]

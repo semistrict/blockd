@@ -86,9 +86,17 @@ impl Daemon {
         let fail = |out: &mut Vec<Effect>| {
             out.push(Effect::Admin(AdminReply::AdminFailed { req }));
         };
-        let Ok(Some((version, bytes))) = result else {
-            fail(out);
-            return;
+        let (version, bytes) = match result {
+            Ok(Some(found)) => found,
+            // An outage queues the restore, it never fails it (R8.3).
+            Err(StoreFault::Unavailable) => {
+                self.park_restore(req, vset, out);
+                return;
+            }
+            Ok(None) | Err(StoreFault::CasConflict { .. }) => {
+                fail(out);
+                return;
+            }
         };
         let Ok(head) = HeadRecord::decode(vset, &bytes) else {
             fail(out);
@@ -143,10 +151,35 @@ impl Daemon {
                     key: layout::manifest_key(vset, ptr.fence, ptr.seq),
                 });
             }
-            // A lost race (some other host claimed first) or an outage:
-            // this host simply is not the runner (R6.3).
-            Err(_) => out.push(Effect::Admin(AdminReply::AdminFailed { req })),
+            // An outage leaves the claim's outcome unknown: retry from the
+            // head read (R8.3) — if our claim actually landed, the re-read
+            // sees this host as holder and the re-claim just bumps the
+            // fence.
+            Err(StoreFault::Unavailable) => self.park_restore(req, vset, out),
+            // A lost race (some other host claimed first): this host
+            // simply is not the runner (R6.3).
+            Err(StoreFault::CasConflict { .. }) => {
+                out.push(Effect::Admin(AdminReply::AdminFailed { req }));
+            }
         }
+    }
+
+    /// Park a restore that hit a store outage; the retry timer re-runs it
+    /// from the head read (every step up to serving is idempotent).
+    fn park_restore(&mut self, req: ReqId, vset: VsetId, out: &mut Vec<Effect>) {
+        self.counters.store_retries += 1;
+        self.restore_retries.insert(vset, req);
+        out.push(Effect::SetTimer {
+            timer: TimerId::RestoreRetry(vset),
+            after: self.config.backup_retry,
+        });
+    }
+
+    pub(super) fn restore_retry(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(req) = self.restore_retries.remove(&vset) else {
+            return;
+        };
+        self.restore_vset(req, vset, out);
     }
 
     pub(super) fn restore_manifest_done(
@@ -158,9 +191,17 @@ impl Daemon {
         result: Result<Option<(u64, Vec<u8>)>, StoreFault>,
         out: &mut Vec<Effect>,
     ) {
-        let Ok(Some((_, bytes))) = result else {
-            out.push(Effect::Admin(AdminReply::AdminFailed { req }));
-            return;
+        let bytes = match result {
+            Ok(Some((_, bytes))) => bytes,
+            // We hold the claim already; wait the outage out (R8.3).
+            Err(StoreFault::Unavailable) => {
+                self.park_restore(req, vset, out);
+                return;
+            }
+            Ok(None) | Err(StoreFault::CasConflict { .. }) => {
+                out.push(Effect::Admin(AdminReply::AdminFailed { req }));
+                return;
+            }
         };
         let Ok(record) = JournalRecord::decode(vset, &bytes) else {
             // The newest backed-up manifest is damaged: restore fails

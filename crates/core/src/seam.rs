@@ -105,6 +105,9 @@ pub enum PeerMsg {
     /// The destination holds every byte it needs: the source may reclaim
     /// the vset's local state.
     Released { vset: VsetId },
+    /// The source's acknowledgment of `Released` (which is retried until
+    /// acked; a source that already reclaimed still acks).
+    ReleasedAck { vset: VsetId },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -207,6 +210,19 @@ pub enum TimerId {
     /// End of the post-resume recording window (R6.2): the pages faulted
     /// so far become the vset's recorded resume set.
     ResumeSet(VsetId),
+    /// Re-send a migration offer until the destination accepts. The peer
+    /// channel is at-least-once; every migration handler is idempotent.
+    MigrateOffer(VsetId),
+    /// Re-issue a peer fetch that has gone unanswered (a lost `FetchRange`
+    /// or `Page` must not hang a guest forever).
+    PeerRetry(IoId),
+    /// Post-migration hydration tick (R7.1's tail drain): pull pages whose
+    /// locations still reference the source until none remain, then release
+    /// the source.
+    Hydrate(VsetId),
+    /// Retry a restore whose store operations hit an outage (R8.3: outages
+    /// queue work, they never fail it).
+    RestoreRetry(VsetId),
 }
 
 /// Everything that can happen to the daemon.

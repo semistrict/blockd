@@ -104,6 +104,11 @@ pub struct Counters {
     pub nvme_stalls: u64,
     /// Resume-set pages prefetched into the cache after a restore (R6.2).
     pub prefetch_fills: u64,
+    /// Tail pages pulled from the migration source in the background
+    /// (post-copy hydration, R7.1).
+    pub hydrate_fills: u64,
+    /// Peer fetches re-issued after going unanswered (lossy channel).
+    pub peer_retries: u64,
 }
 
 /// The page→location map of one consistency point.
@@ -241,6 +246,12 @@ enum Pending {
         write: bool,
         generation: Gen,
         loc: PageLoc,
+    },
+    /// Hydration: a tail page being pulled from the source in the
+    /// background (no guest is waiting; the tick re-issues losses).
+    HydrateFetch {
+        page: PageId,
+        generation: Gen,
     },
     /// Resume-set publish (R6.2): fire-and-forget, best effort.
     ResumeSetPut,
@@ -406,6 +417,8 @@ pub struct Daemon {
     /// Faults waiting for a cache slot (pressure, R2.5): FIFO, never
     /// dropped, never killed. `(page, write)`.
     waiters: VecDeque<(PageId, bool)>,
+    /// Restores waiting out a store outage (R8.3), vset → admin req.
+    restore_retries: BTreeMap<VsetId, ReqId>,
     /// Local bytes written and not yet deleted (the daemon wrote every byte,
     /// so it does its own accounting; R2.7).
     local_bytes: u64,
@@ -422,6 +435,7 @@ impl Daemon {
             next_io: 0,
             pending: BTreeMap::new(),
             waiters: VecDeque::new(),
+            restore_retries: BTreeMap::new(),
             local_bytes: 0,
             counters: Counters::default(),
         };
@@ -458,6 +472,10 @@ impl Daemon {
             Event::StoreGetDone { io, result } => self.store_get_done(io, result, &mut out),
             Event::Timer(TimerId::Backup(vset)) => self.backup_tick(vset, mem, &mut out),
             Event::Timer(TimerId::ResumeSet(vset)) => self.resume_set_flush(vset, &mut out),
+            Event::Timer(TimerId::MigrateOffer(vset)) => self.migrate_offer_tick(vset, &mut out),
+            Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, &mut out),
+            Event::Timer(TimerId::Hydrate(vset)) => self.hydrate_tick(vset, &mut out),
+            Event::Timer(TimerId::RestoreRetry(vset)) => self.restore_retry(vset, &mut out),
             Event::Timer(TimerId::Writeback) => {
                 // MGLRU-mirrored aging (R2.6) rides the writeback cadence,
                 // as reclaim-driven aging rides kswapd in the kernel.
@@ -570,8 +588,18 @@ impl Daemon {
     pub(super) fn fence_vset(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
         if self.vsets.remove(&vset).is_some() {
             self.counters.fenced += 1;
+            self.purge_vset_pages(vset, out);
             out.push(Effect::VsetFenced { vset });
         }
+    }
+
+    /// A vset left this daemon: purge its cache residency and unmap its
+    /// pages — a later incarnation of the vset here must fault fresh.
+    pub(super) fn purge_vset_pages(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        for page in self.cache.purge_vset(vset) {
+            out.push(Effect::Evict { page });
+        }
+        self.drain_waiters(out);
     }
 
     /// Would writing `bytes` more stay inside the device (R2.7)? Reclaim
