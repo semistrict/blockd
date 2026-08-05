@@ -158,8 +158,8 @@ impl Daemon {
         if state.publish.is_none() {
             return;
         }
-        // Verify before upload: publishing damaged bytes would poison the
-        // backup tier (R8.1 applies in both directions).
+        // Verify every frame checksum before upload: publishing damaged
+        // bytes would poison the backup tier (R8.1 applies both ways).
         let intact = bytes.as_ref().is_some_and(|b| {
             scan_segment(b).is_ok_and(|(v, f, s, _)| v == vset_id && f == fence && s == seg)
         });

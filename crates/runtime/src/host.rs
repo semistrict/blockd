@@ -238,58 +238,63 @@ impl Runtime {
             }
         }
 
+        // Local blob I/O has the same completion-event contract as object
+        // storage. Keep disk reads, writes, fsyncs, and deletes off the event
+        // loop so one slow filesystem operation cannot stall guest faults.
+        let (blob_tx, blob_rx) = channel::<BlobJob>();
+        {
+            let blob_rx = Arc::new(Mutex::new(blob_rx));
+            for _ in 0..BLOB_WORKERS {
+                let blob_dir = config.blob_dir.clone();
+                let tx = tx.clone();
+                let blob_rx = blob_rx.clone();
+                thread::spawn(move || blob_worker_loop(&blob_rx, &blob_dir, &tx));
+            }
+        }
+
         // The event loop: the daemon lives here.
         let loop_thread = {
             let shared = shared.clone();
-            let blob_dir = config.blob_dir.clone();
             let tx = tx.clone();
             let peers = peers.clone();
             let self_id = config.daemon.host;
             thread::spawn(move || {
-                let mut local: VecDeque<Event> = VecDeque::new();
-                let apply = |effects: Vec<Effect>, local: &mut VecDeque<Event>| {
+                let apply = |effects: Vec<Effect>| {
                     for effect in effects {
                         apply_effect(
                             effect,
                             &shared,
                             &store_tx,
-                            &blob_dir,
+                            &blob_tx,
                             &timer_tx,
                             &admin_tx,
                             &tx,
-                            local,
                             peers.as_ref(),
                             self_id,
                         );
                     }
                 };
-                apply(boot_effects, &mut local);
+                apply(boot_effects);
                 loop {
-                    // Follow-up I/O completions first (they belong to the
-                    // step that issued them), then the outside world.
-                    let event = if let Some(event) = local.pop_front() {
-                        event
-                    } else {
-                        match rx.recv() {
-                            Ok(Msg::Ev(event)) => event,
-                            Ok(Msg::Quiesced(vset)) => {
-                                let vmstate = {
-                                    let host = shared.vsets.lock().expect("lock")[&vset].clone();
-                                    let mut state = host.ctl.state.lock().expect("lock");
-                                    state.paused = true;
-                                    state.applied
-                                };
-                                Event::GuestPaused { vset, vmstate }
-                            }
-                            Ok(Msg::Stop) | Err(_) => break,
+                    let event = match rx.recv() {
+                        Ok(Msg::Ev(event)) => event,
+                        Ok(Msg::Quiesced(vset)) => {
+                            let vmstate = {
+                                let host = shared.vsets.lock().expect("lock")[&vset].clone();
+                                let mut state = host.ctl.state.lock().expect("lock");
+                                state.paused = true;
+                                state.applied
+                            };
+                            Event::GuestPaused { vset, vmstate }
                         }
+                        Ok(Msg::Stop) | Err(_) => break,
                     };
                     let effects = {
                         let vsets = shared.vsets.lock().expect("lock");
                         daemon.step(event, &MapView { vsets: &vsets })
                     };
                     *shared.counters.lock().expect("lock") = daemon.counters;
-                    apply(effects, &mut local);
+                    apply(effects);
                 }
             })
         };
@@ -578,11 +583,10 @@ fn apply_effect(
     effect: Effect,
     shared: &Arc<Shared>,
     store_tx: &Sender<StoreJob>,
-    blob_dir: &Path,
+    blob_tx: &Sender<BlobJob>,
     timer_tx: &Sender<(TimerId, u64)>,
     admin_tx: &Sender<AdminReply>,
     tx: &Sender<Msg>,
-    local: &mut VecDeque<Event>,
     peers: Option<&Arc<PeerNet>>,
     self_id: blockd_core::types::HostId,
 ) {
@@ -619,12 +623,21 @@ fn apply_effect(
         }
         Effect::WriteProtect { pages } => {
             let vsets = shared.vsets.lock().expect("lock");
+            let mut by_vset: BTreeMap<VsetId, Vec<usize>> = BTreeMap::new();
             for page in pages {
                 let host = &vsets[&page.volume.vset];
-                let index = host.page_index(page);
-                host.uffd
-                    .writeprotect(host.view.addr_of(index), PAGE_SIZE, true)
-                    .expect("write-protect");
+                by_vset
+                    .entry(page.volume.vset)
+                    .or_default()
+                    .push(host.page_index(page));
+            }
+            for (vset, mut indices) in by_vset {
+                let host = &vsets[&vset];
+                for_each_contiguous_run(&mut indices, |start, len| {
+                    host.uffd
+                        .writeprotect(host.view.addr_of(start), len * PAGE_SIZE, true)
+                        .expect("write-protect");
+                });
             }
         }
         Effect::Evict { page } => {
@@ -670,23 +683,14 @@ fn apply_effect(
             }
         }
         Effect::BlobWrite { io, name, bytes } => {
-            let path = blob_dir.join(&name);
-            std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
-            std::fs::write(&path, &bytes).expect("blob write");
-            std::fs::File::open(&path)
-                .expect("open")
-                .sync_all()
-                .expect("fsync");
-            local.push_back(Event::BlobWriteDone { io });
+            blob_tx
+                .send(BlobJob::Write { io, name, bytes })
+                .expect("blob workers alive");
         }
         Effect::BlobRead { io, name } => {
-            let bytes = std::fs::File::open(blob_dir.join(&name))
-                .ok()
-                .and_then(|mut file| {
-                    let mut buf = Vec::new();
-                    file.read_to_end(&mut buf).ok().map(|_| buf)
-                });
-            local.push_back(Event::BlobReadDone { io, bytes });
+            blob_tx
+                .send(BlobJob::Read { io, name })
+                .expect("blob workers alive");
         }
         Effect::BlobReadRange {
             io,
@@ -694,16 +698,19 @@ fn apply_effect(
             offset,
             len,
         } => {
-            let bytes = std::fs::File::open(blob_dir.join(&name))
-                .ok()
-                .and_then(|file| {
-                    let mut buf = vec![0u8; usize::try_from(len).expect("fits")];
-                    file.read_exact_at(&mut buf, offset).ok().map(|()| buf)
-                });
-            local.push_back(Event::BlobReadDone { io, bytes });
+            blob_tx
+                .send(BlobJob::ReadRange {
+                    io,
+                    name,
+                    offset,
+                    len,
+                })
+                .expect("blob workers alive");
         }
         Effect::BlobDelete { name } => {
-            let _ = std::fs::remove_file(blob_dir.join(&name));
+            blob_tx
+                .send(BlobJob::Delete { name })
+                .expect("blob workers alive");
         }
         Effect::SetTimer { timer, after } => {
             let _ = timer_tx.send((timer, after));
@@ -768,10 +775,106 @@ fn apply_effect(
     }
 }
 
+/// Sort, deduplicate, and visit the minimal contiguous runs in a page-index
+/// batch. The callback keeps the production path allocation-free after the
+/// per-vset grouping vector has been built.
+fn for_each_contiguous_run(indices: &mut Vec<usize>, mut visit: impl FnMut(usize, usize)) {
+    indices.sort_unstable();
+    indices.dedup();
+    let Some((&first, rest)) = indices.split_first() else {
+        return;
+    };
+    let mut start = first;
+    let mut end = first;
+    for &index in rest {
+        if index == end + 1 {
+            end = index;
+        } else {
+            visit(start, end - start + 1);
+            start = index;
+            end = index;
+        }
+    }
+    visit(start, end - start + 1);
+}
+
 /// Concurrent object-store round-trips. The daemon's own pipelines bound
 /// what is outstanding (one publish per vset, deduped cold fetches); this
 /// only caps the parallelism of what it issues.
 const STORE_WORKERS: usize = 8;
+
+/// Local disks can service independent segment reads concurrently. This is
+/// also the upper bound on simultaneous fsyncs issued by the runtime.
+const BLOB_WORKERS: usize = 8;
+
+enum BlobJob {
+    Write {
+        io: IoId,
+        name: String,
+        bytes: Vec<u8>,
+    },
+    Read {
+        io: IoId,
+        name: String,
+    },
+    ReadRange {
+        io: IoId,
+        name: String,
+        offset: u64,
+        len: u64,
+    },
+    Delete {
+        name: String,
+    },
+}
+
+fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Sender<Msg>) {
+    loop {
+        let Ok(job) = rx.lock().expect("lock").recv() else {
+            return;
+        };
+        let event = match job {
+            BlobJob::Write { io, name, bytes } => {
+                let path = root.join(name);
+                std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
+                std::fs::write(&path, bytes).expect("blob write");
+                std::fs::File::open(path)
+                    .expect("open")
+                    .sync_all()
+                    .expect("fsync");
+                Event::BlobWriteDone { io }
+            }
+            BlobJob::Read { io, name } => {
+                let bytes = std::fs::File::open(root.join(name))
+                    .ok()
+                    .and_then(|mut file| {
+                        let mut buf = Vec::new();
+                        file.read_to_end(&mut buf).ok().map(|_| buf)
+                    });
+                Event::BlobReadDone { io, bytes }
+            }
+            BlobJob::ReadRange {
+                io,
+                name,
+                offset,
+                len,
+            } => {
+                let bytes = std::fs::File::open(root.join(name)).ok().and_then(|file| {
+                    let mut buf = vec![0u8; usize::try_from(len).expect("fits")];
+                    file.read_exact_at(&mut buf, offset).ok().map(|()| buf)
+                });
+                Event::BlobReadDone { io, bytes }
+            }
+            BlobJob::Delete { name } => {
+                let _ = std::fs::remove_file(root.join(name));
+                continue;
+            }
+        };
+        if tx.send(Msg::Ev(event)).is_err() {
+            return;
+        }
+    }
+}
 
 /// One object-store operation, executed off the event loop; its completion
 /// returns as an event. Deletes are fire-and-forget (R4.5 reclaim).
@@ -898,5 +1001,132 @@ fn scan_blobs(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             let bytes = std::fs::read(&path).expect("blob read");
             out.push((name, bytes));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_pages_collapse_to_minimal_ranges() {
+        let mut indices = vec![9, 3, 4, 4, 5, 12, 11, 20];
+        let mut runs = Vec::new();
+        for_each_contiguous_run(&mut indices, |start, len| runs.push((start, len)));
+        assert_eq!(runs, [(3, 3), (9, 1), (11, 2), (20, 1)]);
+
+        let mut empty = Vec::new();
+        for_each_contiguous_run(&mut empty, |_, _| panic!("empty input has no runs"));
+    }
+
+    #[test]
+    fn queued_blob_io_does_not_block_followup_effects() {
+        let shared = Arc::new(Shared {
+            vsets: Mutex::new(BTreeMap::new()),
+            sync_waiters: Mutex::new(BTreeMap::new()),
+            incidents: Mutex::new(Vec::new()),
+            counters: Mutex::new(blockd_core::daemon::Counters::default()),
+            next_req: AtomicU64::new(1),
+        });
+        let (store_tx, _store_rx) = channel();
+        // No worker receives from this channel: it models every disk worker
+        // being occupied by a slow filesystem operation.
+        let (blob_tx, blob_rx) = channel();
+        let (timer_tx, timer_rx) = channel();
+        let (admin_tx, _admin_rx) = channel();
+        let (tx, _rx) = channel();
+
+        apply_effect(
+            Effect::BlobWrite {
+                io: IoId(7),
+                name: "held/blob".to_owned(),
+                bytes: b"payload".to_vec(),
+            },
+            &shared,
+            &store_tx,
+            &blob_tx,
+            &timer_tx,
+            &admin_tx,
+            &tx,
+            None,
+            blockd_core::types::HostId(0),
+        );
+        apply_effect(
+            Effect::SetTimer {
+                timer: TimerId::Backup(VsetId(9)),
+                after: 123,
+            },
+            &shared,
+            &store_tx,
+            &blob_tx,
+            &timer_tx,
+            &admin_tx,
+            &tx,
+            None,
+            blockd_core::types::HostId(0),
+        );
+
+        assert!(matches!(
+            blob_rx.try_recv().expect("blob job was enqueued"),
+            BlobJob::Write {
+                io: IoId(7),
+                name,
+                bytes,
+            } if name == "held/blob" && bytes == b"payload"
+        ));
+        assert_eq!(
+            timer_rx.try_recv().expect("follow-up effect ran"),
+            (TimerId::Backup(VsetId(9)), 123)
+        );
+    }
+
+    #[test]
+    fn blob_worker_writes_durably_and_reads_ranges() {
+        let root = std::env::temp_dir().join(format!(
+            "blockd-blob-worker-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (job_tx, job_rx) = channel();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let (msg_tx, msg_rx) = channel();
+        let worker = {
+            let root = root.clone();
+            thread::spawn(move || blob_worker_loop(&job_rx, &root, &msg_tx))
+        };
+
+        job_tx
+            .send(BlobJob::Write {
+                io: IoId(1),
+                name: "nested/blob".to_owned(),
+                bytes: b"abcdefgh".to_vec(),
+            })
+            .expect("send write");
+        assert!(matches!(
+            msg_rx.recv().expect("write completion"),
+            Msg::Ev(Event::BlobWriteDone { io: IoId(1) })
+        ));
+
+        job_tx
+            .send(BlobJob::ReadRange {
+                io: IoId(2),
+                name: "nested/blob".to_owned(),
+                offset: 2,
+                len: 4,
+            })
+            .expect("send read");
+        assert!(matches!(
+            msg_rx.recv().expect("read completion"),
+            Msg::Ev(Event::BlobReadDone {
+                io: IoId(2),
+                bytes: Some(bytes),
+            })
+            if bytes == b"cdef"
+        ));
+
+        drop(job_tx);
+        worker.join().expect("worker");
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 }

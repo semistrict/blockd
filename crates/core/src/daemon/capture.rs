@@ -326,6 +326,13 @@ impl Daemon {
                 overlay.insert(page, entry);
             }
         }
+        let mut new_locs_by_span: BTreeMap<u32, Vec<(PageId, (Gen, PageLoc))>> = BTreeMap::new();
+        for &(page, entry) in new_locs {
+            new_locs_by_span
+                .entry(span_of(page))
+                .or_default()
+                .push((page, entry));
+        }
         let mut leaf_table = state.leaf_table.clone();
         let mut span_counts: BTreeMap<u32, usize> = BTreeMap::new();
         for page in overlay.keys() {
@@ -373,9 +380,11 @@ impl Daemon {
                 .range(lo..=hi)
                 .map(|(page, entry)| (*page, *entry))
                 .collect();
-            for &(page, entry) in new_locs {
-                if span_of(page) == span && content.get(&page).is_none_or(|(g, _)| *g < entry.0) {
-                    content.insert(page, entry);
+            if let Some(entries) = new_locs_by_span.get(&span) {
+                for &(page, entry) in entries {
+                    if content.get(&page).is_none_or(|(g, _)| *g < entry.0) {
+                        content.insert(page, entry);
+                    }
                 }
             }
             let id = state.next_leaf;
@@ -863,20 +872,19 @@ impl Daemon {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
         };
-        let mut keep_records: Vec<JournalSeq> = Vec::new();
+        let mut keep_records: BTreeSet<JournalSeq> = BTreeSet::new();
         if let Some((_, seq)) = state.best {
-            keep_records.push(seq);
+            keep_records.insert(seq);
         }
         if let Some(pinned) = &state.pinned {
-            keep_records.push(pinned.seq);
+            keep_records.insert(pinned.seq);
         }
-        let in_flight: Vec<JournalSeq> = state.captures.keys().copied().collect();
-        keep_records.extend(&in_flight);
+        keep_records.extend(state.captures.keys().copied());
         // An in-flight backup publish pins its record and segments: the
         // store copy reads them from local disk (R4.2), and writeback must
         // not race them away.
         if let Some(publish) = &state.publish {
-            keep_records.push(publish.record.seq);
+            keep_records.insert(publish.record.seq);
         }
         // The watermark anchor (R3.8): if none of the kept records carries
         // the highest synced-through watermark, the record that does must
@@ -892,7 +900,7 @@ impl Daemon {
             .max_by_key(|&(seq, &(_, w))| (w, *seq))
             && w > kept_w
         {
-            keep_records.push(anchor);
+            keep_records.insert(anchor);
         }
 
         // Leaves stay while any kept record (or the serving table, or an
@@ -911,7 +919,7 @@ impl Daemon {
             keep_leaves.extend(publish.record.leaves.values());
         }
 
-        let mut keep_segs: Vec<(u64, SegId)> = Vec::new();
+        let mut keep_segs: BTreeSet<(u64, SegId)> = BTreeSet::new();
         keep_segs.extend(
             state
                 .page_locs
@@ -954,7 +962,7 @@ impl Daemon {
             if let Pending::Fetch { page, loc, .. } = pending
                 && page.volume.vset == vset_id
             {
-                keep_segs.push((loc.fence, loc.seg));
+                keep_segs.insert((loc.fence, loc.seg));
             }
         }
         let state = self.vsets.get_mut(&vset_id).expect("known vset");

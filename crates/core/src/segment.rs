@@ -100,6 +100,19 @@ impl SegmentBuilder {
 /// Decode and verify one entry read by ranged read (the fault path). Returns
 /// the page identity, generation and the decompressed page bytes.
 pub fn open_entry(vset: VsetId, bytes: &[u8]) -> Result<(PageId, Gen, Vec<u8>), DecodeError> {
+    let (page, generation, stored) = parse_entry(vset, bytes)?;
+    let raw = lz4_flex::block::decompress(stored, PAGE_SIZE).map_err(|_| DecodeError)?;
+    if raw.len() != PAGE_SIZE {
+        return Err(DecodeError);
+    }
+    Ok((page, generation, raw))
+}
+
+/// Verify an entry's frame and metadata without expanding its payload.
+/// Whole-segment scans use this path: the frame CRC validates the stored
+/// compressed bytes, while page decompression stays on the selected-entry
+/// path instead of multiplying capture, compaction, and publish CPU cost.
+fn parse_entry(vset: VsetId, bytes: &[u8]) -> Result<(PageId, Gen, &[u8]), DecodeError> {
     let payload = open_frame(MAGIC_SEG_ENT, bytes)?;
     let mut d = Dec::new(payload);
     let volume = VolumeIdx(d.u8()?);
@@ -108,19 +121,16 @@ pub fn open_entry(vset: VsetId, bytes: &[u8]) -> Result<(PageId, Gen, Vec<u8>), 
     let stored_len = usize::try_from(d.u32()?).expect("u32 fits usize");
     let stored = d.bytes(stored_len)?;
     d.finish()?;
-    let raw = lz4_flex::block::decompress(stored, PAGE_SIZE).map_err(|_| DecodeError)?;
-    if raw.len() != PAGE_SIZE {
-        return Err(DecodeError);
-    }
     let page = PageId {
         volume: VolumeId { vset, idx: volume },
         page: page_no,
     };
-    Ok((page, generation, raw))
+    Ok((page, generation, stored))
 }
 
-/// Scan a whole segment blob (recovery, hydration, backup verification):
-/// verify the header and every entry, returning identities and locations.
+/// Scan a whole segment blob (recovery, hydration, backup verification),
+/// checksumming the header and every stored entry and returning identities
+/// and locations. Individual entries are decompressed only when consumed.
 pub fn scan_segment(bytes: &[u8]) -> Result<(VsetId, u64, SegId, SegmentEntries), DecodeError> {
     let hdr_end = FRAME_HEADER + HDR_PAYLOAD;
     if bytes.len() < hdr_end {
@@ -151,7 +161,7 @@ pub fn scan_segment(bytes: &[u8]) -> Result<(VsetId, u64, SegId, SegmentEntries)
         if rest.len() < entry_len {
             return Err(DecodeError);
         }
-        let (page, generation, _) = open_entry(vset, &rest[..entry_len])?;
+        let (page, generation, _) = parse_entry(vset, &rest[..entry_len])?;
         entries.push((
             page,
             generation,
@@ -251,5 +261,20 @@ mod tests {
         let mut entry = blob[start..end].to_vec();
         entry[20] ^= 0x40;
         assert!(open_entry(vset, &entry).is_err());
+    }
+
+    #[test]
+    fn segment_scans_reject_any_single_bit_flip() {
+        let (blob, _) = sample_segment();
+        for byte in 0..blob.len() {
+            for bit in 0..8 {
+                let mut damaged = blob.clone();
+                damaged[byte] ^= 1 << bit;
+                assert!(
+                    scan_segment(&damaged).is_err(),
+                    "bit {bit} of byte {byte} escaped the segment scan"
+                );
+            }
+        }
     }
 }

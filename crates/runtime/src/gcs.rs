@@ -33,6 +33,10 @@ const MAX_OBJECT: u64 = 64 * 1024 * 1024 + 4096;
 /// Refresh the token while this much of its lifetime remains.
 const TOKEN_SLACK: Duration = Duration::from_mins(5);
 
+/// Match the runtime's store-worker concurrency so a burst can reuse one
+/// established connection per worker instead of paying new TLS handshakes.
+const IDLE_CONNECTIONS: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct GcsConfig {
     pub bucket: String,
@@ -143,6 +147,8 @@ impl GcsStore {
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(2)))
             .timeout_global(Some(Duration::from_secs(30)))
+            .max_idle_connections(IDLE_CONNECTIONS)
+            .max_idle_connections_per_host(IDLE_CONNECTIONS)
             .build();
         GcsStore {
             cfg,
@@ -437,5 +443,23 @@ mod tests {
             assert_eq!(encode_key(key), key);
         }
         assert_eq!(encode_key("a key%"), "a%20key%25");
+    }
+
+    #[test]
+    fn connection_pool_matches_worker_concurrency() {
+        let store = GcsStore::new(GcsConfig {
+            bucket: "bucket".to_owned(),
+            prefix: String::new(),
+            endpoint: "http://127.0.0.1".to_owned(),
+            metadata_endpoint: "http://127.0.0.1".to_owned(),
+        });
+        assert_eq!(
+            store.agent.config().max_idle_connections(),
+            IDLE_CONNECTIONS
+        );
+        assert_eq!(
+            store.agent.config().max_idle_connections_per_host(),
+            IDLE_CONNECTIONS
+        );
     }
 }
