@@ -50,7 +50,13 @@ fn main() {
                 .expect("usage: demod fake-gcs <addr>")
                 .parse()
                 .expect("addr");
-            let (_fake, endpoint) = FakeGcs::start_on(addr);
+            let (fake, endpoint) = FakeGcs::start_on(addr);
+            if let Some(ms) = args.get(3) {
+                let ms: u64 = ms.parse().expect("latency ms");
+                fake.latency_ms
+                    .store(ms, std::sync::atomic::Ordering::SeqCst);
+                eprintln!("fake-gcs latency {ms}ms");
+            }
             eprintln!("fake-gcs serving on {endpoint}");
             loop {
                 std::thread::park();

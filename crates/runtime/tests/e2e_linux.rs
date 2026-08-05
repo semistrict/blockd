@@ -18,7 +18,8 @@ use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
 use blockd_core::layout;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
-use blockd_runtime::{Runtime, RuntimeConfig, S3Store};
+use blockd_runtime::fakegcs::FakeGcs;
+use blockd_runtime::{GcsConfig, GcsStore, Runtime, RuntimeConfig, S3Store};
 
 const VSET: VsetId = VsetId(1);
 
@@ -400,4 +401,54 @@ fn backup_restore_moves_the_vset_between_hosts_via_s3() {
     assert_eq!(host_b.checkpoint(VSET), 2);
     workload.verify_all(&host_b, true);
     assert_eq!(host_b.incidents(), Vec::<String>::new());
+}
+
+/// Regression: store round-trips must never ride the event loop. With a
+/// real store's latency (~100ms here) a synchronous seam starves fault
+/// resolution — guest writes trickle one per publish cycle, each spawning
+/// its own record, and syncs never ack (the GCP-demo livelock). Backed
+/// vset, latency-injected store: syncs must stay prompt, and captures must
+/// go quiet once the guest does.
+#[test]
+fn backed_vset_syncs_stay_prompt_at_real_store_latency() {
+    let (fake, endpoint) = FakeGcs::start();
+    fake.latency_ms
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+    let store = Arc::new(GcsStore::new(GcsConfig {
+        bucket: "demo".into(),
+        prefix: "blockd/".into(),
+        endpoint: endpoint.clone(),
+        metadata_endpoint: endpoint,
+    }));
+    let config = runtime_config("gcslat", 256);
+    let vc = vset_config(1, 64, true);
+    let rt = Runtime::new(&config, store);
+    rt.create_vset(VSET, vc);
+
+    let mut workload = Workload::new(11, vc);
+    for burst in 0..3u64 {
+        for op in 0..40 {
+            workload.step(&rt, burst * 40 + op);
+        }
+        let start = Instant::now();
+        assert!(rt.guest_sync(VSET, VolumeIdx(1)), "sync rejected");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "sync starved by store latency: {:?}",
+            start.elapsed()
+        );
+    }
+    workload.verify_all(&rt, true);
+
+    // The livelock's signature was captures churning forever with an idle
+    // guest. Let the backup tail drain, then demand quiescence.
+    std::thread::sleep(Duration::from_millis(1500));
+    let settled = rt.counters().records_written;
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        rt.counters().records_written,
+        settled,
+        "captures churning with an idle guest"
+    );
+    assert_eq!(rt.incidents(), Vec::<String>::new());
 }

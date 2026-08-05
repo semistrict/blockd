@@ -60,8 +60,9 @@ cp target/x86_64-unknown-linux-musl/release/blockd-fc-guest "$FC_DIR/initramfs/i
 (cd "$FC_DIR/initramfs" && find . | cpio -o -H newc > "$FC_DIR/initramfs.cpio")
 
 echo "$(date -u) building patched Firecracker (UffdShmem backend)"
-FC_COMMIT=f79d660
-if [ ! -d /opt/firecracker ]; then
+FC_COMMIT=f79d660a379fed936d9234adad3298c0acc9bcd5
+if [ ! -f /opt/firecracker/Cargo.toml ]; then
+  rm -rf /opt/firecracker
   mkdir -p /opt/firecracker
   cd /opt/firecracker
   git init -q
@@ -72,7 +73,7 @@ if [ ! -d /opt/firecracker ]; then
 fi
 cd /opt/firecracker
 cargo build --release -p firecracker
-cp target/release/firecracker "$FC_DIR/firecracker"
+cp build/cargo_target/release/firecracker "$FC_DIR/firecracker"
 
 echo "$(date -u) fetching the Firecracker CI guest kernel"
 ARCH=x86_64

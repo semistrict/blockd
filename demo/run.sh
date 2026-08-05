@@ -16,7 +16,7 @@ say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 show() { printf '   %s\n' "$*"; }
 post() { curl -sf -X POST "$1"; }
 get()  { curl -sf "$1"; }
-field() { sed -n "s/.*\"$2\":\"\?\([^,\"}]*\)\"\?.*/\1/p" <<<"$1"; }
+field() { sed -n "s/.*\"$2\":\"\{0,1\}\([^,\"}]*\)\"\{0,1\}.*/\1/p" <<<"$1"; }
 ssh0() { gcloud compute ssh "$HOST0" --zone "$ZONE" --tunnel-through-iap --command "$1"; }
 ssh1() { gcloud compute ssh "$HOST1" --zone "$ZONE" --tunnel-through-iap --command "$1"; }
 
@@ -33,6 +33,11 @@ for host in "$HOST0" "$HOST1"; do
     sleep 15
   done
 done
+
+say "reset: wipe the demo prefix and restart both daemons (reruns start clean)"
+gcloud storage rm -r "gs://$BUCKET/blockd" 2>/dev/null || true
+ssh0 'sudo systemctl restart blockd-demod'
+ssh1 'sudo systemctl restart blockd-demod'
 
 say "open one SSH tunnel to both demo APIs (they are VPC-internal only)"
 gcloud compute ssh "$HOST0" --zone "$ZONE" --tunnel-through-iap -- -N \

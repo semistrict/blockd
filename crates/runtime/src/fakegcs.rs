@@ -35,6 +35,9 @@ pub struct FakeGcs {
     pub token_expires_in: AtomicU64,
     pub seen: Mutex<Vec<Seen>>,
     pub faults: Mutex<Vec<Fault>>,
+    /// Added to every object request (not token requests): emulates a
+    /// real store's round-trip so cadence bugs reproduce locally.
+    pub latency_ms: AtomicU64,
 }
 
 impl FakeGcs {
@@ -56,6 +59,7 @@ impl FakeGcs {
             token_expires_in: AtomicU64::new(3599),
             seen: Mutex::new(Vec::new()),
             faults: Mutex::new(Vec::new()),
+            latency_ms: AtomicU64::new(0),
         });
         let server = fake.clone();
         thread::spawn(move || {
@@ -84,6 +88,10 @@ impl FakeGcs {
                 continue;
             }
             self.seen.lock().expect("lock").push(seen.clone());
+            let latency = self.latency_ms.load(Ordering::SeqCst);
+            if latency > 0 {
+                thread::sleep(std::time::Duration::from_millis(latency));
+            }
             if let Some(fault) = {
                 let mut faults = self.faults.lock().expect("lock");
                 if faults.is_empty() {

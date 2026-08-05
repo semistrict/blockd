@@ -34,7 +34,8 @@ DEMOD="$TARGET/debug/demod"
 
 say "start: fake GCS + two demod hosts"
 rm -rf "$WORK"; mkdir -p "$WORK"/h0 "$WORK"/h1
-"$DEMOD" fake-gcs 127.0.0.1:7099 >"$WORK/fake-gcs.log" 2>&1 &
+# BLOCKD_FAKEGCS_LATENCY_MS emulates a real store's round-trip.
+"$DEMOD" fake-gcs 127.0.0.1:7099 ${BLOCKD_FAKEGCS_LATENCY_MS:+"$BLOCKD_FAKEGCS_LATENCY_MS"} >"$WORK/fake-gcs.log" 2>&1 &
 for h in 0 1; do
   cat > "$WORK/h$h.conf" <<EOF
 host = $h

@@ -149,7 +149,7 @@ impl FcVm {
             &format!(
                 "{{\"kernel_image_path\": \"{}\", \"initrd_path\": \"{}\", \
                  \"boot_args\": \"keep_bootcon console=ttyS0 reboot=k panic=-1 quiet \
-                 rdinit=/init\"}}",
+                 no-kvmapf rdinit=/init\"}}",
                 kernel.display(),
                 initrd.display()
             ),
@@ -236,16 +236,18 @@ impl FcVm {
     /// Wait for a serial line starting with `prefix`.
     pub fn wait_line(&mut self, prefix: &str) -> String {
         let deadline = Instant::now() + Duration::from_mins(1);
+        let mut skipped: Vec<String> = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 remaining > Duration::ZERO,
-                "guest never produced a {prefix:?} line"
+                "guest never produced a {prefix:?} line; serial transcript: {skipped:?}"
             );
-            if let Ok(line) = self.lines.recv_timeout(remaining)
-                && let Some(rest) = line.trim_start().strip_prefix(prefix)
-            {
-                return rest.trim().to_owned();
+            if let Ok(line) = self.lines.recv_timeout(remaining) {
+                if let Some(rest) = line.trim_start().strip_prefix(prefix) {
+                    return rest.trim().to_owned();
+                }
+                skipped.push(line);
             }
         }
     }

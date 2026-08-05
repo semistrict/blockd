@@ -74,6 +74,7 @@ pub struct Demod {
     pub vms: Mutex<BTreeMap<u64, Vm>>,
     next_vm: AtomicU64,
     next_fork: AtomicU64,
+    next_server: AtomicU64,
     servers: Mutex<BTreeMap<String, Arc<FillServer>>>,
 }
 
@@ -109,6 +110,7 @@ impl Demod {
             store,
             vms: Mutex::new(BTreeMap::new()),
             next_fork: AtomicU64::new(1),
+            next_server: AtomicU64::new(0),
             servers: Mutex::new(BTreeMap::new()),
         }
     }
@@ -138,6 +140,10 @@ impl Demod {
         vm.pause();
         vm.snapshot(&vmstate, &mem);
         vm.kill();
+        // A re-bake replaces the store objects; a cached fill server for
+        // the old snapshot would serve stale memory against the new
+        // vmstate. Drop it so the next boot re-fetches.
+        self.servers.lock().expect("lock").remove("base");
         self.publish_snapshot("base", &vmstate, &mem);
         self.store
             .put("base/sum", sum.clone().into_bytes())
@@ -167,7 +173,11 @@ impl Demod {
         if let Some(server) = servers.get(prefix) {
             return server.clone();
         }
-        let tag = format!("{}-{}", self.cfg.host.0, servers.len());
+        let tag = format!(
+            "{}-{}",
+            self.cfg.host.0,
+            self.next_server.fetch_add(1, Ordering::Relaxed)
+        );
         let sock = self.cfg.scratch.join(format!("fill-{tag}.sock"));
         let shmem = self.cfg.shmem_dir.join(format!("blockd-{tag}.shmem"));
         let _ = std::fs::remove_file(&sock);

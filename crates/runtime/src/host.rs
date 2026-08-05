@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, TimerId, Verdict};
+use blockd_core::seam::{
+    AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, TimerId, Verdict,
+};
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, PAGE_SIZE, Uffd, UffdFeatures};
 
@@ -151,9 +153,11 @@ pub struct Runtime {
 
 impl Runtime {
     /// A fresh daemon on an empty (or to-be-ignored) blob directory.
+    // Ownership transfer: the store workers clone from it.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(config: &RuntimeConfig, store: Arc<dyn ObjectStore>) -> Runtime {
         let (daemon, effects) = Daemon::new(config.daemon.clone());
-        Runtime::start(daemon, effects, BTreeMap::new(), config, store)
+        Runtime::start(daemon, effects, BTreeMap::new(), config, &store)
     }
 
     /// Recover a daemon from the blobs actually on disk (R8.2). The caller
@@ -162,6 +166,7 @@ impl Runtime {
     /// too). Returns the per-vset verdicts for non-backed vsets; backed
     /// vsets report `VsetRecovered` through admin replies after their head
     /// refresh.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn recover(
         config: &RuntimeConfig,
         store: Arc<dyn ObjectStore>,
@@ -179,7 +184,7 @@ impl Runtime {
         for (&vset, &vc) in vset_configs {
             hosts.insert(vset, VsetHost::new(vc));
         }
-        let runtime = Runtime::start(daemon, effects, hosts, config, store);
+        let runtime = Runtime::start(daemon, effects, hosts, config, &store);
         for (&vset, host) in runtime.shared.vsets.lock().expect("lock").iter() {
             runtime.spawn_fault_reader(vset, host.clone());
         }
@@ -191,7 +196,7 @@ impl Runtime {
         boot_effects: Vec<Effect>,
         hosts: BTreeMap<VsetId, Arc<VsetHost>>,
         config: &RuntimeConfig,
-        store: Arc<dyn ObjectStore>,
+        store: &Arc<dyn ObjectStore>,
     ) -> Runtime {
         std::fs::create_dir_all(&config.blob_dir).expect("blob dir");
         let (tx, rx) = channel::<Msg>();
@@ -218,6 +223,21 @@ impl Runtime {
             thread::spawn(move || timer_loop(&timer_rx, &tx));
         }
 
+        // Store workers: object-store round-trips run here, never on the
+        // event loop — a store put at real latency on the loop thread
+        // would stall fault resolution for every vset (the daemon is
+        // sans-IO precisely so completions can arrive as events).
+        let (store_tx, store_rx) = channel::<StoreJob>();
+        {
+            let store_rx = Arc::new(Mutex::new(store_rx));
+            for _ in 0..STORE_WORKERS {
+                let store = store.clone();
+                let tx = tx.clone();
+                let store_rx = store_rx.clone();
+                thread::spawn(move || store_worker_loop(&store_rx, store.as_ref(), &tx));
+            }
+        }
+
         // The event loop: the daemon lives here.
         let loop_thread = {
             let shared = shared.clone();
@@ -232,7 +252,7 @@ impl Runtime {
                         apply_effect(
                             effect,
                             &shared,
-                            &store,
+                            &store_tx,
                             &blob_dir,
                             &timer_tx,
                             &admin_tx,
@@ -555,7 +575,7 @@ impl Drop for Runtime {
 fn apply_effect(
     effect: Effect,
     shared: &Arc<Shared>,
-    store: &Arc<dyn ObjectStore>,
+    store_tx: &Sender<StoreJob>,
     blob_dir: &Path,
     timer_tx: &Sender<(TimerId, u64)>,
     admin_tx: &Sender<AdminReply>,
@@ -687,8 +707,7 @@ fn apply_effect(
             let _ = timer_tx.send((timer, after));
         }
         Effect::StorePut { io, key, bytes } => {
-            let result = store.put(&key, bytes);
-            local.push_back(Event::StorePutDone { io, result });
+            let _ = store_tx.send(StoreJob::Put { io, key, bytes });
         }
         Effect::StoreCas {
             io,
@@ -696,12 +715,15 @@ fn apply_effect(
             expected,
             bytes,
         } => {
-            let result = store.put_cas(&key, expected, bytes);
-            local.push_back(Event::StorePutDone { io, result });
+            let _ = store_tx.send(StoreJob::Cas {
+                io,
+                key,
+                expected,
+                bytes,
+            });
         }
         Effect::StoreGet { io, key } => {
-            let result = store.get(&key);
-            local.push_back(Event::StoreGetDone { io, result });
+            let _ = store_tx.send(StoreJob::Get { io, key });
         }
         Effect::StoreGetRange {
             io,
@@ -709,11 +731,15 @@ fn apply_effect(
             offset,
             len,
         } => {
-            let result = store.get_range(&key, offset, len);
-            local.push_back(Event::StoreGetDone { io, result });
+            let _ = store_tx.send(StoreJob::GetRange {
+                io,
+                key,
+                offset,
+                len,
+            });
         }
         Effect::StoreDelete { key } => {
-            store.delete(&key);
+            let _ = store_tx.send(StoreJob::Delete { key });
         }
         Effect::VsetFenced { vset } => {
             shared
@@ -736,6 +762,87 @@ fn apply_effect(
         Effect::Abort { reason } => {
             eprintln!("FATAL: daemon abort: {reason}");
             std::process::abort();
+        }
+    }
+}
+
+/// Concurrent object-store round-trips. The daemon's own pipelines bound
+/// what is outstanding (one publish per vset, deduped cold fetches); this
+/// only caps the parallelism of what it issues.
+const STORE_WORKERS: usize = 8;
+
+/// One object-store operation, executed off the event loop; its completion
+/// returns as an event. Deletes are fire-and-forget (R4.5 reclaim).
+enum StoreJob {
+    Put {
+        io: IoId,
+        key: String,
+        bytes: Vec<u8>,
+    },
+    Cas {
+        io: IoId,
+        key: String,
+        expected: Option<u64>,
+        bytes: Vec<u8>,
+    },
+    Get {
+        io: IoId,
+        key: String,
+    },
+    GetRange {
+        io: IoId,
+        key: String,
+        offset: u64,
+        len: u64,
+    },
+    Delete {
+        key: String,
+    },
+}
+
+fn store_worker_loop(
+    rx: &Arc<Mutex<Receiver<StoreJob>>>,
+    store: &dyn ObjectStore,
+    tx: &Sender<Msg>,
+) {
+    loop {
+        let Ok(job) = rx.lock().expect("lock").recv() else {
+            return;
+        };
+        let event = match job {
+            StoreJob::Put { io, key, bytes } => Event::StorePutDone {
+                io,
+                result: store.put(&key, bytes),
+            },
+            StoreJob::Cas {
+                io,
+                key,
+                expected,
+                bytes,
+            } => Event::StorePutDone {
+                io,
+                result: store.put_cas(&key, expected, bytes),
+            },
+            StoreJob::Get { io, key } => Event::StoreGetDone {
+                io,
+                result: store.get(&key),
+            },
+            StoreJob::GetRange {
+                io,
+                key,
+                offset,
+                len,
+            } => Event::StoreGetDone {
+                io,
+                result: store.get_range(&key, offset, len),
+            },
+            StoreJob::Delete { key } => {
+                store.delete(&key);
+                continue;
+            }
+        };
+        if tx.send(Msg::Ev(event)).is_err() {
+            return;
         }
     }
 }

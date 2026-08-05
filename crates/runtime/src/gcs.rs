@@ -304,7 +304,13 @@ impl ObjectStore for GcsStore {
         let resp = self.request("PUT", key, &[], Some(&bytes))?;
         match resp.status {
             200 => Ok(Self::generation_or_abort("PUT", &resp)),
-            status => abort("PUT", &format!("status {status} for {key}")),
+            status => abort(
+                "PUT",
+                &format!(
+                    "status {status} for {key}: {}",
+                    String::from_utf8_lossy(&resp.body)
+                ),
+            ),
         }
     }
 
@@ -329,7 +335,13 @@ impl ObjectStore for GcsStore {
                     actual: self.head_generation(key)?,
                 })
             }
-            status => abort("CAS PUT", &format!("status {status} for {key}")),
+            status => abort(
+                "CAS PUT",
+                &format!(
+                    "status {status} for {key}: {}",
+                    String::from_utf8_lossy(&resp.body)
+                ),
+            ),
         }
     }
 
