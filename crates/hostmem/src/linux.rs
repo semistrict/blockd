@@ -649,30 +649,44 @@ impl Uffd {
         Ok(())
     }
 
-    /// Block until the next fault event. (Layout checked against the uapi
-    /// header by the ABI probe: event at offset 0, pagefault flags at 8,
-    /// address at 16.)
-    pub fn read_event(&self) -> io::Result<FaultEvent> {
-        let mut buf = [0u8; 64];
+    /// Block until at least one fault is pending, then return EVERY event
+    /// the kernel hands back: a uffd read fills the buffer with as many
+    /// queued `uffd_msg`s as fit (blocking only for the first), so a
+    /// reader that parsed just one would consume and silently drop the
+    /// rest — leaving those faulters parked in the kernel forever.
+    /// (Message layout checked against the uapi header by the ABI probe:
+    /// 32-byte stride, event at offset 0, pagefault flags at 8, address
+    /// at 16.)
+    pub fn read_events(&self) -> io::Result<Vec<FaultEvent>> {
+        const MSG_SIZE: usize = 32; // sizeof(struct uffd_msg)
+        let mut buf = [0u8; 32 * MSG_SIZE];
         // SAFETY: reading into a local buffer.
         let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             return Err(errno("read(uffd)"));
         }
-        let event = buf[0];
-        if event != UFFD_EVENT_PAGEFAULT {
-            return Err(io::Error::other(format!(
-                "unexpected uffd event 0x{event:x}"
-            )));
+        let n = usize::try_from(n).expect("fits");
+        if n == 0 || n % MSG_SIZE != 0 {
+            return Err(io::Error::other(format!("torn uffd read: {n} bytes")));
         }
-        let flags = u64::from_le_bytes(buf[8..16].try_into().expect("sized"));
-        let address = u64::from_le_bytes(buf[16..24].try_into().expect("sized"));
-        Ok(FaultEvent {
-            address: usize::try_from(address).expect("fits"),
-            write: flags & UFFD_PAGEFAULT_FLAG_WRITE != 0,
-            wp: flags & UFFD_PAGEFAULT_FLAG_WP != 0,
-            minor: flags & UFFD_PAGEFAULT_FLAG_MINOR != 0,
-        })
+        let mut events = Vec::with_capacity(n / MSG_SIZE);
+        for msg in buf[..n].chunks_exact(MSG_SIZE) {
+            let event = msg[0];
+            if event != UFFD_EVENT_PAGEFAULT {
+                return Err(io::Error::other(format!(
+                    "unexpected uffd event 0x{event:x}"
+                )));
+            }
+            let flags = u64::from_le_bytes(msg[8..16].try_into().expect("sized"));
+            let address = u64::from_le_bytes(msg[16..24].try_into().expect("sized"));
+            events.push(FaultEvent {
+                address: usize::try_from(address).expect("fits"),
+                write: flags & UFFD_PAGEFAULT_FLAG_WRITE != 0,
+                wp: flags & UFFD_PAGEFAULT_FLAG_WP != 0,
+                minor: flags & UFFD_PAGEFAULT_FLAG_MINOR != 0,
+            });
+        }
+        Ok(events)
     }
 }
 

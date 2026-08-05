@@ -78,34 +78,36 @@ impl Vm {
                 faults.clone(),
             );
             thread::spawn(move || {
-                while let Ok(event) = uffd.read_event() {
-                    faults.fetch_add(1, Ordering::SeqCst);
-                    let addr = event.address & !(PAGE_SIZE - 1);
-                    if event.wp {
-                        uffd.writeprotect(addr, PAGE_SIZE, false)
-                            .expect("unprotect");
-                        continue;
-                    }
-                    if (base_win.addr_of(0)..base_win.addr_of(0) + BASE_PAGES * PAGE_SIZE)
-                        .contains(&addr)
-                    {
-                        let page = (addr - base_win.addr_of(0)) / PAGE_SIZE;
-                        if event.missing() {
-                            // The backing was reclaimed: "refetch from the
-                            // store" (the base image is the store here).
-                            base.write_page(page, &base_pattern(page));
+                while let Ok(events) = uffd.read_events() {
+                    for event in events {
+                        faults.fetch_add(1, Ordering::SeqCst);
+                        let addr = event.address & !(PAGE_SIZE - 1);
+                        if event.wp {
+                            uffd.writeprotect(addr, PAGE_SIZE, false)
+                                .expect("unprotect");
+                            continue;
                         }
-                        uffd.continue_range(addr, PAGE_SIZE, false)
-                            .expect("continue base");
-                    } else {
-                        let page = (addr - own_win.addr_of(0)) / PAGE_SIZE;
-                        // Divergence: copy-on-write from the base image
-                        // into this VM's own storage (the sim's CoW path:
-                        // the page's location moves to the fork's own
-                        // namespace).
-                        own.write_page(page, &base_pattern(page));
-                        uffd.continue_range(addr, PAGE_SIZE, false)
-                            .expect("continue own");
+                        if (base_win.addr_of(0)..base_win.addr_of(0) + BASE_PAGES * PAGE_SIZE)
+                            .contains(&addr)
+                        {
+                            let page = (addr - base_win.addr_of(0)) / PAGE_SIZE;
+                            if event.missing() {
+                                // The backing was reclaimed: "refetch from the
+                                // store" (the base image is the store here).
+                                base.write_page(page, &base_pattern(page));
+                            }
+                            uffd.continue_range(addr, PAGE_SIZE, false)
+                                .expect("continue base");
+                        } else {
+                            let page = (addr - own_win.addr_of(0)) / PAGE_SIZE;
+                            // Divergence: copy-on-write from the base image
+                            // into this VM's own storage (the sim's CoW path:
+                            // the page's location moves to the fork's own
+                            // namespace).
+                            own.write_page(page, &base_pattern(page));
+                            uffd.continue_range(addr, PAGE_SIZE, false)
+                                .expect("continue own");
+                        }
                     }
                 }
             });
@@ -334,17 +336,19 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
             swapped_out.clone(),
         );
         thread::spawn(move || {
-            while let Ok(event) = uffd.read_event() {
-                let addr = event.address & !(PAGE_SIZE - 1);
-                let page = (addr - view.addr_of(0)) / PAGE_SIZE;
-                assert!(event.missing(), "unexpected fault kind: {event:?}");
-                let mut buf = PageBuf::new();
-                if swapped_out.load(Ordering::SeqCst) {
-                    file.read_page(page, &mut buf).expect("swap-in read");
+            while let Ok(events) = uffd.read_events() {
+                for event in events {
+                    let addr = event.address & !(PAGE_SIZE - 1);
+                    let page = (addr - view.addr_of(0)) / PAGE_SIZE;
+                    assert!(event.missing(), "unexpected fault kind: {event:?}");
+                    let mut buf = PageBuf::new();
+                    if swapped_out.load(Ordering::SeqCst) {
+                        file.read_page(page, &mut buf).expect("swap-in read");
+                    }
+                    region.write_page(page, buf.as_slice());
+                    uffd.continue_range(addr, PAGE_SIZE, false)
+                        .expect("continue");
                 }
-                region.write_page(page, buf.as_slice());
-                uffd.continue_range(addr, PAGE_SIZE, false)
-                    .expect("continue");
             }
         });
     }

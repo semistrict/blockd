@@ -333,8 +333,17 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     );
 
     // Backing reclaim (R2.4/R2.7 under a real VMM): free the entire base.
+    // Paused vCPUs make the zero-resident check exact — a running guest's
+    // timer ticks refault kernel pages through the fill door the instant
+    // the punch lands, and that's refill working, not reclaim failing.
+    for fork in &forks {
+        fork.pause();
+    }
     server.reclaim_all(mem_bytes);
     assert_eq!(server.resident_bytes(), 0, "reclaim left pages behind");
+    for fork in &forks {
+        fork.resume();
+    }
     // Every fork still has its exact diverged state: dirty CoW pages
     // survived the punch; clean pages refaulted and refilled through the
     // handler.

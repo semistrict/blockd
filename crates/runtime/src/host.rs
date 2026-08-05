@@ -316,16 +316,18 @@ impl Runtime {
     fn spawn_fault_reader(&self, vset: VsetId, host: Arc<VsetHost>) {
         let tx = self.tx.clone();
         thread::spawn(move || {
-            while let Ok(event) = host.uffd.read_event() {
-                let page = host.page_of_addr(vset, event.address & !(PAGE_SIZE - 1));
-                if tx
-                    .send(Msg::Ev(Event::GuestFault {
-                        page,
-                        write: event.write,
-                    }))
-                    .is_err()
-                {
-                    break;
+            while let Ok(events) = host.uffd.read_events() {
+                for event in events {
+                    let page = host.page_of_addr(vset, event.address & !(PAGE_SIZE - 1));
+                    if tx
+                        .send(Msg::Ev(Event::GuestFault {
+                            page,
+                            write: event.write,
+                        }))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         });

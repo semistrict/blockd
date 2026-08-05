@@ -31,6 +31,15 @@ fn required_features() -> u64 {
     UffdFeatures::PAGEFAULT_FLAG_WP | UffdFeatures::MINOR_SHMEM | UffdFeatures::WP_HUGETLBFS_SHMEM
 }
 
+/// For the serialized tests below exactly one fault can be pending —
+/// assert that, so an unexpected extra event fails loudly instead of
+/// leaking into the next read.
+fn one_event(uffd: &Uffd) -> FaultEvent {
+    let mut events = uffd.read_events().expect("events");
+    assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+    events.pop().expect("one")
+}
+
 #[test]
 fn kernel_grants_the_features_this_design_needs() {
     let (_uffd, features) = Uffd::new(required_features()).expect("userfaultfd handshake");
@@ -67,7 +76,7 @@ fn first_touch_faults_missing_and_resolves_via_continue() {
         let (region, view, uffd, faults) =
             (region.clone(), view.clone(), uffd.clone(), faults.clone());
         thread::spawn(move || {
-            let event = uffd.read_event().expect("event");
+            let event = one_event(&uffd);
             assert!(event.missing(), "expected a missing fault: {event:?}");
             assert_eq!(event.address & !(PAGE_SIZE - 1), view.addr_of(2));
             faults.fetch_add(1, Ordering::SeqCst);
@@ -170,7 +179,7 @@ fn write_protect_traps_before_the_store_and_capture_reads_old_bytes() {
     let handler = {
         let (region, view, uffd) = (region.clone(), view.clone(), uffd.clone());
         thread::spawn(move || {
-            let event = uffd.read_event().expect("event");
+            let event = one_event(&uffd);
             assert!(
                 event.wp && event.write,
                 "expected a write-protect fault: {event:?}"
@@ -215,7 +224,7 @@ fn continue_can_install_write_protected() {
     let handler = {
         let (view, uffd) = (view.clone(), uffd.clone());
         thread::spawn(move || {
-            let event = uffd.read_event().expect("event");
+            let event = one_event(&uffd);
             assert!(event.wp && event.write, "not a wp fault: {event:?}");
             uffd.writeprotect(view.addr_of(0), PAGE_SIZE, false)
                 .expect("clear");
@@ -249,7 +258,7 @@ fn evict_drops_ptes_keeps_data_and_refaults_minor() {
     let handler = {
         let (view, uffd, faults) = (view.clone(), uffd.clone(), faults.clone());
         thread::spawn(move || {
-            let event = uffd.read_event().expect("event");
+            let event = one_event(&uffd);
             assert!(event.minor, "refault after evict must be minor: {event:?}");
             faults.fetch_add(1, Ordering::SeqCst);
             // No repopulate needed: the page cache still has the bytes.
@@ -296,7 +305,7 @@ fn hole_punch_frees_the_backing_and_the_next_touch_traps_for_refill() {
     let handler = {
         let (region, view, uffd) = (region.clone(), view.clone(), uffd.clone());
         thread::spawn(move || {
-            let event = uffd.read_event().expect("event");
+            let event = one_event(&uffd);
             // Kernel-verified: the backing is gone, so this is a MISSING
             // fault (a present-but-unmapped page would be MINOR).
             assert!(
@@ -336,7 +345,7 @@ fn capture_cycle_write_protect_read_rearm() {
         let (view, uffd) = (view.clone(), uffd.clone());
         thread::spawn(move || {
             for _ in 0..2 {
-                let event = uffd.read_event().expect("event");
+                let event = one_event(&uffd);
                 events_tx.send(event).expect("send");
                 uffd.writeprotect(view.addr_of(0), PAGE_SIZE, false)
                     .expect("clear");
@@ -357,4 +366,82 @@ fn capture_cycle_write_protect_read_rearm() {
         assert_eq!(view.read_word(0), round);
     }
     handler.join().expect("handler");
+}
+
+/// True in /proc exactly when the thread sleeps in the kernel — which,
+/// for the faulters below, can only be `handle_userfault` (the message
+/// is queued before the task schedules away, so blocked implies
+/// readable).
+fn thread_is_blocked(tid: i64) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")) else {
+        return false;
+    };
+    // Field 3 (state) follows the parenthesized comm; comm may itself
+    // contain parentheses, so split after the LAST one.
+    let after = stat.rsplit(')').next().unwrap_or("");
+    matches!(after.split_whitespace().next(), Some("S" | "D"))
+}
+
+/// Two guests fault concurrently on one uffd: the kernel queues both
+/// messages and a single read returns BOTH. A reader that parsed only
+/// the first message would consume and drop the second — that faulter
+/// would stay parked in the kernel forever (the bug this test pins).
+#[test]
+fn one_read_returns_every_pending_fault() {
+    let region = Arc::new(HostRegion::new(2).expect("region"));
+    let view = Arc::new(GuestView::map(&region, 0, 2).expect("view"));
+    let (uffd, _) = Uffd::new(required_features()).expect("uffd");
+    uffd.register_all(&view).expect("register");
+    let uffd = Arc::new(uffd);
+
+    let tids: Vec<Arc<AtomicU64>> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let faulters: Vec<_> = (0..2)
+        .map(|page| {
+            let (view, tid) = (view.clone(), tids[page].clone());
+            thread::spawn(move || {
+                // SAFETY: plain gettid, no arguments.
+                let t = u64::try_from(unsafe { libc::gettid() }).expect("fits");
+                tid.store(t, Ordering::SeqCst);
+                // The ONLY blocking point after publishing the tid: the
+                // MISSING fault (read_word allocates nothing).
+                view.read_word(page)
+            })
+        })
+        .collect();
+
+    // Both faults must be QUEUED before the one read below — wait until
+    // each faulter is observably asleep in the kernel.
+    for tid in &tids {
+        loop {
+            let t = tid.load(Ordering::SeqCst);
+            if t != 0 && thread_is_blocked(i64::try_from(t).expect("fits")) {
+                break;
+            }
+            thread::yield_now();
+        }
+    }
+
+    let events = uffd.read_events().expect("events");
+    assert_eq!(
+        events.len(),
+        2,
+        "one read must surface both pending faults: {events:?}"
+    );
+    for event in &events {
+        assert!(event.missing(), "expected a missing fault: {event:?}");
+        let addr = event.address & !(PAGE_SIZE - 1);
+        let page = (addr - view.addr_of(0)) / PAGE_SIZE;
+        region.write_page(page, &pattern(0x80 + page as u8));
+        uffd.continue_range(addr, PAGE_SIZE, false)
+            .expect("continue");
+    }
+    for (page, faulter) in faulters.into_iter().enumerate() {
+        let got = faulter.join().expect("faulter");
+        let expected =
+            u64::from_le_bytes(pattern(0x80 + page as u8)[0..8].try_into().expect("sized"));
+        assert_eq!(
+            got, expected,
+            "page {page}: fill bytes did not reach the guest"
+        );
+    }
 }
