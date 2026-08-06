@@ -275,6 +275,14 @@ fn schedule_faults(h: &mut Harness) {
 }
 
 pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
+    run_final_blobs(seed, config).0
+}
+
+/// Run, and also export the blob device's final contents verbatim — every
+/// name and byte exactly as the run left them, torn tails and bit rot
+/// included. The differential recovery test writes these to a real
+/// directory and demands the runtime's on-disk scan recover identically.
+pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(String, Vec<u8>)>) {
     let kernel = Kernel::new(seed);
     let (daemon, effects) = Daemon::new(config.daemon.clone());
     let bdev = BlobDev::new(config.bdev.clone());
@@ -358,7 +366,12 @@ pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
     h.store.set_outage(false);
     let (_, keys) = h.store.list_prefix(now, h.kernel.rng(), "");
     h.report.store_keys = keys.expect("outage lifted");
-    h.report
+    let blobs = h
+        .bdev
+        .scan()
+        .map(|(name, bytes)| (name.clone(), bytes.clone()))
+        .collect();
+    (h.report, blobs)
 }
 
 impl Harness {

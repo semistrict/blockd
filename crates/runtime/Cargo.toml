@@ -23,3 +23,8 @@ missing_panics_doc = "allow"
 blockd-core = { path = "../core" }
 blockd-hostmem = { path = "../hostmem" }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# The differential recovery test replays simulation-produced blob sets
+# through the runtime's on-disk scan path.
+blockd-sim = { path = "../sim" }

@@ -13,6 +13,7 @@
 // time are the implementation, not a hazard.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod blobscan;
 pub mod fakegcs;
 #[cfg(target_os = "linux")]
 pub mod fc;
@@ -27,6 +28,7 @@ mod peer;
 mod s3;
 mod store;
 
+pub use blobscan::scan_blob_dir;
 pub use gcs::{GcsConfig, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
 pub use host::{Runtime, RuntimeConfig};

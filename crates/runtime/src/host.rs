@@ -251,8 +251,7 @@ impl Runtime {
         store: Arc<dyn ObjectStore>,
         vset_configs: &BTreeMap<VsetId, VsetConfig>,
     ) -> (Runtime, BTreeMap<VsetId, Verdict>) {
-        let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
-        scan_blobs(&config.blob_dir, &config.blob_dir, &mut blobs);
+        let blobs = crate::blobscan::scan_blob_dir(&config.blob_dir);
         let (daemon, verdicts, effects) = Daemon::recover(
             config.daemon.clone(),
             blobs
@@ -1125,27 +1124,6 @@ struct IoLanes {
 
 fn elapsed_ns(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).expect("fits")
-}
-
-fn scan_blobs(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            scan_blobs(root, &path, out);
-        } else {
-            let name = path
-                .strip_prefix(root)
-                .expect("under root")
-                .to_str()
-                .expect("utf8")
-                .to_owned();
-            let bytes = std::fs::read(&path).expect("blob read");
-            out.push((name, bytes));
-        }
-    }
 }
 
 #[cfg(test)]

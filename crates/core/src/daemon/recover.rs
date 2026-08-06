@@ -31,8 +31,17 @@ impl Daemon {
             max_leaf: u64,
             handoff: Option<crate::types::HostId>,
         }
+        // Canonicalize: recovery must be a function of the blob SET, not
+        // the scan sequence. A real directory walk yields readdir order;
+        // the simulation's blob device yields name order — and scan order
+        // leaks into recovered state (`seg_blobs` order, the cold-record
+        // tiebreak, which duplicate-seq record wins `record_ws`). Sorting
+        // here makes every production recovery byte-identical to the one
+        // the simulation proved on the same bytes.
+        let mut scan: Vec<(&'a str, &'a [u8])> = blobs.collect();
+        scan.sort_unstable_by_key(|&(name, _)| name);
         let mut found: BTreeMap<VsetId, Found> = BTreeMap::new();
-        for (name, bytes) in blobs {
+        for (name, bytes) in scan {
             let Some(parsed) = layout::parse_blob(name) else {
                 continue;
             };

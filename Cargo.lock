@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "blockd-core",
  "blockd-hostmem",
+ "blockd-sim",
  "ureq",
 ]
 
