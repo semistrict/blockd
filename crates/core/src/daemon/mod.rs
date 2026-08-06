@@ -653,6 +653,14 @@ pub struct Daemon {
     /// runner (R7.2). In-memory only: a crash forgets, and the reclaimed
     /// disk plus the placement authority guard the residual.
     released_fences: BTreeMap<VsetId, u64>,
+    /// The highest fence this host's disk has ever held per vset —
+    /// populated by recovery from every scanned name, bumped on adoption.
+    /// An inbound migration takes its fence strictly ABOVE this: an
+    /// earlier incarnation abandoned as unrestorable leaves its blobs
+    /// behind (R4.5: reclaim is explicit), and a re-adoption deriving its
+    /// fence from the offer alone would re-enter that namespace and
+    /// collide with the wreckage's surviving write-once names.
+    fence_floors: BTreeMap<VsetId, u64>,
     /// Local bytes written and not yet deleted (the daemon wrote every byte,
     /// so it does its own accounting; R2.7).
     local_bytes: u64,
@@ -685,6 +693,7 @@ impl Daemon {
             restore_retries: BTreeMap::new(),
             writeback_cursor: 0,
             released_fences: BTreeMap::new(),
+            fence_floors: BTreeMap::new(),
             local_bytes: 0,
             counters: Counters::default(),
         };

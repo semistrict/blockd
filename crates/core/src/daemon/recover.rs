@@ -20,12 +20,14 @@ impl Daemon {
         config: DaemonConfig,
         blobs: impl Iterator<Item = (&'a str, &'a [u8])>,
     ) -> (Daemon, BTreeMap<VsetId, Verdict>, Vec<Effect>) {
-        struct Found {
+        struct Found<'a> {
             records: Vec<JournalRecord>,
             journal_names: Vec<(u64, JournalSeq)>,
             seg_names: Vec<(u64, SegId, u64)>,
             /// Intact leaf blobs: ptr → (size, decoded content).
             leaves: BTreeMap<LeafPtr, (u64, MapLeaf)>,
+            /// Every scanned name of this vset, for wreckage reclaim.
+            names: Vec<&'a str>,
             max_seq: u64,
             max_seg: u64,
             max_leaf: u64,
@@ -41,6 +43,13 @@ impl Daemon {
         let mut scan: Vec<(&'a str, &'a [u8])> = blobs.collect();
         scan.sort_unstable_by_key(|&(name, _)| name);
         let mut found: BTreeMap<VsetId, Found> = BTreeMap::new();
+        // The fence floor: the highest fence this disk has EVER held per
+        // vset, including vsets recovery abandons as unrestorable. Their
+        // blobs stay behind (reclaim is explicit, R4.5) — and a later
+        // inbound migration that derived its fence from the offer alone
+        // could land on the same fence and collide with the wreckage's
+        // surviving write-once names. Adoption goes strictly above this.
+        let mut fence_floors: BTreeMap<VsetId, u64> = BTreeMap::new();
         for (name, bytes) in scan {
             let Some(parsed) = layout::parse_blob(name) else {
                 continue;
@@ -52,16 +61,25 @@ impl Daemon {
                 | BlobName::BaseLeaf { vset, .. }
                 | BlobName::Handoff { vset } => vset,
             };
+            if let BlobName::Journal { fence, .. }
+            | BlobName::Segment { fence, .. }
+            | BlobName::Leaf { fence, .. } = parsed
+            {
+                let floor = fence_floors.entry(vset).or_insert(0);
+                *floor = (*floor).max(fence);
+            }
             let f = found.entry(vset).or_insert_with(|| Found {
                 records: Vec::new(),
                 journal_names: Vec::new(),
                 seg_names: Vec::new(),
                 leaves: BTreeMap::new(),
+                names: Vec::new(),
                 max_seq: 0,
                 max_seg: 0,
                 max_leaf: 0,
                 handoff: None,
             });
+            f.names.push(name);
             match parsed {
                 BlobName::Journal { fence, seq, .. } => {
                     f.journal_names.push((fence, seq));
@@ -105,6 +123,7 @@ impl Daemon {
         }
 
         let (mut daemon, mut effects) = Daemon::new(config);
+        daemon.fence_floors = fence_floors;
         let mut verdicts = BTreeMap::new();
         let mut recovered_bytes: u64 = 0;
         for (vset_id, f) in found {
@@ -125,6 +144,22 @@ impl Daemon {
                 .cloned();
             let Some(cold) = cold else {
                 verdicts.insert(vset_id, Verdict::Unrestorable);
+                // Unrestorable wreckage claims nothing and can only do
+                // harm left behind: an intact stray record would read as
+                // ownership to a LATER recovery, and its write-once names
+                // squat the fence namespace (the fence floor guards the
+                // window until these deletes land). Reclaim it — UNLESS an
+                // intact handoff marker stands: an outbound source's
+                // segments still serve the destination's post-copy tail
+                // by raw reads, records or no records.
+                if f.handoff.is_none() {
+                    for name in f.names {
+                        daemon.counters.blobs_deleted += 1;
+                        effects.push(Effect::BlobDelete {
+                            name: name.to_owned(),
+                        });
+                    }
+                }
                 continue;
             };
             // Recovery is always to the NEWEST committed recovery point

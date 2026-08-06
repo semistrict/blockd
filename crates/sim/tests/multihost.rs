@@ -519,7 +519,13 @@ fn migration_chaos_corpus_stays_consistent() {
     //      harness's WP-retrap model). 1614: destination crashed after its
     //      durable accept, before anyone learned — recovery must complete
     //      the handshake, not ignite a second runner.
-    for seed in [7, 13, 19, 31, 44, 52, 71, 88, 192, 1614] {
+    // 1252 (at 16 KiB pages): a destination crash mid-handshake left
+    // unrestorable wreckage whose fence a re-adoption then reused —
+    // write-once names rewritten, and stray intact records read as
+    // ownership by later recoveries (two runners). Forced the fence
+    // floor, wreckage reclaim, and the harness's unrestorable-elsewhere
+    // classification.
+    for seed in [7, 13, 19, 31, 44, 52, 71, 88, 192, 1252, 1614] {
         let report = run(seed, migration_chaos_config());
         assert_eq!(
             report.violations,

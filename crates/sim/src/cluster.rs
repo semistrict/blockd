@@ -1103,6 +1103,14 @@ impl Cluster {
     /// runnable verdict for a vset that runs elsewhere is exactly the
     /// double-run the two-sided handoff and the head CAS exist to prevent.
     fn attach_recovered(&mut self, host: u16, vset: VsetId, verdict: Verdict) {
+        if verdict == Verdict::Unrestorable && self.placement.get(&vset) != Some(&host) {
+            // Nothing usable here while the vset runs (or is being
+            // offered) elsewhere: exactly what a destination crash
+            // mid-handshake leaves behind. The verdict claims nothing —
+            // ownership stays put, recovery reclaims the wreckage, and
+            // the source's re-offers restart the migration from scratch.
+            return;
+        }
         if self.placement.get(&vset) != Some(&host) {
             // One legitimate mismatch (R7.2): the current holder offered
             // this vset here, the destination durably accepted, then

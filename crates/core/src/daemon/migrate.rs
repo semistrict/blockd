@@ -448,7 +448,14 @@ impl Daemon {
             return; // migration always offers a whole point
         };
         let mut state = Vset::new(record.config);
-        state.fence = record.fence + 1;
+        // Strictly above BOTH the offer's fence and this host's fence
+        // floor: a dead local incarnation of this vset (crashed dest
+        // recovered unrestorable) left its write-once names on disk, and
+        // adopting at the offer-derived fence alone would re-enter that
+        // namespace and re-write them.
+        let floor = self.fence_floors.get(&vset).copied().unwrap_or(0);
+        state.fence = record.fence.max(floor) + 1;
+        self.fence_floors.insert(vset, state.fence);
         state.epoch = Epoch(epoch.0);
         state.mutation_seq = record.capture_seq;
         state.durable_watermark = record.synced_through;
