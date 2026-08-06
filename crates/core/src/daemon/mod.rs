@@ -592,6 +592,11 @@ pub struct Daemon {
     waiters: VecDeque<(PageId, bool)>,
     /// Restores waiting out a store outage (R8.3), vset → admin req.
     restore_retries: BTreeMap<VsetId, ReqId>,
+    /// Where the writeback rotation resumes (the last vset that took a
+    /// budgeted capture slot): a capture reads and compresses its vset's
+    /// whole dirty set in one step, so a tick captures a bounded, rotating
+    /// share of the fleet rather than all of it at once.
+    writeback_cursor: u64,
     /// The fence each released (migrated-away) vset last ran at here. A
     /// late duplicate `MigrateOffer` carrying a record at or below this
     /// fence is a dead incarnation — adopting it would resurrect a second
@@ -628,6 +633,7 @@ impl Daemon {
             pending: BTreeMap::new(),
             waiters: VecDeque::new(),
             restore_retries: BTreeMap::new(),
+            writeback_cursor: 0,
             released_fences: BTreeMap::new(),
             local_bytes: 0,
             counters: Counters::default(),
@@ -675,11 +681,7 @@ impl Daemon {
                 // MGLRU-mirrored aging (R2.6) rides the writeback cadence,
                 // as reclaim-driven aging rides kswapd in the kernel.
                 self.cache.age(|| mem.harvest_accessed());
-                let vsets: Vec<VsetId> = self.vsets.keys().copied().collect();
-                for vset in vsets {
-                    self.maybe_start_commit(vset, mem, &mut out);
-                    self.maybe_start_compact(vset, &mut out);
-                }
+                self.writeback_tick(mem, &mut out);
                 out.push(Effect::SetTimer {
                     timer: TimerId::Writeback,
                     after: self.config.writeback_interval,

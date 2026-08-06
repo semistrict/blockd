@@ -233,6 +233,34 @@ fn scale_run_hosts_many_overcommitted_vsets() {
 /// The standing long-haul suite (R10.1): full-nemesis runs over the
 /// committed regression seed corpus. Every seed that ever exposed a bug
 /// belongs in this list, forever.
+/// The step-cost bound (design flaw 2): one writeback tick captures a
+/// bounded, rotating share of the fleet — never every vset at once — so a
+/// step's page-read work is O(slots × working set), not O(fleet). Wall
+/// time cannot pass inside a sim step; counted work units can, and this
+/// pins them.
+#[test]
+fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
+    let mut config = base_config();
+    config.vset_count = 64;
+    config.horizon = secs(3);
+    config.vset_config.pages_per_volume = 24;
+    let report = run(5, config);
+    assert_clean(&report);
+    // 3 volumes × 24 pages = 72 resident pages per vset; 8 rotation slots.
+    let per_vset: u64 = 3 * 24;
+    assert!(
+        report.max_step_page_reads <= 8 * per_vset,
+        "one step read {} pages — the tick captured more than its slots",
+        report.max_step_page_reads
+    );
+    // Non-vacuous: the fleet's total dirty work far exceeded one tick's
+    // bound, so the rotation genuinely spread it across ticks.
+    assert!(
+        report.counters.pages_flushed > 8 * per_vset,
+        "fleet never generated more work than one tick's budget"
+    );
+}
+
 #[test]
 fn chaos_seed_corpus_stays_consistent() {
     for seed in [3, 8, 21, 29, 47, 63, 77, 90, 104, 131] {

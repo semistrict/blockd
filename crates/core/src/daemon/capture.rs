@@ -94,6 +94,49 @@ impl Daemon {
 
     // ── captures ────────────────────────────────────────────────────────
 
+    /// One writeback tick's captures, bounded (R2.4 with a step-cost
+    /// bound): a capture reads and compresses its vset's whole unstable
+    /// set in-step, so a tick must not run one for every vset of a large
+    /// fleet at once — every guest's fault would wait behind the pile.
+    /// Sync-pending vsets always capture (one blocked guest sits behind
+    /// each pending sync, so their inflow is self-limiting); the rest
+    /// take at most `WRITEBACK_VSETS_PER_TICK` slots, rotating from a
+    /// cursor so every vset's turn comes around. When the budget does not
+    /// bind, the rotation visits keys in order from the top — exactly the
+    /// unbounded tick's behavior.
+    pub(super) fn writeback_tick(&mut self, mem: &dyn HostMap, out: &mut Vec<Effect>) {
+        const WRITEBACK_VSETS_PER_TICK: usize = 8;
+        let keys: Vec<VsetId> = self.vsets.keys().copied().collect();
+        if keys.is_empty() {
+            return;
+        }
+        // Fleets within the budget keep the plain key order (the rotation
+        // would reshuffle capture order without bounding anything).
+        let start = if keys.len() <= WRITEBACK_VSETS_PER_TICK {
+            0
+        } else {
+            keys.partition_point(|&v| v.0 <= self.writeback_cursor) % keys.len()
+        };
+        let mut budget = WRITEBACK_VSETS_PER_TICK;
+        for i in 0..keys.len() {
+            let vset = keys[(start + i) % keys.len()];
+            let must = self
+                .vsets
+                .get(&vset)
+                .is_some_and(|s| !s.pending_syncs.is_empty());
+            if budget > 0 || must {
+                let was = self.vsets.get(&vset).is_some_and(|s| s.commit_running);
+                self.maybe_start_commit(vset, mem, out);
+                let now = self.vsets.get(&vset).is_some_and(|s| s.commit_running);
+                if !was && now && !must {
+                    budget -= 1;
+                    self.writeback_cursor = vset.0;
+                }
+            }
+            self.maybe_start_compact(vset, out);
+        }
+    }
+
     pub(super) fn maybe_start_commit(
         &mut self,
         vset: VsetId,

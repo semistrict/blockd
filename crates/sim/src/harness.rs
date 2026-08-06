@@ -130,6 +130,10 @@ pub struct RunReport {
     /// journal records and map leaves. The cost of remembering where pages
     /// live must track the DELTA, not the vset size.
     pub map_bytes_written: u64,
+    /// The most pages any single `Daemon::step` read through `HostMap` —
+    /// the step-cost bound (2c): a step's work must not scale with fleet
+    /// size, or every guest's fault waits behind it in the real runtime.
+    pub max_step_page_reads: u64,
     /// The largest single journal record ever written: bounded by the
     /// overlay cap regardless of vset size (leaves carry the bulk).
     pub max_record_blob_bytes: u64,
@@ -193,17 +197,24 @@ struct VsetMem {
 }
 
 /// The daemon's synchronous window onto the mappings.
-struct MemView<'a>(&'a BTreeMap<VsetId, VsetMem>);
+struct MemView<'a> {
+    mems: &'a BTreeMap<VsetId, VsetMem>,
+    /// Page reads this step — the sim's window onto STEP COST (2c): wall
+    /// time cannot pass inside a step, but work units can be counted, so
+    /// "one step captures a bounded amount" becomes a checkable invariant.
+    reads: &'a std::cell::Cell<u64>,
+}
 
 impl HostMap for MemView<'_> {
     fn read_page(&self, page: PageId) -> Vec<u8> {
-        self.0[&page.volume.vset].pages[&page].clone()
+        self.reads.set(self.reads.get() + 1);
+        self.mems[&page.volume.vset].pages[&page].clone()
     }
 
     fn harvest_accessed(&self) -> Vec<PageId> {
         // One-shot: drain every guest's touch record. `mems` is a BTreeMap
         // and each set is ordered, so the result is deterministic.
-        self.0
+        self.mems
             .values()
             .flat_map(|mem| mem.accessed.take())
             .collect()
@@ -377,7 +388,15 @@ impl Harness {
         let Some(daemon) = &mut self.daemon else {
             return;
         };
-        let effects = daemon.step(event, &MemView(&self.mems));
+        let reads = std::cell::Cell::new(0);
+        let effects = daemon.step(
+            event,
+            &MemView {
+                mems: &self.mems,
+                reads: &reads,
+            },
+        );
+        self.report.max_step_page_reads = self.report.max_step_page_reads.max(reads.get());
         self.apply_effects(effects);
         // Retried writes trap again after the batch (see `refaults`).
         while let Some(page) = self.refaults.pop() {

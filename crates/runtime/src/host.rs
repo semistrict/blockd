@@ -112,6 +112,81 @@ pub(crate) enum Msg {
     Stop,
 }
 
+/// The loop's inbox, two lanes: events a guest is blocked on RIGHT NOW —
+/// faults, fill-path read completions, pause boundaries — outrank bursts
+/// of write/admin completions, so a pile of writeback acks never queues
+/// ahead of a vCPU stuck in a page fault. Timers ride the critical lane
+/// too: the tick is the pacemaker, and delaying it under load does not
+/// shed work — it batches the next capture bigger and lengthens the very
+/// stalls the lanes exist to avoid. A fairness valve drains one
+/// background event per `BACKGROUND_SHARE` criticals so completion
+/// processing can never starve outright.
+pub(crate) struct LoopQueue {
+    lanes: Mutex<Lanes>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct Lanes {
+    critical: VecDeque<Msg>,
+    background: VecDeque<Msg>,
+    /// Criticals served since the last background pop.
+    streak: u32,
+}
+
+const BACKGROUND_SHARE: u32 = 32;
+
+impl LoopQueue {
+    fn new() -> Arc<LoopQueue> {
+        Arc::new(LoopQueue {
+            lanes: Mutex::new(Lanes::default()),
+            cv: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn push(&self, msg: Msg) {
+        let critical = match &msg {
+            Msg::Ev(
+                Event::GuestFault { .. }
+                | Event::BlobReadDone { .. }
+                | Event::StoreGetDone { .. }
+                | Event::Timer(_),
+            )
+            | Msg::Quiesced(_)
+            | Msg::Stop => true,
+            Msg::Ev(Event::PeerDelivered { msg, .. }) => matches!(
+                msg,
+                blockd_core::seam::PeerMsg::Page { .. } | blockd_core::seam::PeerMsg::Leaf { .. }
+            ),
+            Msg::Ev(_) => false,
+        };
+        let mut lanes = self.lanes.lock().expect("lock");
+        if critical {
+            lanes.critical.push_back(msg);
+        } else {
+            lanes.background.push_back(msg);
+        }
+        drop(lanes);
+        self.cv.notify_one();
+    }
+
+    fn pop(&self) -> Msg {
+        let mut lanes = self.lanes.lock().expect("lock");
+        loop {
+            let starve_valve = lanes.streak >= BACKGROUND_SHARE;
+            if !lanes.background.is_empty() && (lanes.critical.is_empty() || starve_valve) {
+                lanes.streak = 0;
+                return lanes.background.pop_front().expect("checked");
+            }
+            if let Some(msg) = lanes.critical.pop_front() {
+                lanes.streak += 1;
+                return msg;
+            }
+            lanes = self.cv.wait(lanes).expect("wait");
+        }
+    }
+}
+
 struct Shared {
     vsets: Mutex<BTreeMap<VsetId, Arc<VsetHost>>>,
     sync_waiters: Mutex<BTreeMap<ReqId, Sender<bool>>>,
@@ -146,7 +221,7 @@ impl HostMap for MapView<'_> {
 }
 
 pub struct Runtime {
-    tx: Sender<Msg>,
+    tx: Arc<LoopQueue>,
     shared: Arc<Shared>,
     admin_rx: Mutex<Receiver<AdminReply>>,
     admin_backlog: Mutex<VecDeque<AdminReply>>,
@@ -203,7 +278,8 @@ impl Runtime {
         store: &Arc<dyn ObjectStore>,
     ) -> Runtime {
         std::fs::create_dir_all(&config.blob_dir).expect("blob dir");
-        let (tx, rx) = channel::<Msg>();
+        let tx = LoopQueue::new();
+        let rx = tx.clone();
         let (admin_tx, admin_rx) = channel::<AdminReply>();
         let shared = Arc::new(Shared {
             vsets: Mutex::new(hosts),
@@ -217,7 +293,7 @@ impl Runtime {
         let peers = config.peer.as_ref().map(|p| {
             let tx = tx.clone();
             PeerNet::start(p, config.daemon.host, move |from, msg| {
-                let _ = tx.send(Msg::Ev(Event::PeerDelivered { from, msg }));
+                tx.push(Msg::Ev(Event::PeerDelivered { from, msg }));
             })
         });
 
@@ -259,11 +335,11 @@ impl Runtime {
                 apply(boot_effects);
                 loop {
                     let blocked = Instant::now();
-                    let msg = rx.recv();
+                    let msg = rx.pop();
                     shared.stats.record_idle(elapsed_ns(blocked.elapsed()));
                     let event = match msg {
-                        Ok(Msg::Ev(event)) => event,
-                        Ok(Msg::Quiesced(vset)) => {
+                        Msg::Ev(event) => event,
+                        Msg::Quiesced(vset) => {
                             let vmstate = {
                                 let host = shared.vsets.lock().expect("lock")[&vset].clone();
                                 let mut state = host.ctl.state.lock().expect("lock");
@@ -272,7 +348,7 @@ impl Runtime {
                             };
                             Event::GuestPaused { vset, vmstate }
                         }
-                        Ok(Msg::Stop) | Err(_) => break,
+                        Msg::Stop => break,
                     };
                     let kind = event_kind(&event);
                     let started = Instant::now();
@@ -315,19 +391,15 @@ impl Runtime {
 
     fn spawn_fault_reader(&self, vset: VsetId, host: Arc<VsetHost>) {
         let tx = self.tx.clone();
+        // Exits when the vset's uffd closes (the vset was dropped).
         thread::spawn(move || {
             while let Ok(events) = host.uffd.read_events() {
                 for event in events {
                     let page = host.page_of_addr(vset, event.address & !(PAGE_SIZE - 1));
-                    if tx
-                        .send(Msg::Ev(Event::GuestFault {
-                            page,
-                            write: event.write,
-                        }))
-                        .is_err()
-                    {
-                        return;
-                    }
+                    tx.push(Msg::Ev(Event::GuestFault {
+                        page,
+                        write: event.write,
+                    }));
                 }
             }
         });
@@ -371,14 +443,12 @@ impl Runtime {
             .insert(vset, host.clone());
         self.spawn_fault_reader(vset, host);
         let req = self.req();
-        self.tx
-            .send(Msg::Ev(Event::Admin(AdminCmd::CreateVset {
-                req,
-                vset,
-                config,
-                from_base: None,
-            })))
-            .expect("send");
+        self.tx.push(Msg::Ev(Event::Admin(AdminCmd::CreateVset {
+            req,
+            vset,
+            config,
+            from_base: None,
+        })));
         self.wait_admin(|reply| match reply {
             AdminReply::VsetCreated { req: r, vset: v } if *r == req && *v == vset => Some(()),
             _ => None,
@@ -388,8 +458,7 @@ impl Runtime {
     pub fn checkpoint(&self, vset: VsetId) -> u64 {
         let req = self.req();
         self.tx
-            .send(Msg::Ev(Event::Admin(AdminCmd::Checkpoint { req, vset })))
-            .expect("send");
+            .push(Msg::Ev(Event::Admin(AdminCmd::Checkpoint { req, vset })));
         self.wait_admin(|reply| match reply {
             AdminReply::CheckpointDone { req: r, epoch, .. } if *r == req => Some(epoch.0),
             AdminReply::AdminFailed { req: r } if *r == req => {
@@ -410,8 +479,7 @@ impl Runtime {
         self.spawn_fault_reader(vset, host);
         let req = self.req();
         self.tx
-            .send(Msg::Ev(Event::Admin(AdminCmd::RestoreVset { req, vset })))
-            .expect("send");
+            .push(Msg::Ev(Event::Admin(AdminCmd::RestoreVset { req, vset })));
         self.wait_admin(|reply| match reply {
             AdminReply::VsetRestored {
                 req: r, verdict, ..
@@ -448,13 +516,11 @@ impl Runtime {
     /// Returns once this side's `MigratedOut` lands.
     pub fn migrate_out(&self, vset: VsetId, to: blockd_core::types::HostId) {
         let req = self.req();
-        self.tx
-            .send(Msg::Ev(Event::Admin(AdminCmd::MigrateOut {
-                req,
-                vset,
-                to,
-            })))
-            .expect("send");
+        self.tx.push(Msg::Ev(Event::Admin(AdminCmd::MigrateOut {
+            req,
+            vset,
+            to,
+        })));
         self.wait_admin(|reply| match reply {
             AdminReply::MigratedOut { req: r, .. } if *r == req => Some(()),
             AdminReply::AdminFailed { req: r } if *r == req => panic!("migrate out failed"),
@@ -504,7 +570,7 @@ impl Runtime {
         state.applied += 1;
         if state.pause_requested && !state.paused {
             drop(state);
-            self.tx.send(Msg::Quiesced(vset)).expect("send");
+            self.tx.push(Msg::Quiesced(vset));
         }
     }
 
@@ -537,12 +603,10 @@ impl Runtime {
             .lock()
             .expect("lock")
             .insert(req, done_tx);
-        self.tx
-            .send(Msg::Ev(Event::GuestSync {
-                req,
-                volume: VolumeId { vset, idx: volume },
-            }))
-            .expect("send");
+        self.tx.push(Msg::Ev(Event::GuestSync {
+            req,
+            volume: VolumeId { vset, idx: volume },
+        }));
         let ok = done_rx
             .recv_timeout(Duration::from_secs(30))
             .expect("sync ack within 30s");
@@ -564,7 +628,7 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        let _ = self.tx.send(Msg::Stop);
+        self.tx.push(Msg::Stop);
         if let Some(handle) = self.loop_thread.take() {
             let _ = handle.join();
         }
@@ -582,7 +646,7 @@ fn apply_effect(
     blob_delete_tx: &Sender<BlobJob>,
     timer_tx: &Sender<(TimerId, u64)>,
     admin_tx: &Sender<AdminReply>,
-    tx: &Sender<Msg>,
+    tx: &Arc<LoopQueue>,
     peers: Option<&Arc<PeerNet>>,
     self_id: blockd_core::types::HostId,
 ) {
@@ -657,7 +721,7 @@ fn apply_effect(
                 let mut state = state;
                 state.pause_requested = true;
                 drop(state);
-                tx.send(Msg::Quiesced(vset)).expect("send");
+                tx.push(Msg::Quiesced(vset));
             }
         }
         Effect::ResumeGuest { vset } => {
@@ -826,7 +890,7 @@ enum BlobJob {
     },
 }
 
-fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Sender<Msg>) {
+fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Arc<LoopQueue>) {
     loop {
         let Ok(job) = rx.lock().expect("lock").recv() else {
             return;
@@ -883,9 +947,7 @@ fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Sender
                 continue;
             }
         };
-        if tx.send(Msg::Ev(event)).is_err() {
-            return;
-        }
+        tx.push(Msg::Ev(event));
     }
 }
 
@@ -921,7 +983,7 @@ enum StoreJob {
 fn store_worker_loop(
     rx: &Arc<Mutex<Receiver<StoreJob>>>,
     store: &dyn ObjectStore,
-    tx: &Sender<Msg>,
+    tx: &Arc<LoopQueue>,
 ) {
     loop {
         let Ok(job) = rx.lock().expect("lock").recv() else {
@@ -959,13 +1021,11 @@ fn store_worker_loop(
                 continue;
             }
         };
-        if tx.send(Msg::Ev(event)).is_err() {
-            return;
-        }
+        tx.push(Msg::Ev(event));
     }
 }
 
-fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Sender<Msg>) {
+fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Arc<LoopQueue>) {
     let mut armed: Vec<(Instant, TimerId)> = Vec::new();
     loop {
         let now = Instant::now();
@@ -974,9 +1034,7 @@ fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Sender<Msg>) {
         while i < armed.len() {
             if armed[i].0 <= now {
                 let (_, timer) = armed.remove(i);
-                if tx.send(Msg::Ev(Event::Timer(timer))).is_err() {
-                    return;
-                }
+                tx.push(Msg::Ev(Event::Timer(timer)));
             } else {
                 i += 1;
             }
@@ -1007,7 +1065,7 @@ fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Sender<Msg>) {
 /// - Blob workers: local blob I/O has the same completion-event
 ///   contract — one slow filesystem operation (fsync included) must not
 ///   stall guest faults.
-fn spawn_io_workers(blob_dir: &Path, store: &Arc<dyn ObjectStore>, tx: &Sender<Msg>) -> IoLanes {
+fn spawn_io_workers(blob_dir: &Path, store: &Arc<dyn ObjectStore>, tx: &Arc<LoopQueue>) -> IoLanes {
     let (timer_tx, timer_rx) = channel::<(TimerId, u64)>();
     {
         let tx = tx.clone();
@@ -1122,7 +1180,7 @@ mod tests {
         let (blob_delete_tx, _blob_delete_rx) = channel();
         let (timer_tx, timer_rx) = channel();
         let (admin_tx, _admin_rx) = channel();
-        let (tx, _rx) = channel();
+        let tx = LoopQueue::new();
 
         apply_effect(
             Effect::BlobWrite {
@@ -1180,10 +1238,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let (job_tx, job_rx) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
-        let (msg_tx, msg_rx) = channel();
+        let msg_queue = LoopQueue::new();
         let worker = {
             let root = root.clone();
-            thread::spawn(move || blob_worker_loop(&job_rx, &root, &msg_tx))
+            let msg_queue = msg_queue.clone();
+            thread::spawn(move || blob_worker_loop(&job_rx, &root, &msg_queue))
         };
 
         job_tx
@@ -1194,7 +1253,7 @@ mod tests {
             })
             .expect("send write");
         assert!(matches!(
-            msg_rx.recv().expect("write completion"),
+            msg_queue.pop(),
             Msg::Ev(Event::BlobWriteDone { io: IoId(1) })
         ));
 
@@ -1207,7 +1266,7 @@ mod tests {
             })
             .expect("send read");
         assert!(matches!(
-            msg_rx.recv().expect("read completion"),
+            msg_queue.pop(),
             Msg::Ev(Event::BlobReadDone {
                 io: IoId(2),
                 bytes: Some(bytes),
