@@ -46,6 +46,7 @@ fn created_daemon() -> Daemon {
         backup_retry: 200_000_000,
         disk_capacity: None,
         disk_headroom: 0,
+        wedge_ticks: 25,
     });
     let effects = step_settled(
         &mut daemon,
@@ -214,6 +215,7 @@ fn checkpoint_cost_scales_with_the_delta_not_the_volume() {
         backup_retry: 200_000_000,
         disk_capacity: None,
         disk_headroom: 0,
+        wedge_ticks: 25,
     });
     let config = VsetConfig {
         disk_volumes: 1,

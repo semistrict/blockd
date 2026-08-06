@@ -6,7 +6,7 @@
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{VsetId, micros, millis, page_size, secs};
-use blockd_sim::cluster::{ClusterConfig, ClusterReport, run};
+use blockd_sim::cluster::{ClusterConfig, ClusterReport, PeerKind, run};
 use blockd_sim::harness::Sabotage;
 use blockd_sim::rng::Ppm;
 
@@ -63,6 +63,7 @@ fn migrate_config() -> ClusterConfig {
             backed_up: false,
         },
         kill_hosts_at: vec![],
+        drop_peer: None,
         race_restore: false,
         migrate_at: Some((millis(1500), VsetId(1), 1)),
         ..base_config()
@@ -125,6 +126,7 @@ fn restores_meet_the_200ms_budget_and_prefetch_the_resume_set() {
                 pages_per_volume,
                 backed_up: true,
             },
+            drop_peer: None,
             race_restore: false,
             // Host 0 dies; the vset restores onto host 1, resumes, records
             // its resume set; then host 1 dies and host 2 restores it.
@@ -270,6 +272,11 @@ fn hydration_drains_the_tail_and_releases_the_source() {
     // The post-release crash recovers a daemon with nothing to say — and
     // the two-runners check stays silent.
     assert_eq!(report.recoveries, 1);
+    // A healthy drain never trips the liveness watch (no false alarms).
+    assert_eq!(
+        report.wedged_guests + report.wedged_hydration + report.wedged_outbound,
+        0
+    );
     assert_eq!(report.completed_ops, page_pin(1614, 1549));
 }
 
@@ -368,6 +375,72 @@ fn store_outage_during_cold_serving_parks_fills_until_heal() {
     // Non-vacuous: the outage really intersected demand fills — these are
     // parked faults that would have been guest deaths.
     assert!(report.store_retries > 0, "outage never hit the fill path");
+    // The 700 ms outage exceeds the 500 ms wedge threshold: the liveness
+    // watch flagged the parked guests while they waited (R9.2)…
+    assert!(report.wedged_guests >= 1, "the parked wait never flagged");
+    // …and the heal drained every one of them (the liveness oracle).
+    assert_eq!(report.parked_end, 0);
+}
+
+/// Wedge nemesis (5b): drop 100% of `Released` for a window. The drained
+/// destination keeps asking the source to let go and hears nothing back —
+/// the hydration watch must flag the destination and the outbound watch
+/// the now-silent source, loudly, while it lasts; after the heal the very
+/// next release lands and the system converges as if nothing happened.
+#[test]
+fn a_released_blackout_wedges_both_sides_loudly_then_converges() {
+    let config = ClusterConfig {
+        // From the migration instant: the 32-page tail drains in tens of
+        // milliseconds, and a window that starts later misses the release.
+        drop_peer: Some((PeerKind::Released, millis(1500), millis(3100))),
+        ..migrate_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert!(report.nemesis_drops > 0, "the blackout never intercepted");
+    // Both sides flagged the stall while it lasted (R9.2)…
+    assert!(report.wedged_hydration >= 1, "destination never flagged");
+    assert!(report.wedged_outbound >= 1, "silent source never flagged");
+    // …and the first post-heal release completed the migration: source
+    // reclaimed, nothing parked, nothing still hydrating.
+    assert_eq!(report.releases, 1);
+    assert_eq!(report.blobs_per_host[0], 0);
+    assert_eq!((report.parked_end, report.hydrating_end), (0, 0));
+}
+
+/// Wedge nemesis (5b): drop 100% of `Leaf` replies while a migrated
+/// multi-leaf vset hydrates its map. Faults into unhydrated spans park;
+/// the watch must flag the parked guests during the blackout, and the
+/// hydration tick's own retry must serve every one of them after the
+/// heal — parked means waiting, never lost.
+#[test]
+fn a_leaf_blackout_parks_faults_loudly_and_the_heal_serves_them_all() {
+    let config = ClusterConfig {
+        hosts: 2,
+        vset_config: VsetConfig {
+            disk_volumes: 2,
+            pages_per_volume: 5_000,
+            backed_up: false,
+        },
+        migrate_at: Some((millis(1200), VsetId(1), 1)),
+        drop_peer: Some((PeerKind::Leaf, millis(1150), millis(2400))),
+        ..multi_leaf_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert!(report.nemesis_drops > 0, "the blackout never intercepted");
+    assert!(
+        report.wedged_guests + report.wedged_hydration >= 1,
+        "a guest parked for over the threshold and nothing flagged"
+    );
+    // Post-heal the leaves arrived and every parked fault was served (the
+    // tail keeps hydrating legitimately — that is progress, not a wedge).
+    assert!(report.leaf_fills > 0, "the map never hydrated after heal");
+    assert_eq!(report.parked_end, 0);
 }
 
 /// R11.1: `Released` is the reclaim trigger, so the source accepts it only
@@ -510,6 +583,7 @@ fn a_rotten_resume_set_is_ignored_not_fatal() {
             pages_per_volume: 16,
             backed_up: true,
         },
+        drop_peer: None,
         race_restore: false,
         kill_hosts_at: vec![(millis(1500), 0), (millis(2800), 1)],
         rot_resume_set_at: Some(millis(2700)),
@@ -548,6 +622,7 @@ fn multi_leaf_config() -> ClusterConfig {
         },
         think: (micros(20), micros(100)),
         guest_sync_share: Some(Ppm(1_000)),
+        drop_peer: None,
         race_restore: false,
         kill_hosts_at: vec![],
         horizon: secs(2),

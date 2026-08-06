@@ -53,6 +53,7 @@ fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
             backup_retry: millis(20),
             disk_capacity: None,
             disk_headroom: 0,
+            wedge_ticks: 500,
         },
         blob_dir: temp_dir(tag),
         peer: Some(peer),

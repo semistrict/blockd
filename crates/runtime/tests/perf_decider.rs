@@ -297,6 +297,7 @@ fn drive(vsets: u64) -> World {
         backup_retry: millis(20),
         disk_capacity: None,
         disk_headroom: 0,
+        wedge_ticks: 500,
     });
     for n in 0..vsets {
         world.step(
@@ -355,6 +356,7 @@ fn profile_huge_vset_capture_stall() {
         backup_retry: millis(20),
         disk_capacity: None,
         disk_headroom: 0,
+        wedge_ticks: 500,
     });
     world.step(
         Event::Admin(AdminCmd::CreateVset {

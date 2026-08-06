@@ -49,6 +49,7 @@ fn runtime_config(tag: &str, cache_pages: usize) -> RuntimeConfig {
             backup_retry: millis(20),
             disk_capacity: None,
             disk_headroom: 0,
+            wedge_ticks: 500,
         },
         blob_dir: temp_dir(tag),
         peer: None,

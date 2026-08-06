@@ -283,17 +283,9 @@ impl Daemon {
                 // Serve from local storage — outbound vsets keep serving
                 // until released (R7.2); absent state answers None (the
                 // requester's loud R7.3 miss).
-                if self.rejects_counterparty(vset, from) {
+                let Some(our_io) = self.serve_peer(vset, from, false, io) else {
                     return;
-                }
-                let our_io = self.io();
-                self.pending.insert(
-                    our_io,
-                    Pending::PeerRead {
-                        requester: from,
-                        peer_io: io,
-                    },
-                );
+                };
                 out.push(Effect::BlobReadRange {
                     io: our_io,
                     name: layout::segment_blob(vset, fence, seg),
@@ -310,17 +302,9 @@ impl Daemon {
                 id,
             } => {
                 // Serve leaves like ranges: from local storage, verbatim.
-                if self.rejects_counterparty(vset, from) {
+                let Some(our_io) = self.serve_peer(vset, from, true, io) else {
                     return;
-                }
-                let our_io = self.io();
-                self.pending.insert(
-                    our_io,
-                    Pending::PeerLeafRead {
-                        requester: from,
-                        peer_io: io,
-                    },
-                );
+                };
                 let name = if base == 0 {
                     layout::leaf_blob(vset, fence, id)
                 } else {
@@ -362,6 +346,38 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Admit one peer fetch: authorize the counterparty (R11.1), note the
+    /// outbound liveness progress, and register the local read that will
+    /// answer it. `None` means rejected.
+    fn serve_peer(
+        &mut self,
+        vset: VsetId,
+        from: HostId,
+        leaf: bool,
+        peer_io: crate::seam::IoId,
+    ) -> Option<crate::seam::IoId> {
+        if self.rejects_counterparty(vset, from) {
+            return None;
+        }
+        if let Some(state) = self.vsets.get_mut(&vset) {
+            state.wedge.served += 1;
+        }
+        let our_io = self.io();
+        let pending = if leaf {
+            Pending::PeerLeafRead {
+                requester: from,
+                peer_io,
+            }
+        } else {
+            Pending::PeerRead {
+                requester: from,
+                peer_io,
+            }
+        };
+        self.pending.insert(our_io, pending);
+        Some(our_io)
     }
 
     /// The destination holds everything: reclaim the released vset's
@@ -566,12 +582,14 @@ impl Daemon {
             return;
         }
         let mut issued = 0;
+        let mut marked = 0u64;
         for (page, generation, loc) in foreign {
             if self.cache.is_resident(page) {
                 // The bytes are already in guest memory: dirtying the page
                 // is enough — writeback re-homes it into our own segment.
                 if !self.cache.is_dirty(page) {
                     self.cache.mark_dirty(page);
+                    marked += 1;
                 }
                 continue;
             }
@@ -605,6 +623,14 @@ impl Daemon {
                 },
             });
             issued += 1;
+        }
+        if marked > 0 {
+            // Re-homing resident tail pages through writeback IS hydration
+            // progress — without this the watch would cry wedge while the
+            // captures do the work.
+            if let Some(state) = self.vsets.get_mut(&vset) {
+                state.wedge.hydration += marked;
+            }
         }
         out.push(Effect::SetTimer {
             timer: TimerId::Hydrate(vset),
@@ -641,6 +667,9 @@ impl Daemon {
         }
         self.cache.fill_slot_cold(page);
         self.cache.mark_dirty(page);
+        if let Some(state) = self.vsets.get_mut(&page.volume.vset) {
+            state.wedge.hydration += 1;
+        }
         self.counters.hydrate_fills += 1;
         out.push(Effect::Fill {
             page,

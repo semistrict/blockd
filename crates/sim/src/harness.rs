@@ -143,6 +143,10 @@ pub struct RunReport {
     /// Bytes the serving maps still reference at the end (the daemon's
     /// own live accounting, R9.2) — what `seg_bytes_end` is bounded by.
     pub seg_live_bytes_end: u64,
+    /// The liveness oracle's end-state: fills still parked (pressure,
+    /// outage, unhydrated spans) when the run drained. A healed run must
+    /// end at 0 — convergence, not just safety.
+    pub parked_end: usize,
 }
 
 #[derive(Debug)]
@@ -351,6 +355,7 @@ pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(Str
         .map(|(_, bytes)| bytes.len() as u64)
         .sum();
     h.report.seg_live_bytes_end = h.daemon.as_ref().map_or(0, |d| d.seg_space().0);
+    h.report.parked_end = h.daemon.as_ref().map_or(0, Daemon::parked_fills);
     if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
         let mut blobs: Vec<(usize, &String)> = h
             .bdev

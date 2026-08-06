@@ -414,6 +414,7 @@ impl Daemon {
             .filter(|leaf| leaf.span == span);
         let Some(leaf) = leaf else {
             state.pending_leaves.remove(&span);
+            state.wedge.hydration += 1;
             state.dead_spans.insert(span);
             let waiters = state.leaf_waiters.remove(&span).unwrap_or_default();
             for (page, _) in waiters {
@@ -449,6 +450,7 @@ impl Daemon {
             state.next_gen = state.next_gen.max(generation.0 + 1);
         }
         state.pending_leaves.remove(&span);
+        state.wedge.hydration += 1;
         let waiters = state.leaf_waiters.remove(&span).unwrap_or_default();
         let name = if ptr.base == 0 {
             layout::leaf_blob(vset_id, ptr.fence, ptr.id)

@@ -45,6 +45,7 @@ fn daemon(host: u16) -> Daemon {
         backup_retry: 1_000_000,
         disk_capacity: None,
         disk_headroom: 0,
+        wedge_ticks: 25,
     })
     .0
 }

@@ -22,6 +22,35 @@ use crate::oracle::Oracle;
 use crate::world::blobdev::{BdevIo, BlobDev, BlobDevConfig};
 use crate::world::store::{ObjectStore, StoreConfig, Version};
 
+/// One peer message kind, as the wedge nemesis targets them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PeerKind {
+    Offer,
+    Accept,
+    FetchRange,
+    Page,
+    FetchLeaf,
+    Leaf,
+    Released,
+    ReleasedAck,
+}
+
+impl PeerKind {
+    fn of(msg: &blockd_core::seam::PeerMsg) -> PeerKind {
+        use blockd_core::seam::PeerMsg;
+        match msg {
+            PeerMsg::MigrateOffer { .. } => PeerKind::Offer,
+            PeerMsg::MigrateAccept { .. } => PeerKind::Accept,
+            PeerMsg::FetchRange { .. } => PeerKind::FetchRange,
+            PeerMsg::Page { .. } => PeerKind::Page,
+            PeerMsg::FetchLeaf { .. } => PeerKind::FetchLeaf,
+            PeerMsg::Leaf { .. } => PeerKind::Leaf,
+            PeerMsg::Released { .. } => PeerKind::Released,
+            PeerMsg::ReleasedAck { .. } => PeerKind::ReleasedAck,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub hosts: u16,
@@ -65,6 +94,12 @@ pub struct ClusterConfig {
     /// affected vsets' next adopter has dead spans: faults into them die
     /// loudly (R8.1) — a sanctioned, injected loss.
     pub rot_leaves_at: Option<u64>,
+    /// Wedge nemesis (5b): drop 100% of ONE peer message kind inside the
+    /// window `[start, end)` — the targeted outage probabilistic loss
+    /// cannot produce, healing on schedule so post-heal convergence is
+    /// checkable. The wedge counters must fire DURING the window and the
+    /// system must converge after it.
+    pub drop_peer: Option<(PeerKind, u64, u64)>,
     /// Send the restore of each orphaned vset to TWO hosts (CAS race).
     pub race_restore: bool,
     /// Migrate a vset to a destination host at an instant (R7).
@@ -116,6 +151,17 @@ pub struct ClusterReport {
     /// Peer messages refused by a protocol guard (R11.1) across live
     /// daemons.
     pub peer_rejected: u64,
+    /// Messages the wedge nemesis dropped.
+    pub nemesis_drops: u64,
+    /// Wedge incidents across live daemons (R9.2 liveness watch).
+    pub wedged_guests: u64,
+    pub wedged_hydration: u64,
+    pub wedged_outbound: u64,
+    /// The liveness oracle's end-state: parked fills and still-hydrating
+    /// vsets summed over live daemons after the drain. A healed run must
+    /// end at (0, 0) — convergence, not just safety.
+    pub parked_end: usize,
+    pub hydrating_end: usize,
     /// Blobs left on each host's device at the end of the run.
     pub blobs_per_host: Vec<usize>,
 }
@@ -329,6 +375,14 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
     c.report.leaf_fills = sum(|k| k.leaf_fills);
     c.report.store_retries = sum(|k| k.store_retries);
     c.report.peer_rejected = sum(|k| k.peer_rejected);
+    c.report.wedged_guests = sum(|k| k.wedged_guests);
+    c.report.wedged_hydration = sum(|k| k.wedged_hydration);
+    c.report.wedged_outbound = sum(|k| k.wedged_outbound);
+    let live = || c.hosts.iter().filter_map(|h| h.daemon.as_ref());
+    c.report.parked_end = live().map(blockd_core::daemon::Daemon::parked_fills).sum();
+    c.report.hydrating_end = live()
+        .map(blockd_core::daemon::Daemon::hydrating_vsets)
+        .sum();
     c.report.blobs_per_host = c.hosts.iter().map(|h| h.bdev.blob_count()).collect();
     c.report
 }
@@ -657,6 +711,16 @@ impl Cluster {
                 }
                 Effect::Admin(reply) => self.admin_reply(host, reply),
                 Effect::PeerSend { to, msg } => {
+                    // The wedge nemesis: a total, targeted outage of one
+                    // message kind. Deterministic (no RNG draw), so runs
+                    // without it replay byte-identically.
+                    if let Some((kind, start, stop)) = self.config.drop_peer {
+                        let now = self.kernel.now().nanos();
+                        if kind == PeerKind::of(&msg) && (start..stop).contains(&now) {
+                            self.report.nemesis_drops += 1;
+                            continue;
+                        }
+                    }
                     // The cluster network: peers reach each other with a
                     // small latency; a dead destination just never answers
                     // (handled at delivery). Loss and duplication draw

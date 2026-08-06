@@ -66,6 +66,12 @@ pub struct DaemonConfig {
     /// Reclaim starts when usage crosses `capacity - headroom`, leaving room
     /// for in-flight writeback to complete (R2.7).
     pub disk_headroom: u64,
+    /// Liveness watch (R9.2): writeback ticks a stalled concern — parked
+    /// guests, hydration, an outbound handoff — may go without its
+    /// progress signal before a wedge counter fires. A still-wedged
+    /// concern re-fires every interval (silence would read as recovery).
+    /// 0 disables the watch.
+    pub wedge_ticks: u64,
 }
 
 /// The operable minimum of observability (R9.2). Plain counters; the
@@ -118,6 +124,17 @@ pub struct Counters {
     /// Armed-but-unread pages captured out of order because the guest
     /// wrote them mid-drain (2a-full's copy-on-fault).
     pub cow_captures: u64,
+    /// Wedge incidents (R9.2): a vset held parked guests for
+    /// `wedge_ticks` writeback ticks with no fill landing.
+    pub wedged_guests: u64,
+    /// Wedge incidents: a hydrating vset (post-copy tail, pending map
+    /// leaves, or an unacked release) made no hydration progress for
+    /// `wedge_ticks` ticks.
+    pub wedged_hydration: u64,
+    /// Wedge incidents: an outbound (handed-off) vset served its
+    /// destination nothing for `wedge_ticks` ticks — a vanished
+    /// destination, or an accept that never arrives.
+    pub wedged_outbound: u64,
     /// Map spans rolled into fresh leaf blobs (the amortized half of the
     /// map's write cost; records carry only the overlay).
     pub leaf_rolls: u64,
@@ -360,6 +377,27 @@ enum Pending {
     },
 }
 
+/// One vset's liveness watch (R9.2). Each concern pairs a monotone
+/// progress signal (bumped where the work actually lands) with a count of
+/// consecutive writeback ticks the concern was active but the signal did
+/// not move; crossing `wedge_ticks` fires the matching incident counter.
+#[derive(Debug, Default)]
+struct Wedge {
+    /// Fills served to this vset, any tier — parked guests' progress.
+    fills: u64,
+    fills_seen: u64,
+    parked_ticks: u64,
+    /// Hydration events: leaf arrivals resolved, tail pages installed.
+    hydration: u64,
+    hydration_seen: u64,
+    hydration_ticks: u64,
+    /// Peer fetches served while outbound — the destination's drain is
+    /// this vset's only remaining purpose; silence is the wedge.
+    served: u64,
+    served_seen: u64,
+    outbound_ticks: u64,
+}
+
 // The flags are independent protocol states, not an encoding smell.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
@@ -485,6 +523,8 @@ struct Vset {
     /// Reply verdict for an inbound migration, delivered when its first
     /// record lands.
     migrated_verdict: Option<crate::seam::Verdict>,
+    /// Liveness watch state (R9.2), advanced once per writeback tick.
+    wedge: Wedge,
 }
 
 /// One in-flight backup publish (R4.2): segments verbatim, then the
@@ -554,6 +594,7 @@ impl Vset {
             outbound: None,
             peer_source: None,
             migrated_verdict: None,
+            wedge: Wedge::default(),
         }
     }
 
@@ -691,6 +732,7 @@ impl Daemon {
                 // MGLRU-mirrored aging (R2.6) rides the writeback cadence,
                 // as reclaim-driven aging rides kswapd in the kernel.
                 self.cache.age(|| mem.harvest_accessed());
+                self.wedge_tick();
                 self.writeback_tick(mem, &mut out);
                 out.push(Effect::SetTimer {
                     timer: TimerId::Writeback,
@@ -944,5 +986,111 @@ impl Daemon {
     /// Test/oracle introspection: faults waiting on pressure right now.
     pub fn waiting_guests(&self) -> usize {
         self.waiters.len()
+    }
+
+    /// Test/oracle introspection: every parked fill — pressure waiters,
+    /// outage-parked store fills, faults parked on unhydrated spans. A
+    /// healed world must drain this to zero (the liveness oracle).
+    pub fn parked_fills(&self) -> usize {
+        self.waiters.len()
+            + self
+                .vsets
+                .values()
+                .map(|s| {
+                    s.store_fill_retry.len() + s.leaf_waiters.values().map(Vec::len).sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+
+    /// Test/oracle introspection: vsets still mid-hydration — a post-copy
+    /// tail, pending map leaves, or an unacknowledged release.
+    pub fn hydrating_vsets(&self) -> usize {
+        self.vsets
+            .values()
+            .filter(|s| s.peer_source.is_some() || !s.pending_leaves.is_empty())
+            .count()
+    }
+
+    /// One liveness concern's tick (R9.2): idle or progressing concerns
+    /// reset; an active concern whose progress signal has not moved for
+    /// `threshold` consecutive ticks fires — and restarts, so a concern
+    /// wedged forever re-fires every interval instead of going quiet.
+    fn watch(
+        active: bool,
+        progress: u64,
+        seen: &mut u64,
+        ticks: &mut u64,
+        threshold: u64,
+        fired: &mut u64,
+    ) {
+        if !active || progress != *seen {
+            *seen = progress;
+            *ticks = 0;
+            return;
+        }
+        *ticks += 1;
+        if *ticks >= threshold {
+            *fired += 1;
+            *ticks = 0;
+        }
+    }
+
+    /// The liveness watch (R9.2), on the writeback cadence: nothing the
+    /// daemon waits on may stall silently. Wedges only count — loud
+    /// counters, no recovery action: every watched path already has its
+    /// own retry, and what these surface is the retry not working.
+    fn wedge_tick(&mut self) {
+        let threshold = self.config.wedge_ticks;
+        if threshold == 0 {
+            return;
+        }
+        let mut blocked: BTreeMap<VsetId, usize> = BTreeMap::new();
+        for &(page, _) in &self.waiters {
+            *blocked.entry(page.volume.vset).or_default() += 1;
+        }
+        // In-flight demand fetches count as blocked too: an outage-parked
+        // fill spends part of every retry cycle in flight, and a watch
+        // that only saw the parked half would reset in the gaps. Healthy
+        // fetches complete and bump the progress signal, so counting them
+        // costs nothing.
+        for p in self.pending.values() {
+            let (Pending::Fetch { page, .. }
+            | Pending::StoreFetch { page, .. }
+            | Pending::PeerFetch { page, .. }) = p
+            else {
+                continue;
+            };
+            *blocked.entry(page.volume.vset).or_default() += 1;
+        }
+        for (vset_id, state) in &mut self.vsets {
+            let w = &mut state.wedge;
+            let parked = blocked.get(vset_id).copied().unwrap_or(0)
+                + state.store_fill_retry.len()
+                + state.leaf_waiters.values().map(Vec::len).sum::<usize>();
+            Self::watch(
+                parked > 0,
+                w.fills,
+                &mut w.fills_seen,
+                &mut w.parked_ticks,
+                threshold,
+                &mut self.counters.wedged_guests,
+            );
+            Self::watch(
+                state.peer_source.is_some() || !state.pending_leaves.is_empty(),
+                w.hydration,
+                &mut w.hydration_seen,
+                &mut w.hydration_ticks,
+                threshold,
+                &mut self.counters.wedged_hydration,
+            );
+            Self::watch(
+                state.outbound.is_some(),
+                w.served,
+                &mut w.served_seen,
+                &mut w.outbound_ticks,
+                threshold,
+                &mut self.counters.wedged_outbound,
+            );
+        }
     }
 }

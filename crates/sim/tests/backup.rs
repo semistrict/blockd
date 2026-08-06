@@ -20,6 +20,7 @@ fn base_config() -> HarnessConfig {
             backup_retry: millis(100),
             disk_capacity: None,
             disk_headroom: 0,
+            wedge_ticks: 25,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::s3(),

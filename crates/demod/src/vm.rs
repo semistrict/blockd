@@ -95,6 +95,7 @@ impl Demod {
                 backup_retry: millis(100),
                 disk_capacity: None,
                 disk_headroom: 0,
+                wedge_ticks: 500,
             },
             blob_dir: cfg.blob_dir.clone(),
             peer: Some(PeerConfig {

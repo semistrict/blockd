@@ -25,6 +25,9 @@ pub fn single_host_base() -> HarnessConfig {
             backup_retry: millis(200),
             disk_capacity: None,
             disk_headroom: 0,
+            // 25 ticks × 20 ms = 500 ms: reachable inside sim horizons, so
+            // the wedge watch is exercised, not decorative.
+            wedge_ticks: 25,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::s3(),
@@ -79,6 +82,7 @@ pub fn cluster_kill_race() -> ClusterConfig {
             backup_retry: millis(100),
             disk_capacity: None,
             disk_headroom: 0,
+            wedge_ticks: 25,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::s3(),
@@ -102,6 +106,7 @@ pub fn cluster_kill_race() -> ClusterConfig {
         store_outage: None,
         rot_resume_set_at: None,
         rot_leaves_at: None,
+        drop_peer: None,
         race_restore: true,
         migrate_at: None,
         sabotage: None,
@@ -124,6 +129,7 @@ pub fn migration_chaos() -> ClusterConfig {
         peer_dup: (1, 8),
         store_outage: Some((millis(1800), millis(2600))),
         kill_hosts_at: vec![],
+        drop_peer: None,
         race_restore: false,
         ..cluster_kill_race()
     }

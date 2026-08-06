@@ -96,6 +96,7 @@ impl Daemon {
                             self.cache.fill_slot(page, true);
                             let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                             vset.mutation_seq += 1;
+                            vset.wedge.fills += 1;
                             self.counters.shared_fills += 1;
                             out.push(Effect::FillShared {
                                 page,
@@ -105,6 +106,8 @@ impl Daemon {
                         }
                     }
                 } else {
+                    let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
+                    vset.wedge.fills += 1;
                     self.counters.shared_fills += 1;
                     out.push(Effect::FillShared {
                         page,
@@ -128,10 +131,11 @@ impl Daemon {
                     None => {
                         // Never written: the zero page.
                         self.cache.fill_slot(page, write);
+                        let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                         if write {
-                            let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                             vset.mutation_seq += 1;
                         }
+                        vset.wedge.fills += 1;
                         self.counters.zero_fills += 1;
                         out.push(Effect::Fill {
                             page,
@@ -276,8 +280,11 @@ impl Daemon {
         } else {
             self.cache.fill_slot(page, write);
         }
-        if write && let Some(vset) = self.vsets.get_mut(&page.volume.vset) {
-            vset.mutation_seq += 1;
+        if let Some(vset) = self.vsets.get_mut(&page.volume.vset) {
+            if write {
+                vset.mutation_seq += 1;
+            }
+            vset.wedge.fills += 1;
         }
         self.counters.fills += 1;
         out.push(Effect::Fill {
