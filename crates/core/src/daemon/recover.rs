@@ -102,9 +102,12 @@ impl Daemon {
             // Cold-boot candidate: newest intact consistency point whose
             // every referenced leaf also decoded intact — a record with a
             // missing or damaged leaf is unusable, exactly like a torn
-            // record, and recovery falls back to the next-best.
-            let usable =
-                |r: &&JournalRecord| r.leaves.values().all(|ptr| f.leaves.contains_key(ptr));
+            // record, and recovery falls back to the next-best. A record
+            // still naming its migration source is exempt: its leaves are
+            // EXPECTED to be absent (they hydrate from the peer, R7.2).
+            let usable = |r: &&JournalRecord| {
+                r.migrated_from.is_some() || r.leaves.values().all(|ptr| f.leaves.contains_key(ptr))
+            };
             let cold = f
                 .records
                 .iter()
@@ -157,10 +160,13 @@ impl Daemon {
             };
             state.fence = chosen.fence;
             state.mutation_seq = chosen.capture_seq;
-            // Materialize the serving map: leaves first, overlay wins.
+            // Materialize the serving map: leaves first, overlay wins. A
+            // leaf not local (mid-hydration migration) parks its span.
             let mut locs = super::PageMap::new();
             for ptr in chosen.leaves.values() {
-                let (_, leaf) = &f.leaves[ptr];
+                let Some((_, leaf)) = f.leaves.get(ptr) else {
+                    continue;
+                };
                 for &(idx, page_no, generation, loc) in &leaf.entries {
                     let page = PageId {
                         volume: VolumeId { vset: vset_id, idx },
@@ -213,6 +219,26 @@ impl Daemon {
             recovered_bytes += f.seg_names.iter().map(|&(_, _, size)| size).sum::<u64>();
             recovered_bytes += f.leaves.values().map(|(size, _)| size).sum::<u64>();
             state.seg_blobs = f.seg_names;
+            // Recovery landed mid-migration-handshake (R7.2): the durable
+            // accept IS ownership, but the tail still lives on the source.
+            // Restore the destination side — foreign pages and missing
+            // leaves keep hydrating from the peer, and the source's
+            // re-offers (it never saw the accept) get re-acked instead of
+            // igniting a second runner.
+            state.peer_source = chosen.migrated_from;
+            let hydrating = chosen.migrated_from.is_some();
+            if hydrating {
+                state.pending_leaves = chosen
+                    .leaves
+                    .iter()
+                    .filter(|(_, ptr)| !f.leaves.contains_key(ptr))
+                    .map(|(&span, &ptr)| (span, ptr))
+                    .collect();
+                effects.push(Effect::SetTimer {
+                    timer: crate::seam::TimerId::Hydrate(vset_id),
+                    after: super::migrate::HYDRATE_TICK,
+                });
+            }
             state.best_record = Some(chosen);
             if let Some(to) = f.handoff {
                 // Handed off before the crash (R7.2): this vset now exists
@@ -237,6 +263,9 @@ impl Daemon {
                 state.pending_verdict = Some(verdict);
             }
             daemon.vsets.insert(vset_id, state);
+            if hydrating {
+                daemon.request_pending_leaves(vset_id, &mut effects);
+            }
             daemon.cleanup(vset_id, &mut effects);
             if backed {
                 let io = daemon.io();

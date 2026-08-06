@@ -5,41 +5,14 @@
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::types::{HostId, micros, millis, secs};
+use blockd_core::types::{micros, millis, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::rng::Ppm;
-use blockd_sim::world::blobdev::BlobDevConfig;
-use blockd_sim::world::store::StoreConfig;
 
+/// The library preset, by reference: the `sweep` binary drives the same
+/// schedules, so corpus and sweep can never drift apart.
 fn base_config() -> HarnessConfig {
-    HarnessConfig {
-        daemon: DaemonConfig {
-            host: HostId(0),
-            cache_pages: 256,
-            writeback_interval: millis(20),
-            backup_retry: millis(200),
-            disk_capacity: None,
-            disk_headroom: 0,
-        },
-        bdev: BlobDevConfig::nvme(),
-        store: StoreConfig::s3(),
-        vset_count: 3,
-        backed_vsets: 0,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 16,
-            backed_up: false,
-        },
-        horizon: secs(2),
-        think: (millis(1), millis(5)),
-        checkpoint_interval: None,
-        faults: FaultPlan::none(),
-        sabotage: None,
-        guest_sync_share: None,
-        guest_hot_pages: None,
-        rot_records_at: vec![],
-        crash_at: vec![],
-    }
+    blockd_sim::presets::single_host_base()
 }
 
 fn assert_clean(report: &RunReport) {
@@ -263,19 +236,7 @@ fn scale_run_hosts_many_overcommitted_vsets() {
 #[test]
 fn chaos_seed_corpus_stays_consistent() {
     for seed in [3, 8, 21, 29, 47, 63, 77, 90, 104, 131] {
-        let mut config = base_config();
-        config.horizon = secs(3);
-        config.checkpoint_interval = Some(millis(300));
-        config.backed_vsets = 1;
-        config.vset_config.pages_per_volume = 12;
-        config.faults = FaultPlan {
-            crash_mean_interval: millis(600),
-            restart_delay: (millis(10), millis(300)),
-            bitflip_mean_interval: millis(500),
-            journal_bitflip_mean_interval: 0,
-            store_outage: Some((millis(1200), millis(1900))),
-        };
-        let report = run(seed, config);
+        let report = run(seed, blockd_sim::presets::single_host_chaos());
         assert_eq!(
             report.violations,
             Vec::<String>::new(),

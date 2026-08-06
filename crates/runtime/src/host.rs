@@ -221,7 +221,12 @@ impl Runtime {
             })
         });
 
-        let (store_tx, blob_tx, timer_tx) = spawn_io_workers(&config.blob_dir, store, &tx);
+        let IoLanes {
+            store: store_tx,
+            blob: blob_tx,
+            blob_delete: blob_delete_tx,
+            timer: timer_tx,
+        } = spawn_io_workers(&config.blob_dir, store, &tx);
 
         // The event loop: the daemon lives here.
         let loop_thread = {
@@ -239,6 +244,7 @@ impl Runtime {
                             &shared,
                             &store_tx,
                             &blob_tx,
+                            &blob_delete_tx,
                             &timer_tx,
                             &admin_tx,
                             &tx,
@@ -573,6 +579,7 @@ fn apply_effect(
     shared: &Arc<Shared>,
     store_tx: &Sender<StoreJob>,
     blob_tx: &Sender<BlobJob>,
+    blob_delete_tx: &Sender<BlobJob>,
     timer_tx: &Sender<(TimerId, u64)>,
     admin_tx: &Sender<AdminReply>,
     tx: &Sender<Msg>,
@@ -697,9 +704,11 @@ fn apply_effect(
                 .expect("blob workers alive");
         }
         Effect::BlobDelete { name } => {
-            blob_tx
+            // The single ordered lane: see `spawn_io_workers` on why
+            // reclaim deletes must not reorder.
+            blob_delete_tx
                 .send(BlobJob::Delete { name })
-                .expect("blob workers alive");
+                .expect("blob delete worker alive");
         }
         Effect::SetTimer { timer, after } => {
             let _ = timer_tx.send((timer, after));
@@ -998,11 +1007,7 @@ fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Sender<Msg>) {
 /// - Blob workers: local blob I/O has the same completion-event
 ///   contract — one slow filesystem operation (fsync included) must not
 ///   stall guest faults.
-fn spawn_io_workers(
-    blob_dir: &Path,
-    store: &Arc<dyn ObjectStore>,
-    tx: &Sender<Msg>,
-) -> (Sender<StoreJob>, Sender<BlobJob>, Sender<(TimerId, u64)>) {
+fn spawn_io_workers(blob_dir: &Path, store: &Arc<dyn ObjectStore>, tx: &Sender<Msg>) -> IoLanes {
     let (timer_tx, timer_rx) = channel::<(TimerId, u64)>();
     {
         let tx = tx.clone();
@@ -1031,7 +1036,33 @@ fn spawn_io_workers(
         }
     }
 
-    (store_tx, blob_tx, timer_tx)
+    // Deletes get ONE lane of their own: reclaim order is load-bearing.
+    // `released` deletes a vset's records BEFORE its handoff marker, so a
+    // crash mid-reclaim can never leave records on disk without the
+    // marker that says they were handed off — recovery would resurrect a
+    // stale owner. The read/write pool would reorder them.
+    let (blob_delete_tx, blob_delete_rx) = channel::<BlobJob>();
+    {
+        let blob_delete_rx = Arc::new(Mutex::new(blob_delete_rx));
+        let blob_dir = blob_dir.to_path_buf();
+        let tx = tx.clone();
+        thread::spawn(move || blob_worker_loop(&blob_delete_rx, &blob_dir, &tx));
+    }
+
+    IoLanes {
+        store: store_tx,
+        blob: blob_tx,
+        blob_delete: blob_delete_tx,
+        timer: timer_tx,
+    }
+}
+
+/// The job senders `spawn_io_workers` hands back, one per lane.
+struct IoLanes {
+    store: Sender<StoreJob>,
+    blob: Sender<BlobJob>,
+    blob_delete: Sender<BlobJob>,
+    timer: Sender<(TimerId, u64)>,
 }
 
 fn elapsed_ns(elapsed: Duration) -> u64 {
@@ -1088,6 +1119,7 @@ mod tests {
         // No worker receives from this channel: it models every disk worker
         // being occupied by a slow filesystem operation.
         let (blob_tx, blob_rx) = channel();
+        let (blob_delete_tx, _blob_delete_rx) = channel();
         let (timer_tx, timer_rx) = channel();
         let (admin_tx, _admin_rx) = channel();
         let (tx, _rx) = channel();
@@ -1101,6 +1133,7 @@ mod tests {
             &shared,
             &store_tx,
             &blob_tx,
+            &blob_delete_tx,
             &timer_tx,
             &admin_tx,
             &tx,
@@ -1115,6 +1148,7 @@ mod tests {
             &shared,
             &store_tx,
             &blob_tx,
+            &blob_delete_tx,
             &timer_tx,
             &admin_tx,
             &tx,

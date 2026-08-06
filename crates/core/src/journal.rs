@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::mapleaf::LeafPtr;
 use crate::segment::PageLoc;
-use crate::types::{Epoch, Gen, JournalSeq, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 
 pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
 
@@ -72,12 +72,19 @@ pub struct JournalRecord {
     pub overlay: BTreeMap<PageId, (Gen, PageLoc)>,
     /// The rest of the captured map: one leaf blob per span.
     pub leaves: BTreeMap<u32, LeafPtr>,
+    /// Migration provenance (R7.2): while an in-migrated vset still
+    /// hydrates from its source, every record names that source. The
+    /// destination's first record — the durable ACCEPT of the handoff —
+    /// must let a recovery finish the handshake it interrupts: answer the
+    /// source's re-offers and keep pulling the tail. Cleared by the first
+    /// capture after `Released`.
+    pub migrated_from: Option<HostId>,
 }
 
 impl JournalRecord {
     pub fn encode(&self, vset: VsetId) -> Vec<u8> {
         let mut e = Enc::new();
-        e.u16(2); // version
+        e.u16(3); // version
         e.u64(vset.0);
         e.u64(self.seq.0);
         e.u64(self.fence);
@@ -95,6 +102,16 @@ impl JournalRecord {
         }
         e.u64(self.capture_seq);
         e.u64(self.synced_through);
+        match self.migrated_from {
+            None => {
+                e.u8(0);
+                e.u16(0);
+            }
+            Some(source) => {
+                e.u8(1);
+                e.u16(source.0);
+            }
+        }
         e.u8(self.config.disk_volumes);
         e.u32(self.config.pages_per_volume);
         e.u8(u8::from(self.config.backed_up));
@@ -123,7 +140,7 @@ impl JournalRecord {
     pub fn decode(vset: VsetId, bytes: &[u8]) -> Result<JournalRecord, DecodeError> {
         let payload = open_frame(MAGIC_JOURNAL, bytes)?;
         let mut d = Dec::new(payload);
-        if d.u16()? != 2 {
+        if d.u16()? != 3 {
             return Err(DecodeError);
         }
         if d.u64()? != vset.0 {
@@ -141,6 +158,11 @@ impl JournalRecord {
         };
         let capture_seq = d.u64()?;
         let synced_through = d.u64()?;
+        let migrated_from = match (d.u8()?, d.u16()?) {
+            (0, 0) => None,
+            (1, source) => Some(HostId(source)),
+            _ => return Err(DecodeError),
+        };
         let config = VsetConfig {
             disk_volumes: d.u8()?,
             pages_per_volume: d.u32()?,
@@ -197,6 +219,7 @@ impl JournalRecord {
             synced_through,
             overlay,
             leaves,
+            migrated_from,
         })
     }
 
@@ -273,6 +296,7 @@ mod tests {
                     id: 11,
                 },
             )]),
+            migrated_from: Some(HostId(2)),
         }
     }
 
@@ -282,8 +306,8 @@ mod tests {
         let bytes = record.encode(VsetId(0xA1));
         assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
         // Byte pin (R10.2): any change here is a storage format change.
-        assert_eq!(bytes.len(), 203);
-        assert_eq!(crc32c(&bytes), 0x49C8_F246);
+        assert_eq!(bytes.len(), 206);
+        assert_eq!(crc32c(&bytes), 0x5C1E_CF77);
     }
 
     #[test]
@@ -385,6 +409,7 @@ mod tests {
             synced_through: 0,
             overlay,
             leaves,
+            migrated_from: None,
         };
         let bytes = record.encode(vset);
         assert!(

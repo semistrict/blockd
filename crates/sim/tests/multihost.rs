@@ -5,50 +5,14 @@
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::types::{HostId, VsetId, micros, millis, secs};
+use blockd_core::types::{VsetId, micros, millis, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, run};
 use blockd_sim::rng::Ppm;
-use blockd_sim::world::blobdev::BlobDevConfig;
-use blockd_sim::world::store::StoreConfig;
 
+/// The library preset, by reference: the `sweep` binary drives the same
+/// schedules, so corpus and sweep can never drift apart.
 fn base_config() -> ClusterConfig {
-    ClusterConfig {
-        hosts: 3,
-        daemon: DaemonConfig {
-            host: HostId(0), // overridden per host
-            cache_pages: 128,
-            writeback_interval: millis(20),
-            backup_retry: millis(100),
-            disk_capacity: None,
-            disk_headroom: 0,
-        },
-        bdev: BlobDevConfig::nvme(),
-        store: StoreConfig::s3(),
-        vset_count: 3,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 16,
-            backed_up: true,
-        },
-        nonbacked_vsets: 0,
-        horizon: secs(4),
-        think: (millis(1), millis(5)),
-        checkpoint_interval: Some(millis(300)),
-        kill_hosts_at: vec![(millis(1500), 0)],
-        crash_hosts_at: vec![],
-        restart_delay: (millis(50), millis(200)),
-        crash_mean_interval: 0,
-        migrate_mean_interval: 0,
-        peer_drop: (0, 1),
-        peer_dup: (0, 1),
-        store_outage: None,
-        rot_resume_set_at: None,
-        rot_leaves_at: None,
-        race_restore: true,
-        migrate_at: None,
-        sabotage: None,
-        guest_sync_share: None,
-    }
+    blockd_sim::presets::cluster_kill_race()
 }
 
 fn assert_clean(report: &ClusterReport) {
@@ -344,12 +308,14 @@ fn torn_handoff_marker_means_the_migration_never_happened() {
     assert_eq!(report.completed_ops, 1460);
 }
 
-/// R7.3's mirror: the DESTINATION crashing mid-drain loses its volatile
-/// peer link, so the undrained tail is unreachable after its restart. The
-/// vset dies loudly at its first unservable page — and the source stays
-/// outbound forever, never running the guest (no silent double-run).
+/// R7.3's mirror: the DESTINATION crashes mid-drain. Its durable records
+/// name the migration source (R7.2), so recovery restores the peer link
+/// the crash interrupted: hydration resumes against the still-alive
+/// source, the drain finishes, and the source — outbound the whole time,
+/// never running the guest — is released and reclaimed. Exactly one
+/// runner throughout; nothing dies.
 #[test]
-fn dest_crash_mid_drain_dies_loudly_not_silently() {
+fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
     let config = ClusterConfig {
         crash_hosts_at: vec![(millis(1520), 1)],
         ..migrate_config()
@@ -357,12 +323,13 @@ fn dest_crash_mid_drain_dies_loudly_not_silently() {
     let report = run(7, config);
     assert_clean(&report);
     assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.releases, 0);
+    assert_eq!(report.guest_deaths, 0);
+    assert_eq!(report.releases, 1);
     assert_eq!(report.recoveries, 1);
-    // Never released: the source keeps the tail.
-    assert!(report.blobs_per_host[0] > 0);
-    assert_eq!(report.completed_ops, 592);
+    // Released and reclaimed: the source holds nothing.
+    assert_eq!(report.blobs_per_host[0], 0);
+    // Well past the old die-loudly count (592): the guest lived on.
+    assert_eq!(report.completed_ops, 1508);
 }
 
 /// Migration completes losslessly over a channel that drops a quarter of
@@ -405,20 +372,7 @@ fn lossy_migration_replays_byte_for_byte() {
 }
 
 fn migration_chaos_config() -> ClusterConfig {
-    ClusterConfig {
-        hosts: 3,
-        vset_count: 4,
-        nonbacked_vsets: 2,
-        migrate_mean_interval: millis(400),
-        crash_mean_interval: millis(1100),
-        restart_delay: (millis(50), millis(200)),
-        peer_drop: (1, 8),
-        peer_dup: (1, 8),
-        store_outage: Some((millis(1800), millis(2600))),
-        kill_hosts_at: vec![],
-        race_restore: false,
-        ..base_config()
-    }
+    blockd_sim::presets::migration_chaos()
 }
 
 /// Randomized composition: migrations keep firing while hosts crash and
@@ -429,7 +383,11 @@ fn migration_chaos_config() -> ClusterConfig {
 fn migration_chaos_corpus_stays_consistent() {
     let mut migrations = 0;
     let mut drops = 0;
-    for seed in [7, 13, 19, 31, 44, 52, 71, 88] {
+    // 192: a write fault answered by an unsolicited protected fill (the
+    //      harness's WP-retrap model). 1614: destination crashed after its
+    //      durable accept, before anyone learned — recovery must complete
+    //      the handshake, not ignite a second runner.
+    for seed in [7, 13, 19, 31, 44, 52, 71, 88, 192, 1614] {
         let report = run(seed, migration_chaos_config());
         assert_eq!(
             report.violations,

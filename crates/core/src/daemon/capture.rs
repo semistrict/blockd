@@ -641,6 +641,7 @@ impl Daemon {
             synced_through: capture.synced_through,
             overlay: capture.overlay.clone(),
             leaves: capture.leaf_table.clone(),
+            migrated_from: state.peer_source,
         };
         state
             .record_ws

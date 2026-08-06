@@ -221,6 +221,10 @@ struct Harness {
     poisoned: BTreeSet<VsetId>,
     /// The host's shared base-page tier bytes (R5.3), keyed by location.
     shared_base: BTreeMap<(u64, u64, blockd_core::types::SegId, u32), Vec<u8>>,
+    /// Write ops whose page just installed write-protected: the vCPU's
+    /// retry traps again as a WP fault once the current effect batch is
+    /// applied (real uffd's double fault under an unsolicited fill).
+    refaults: Vec<PageId>,
     pause_started: BTreeMap<VsetId, SimTime>,
     last_counters: Counters,
     report: RunReport,
@@ -273,6 +277,7 @@ pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
         sync_reqs: BTreeMap::new(),
         admin_reqs: BTreeMap::new(),
         poisoned: BTreeSet::new(),
+        refaults: Vec::new(),
         shared_base: BTreeMap::new(),
         pause_started: BTreeMap::new(),
         last_counters: Counters::default(),
@@ -369,6 +374,10 @@ impl Harness {
         };
         let effects = daemon.step(event, &MemView(&self.mems));
         self.apply_effects(effects);
+        // Retried writes trap again after the batch (see `refaults`).
+        while let Some(page) = self.refaults.pop() {
+            self.step_daemon(Event::GuestFault { page, write: true });
+        }
     }
 
     // One arm per effect kind; splitting would only scatter the seam.
@@ -867,6 +876,14 @@ impl Harness {
             guest.state = GuestState::Parked { op };
             return;
         }
+        if !writable && matches!(op, PendingOp::Write { .. }) {
+            // An unsolicited fill (prefetch pre-population) landed
+            // write-protected under this waiting writer. Real uffd resolves
+            // the missing fault, the write retries, and traps again as a WP
+            // fault — model exactly that; the op retires via `Unprotect`.
+            self.refaults.push(page);
+            return;
+        }
         guest.state = GuestState::Idle;
         self.complete_op(vset, op);
     }
@@ -948,8 +965,11 @@ impl Harness {
         let guest = self.guests.get_mut(&vset).expect("guest exists");
         match guest.state {
             GuestState::Parked { op } => {
+                // The resumed vCPU retries the instruction: re-attempt, so
+                // a write whose page re-protected meanwhile traps again
+                // instead of completing into a protected page.
                 guest.state = GuestState::Idle;
-                self.complete_op(vset, op);
+                self.attempt_op(vset, op);
             }
             GuestState::SyncParked { volume } => {
                 guest.applied += 1;

@@ -213,6 +213,11 @@ struct Cluster {
     paused_at: BTreeMap<VsetId, SimTime>,
     /// Migrated-in vsets and the source host still serving their tail.
     migrated_from: BTreeMap<VsetId, u16>,
+    /// Offers seen in flight: vset → (source, destination). A destination
+    /// that durably accepted and then crashed recovers as the legitimate
+    /// owner (R7.2) — this map is how `attach_recovered` tells that
+    /// completion apart from a genuine second runner.
+    pending_offers: BTreeMap<VsetId, (u16, u16)>,
     /// Vsets whose migration source died mid-drain: unservable pages are
     /// the sanctioned R7.3 loss, not a violation.
     doomed: BTreeSet<VsetId>,
@@ -223,6 +228,10 @@ struct Cluster {
     /// Requests issued by `MigrateOut` (their failures are refusals, not
     /// lost restore claims).
     migrate_reqs: BTreeSet<ReqId>,
+    /// Write ops whose page just installed write-protected: the vCPU's
+    /// retry traps again as a WP fault once the current effect batch is
+    /// applied (real uffd's double fault under an unsolicited fill).
+    refaults: Vec<(u16, PageId)>,
     report: ClusterReport,
 }
 
@@ -255,6 +264,8 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
         next_req: 0,
         sync_reqs: BTreeMap::new(),
         admin_reqs: BTreeMap::new(),
+        refaults: Vec::new(),
+        pending_offers: BTreeMap::new(),
         expected_ptr: BTreeMap::new(),
         restore_sent: BTreeMap::new(),
         paused_at: BTreeMap::new(),
@@ -385,6 +396,10 @@ impl Cluster {
         };
         let effects = daemon.step(event, &MemView(&state.mems));
         self.apply_effects(host, effects);
+        // Retried writes trap again after the batch (see `refaults`).
+        while let Some((host, page)) = self.refaults.pop() {
+            self.step_daemon(host, Event::GuestFault { page, write: true });
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -767,6 +782,17 @@ impl Cluster {
     }
 
     fn peer_deliver(&mut self, from: u16, to: u16, msg: blockd_core::seam::PeerMsg) {
+        if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
+            let mut text = format!("{msg:?}");
+            text.truncate(110);
+            eprintln!(
+                "[{:>12}] peer {from} -> {to}: {text}",
+                self.kernel.now().nanos()
+            );
+        }
+        if let blockd_core::seam::PeerMsg::MigrateOffer { vset, .. } = &msg {
+            self.pending_offers.insert(*vset, (from, to));
+        }
         if self.hosts[usize::from(to)].daemon.is_some() {
             if let blockd_core::seam::PeerMsg::Released { vset } = msg
                 && self.migrated_from.remove(&vset).is_some()
@@ -1006,10 +1032,27 @@ impl Cluster {
     /// double-run the two-sided handoff and the head CAS exist to prevent.
     fn attach_recovered(&mut self, host: u16, vset: VsetId, verdict: Verdict) {
         if self.placement.get(&vset) != Some(&host) {
-            self.report.violations.push(format!(
-                "two runners: host {host} recovered {vset:?} as runnable, but it runs elsewhere"
-            ));
-            return;
+            // One legitimate mismatch (R7.2): the current holder offered
+            // this vset here, the destination durably accepted, then
+            // crashed before anyone learned. The accept IS ownership —
+            // recovery completes the handshake (the source's re-offers
+            // get re-acked), so the placement moves; anything else is a
+            // genuine second runner.
+            let offered = self
+                .pending_offers
+                .get(&vset)
+                .is_some_and(|&(source, dest)| {
+                    dest == host && self.placement.get(&vset) == Some(&source)
+                });
+            if !offered {
+                self.report.violations.push(format!(
+                    "two runners: host {host} recovered {vset:?} as runnable, but it runs elsewhere"
+                ));
+                return;
+            }
+            self.pending_offers.remove(&vset);
+            let source = self.placement.insert(vset, host).expect("was placed");
+            self.migrated_from.insert(vset, source);
         }
         self.hosts[usize::from(host)]
             .mems
@@ -1190,6 +1233,14 @@ impl Cluster {
             guest.state = GuestState::Parked { op };
             return;
         }
+        if !writable && matches!(op, PendingOp::Write { .. }) {
+            // An unsolicited fill (hydration, resume-set prefetch) landed
+            // write-protected under this waiting writer. Real uffd resolves
+            // the missing fault, the write retries, and traps again as a WP
+            // fault — model exactly that; the op retires via `Unprotect`.
+            self.refaults.push((host, page));
+            return;
+        }
         guest.state = GuestState::Idle;
         self.complete_op(host, vset, op);
     }
@@ -1262,8 +1313,11 @@ impl Cluster {
         let guest = self.guests.get_mut(&vset).expect("guest exists");
         match guest.state {
             GuestState::Parked { op } => {
+                // The resumed vCPU retries the instruction: re-attempt, so
+                // a write whose page re-protected meanwhile traps again
+                // instead of completing into a protected page.
                 guest.state = GuestState::Idle;
-                self.complete_op(host, vset, op);
+                self.attempt_op(host, vset, op);
             }
             GuestState::SyncParked { volume } => {
                 guest.applied += 1;

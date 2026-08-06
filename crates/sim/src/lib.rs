@@ -13,5 +13,6 @@ pub mod hash;
 pub mod kernel;
 pub mod nemesis;
 pub mod oracle;
+pub mod presets;
 pub mod rng;
 pub mod world;
