@@ -339,6 +339,75 @@ fn drive(vsets: u64) -> World {
     world
 }
 
+/// 2a-full's target number: ONE vset with a giant dirty set. Before the
+/// incremental drain, the writeback capture read and compressed the whole
+/// set inside a single step — seconds of stall every other sandbox's
+/// fault waited behind. Now the arm step reads nothing, every drain
+/// continuation reads one bounded batch, and the worst single step is the
+/// SEAL (map metadata, O(delta)) — not O(dirty) page work.
+#[test]
+fn profile_huge_vset_capture_stall() {
+    const HUGE_PAGES: u32 = 300_000;
+    let mut world = World::new(DaemonConfig {
+        host: HostId(0),
+        cache_pages: 1 << 22,
+        writeback_interval: millis(5),
+        backup_retry: millis(20),
+        disk_capacity: None,
+        disk_headroom: 0,
+    });
+    world.step(
+        Event::Admin(AdminCmd::CreateVset {
+            req: ReqId(1),
+            vset: VsetId(1),
+            config: VsetConfig {
+                disk_volumes: 1,
+                pages_per_volume: HUGE_PAGES,
+                backed_up: false,
+            },
+            from_base: None,
+        }),
+        Bucket::Admin,
+    );
+    // Dirty the entire volume without letting a writeback tick run: one
+    // capture then owes all 300k pages at once.
+    for n in 0..HUGE_PAGES {
+        let page = PageId {
+            volume: VolumeId {
+                vset: VsetId(1),
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(n),
+        };
+        world.step(Event::GuestFault { page, write: true }, Bucket::FaultMiss);
+    }
+    world.advance(millis(20));
+
+    let counters = world.daemon.counters;
+    assert!(
+        counters.pages_flushed >= u64::from(HUGE_PAGES),
+        "the capture never flushed the dirty set: {}",
+        counters.pages_flushed
+    );
+    let (timer_steps, _, worst_timer) = world.times[&Bucket::Timer];
+    assert!(
+        timer_steps > u64::from(HUGE_PAGES) / 64,
+        "the capture did not drain in batches: {timer_steps} timer steps"
+    );
+    eprintln!(
+        "── PROFILE: one {HUGE_PAGES}-dirty-page vset ── {timer_steps} drain/tick steps, \
+         worst single step {:.1}ms",
+        worst_timer as f64 / 1e6,
+    );
+    // Sanity ceiling only (machine-dependent): the pre-drain whole-set
+    // read+compress cost seconds; batches plus the seal's metadata step
+    // must stay well under that.
+    assert!(
+        worst_timer < 1_000_000_000,
+        "worst step {worst_timer}ns — the drain failed to bound the stall"
+    );
+}
+
 #[test]
 fn profile_decider_event_ceiling() {
     eprintln!("── PROFILE: bare Daemon::step ceiling (zero-cost I/O, one thread) ──");

@@ -549,6 +549,17 @@ impl Harness {
                     self.bdev.delete(&name);
                 }
                 Effect::SetTimer { timer, after } => {
+                    // A zero-delay timer means "continue once the loop is
+                    // free": the emitting step's own work has real duration
+                    // in the runtime, so model one — without it a drain
+                    // would run every continuation at a single instant and
+                    // nothing (no guest write, no copy-on-fault) could
+                    // ever interleave with it.
+                    let after = if after == 0 {
+                        self.kernel.rng().range(micros(20), micros(200))
+                    } else {
+                        after
+                    };
                     self.kernel.schedule_after(
                         after,
                         Ev::Daemon {

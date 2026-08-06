@@ -569,7 +569,7 @@ fn restores_hydrate_multi_leaf_maps_lazily() {
     );
     // The map really was sharded, and really hydrated span by span.
     assert!(report.leaf_fills > 0, "no leaves hydrated");
-    assert_eq!(report.completed_ops, 24874);
+    assert_eq!(report.completed_ops, 24845);
 }
 
 /// Migration of a multi-leaf vset: the offer stays small, the destination
@@ -597,7 +597,7 @@ fn migration_hydrates_multi_leaf_maps_from_the_source() {
     // throughput concern, not a correctness one, and is asserted by the
     // small-map release tests).
     assert!(report.hydrate_fills > 0);
-    assert_eq!(report.completed_ops, 29078);
+    assert_eq!(report.completed_ops, 29162);
 }
 
 /// A leaf object rotten in the store makes exactly its span unservable:
@@ -619,5 +619,5 @@ fn a_rotten_leaf_kills_its_span_loudly_and_nothing_else() {
     assert_eq!(report.restores, 1);
     // The reborn guest's verification pass hit the dead span: loud death.
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, 24437);
+    assert_eq!(report.completed_ops, 24315);
 }

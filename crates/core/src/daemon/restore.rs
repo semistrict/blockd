@@ -12,7 +12,7 @@ use crate::head::{HeadRecord, ManifestPtr};
 use crate::journal::{JournalRecord, RecordKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf};
-use crate::seam::{AdminReply, Effect, ReqId, StoreFault, TimerId, Verdict};
+use crate::seam::{AdminReply, Effect, HostMap, ReqId, StoreFault, TimerId, Verdict};
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 
@@ -356,10 +356,11 @@ impl Daemon {
         span: u32,
         ptr: LeafPtr,
         result: Result<Option<(u64, Vec<u8>)>, StoreFault>,
+        mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
         if let Ok(found) = result {
-            self.leaf_arrived(vset, span, ptr, found.map(|(_, b)| b), out);
+            self.leaf_arrived(vset, span, ptr, found.map(|(_, b)| b), mem, out);
             return;
         }
         // Transient outage: retry — hydration never gives up (R8.3).
@@ -393,6 +394,7 @@ impl Daemon {
         span: u32,
         ptr: LeafPtr,
         bytes: Option<Vec<u8>>,
+        mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
@@ -463,7 +465,7 @@ impl Daemon {
             bytes: blob,
         });
         for (page, write) in waiters {
-            self.fault(page, write, out);
+            self.fault(page, write, mem, out);
         }
     }
 

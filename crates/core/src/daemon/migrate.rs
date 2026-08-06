@@ -247,7 +247,13 @@ impl Daemon {
     }
 
     /// A peer message arrived (authenticated cluster member, R11.1).
-    pub(super) fn peer(&mut self, from: HostId, msg: PeerMsg, out: &mut Vec<Effect>) {
+    pub(super) fn peer(
+        &mut self,
+        from: HostId,
+        msg: PeerMsg,
+        mem: &dyn crate::seam::HostMap,
+        out: &mut Vec<Effect>,
+    ) {
         match msg {
             PeerMsg::MigrateOffer { vset, record } => self.migrate_in(from, vset, &record, out),
             PeerMsg::MigrateAccept { vset } => {
@@ -325,7 +331,7 @@ impl Daemon {
             PeerMsg::Leaf { io, bytes } => {
                 match self.pending.remove(&io) {
                     Some(Pending::PeerLeafFetch { vset, span, ptr }) => {
-                        self.leaf_arrived(vset, span, ptr, bytes, out);
+                        self.leaf_arrived(vset, span, ptr, bytes, mem, out);
                     }
                     Some(other) => {
                         self.pending.insert(io, other);

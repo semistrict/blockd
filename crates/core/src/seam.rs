@@ -283,6 +283,11 @@ pub enum TimerId {
     /// Re-issue demand fills parked by a store outage (R8.3: an outage is
     /// not absence — the blocked guests wait it out, they are not killed).
     FillRetry(VsetId),
+    /// Continue an in-flight incremental capture drain (armed at a single
+    /// write-protected instant, read out a bounded batch per step). Set
+    /// with `after: 0`: the next batch runs as soon as the loop has served
+    /// whatever else is waiting — that yield is the entire point.
+    CaptureStep(VsetId),
     /// Post-migration hydration tick (R7.1's tail drain): pull pages whose
     /// locations still reference the source until none remain, then release
     /// the source.

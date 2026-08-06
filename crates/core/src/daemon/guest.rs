@@ -8,7 +8,13 @@ use crate::segment::{PageLoc, open_entry};
 use crate::types::{Gen, PAGE_SIZE, PageId, VolumeId, VsetId};
 
 impl Daemon {
-    pub(super) fn fault(&mut self, page: PageId, write: bool, out: &mut Vec<Effect>) {
+    pub(super) fn fault(
+        &mut self,
+        page: PageId,
+        write: bool,
+        mem: &dyn HostMap,
+        out: &mut Vec<Effect>,
+    ) {
         let Some(vset) = self.vsets.get_mut(&page.volume.vset) else {
             self.counters.guest_rejected += 1;
             out.push(Effect::FillFailed { page });
@@ -23,7 +29,11 @@ impl Daemon {
             // Write-protect fault: first write since the last capture. (A
             // spurious resolve is harmless; a real read never traps here.)
             if write && !self.cache.is_dirty(page) {
+                // An armed-but-unread page of an in-flight drain must be
+                // captured before the write may land (copy-on-fault).
+                self.drain_cow(page, mem);
                 self.cache.mark_dirty(page);
+                let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                 vset.mutation_seq += 1;
                 self.counters.wp_faults += 1;
             }

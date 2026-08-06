@@ -15,7 +15,7 @@ use super::{Capture, Daemon, PageMap, Pending, Vset};
 use crate::journal::{JournalRecord, RecordKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_of};
-use crate::seam::{AdminCmd, AdminReply, Effect, HostMap, IoId, ReqId};
+use crate::seam::{AdminCmd, AdminReply, Effect, HostMap, IoId, ReqId, TimerId};
 use crate::segment::{PageLoc, SegmentBuilder};
 use crate::types::{Epoch, Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
 
@@ -30,6 +30,60 @@ pub(super) const OVERLAY_MAX: usize = 2048;
 /// A span rolls into a fresh leaf once this many of its entries sit in
 /// the overlay: one leaf write (≤ ~180 KB) per this many page updates.
 const ROLL_THRESHOLD: usize = 256;
+
+/// A rolled map leaf on its way to disk: pointer, encoded bytes, and the
+/// own-namespace segments its entries reference.
+type LeafWrite = (LeafPtr, Vec<u8>, BTreeSet<(u64, SegId)>);
+
+/// A fresh location a capture's segment holds for one page.
+type NewLoc = (PageId, (Gen, PageLoc));
+
+/// A commit capture whose set exceeds this many pages goes incremental
+/// (2a-full): armed whole in one cheap step, then read out this many
+/// pages per `CaptureStep`. The value bounds a step's read+compress work
+/// to sub-millisecond territory; smaller sets keep the synchronous path
+/// (one step, at most this many reads) byte-for-byte unchanged.
+const DRAIN_PAGES_PER_STEP: usize = 64;
+
+/// One in-flight incremental commit capture (2a-full). The consistency
+/// cut is fixed at the ARM step, where the entire unstable set went (or
+/// already was) behind write protection with NOTHING read yet; from that
+/// instant no armed page can change without the daemon hearing first, so
+/// reads may spread over as many steps as they like — every one returns
+/// the arm-instant bytes exactly.
+#[derive(Debug)]
+pub(super) struct Drain {
+    seq: JournalSeq,
+    capture_seq: u64,
+    seg: SegId,
+    builder: SegmentBuilder,
+    /// Armed pages not yet read: drained in key order, or immediately on
+    /// a write-protect fault (copy-on-fault, the crux — see `drain_cow`).
+    unread: BTreeMap<PageId, Gen>,
+    /// Every armed page — `begin_flush`ed at the arm; exactly these get
+    /// `end_flush` on segment durability (or in the unwind).
+    armed: Vec<PageId>,
+    /// Compaction rescues awaiting the builder. Their bytes are already
+    /// in hand, but compression is the cost being spread — they take
+    /// drain budget like everything else.
+    rescues: Vec<(PageId, Gen, Vec<u8>)>,
+    compact_victims: BTreeSet<(u64, SegId)>,
+    compact_pages: u64,
+}
+
+/// A fully-built capture on its way to `seal_capture`: everything the
+/// synchronous path produces in one step and the drain produces across
+/// many.
+struct Built {
+    seq: JournalSeq,
+    capture_seq: u64,
+    checkpoint: Option<(Epoch, u64, ReqId)>,
+    new_locs: Vec<NewLoc>,
+    seg_blob: Option<(SegId, Vec<u8>)>,
+    flushed: Vec<PageId>,
+    compact_victims: BTreeSet<(u64, SegId)>,
+    compact_pages: u64,
+}
 
 impl Daemon {
     // ── admin ───────────────────────────────────────────────────────────
@@ -95,9 +149,10 @@ impl Daemon {
     // ── captures ────────────────────────────────────────────────────────
 
     /// One writeback tick's captures, bounded (R2.4 with a step-cost
-    /// bound): a capture reads and compresses its vset's whole unstable
-    /// set in-step, so a tick must not run one for every vset of a large
-    /// fleet at once — every guest's fault would wait behind the pile.
+    /// bound): a small capture reads its whole set in-step (a large one
+    /// arms an incremental drain), so a tick must not start one for every
+    /// vset of a large fleet at once — every guest's fault would wait
+    /// behind the pile.
     /// Sync-pending vsets always capture (one blocked guest sits behind
     /// each pending sync, so their inflow is self-limiting); the rest
     /// take at most `WRITEBACK_VSETS_PER_TICK` slots, rotating from a
@@ -299,7 +354,10 @@ impl Daemon {
         };
         if state.ckpt_pausing.is_none() && state.migrate.is_some() {
             // Migration's final capture: the guest does NOT resume here —
-            // it resumes on the destination (post-copy cutover, R7.1).
+            // it resumes on the destination (post-copy cutover, R7.1). An
+            // in-flight drain is dropped first: the final capture re-reads
+            // its pages at this paused instant.
+            self.abandon_drain(vset);
             self.start_capture(vset, Some((ReqId(u64::MAX), vmstate)), mem, out);
             return;
         }
@@ -351,17 +409,16 @@ impl Daemon {
     /// `force_rolls` spans roll regardless of their overlay share:
     /// compaction re-homes pages whose old locations live in leaves, and
     /// the leaf must stop referencing the dying segment.
-    #[allow(clippy::type_complexity)]
     fn shard_map(
         state: &mut Vset,
         vset_id: VsetId,
-        new_locs: &[(PageId, (Gen, PageLoc))],
+        new_locs: &[NewLoc],
         force_rolls: &BTreeSet<u32>,
     ) -> (
         PageMap,
         BTreeMap<u32, LeafPtr>,
         BTreeMap<PageId, Gen>,
-        Vec<(LeafPtr, Vec<u8>, BTreeSet<(u64, SegId)>)>,
+        Vec<LeafWrite>,
     ) {
         let mut overlay = state.overlay.clone();
         for &(page, entry) in new_locs {
@@ -369,7 +426,7 @@ impl Daemon {
                 overlay.insert(page, entry);
             }
         }
-        let mut new_locs_by_span: BTreeMap<u32, Vec<(PageId, (Gen, PageLoc))>> = BTreeMap::new();
+        let mut new_locs_by_span: BTreeMap<u32, Vec<NewLoc>> = BTreeMap::new();
         for &(page, entry) in new_locs {
             new_locs_by_span
                 .entry(span_of(page))
@@ -460,9 +517,11 @@ impl Daemon {
         (overlay, leaf_table, rolled_gens, writes)
     }
 
-    /// Begin a capture of the vset's exact current state, reading dirty page
-    /// contents straight from the shared mapping and re-arming write
-    /// protection on them.
+    /// Begin a capture of the vset's exact current state: re-arm write
+    /// protection on its dirty pages and read their contents straight from
+    /// the shared mapping — in this step when the set is small (and always
+    /// for checkpoints, whose pause is the snapshot), or spread across
+    /// `CaptureStep`s by the incremental drain when it is not.
     #[allow(clippy::too_many_lines)]
     pub(super) fn start_capture(
         &mut self,
@@ -508,6 +567,26 @@ impl Daemon {
             }
         }
 
+        // 2a-full: a large commit capture must not read and compress its
+        // whole set inside one step. Arm it instead — the cut is fixed at
+        // this instant, behind write protection, with nothing read — and
+        // drain in bounded batches. Checkpoints (and the migration's final
+        // capture) stay synchronous: the guest is paused, and the pause IS
+        // the snapshot.
+        if checkpoint.is_none() && to_flush.len() + compact_pages.len() > DRAIN_PAGES_PER_STEP {
+            self.arm_drain(
+                vset_id,
+                seq,
+                capture_seq,
+                &to_flush,
+                to_protect,
+                compact_victims,
+                compact_pages,
+                out,
+            );
+            return;
+        }
+
         let mut new_locs: Vec<(PageId, (Gen, PageLoc))> = Vec::new();
         let mut seg_blob: Option<(SegId, Vec<u8>)> = None;
         let mut flushed = Vec::new();
@@ -549,7 +628,54 @@ impl Daemon {
             seg_blob = Some((seg, blob));
         }
 
-        let state = self.vsets.get_mut(&vset_id).expect("just seen");
+        let gens_allocated = new_locs.len() as u64;
+        let had_seg = seg_blob.is_some();
+        let sealed = self.seal_capture(
+            vset_id,
+            Built {
+                seq,
+                capture_seq,
+                checkpoint,
+                new_locs,
+                seg_blob,
+                flushed,
+                compact_victims,
+                compact_pages: compact_pages.len() as u64,
+            },
+            out,
+        );
+        if !sealed {
+            // Deferred within one step: nothing can have interleaved, so
+            // the identifiers allocated above rewind exactly.
+            let state = self.vsets.get_mut(&vset_id).expect("just seen");
+            state.next_seq = state.next_seq.saturating_sub(1);
+            state.next_gen = state.next_gen.saturating_sub(gens_allocated);
+            if had_seg {
+                state.next_seg = state.next_seg.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Seal a fully-built capture: roll the map, check disk room, issue
+    /// the blob writes, and register the [`Capture`]. Returns `false` when
+    /// the disk is full even after reclaim (R2.7's coupled stall) — the
+    /// shared unwind has run (pages back to dirty, running flag cleared,
+    /// `next_leaf` rewound); the caller reverses whatever identifiers it
+    /// allocated that are still safely reversible. Dirty pages stay dirty;
+    /// the writeback timer retries; syncs wait; nothing corrupts, nothing
+    /// dies.
+    fn seal_capture(&mut self, vset_id: VsetId, built: Built, out: &mut Vec<Effect>) -> bool {
+        let Built {
+            seq,
+            capture_seq,
+            checkpoint,
+            new_locs,
+            seg_blob,
+            flushed,
+            compact_victims,
+            compact_pages,
+        } = built;
+        let state = self.vsets.get_mut(&vset_id).expect("sealing a known vset");
         // Every leaf still referencing a victim segment — via live
         // entries (all in the rescue) or stale ones — must rotate, or the
         // leaf keeps the dying segment pinned.
@@ -571,9 +697,6 @@ impl Daemon {
         let (overlay, leaf_table, rolled_gens, leaf_writes) =
             Self::shard_map(state, vset_id, &new_locs, &force_rolls);
 
-        // R2.7: no room even after reclaim ⇒ the capture is deferred — the
-        // coupled stall. Dirty pages stay dirty; the writeback timer
-        // retries; syncs wait; nothing corrupts, nothing dies.
         self.nvme_reclaim(out);
         let bytes_needed = seg_blob.as_ref().map_or(0, |(_, b)| b.len() as u64)
             + leaf_writes
@@ -583,12 +706,7 @@ impl Daemon {
         if !self.disk_has_room(bytes_needed) {
             self.counters.nvme_stalls += 1;
             let state = self.vsets.get_mut(&vset_id).expect("just seen");
-            state.next_seq = state.next_seq.saturating_sub(1);
-            state.next_gen = state.next_gen.saturating_sub(new_locs.len() as u64);
             state.next_leaf = leaves_before;
-            if seg_blob.is_some() {
-                state.next_seg = state.next_seg.saturating_sub(1);
-            }
             if checkpoint.is_none() {
                 state.commit_running = false;
             } else {
@@ -598,18 +716,54 @@ impl Daemon {
                 self.cache.end_flush(*page);
                 self.cache.mark_dirty(*page);
             }
-            return;
+            return false;
         }
 
         self.local_bytes += bytes_needed;
+        if seg_blob.is_some() {
+            self.counters.pages_flushed += flushed.len() as u64;
+            self.counters.segs_compacted += compact_victims.len() as u64;
+            self.counters.pages_compacted += compact_pages;
+        }
+        let writes_pending = self.issue_capture_writes(vset_id, seq, seg_blob, leaf_writes, out);
+        let state = self.vsets.get_mut(&vset_id).expect("just seen");
+        state.captures.insert(
+            seq,
+            Capture {
+                capture_seq,
+                checkpoint,
+                overlay,
+                leaf_table,
+                rolled_gens,
+                new_locs,
+                flushes: flushed,
+                writes_pending,
+                record_writes: 0,
+                synced_through: 0,
+                record: None,
+            },
+        );
+        if writes_pending == 0 {
+            self.write_record(vset_id, seq, out);
+        }
+        true
+    }
+
+    /// Issue a sealed capture's blob writes — the segment and every rolled
+    /// leaf — returning how many the record must wait on.
+    fn issue_capture_writes(
+        &mut self,
+        vset_id: VsetId,
+        seq: JournalSeq,
+        seg_blob: Option<(SegId, Vec<u8>)>,
+        leaf_writes: Vec<LeafWrite>,
+        out: &mut Vec<Effect>,
+    ) -> usize {
         let mut writes_pending = 0;
         let fence = self.vsets[&vset_id].fence;
         if let Some((seg, blob)) = seg_blob {
             let state = self.vsets.get_mut(&vset_id).expect("just seen");
             state.seg_blobs.push((fence, seg, blob.len() as u64));
-            self.counters.pages_flushed += flushed.len() as u64;
-            self.counters.segs_compacted += compact_victims.len() as u64;
-            self.counters.pages_compacted += compact_pages.len() as u64;
             let io = self.io();
             self.pending
                 .insert(io, Pending::SegWrite { vset: vset_id, seq });
@@ -634,25 +788,177 @@ impl Daemon {
             });
             writes_pending += 1;
         }
-        let state = self.vsets.get_mut(&vset_id).expect("just seen");
-        state.captures.insert(
+        writes_pending
+    }
+
+    // ── the incremental drain (2a-full) ─────────────────────────────────
+
+    /// ARM: fix the cut. Every armed page is behind write protection when
+    /// this step's effects land — dirty pages by the batched
+    /// `WriteProtect` emitted here, mid-flush pages since the capture that
+    /// flushed them — and NOTHING has been read: from this instant a page
+    /// in the set cannot change without a write-protect fault arriving
+    /// first, so the reads may spread over later steps and still return
+    /// arm-instant bytes exactly. Identifiers (seq, generations, the
+    /// segment) are allocated here; an abandoned drain burns them rather
+    /// than rewinding — a concurrent checkpoint may have allocated past
+    /// them mid-drain, and every name is write-once, so gaps are free.
+    #[allow(clippy::too_many_arguments)]
+    fn arm_drain(
+        &mut self,
+        vset_id: VsetId,
+        seq: JournalSeq,
+        capture_seq: u64,
+        to_flush: &[PageId],
+        to_protect: Vec<PageId>,
+        compact_victims: BTreeSet<(u64, SegId)>,
+        compact_pages: Vec<(PageId, Gen, Vec<u8>)>,
+        out: &mut Vec<Effect>,
+    ) {
+        let state = self.vsets.get_mut(&vset_id).expect("arming a known vset");
+        let seg = SegId(state.next_seg);
+        state.next_seg += 1;
+        let fence = state.fence;
+        let mut unread = BTreeMap::new();
+        for page in to_flush {
+            unread.insert(*page, Gen(state.next_gen));
+            state.next_gen += 1;
+        }
+        let mut rescues = Vec::new();
+        for (page, _, bytes) in compact_pages {
+            rescues.push((page, Gen(state.next_gen), bytes));
+            state.next_gen += 1;
+        }
+        let compact_count = rescues.len() as u64;
+        state.drain = Some(Drain {
             seq,
-            Capture {
-                capture_seq,
-                checkpoint,
-                overlay,
-                leaf_table,
-                rolled_gens,
+            capture_seq,
+            seg,
+            builder: SegmentBuilder::new(vset_id, fence, seg),
+            unread,
+            armed: to_flush.to_vec(),
+            rescues,
+            compact_victims,
+            compact_pages: compact_count,
+        });
+        for page in to_flush {
+            self.cache.begin_flush(*page);
+        }
+        if !to_protect.is_empty() {
+            out.push(Effect::WriteProtect { pages: to_protect });
+        }
+        out.push(Effect::SetTimer {
+            timer: TimerId::CaptureStep(vset_id),
+            after: 0,
+        });
+    }
+
+    /// DRAIN: one continuation step — read and compress a bounded batch
+    /// of armed pages into the in-flight segment, then re-arm the step
+    /// timer; when nothing is left, seal. A stale timer (the drain
+    /// finished, was abandoned, or its vset left this host) finds no
+    /// drain and does nothing.
+    pub(super) fn capture_step(
+        &mut self,
+        vset_id: VsetId,
+        mem: &dyn HostMap,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(state) = self.vsets.get_mut(&vset_id) else {
+            return;
+        };
+        let Some(drain) = &mut state.drain else {
+            return;
+        };
+        let mut budget = DRAIN_PAGES_PER_STEP;
+        while budget > 0 {
+            let Some((&page, &generation)) = drain.unread.first_key_value() else {
+                break;
+            };
+            drain.unread.remove(&page);
+            let bytes = mem.read_page(page);
+            drain.builder.add(page, generation, &bytes);
+            budget -= 1;
+        }
+        let take = budget.min(drain.rescues.len());
+        for (page, generation, bytes) in drain.rescues.drain(..take) {
+            drain.builder.add(page, generation, &bytes);
+        }
+        if drain.unread.is_empty() && drain.rescues.is_empty() {
+            self.finish_drain(vset_id, out);
+        } else {
+            out.push(Effect::SetTimer {
+                timer: TimerId::CaptureStep(vset_id),
+                after: 0,
+            });
+        }
+    }
+
+    /// COPY-ON-FAULT: the guest is writing an armed-but-unread page of an
+    /// in-flight drain. Capture it now, out of order — write protection
+    /// has held its arm-instant content, and after this read the caller
+    /// unprotects: the write lands, the page re-dirties, and the NEW
+    /// content belongs to the next capture. One page per fault, bounded.
+    pub(super) fn drain_cow(&mut self, page: PageId, mem: &dyn HostMap) {
+        let Some(state) = self.vsets.get_mut(&page.volume.vset) else {
+            return;
+        };
+        let Some(drain) = &mut state.drain else {
+            return;
+        };
+        let Some(generation) = drain.unread.remove(&page) else {
+            return;
+        };
+        let bytes = mem.read_page(page);
+        drain.builder.add(page, generation, &bytes);
+        self.counters.cow_captures += 1;
+    }
+
+    /// The drain read everything: build the blob and seal exactly as the
+    /// synchronous path would have. On a full disk the arm-time
+    /// identifiers burn (see `arm_drain`); the shared unwind in
+    /// `seal_capture` has already returned the pages to dirty.
+    fn finish_drain(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
+        let state = self.vsets.get_mut(&vset_id).expect("draining vset");
+        let drain = state.drain.take().expect("drain in flight");
+        let (blob, locs) = drain.builder.finish();
+        let new_locs = locs
+            .into_iter()
+            .map(|(page, generation, loc)| (page, (generation, loc)))
+            .collect();
+        self.seal_capture(
+            vset_id,
+            Built {
+                seq: drain.seq,
+                capture_seq: drain.capture_seq,
+                checkpoint: None,
                 new_locs,
-                flushes: flushed,
-                writes_pending,
-                record_writes: 0,
-                synced_through: 0,
-                record: None,
+                seg_blob: Some((drain.seg, blob)),
+                flushed: drain.armed,
+                compact_victims: drain.compact_victims,
+                compact_pages: drain.compact_pages,
             },
+            out,
         );
-        if writes_pending == 0 {
-            self.write_record(vset_id, seq, out);
+    }
+
+    /// Drop an in-flight drain: its pages return to dirty and its
+    /// identifiers burn. The migration's final capture re-reads
+    /// everything at the paused instant — a drain record landing after
+    /// the handoff would trail the final record for nothing — and the
+    /// dropped rescues just re-run compaction later (they are volatile by
+    /// design).
+    pub(super) fn abandon_drain(&mut self, vset_id: VsetId) {
+        let Some(state) = self.vsets.get_mut(&vset_id) else {
+            return;
+        };
+        let Some(drain) = state.drain.take() else {
+            return;
+        };
+        state.commit_running = false;
+        for page in drain.armed {
+            self.cache.end_flush(page);
+            self.cache.mark_dirty(page);
         }
     }
 

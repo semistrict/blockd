@@ -115,6 +115,9 @@ pub struct Counters {
     pub hydrate_fills: u64,
     /// Peer fetches re-issued after going unanswered (lossy channel).
     pub peer_retries: u64,
+    /// Armed-but-unread pages captured out of order because the guest
+    /// wrote them mid-drain (2a-full's copy-on-fault).
+    pub cow_captures: u64,
     /// Map spans rolled into fresh leaf blobs (the amortized half of the
     /// map's write cost; records carry only the overlay).
     pub leaf_rolls: u64,
@@ -467,6 +470,12 @@ struct Vset {
     fork_verdict: Option<crate::seam::Verdict>,
     /// Post-resume fault recording toward the next resume set (R6.2).
     resume_recording: Option<Vec<PageId>>,
+    /// An in-flight incremental commit capture (2a-full): the unstable set
+    /// was write-protected in one arm step; its pages are read out a
+    /// bounded batch per `CaptureStep`, or immediately on a write-protect
+    /// fault (copy-on-fault) — so the record is an exact cut at the arm
+    /// instant without any step ever reading the whole set.
+    drain: Option<capture::Drain>,
     /// Source-side migration in flight.
     migrate: Option<migrate::MigrateOut>,
     /// This vset was handed off (R7.2): serve peer fetches, never guests.
@@ -540,6 +549,7 @@ impl Vset {
             fork_vmstate: None,
             fork_verdict: None,
             resume_recording: None,
+            drain: None,
             migrate: None,
             outbound: None,
             peer_source: None,
@@ -593,9 +603,8 @@ pub struct Daemon {
     /// Restores waiting out a store outage (R8.3), vset → admin req.
     restore_retries: BTreeMap<VsetId, ReqId>,
     /// Where the writeback rotation resumes (the last vset that took a
-    /// budgeted capture slot): a capture reads and compresses its vset's
-    /// whole dirty set in one step, so a tick captures a bounded, rotating
-    /// share of the fleet rather than all of it at once.
+    /// budgeted capture slot): a tick captures a bounded, rotating share
+    /// of the fleet rather than all of it at once.
     writeback_cursor: u64,
     /// The fence each released (migrated-away) vset last ran at here. A
     /// late duplicate `MigrateOffer` carrying a record at or below this
@@ -660,20 +669,21 @@ impl Daemon {
     pub fn step(&mut self, event: Event, mem: &dyn HostMap) -> Vec<Effect> {
         let mut out = Vec::new();
         match event {
-            Event::GuestFault { page, write } => self.fault(page, write, &mut out),
+            Event::GuestFault { page, write } => self.fault(page, write, mem, &mut out),
             Event::GuestSync { req, volume } => self.sync(req, volume, mem, &mut out),
             Event::GuestPaused { vset, vmstate } => self.paused(vset, vmstate, mem, &mut out),
-            Event::PeerDelivered { from, msg } => self.peer(from, msg, &mut out),
+            Event::PeerDelivered { from, msg } => self.peer(from, msg, mem, &mut out),
             Event::Admin(cmd) => self.admin(cmd, &mut out),
             Event::BlobWriteDone { io } => self.blob_write_done(io, mem, &mut out),
             Event::BlobReadDone { io, bytes } => self.blob_read_routed(io, bytes, &mut out),
             Event::StorePutDone { io, result } => self.store_put_done(io, result, &mut out),
-            Event::StoreGetDone { io, result } => self.store_get_done(io, result, &mut out),
+            Event::StoreGetDone { io, result } => self.store_get_done(io, result, mem, &mut out),
             Event::Timer(TimerId::Backup(vset)) => self.backup_tick(vset, mem, &mut out),
             Event::Timer(TimerId::ResumeSet(vset)) => self.resume_set_flush(vset, &mut out),
             Event::Timer(TimerId::MigrateOffer(vset)) => self.migrate_offer_tick(vset, &mut out),
             Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, &mut out),
             Event::Timer(TimerId::FillRetry(vset)) => self.fill_retry_tick(vset, &mut out),
+            Event::Timer(TimerId::CaptureStep(vset)) => self.capture_step(vset, mem, &mut out),
             Event::Timer(TimerId::Hydrate(vset)) => self.hydrate_tick(vset, &mut out),
             Event::Timer(TimerId::RestoreRetry(vset)) => self.restore_retry(vset, &mut out),
             Event::Timer(TimerId::LeafRetry(vset)) => self.leaf_retry(vset, &mut out),
@@ -728,6 +738,7 @@ impl Daemon {
         &mut self,
         io: IoId,
         result: Result<Option<(u64, Vec<u8>)>, crate::seam::StoreFault>,
+        mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
         match self.pending.remove(&io) {
@@ -748,7 +759,7 @@ impl Daemon {
                 loc,
             }) => self.store_fill_done(page, write, generation, loc, result, out),
             Some(Pending::LeafGet { vset, span, ptr }) => {
-                self.leaf_get_done(vset, span, ptr, result, out);
+                self.leaf_get_done(vset, span, ptr, result, mem, out);
             }
             Some(Pending::ForkBaseGet { vset, base }) => {
                 self.fork_base_done(vset, base, result, out);

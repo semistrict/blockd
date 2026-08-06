@@ -553,6 +553,14 @@ impl Cluster {
                     self.hosts[usize::from(host)].bdev.delete(&name);
                 }
                 Effect::SetTimer { timer, after } => {
+                    // Zero-delay = "continue once the loop is free"; model
+                    // the emitting step's real duration (see the single-
+                    // host harness) so other events can interleave.
+                    let after = if after == 0 {
+                        self.kernel.rng().range(micros(20), micros(200))
+                    } else {
+                        after
+                    };
                     self.kernel.schedule_after(
                         after,
                         Ev::Daemon {

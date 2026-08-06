@@ -233,11 +233,13 @@ fn scale_run_hosts_many_overcommitted_vsets() {
 /// The standing long-haul suite (R10.1): full-nemesis runs over the
 /// committed regression seed corpus. Every seed that ever exposed a bug
 /// belongs in this list, forever.
-/// The step-cost bound (design flaw 2): one writeback tick captures a
-/// bounded, rotating share of the fleet — never every vset at once — so a
-/// step's page-read work is O(slots × working set), not O(fleet). Wall
-/// time cannot pass inside a sim step; counted work units can, and this
-/// pins them.
+/// The step-cost bound (design flaw 2): one writeback tick starts a
+/// bounded, rotating share of the fleet's captures — never every vset at
+/// once — and each capture reads at most one drain batch in any step (a
+/// larger set arms an incremental drain and reads NOTHING in the tick).
+/// Wall time cannot pass inside a sim step; counted work units can, and
+/// this pins them: a step's reads are O(slots × batch), independent of
+/// both fleet size and dirty-set size.
 #[test]
 fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
     let mut config = base_config();
@@ -246,18 +248,62 @@ fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
     config.vset_config.pages_per_volume = 24;
     let report = run(5, config);
     assert_clean(&report);
-    // 3 volumes × 24 pages = 72 resident pages per vset; 8 rotation slots.
-    let per_vset: u64 = 3 * 24;
+    // 8 rotation slots × the 64-page synchronous-capture ceiling; a vset's
+    // full 72-page set never lands in one step at all.
+    let step_ceiling: u64 = 8 * 64;
     assert!(
-        report.max_step_page_reads <= 8 * per_vset,
-        "one step read {} pages — the tick captured more than its slots",
+        report.max_step_page_reads <= step_ceiling,
+        "one step read {} pages — a capture or tick exceeded its batch",
         report.max_step_page_reads
     );
-    // Non-vacuous: the fleet's total dirty work far exceeded one tick's
-    // bound, so the rotation genuinely spread it across ticks.
+    // Non-vacuous: the fleet's total dirty work far exceeded one step's
+    // bound, so the pacing genuinely spread it.
     assert!(
-        report.counters.pages_flushed > 8 * per_vset,
-        "fleet never generated more work than one tick's budget"
+        report.counters.pages_flushed > step_ceiling,
+        "fleet never generated more work than one step's budget"
+    );
+}
+
+/// 2a-full, the residual after the tick stagger: ONE vset with a huge
+/// dirty set must not cost O(dirty) inside any single step. The capture
+/// arms the whole set behind write protection in one cheap read-free
+/// step, drains a bounded batch per continuation step, and a guest write
+/// to an armed-but-unread page is captured immediately, out of order
+/// (copy-on-fault) — so the record remains an exact cut at the arm
+/// instant while the guest keeps running through the drain. The oracle's
+/// byte checks and durability accounting hold as everywhere else.
+#[test]
+fn huge_dirty_sets_capture_incrementally_with_copy_on_fault() {
+    let mut config = base_config();
+    config.vset_count = 1;
+    config.daemon.cache_pages = 4096;
+    config.vset_config.pages_per_volume = 600; // 3 volumes × 600 pages
+    config.horizon = secs(2);
+    // A hot writer: the dirty set between writeback ticks dwarfs one
+    // drain batch, and writes keep landing while the drain runs. No
+    // syncs — a pending sync parks the guest until the capture's record
+    // lands, and this test needs the guest AWAKE mid-drain.
+    config.think = (micros(5), micros(50));
+    config.guest_sync_share = Some(Ppm::NEVER);
+    let report = run(9, config);
+    assert_clean(&report);
+    assert_eq!(report.guest_deaths, 0);
+    // No step — arm, drain, fault, or tick — read more than one batch.
+    assert!(
+        report.max_step_page_reads <= 64,
+        "one step read {} pages — a capture read past its batch",
+        report.max_step_page_reads
+    );
+    // The load was real: far more than one batch's worth was captured…
+    assert!(
+        report.counters.pages_flushed > 10 * 64,
+        "only {} pages flushed — the dirty set never exceeded a batch",
+        report.counters.pages_flushed
+    );
+    // …and the guest raced a drain into copy-on-fault, repeatedly.
+    assert!(
+        report.counters.cow_captures > 0,
+        "no copy-on-fault ever fired — drains never overlapped guest writes"
     );
 }
 

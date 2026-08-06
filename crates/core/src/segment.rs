@@ -35,6 +35,7 @@ const HDR_PAYLOAD: usize = 2 + 8 + 8 + 8 + 4; // version, vset, fence, seg, entr
 pub type SegmentEntries = Vec<(PageId, Gen, PageLoc)>;
 
 /// Builds a segment blob, returning the exact byte range of every entry.
+#[derive(Debug)]
 pub struct SegmentBuilder {
     vset: VsetId,
     fence: u64,
