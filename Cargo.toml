@@ -5,6 +5,7 @@ members = [
     "crates/demod",
     "crates/fc-guest",
     "crates/hostmem",
+    "crates/platform",
     "crates/runtime",
     "crates/sim",
 ]

@@ -8,7 +8,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-pub const PAGE_SIZE: usize = 4096;
+use blockd_platform::page_size;
 
 // ── userfaultfd ABI ─────────────────────────────────────────────────────
 
@@ -126,6 +126,7 @@ pub struct HostRegion {
     fd: OwnedFd,
     daemon: *mut u8,
     len: usize,
+    pages: usize,
 }
 
 // The raw pointer is to a shared file mapping owned by this struct.
@@ -134,7 +135,7 @@ unsafe impl Sync for HostRegion {}
 
 impl HostRegion {
     pub fn new(pages: usize) -> io::Result<HostRegion> {
-        let len = pages * PAGE_SIZE;
+        let len = pages.checked_mul(page_size()).expect("region size fits");
         // SAFETY: plain syscalls; the fd and mapping are owned below.
         let fd = unsafe { libc::memfd_create(c"blockd-region".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
@@ -163,24 +164,25 @@ impl HostRegion {
             fd,
             daemon: daemon.cast(),
             len,
+            pages,
         })
     }
 
     pub fn pages(&self) -> usize {
-        self.len / PAGE_SIZE
+        self.pages
     }
 
     /// Fill's first half: write bytes through the daemon view, populating
     /// the shared page-cache page a `UFFDIO_CONTINUE` will then map.
     pub fn write_page(&self, page: usize, bytes: &[u8]) {
-        assert_eq!(bytes.len(), PAGE_SIZE);
+        assert_eq!(bytes.len(), page_size());
         assert!(page < self.pages());
         // SAFETY: in-bounds write to our own shared mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                self.daemon.add(page * PAGE_SIZE),
-                PAGE_SIZE,
+                self.daemon.add(page * page_size()),
+                page_size(),
             );
         }
     }
@@ -190,13 +192,13 @@ impl HostRegion {
     /// coherent shared mapping.
     pub fn read_page(&self, page: usize) -> Vec<u8> {
         assert!(page < self.pages());
-        let mut bytes = vec![0u8; PAGE_SIZE];
+        let mut bytes = vec![0u8; page_size()];
         // SAFETY: in-bounds read from our own shared mapping.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.daemon.add(page * PAGE_SIZE),
+                self.daemon.add(page * page_size()),
                 bytes.as_mut_ptr(),
-                PAGE_SIZE,
+                page_size(),
             );
         }
         bytes
@@ -209,8 +211,8 @@ impl HostRegion {
             libc::fallocate(
                 self.fd.as_raw_fd(),
                 libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                libc::off_t::try_from(page * PAGE_SIZE).expect("fits"),
-                libc::off_t::try_from(count * PAGE_SIZE).expect("fits"),
+                libc::off_t::try_from(page * page_size()).expect("fits"),
+                libc::off_t::try_from(count * page_size()).expect("fits"),
             )
         };
         if r != 0 {
@@ -252,8 +254,8 @@ impl GuestView {
     /// Map `pages` pages of `region` starting at `first_page`. Many views
     /// of the same range share the same physical pages (R5.3).
     pub fn map(region: &HostRegion, first_page: usize, pages: usize) -> io::Result<GuestView> {
-        let len = pages * PAGE_SIZE;
-        assert!((first_page + pages) * PAGE_SIZE <= region.len);
+        let len = pages.checked_mul(page_size()).expect("view size fits");
+        assert!(first_page + pages <= region.pages);
         // SAFETY: fresh shared mapping of the region's fd; owned below.
         let base = unsafe {
             libc::mmap(
@@ -262,7 +264,7 @@ impl GuestView {
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 region.fd.as_raw_fd(),
-                libc::off_t::try_from(first_page * PAGE_SIZE).expect("fits"),
+                libc::off_t::try_from(first_page * page_size()).expect("fits"),
             )
         };
         if base == libc::MAP_FAILED {
@@ -275,8 +277,8 @@ impl GuestView {
     }
 
     pub fn addr_of(&self, page: usize) -> usize {
-        assert!(page * PAGE_SIZE < self.len);
-        self.base as usize + page * PAGE_SIZE
+        assert!(page * page_size() < self.len);
+        self.base as usize + page * page_size()
     }
 
     /// A guest load: blocks in the kernel if the page faults, until the
@@ -287,13 +289,13 @@ impl GuestView {
     }
 
     pub fn read_page(&self, page: usize) -> Vec<u8> {
-        let mut bytes = vec![0u8; PAGE_SIZE];
+        let mut bytes = vec![0u8; page_size()];
         // SAFETY: in-bounds read; may fault.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.addr_of(page) as *const u8,
                 bytes.as_mut_ptr(),
-                PAGE_SIZE,
+                page_size(),
             );
         }
         bytes
@@ -312,7 +314,7 @@ impl GuestView {
     /// survives; only a refault proves the PTE went away), while a hole
     /// punch flips pages to false (the backing itself is gone).
     pub fn resident(&self) -> io::Result<Vec<bool>> {
-        let pages = self.len / PAGE_SIZE;
+        let pages = self.len / page_size();
         let mut vec = vec![0u8; pages];
         // SAFETY: querying our own mapping with a correctly sized buffer.
         let r = unsafe {
@@ -335,7 +337,7 @@ impl GuestView {
         let r = unsafe {
             libc::madvise(
                 self.addr_of(page) as *mut libc::c_void,
-                count * PAGE_SIZE,
+                count * page_size(),
                 libc::MADV_DONTNEED,
             )
         };
@@ -368,7 +370,7 @@ unsafe impl Send for PageBuf {}
 impl PageBuf {
     #[allow(clippy::new_without_default)]
     pub fn new() -> PageBuf {
-        let layout = std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).expect("layout");
+        let layout = std::alloc::Layout::from_size_align(page_size(), page_size()).expect("layout");
         // SAFETY: nonzero size; deallocated with the same layout in Drop.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "aligned alloc failed");
@@ -376,19 +378,19 @@ impl PageBuf {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: PAGE_SIZE bytes owned by this buffer.
-        unsafe { std::slice::from_raw_parts(self.ptr, PAGE_SIZE) }
+        // SAFETY: one system page is owned by this buffer.
+        unsafe { std::slice::from_raw_parts(self.ptr, page_size()) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: PAGE_SIZE bytes owned by this buffer.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, PAGE_SIZE) }
+        // SAFETY: one system page is owned by this buffer.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, page_size()) }
     }
 }
 
 impl Drop for PageBuf {
     fn drop(&mut self) {
-        let layout = std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).expect("layout");
+        let layout = std::alloc::Layout::from_size_align(page_size(), page_size()).expect("layout");
         // SAFETY: allocated in `new` with this exact layout.
         unsafe { std::alloc::dealloc(self.ptr, layout) }
     }
@@ -416,32 +418,32 @@ impl DirectFile {
     /// Durable page write (writeback's disk half, R2.4): aligned buffer,
     /// aligned offset, whole pages — the `O_DIRECT` contract.
     pub fn write_page(&self, page: usize, buf: &PageBuf) -> io::Result<()> {
-        // SAFETY: aligned PAGE_SIZE buffer; pwrite on our own fd.
+        // SAFETY: aligned page-sized buffer; pwrite on our own fd.
         let n = unsafe {
             libc::pwrite(
                 self.file.as_raw_fd(),
                 buf.ptr.cast(),
-                PAGE_SIZE,
-                libc::off_t::try_from(page * PAGE_SIZE).expect("fits"),
+                page_size(),
+                libc::off_t::try_from(page * page_size()).expect("fits"),
             )
         };
-        if n != PAGE_SIZE.cast_signed() {
+        if n != page_size().cast_signed() {
             return Err(errno("pwrite(O_DIRECT)"));
         }
         Ok(())
     }
 
     pub fn read_page(&self, page: usize, buf: &mut PageBuf) -> io::Result<()> {
-        // SAFETY: aligned PAGE_SIZE buffer; pread on our own fd.
+        // SAFETY: aligned page-sized buffer; pread on our own fd.
         let n = unsafe {
             libc::pread(
                 self.file.as_raw_fd(),
                 buf.ptr.cast(),
-                PAGE_SIZE,
-                libc::off_t::try_from(page * PAGE_SIZE).expect("fits"),
+                page_size(),
+                libc::off_t::try_from(page * page_size()).expect("fits"),
             )
         };
-        if n != PAGE_SIZE.cast_signed() {
+        if n != page_size().cast_signed() {
             return Err(errno("pread(O_DIRECT)"));
         }
         Ok(())

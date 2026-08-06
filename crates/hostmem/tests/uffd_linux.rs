@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
-use blockd_hostmem::{FaultEvent, GuestView, HostRegion, PAGE_SIZE, Uffd, UffdFeatures};
+use blockd_hostmem::{FaultEvent, GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 
 fn pattern(tag: u8) -> Vec<u8> {
-    let mut bytes = vec![0u8; PAGE_SIZE];
+    let mut bytes = vec![0u8; page_size()];
     for (i, b) in bytes.iter_mut().enumerate() {
         *b = tag ^ (i as u8);
     }
@@ -29,6 +29,21 @@ fn pattern(tag: u8) -> Vec<u8> {
 
 fn required_features() -> u64 {
     UffdFeatures::PAGEFAULT_FLAG_WP | UffdFeatures::MINOR_SHMEM | UffdFeatures::WP_HUGETLBFS_SHMEM
+}
+
+#[test]
+fn every_system_page_is_one_native_fault_granule() {
+    let region = HostRegion::new(3).expect("region");
+    let view = GuestView::map(&region, 0, 3).expect("view");
+
+    assert_eq!(region.pages(), 3);
+    assert_eq!(view.addr_of(1) - view.addr_of(0), page_size());
+    assert_eq!(view.addr_of(2) - view.addr_of(1), page_size());
+
+    region.write_page(1, &pattern(0x39));
+    assert_eq!(region.read_page(1), pattern(0x39));
+    assert_eq!(region.read_page(0), vec![0; page_size()]);
+    assert_eq!(region.read_page(2), vec![0; page_size()]);
 }
 
 /// For the serialized tests below exactly one fault can be pending —
@@ -78,11 +93,11 @@ fn first_touch_faults_missing_and_resolves_via_continue() {
         thread::spawn(move || {
             let event = one_event(&uffd);
             assert!(event.missing(), "expected a missing fault: {event:?}");
-            assert_eq!(event.address & !(PAGE_SIZE - 1), view.addr_of(2));
+            assert_eq!(event.address & !(page_size() - 1), view.addr_of(2));
             faults.fetch_add(1, Ordering::SeqCst);
             // Fill = populate via the daemon view, then CONTINUE.
             region.write_page(2, &pattern(0x5A));
-            uffd.continue_range(view.addr_of(2), PAGE_SIZE, false)
+            uffd.continue_range(view.addr_of(2), page_size(), false)
                 .expect("continue");
         })
     };
@@ -105,7 +120,7 @@ fn proactive_continue_prefetches_without_any_fault() {
     uffd.register_all(&view).expect("register");
 
     region.write_page(1, &pattern(0x7B));
-    uffd.continue_range(view.addr_of(1), PAGE_SIZE, false)
+    uffd.continue_range(view.addr_of(1), page_size(), false)
         .expect("eager continue");
 
     // No handler thread exists: if this faulted, the read would hang and
@@ -131,10 +146,10 @@ fn shared_base_views_map_one_physical_copy() {
     for page in 0..8 {
         region.write_page(page, &pattern(page as u8));
         uffd_a
-            .continue_range(fork_a.addr_of(page), PAGE_SIZE, false)
+            .continue_range(fork_a.addr_of(page), page_size(), false)
             .expect("continue a");
         uffd_b
-            .continue_range(fork_b.addr_of(page), PAGE_SIZE, false)
+            .continue_range(fork_b.addr_of(page), page_size(), false)
             .expect("continue b");
     }
     for page in 0..8 {
@@ -152,7 +167,7 @@ fn shared_base_views_map_one_physical_copy() {
 
     // And the backing holds exactly 8 pages — not 8 per fork.
     let resident = region.resident_bytes().expect("resident");
-    assert_eq!(resident, 8 * PAGE_SIZE, "forks duplicated pages");
+    assert_eq!(resident, 8 * page_size(), "forks duplicated pages");
 }
 
 /// The capture boundary (R2.4/R3.8): a write-protected page traps the
@@ -169,10 +184,10 @@ fn write_protect_traps_before_the_store_and_capture_reads_old_bytes() {
 
     // Fill page 0 writable, then arm write protection (as a capture does).
     region.write_page(0, &pattern(0x11));
-    uffd.continue_range(view.addr_of(0), PAGE_SIZE, false)
+    uffd.continue_range(view.addr_of(0), page_size(), false)
         .expect("continue");
     assert_eq!(view.read_page(0), pattern(0x11));
-    uffd.writeprotect(view.addr_of(0), PAGE_SIZE, true)
+    uffd.writeprotect(view.addr_of(0), page_size(), true)
         .expect("arm wp");
 
     let (captured_tx, captured_rx) = mpsc::channel::<Vec<u8>>();
@@ -184,11 +199,11 @@ fn write_protect_traps_before_the_store_and_capture_reads_old_bytes() {
                 event.wp && event.write,
                 "expected a write-protect fault: {event:?}"
             );
-            assert_eq!(event.address & !(PAGE_SIZE - 1), view.addr_of(0));
+            assert_eq!(event.address & !(page_size() - 1), view.addr_of(0));
             // The writer is blocked: what the capture reads NOW is the
             // pre-write state — the R3.8-critical ordering.
             captured_tx.send(region.read_page(0)).expect("send");
-            uffd.writeprotect(view.addr_of(0), PAGE_SIZE, false)
+            uffd.writeprotect(view.addr_of(0), page_size(), false)
                 .expect("clear wp");
         })
     };
@@ -215,7 +230,7 @@ fn continue_can_install_write_protected() {
     let uffd = Arc::new(uffd);
 
     region.write_page(0, &pattern(0x33));
-    uffd.continue_range(view.addr_of(0), PAGE_SIZE, true)
+    uffd.continue_range(view.addr_of(0), page_size(), true)
         .expect("continue wp");
     // Reads pass through...
     assert_eq!(view.read_page(0), pattern(0x33));
@@ -226,7 +241,7 @@ fn continue_can_install_write_protected() {
         thread::spawn(move || {
             let event = one_event(&uffd);
             assert!(event.wp && event.write, "not a wp fault: {event:?}");
-            uffd.writeprotect(view.addr_of(0), PAGE_SIZE, false)
+            uffd.writeprotect(view.addr_of(0), page_size(), false)
                 .expect("clear");
         })
     };
@@ -248,7 +263,7 @@ fn evict_drops_ptes_keeps_data_and_refaults_minor() {
     let uffd = Arc::new(uffd);
 
     region.write_page(0, &pattern(0x44));
-    uffd.continue_range(view.addr_of(0), PAGE_SIZE, false)
+    uffd.continue_range(view.addr_of(0), page_size(), false)
         .expect("continue");
     view.write_word(0, 0xA11C_E000_0000_0001); // guest dirties the page
 
@@ -262,7 +277,7 @@ fn evict_drops_ptes_keeps_data_and_refaults_minor() {
             assert!(event.minor, "refault after evict must be minor: {event:?}");
             faults.fetch_add(1, Ordering::SeqCst);
             // No repopulate needed: the page cache still has the bytes.
-            uffd.continue_range(view.addr_of(0), PAGE_SIZE, false)
+            uffd.continue_range(view.addr_of(0), page_size(), false)
                 .expect("continue");
         })
     };
@@ -285,10 +300,10 @@ fn hole_punch_frees_the_backing_and_the_next_touch_traps_for_refill() {
     let uffd = Arc::new(uffd);
 
     region.write_page(2, &pattern(0x66));
-    uffd.continue_range(view.addr_of(2), PAGE_SIZE, false)
+    uffd.continue_range(view.addr_of(2), page_size(), false)
         .expect("continue");
     assert_eq!(view.read_page(2), pattern(0x66));
-    assert_eq!(region.resident_bytes().expect("resident"), PAGE_SIZE);
+    assert_eq!(region.resident_bytes().expect("resident"), page_size());
 
     // Drop the PTE, then free the backing itself.
     view.evict(2, 1).expect("evict");
@@ -313,7 +328,7 @@ fn hole_punch_frees_the_backing_and_the_next_touch_traps_for_refill() {
                 "post-punch touch must trap as missing: {event:?}"
             );
             region.write_page(2, &pattern(0x77));
-            uffd.continue_range(view.addr_of(2), PAGE_SIZE, false)
+            uffd.continue_range(view.addr_of(2), page_size(), false)
                 .expect("continue");
         })
     };
@@ -336,7 +351,7 @@ fn capture_cycle_write_protect_read_rearm() {
 
     // Fill + first guest write (installs writable via minor-fault path).
     region.write_page(0, &pattern(0x00));
-    uffd.continue_range(view.addr_of(0), PAGE_SIZE, false)
+    uffd.continue_range(view.addr_of(0), page_size(), false)
         .expect("continue");
     view.write_word(0, 1);
 
@@ -347,7 +362,7 @@ fn capture_cycle_write_protect_read_rearm() {
             for _ in 0..2 {
                 let event = one_event(&uffd);
                 events_tx.send(event).expect("send");
-                uffd.writeprotect(view.addr_of(0), PAGE_SIZE, false)
+                uffd.writeprotect(view.addr_of(0), page_size(), false)
                     .expect("clear");
             }
         })
@@ -355,7 +370,7 @@ fn capture_cycle_write_protect_read_rearm() {
 
     for round in 2..4u64 {
         // Capture: arm WP, read the stable bytes through the daemon view.
-        uffd.writeprotect(view.addr_of(0), PAGE_SIZE, true)
+        uffd.writeprotect(view.addr_of(0), page_size(), true)
             .expect("arm");
         let captured = region.read_page(0);
         assert_eq!(captured[0..8], (round - 1).to_le_bytes());
@@ -429,10 +444,10 @@ fn one_read_returns_every_pending_fault() {
     );
     for event in &events {
         assert!(event.missing(), "expected a missing fault: {event:?}");
-        let addr = event.address & !(PAGE_SIZE - 1);
-        let page = (addr - view.addr_of(0)) / PAGE_SIZE;
+        let addr = event.address & !(page_size() - 1);
+        let page = (addr - view.addr_of(0)) / page_size();
         region.write_page(page, &pattern(0x80 + page as u8));
-        uffd.continue_range(addr, PAGE_SIZE, false)
+        uffd.continue_range(addr, page_size(), false)
             .expect("continue");
     }
     for (page, faulter) in faulters.into_iter().enumerate() {

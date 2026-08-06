@@ -17,9 +17,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use blockd_hostmem::page_size;
 use blockd_runtime::fc::{FcVm, rss_pss_of_pid, serve_uffd};
 
 const MEM_MIB: u32 = 128;
+const WORKLOAD_PAGES: usize = 4096;
+
+fn arena_host_pages() -> u64 {
+    u64::try_from(WORKLOAD_PAGES).expect("fits")
+}
 
 struct Artifacts {
     fc: PathBuf,
@@ -221,11 +227,10 @@ fn uffd_restore_serves_guest_memory_on_demand() {
     restored.load_snapshot(&snap, &mem, Some(&uffd_sock));
     let sum_after = restored.cmd("sum 4096", "SUM ");
     assert_eq!(sum_before, sum_after, "a demand-served page was wrong");
-    // The 16 MiB arena alone is 4096 pages; the checksum touched them all
-    // through OUR handler.
+    // The 16 MiB arena was touched in full through OUR handler.
     let served_pages = served.load(Ordering::SeqCst);
     assert!(
-        served_pages >= 4096,
+        served_pages >= arena_host_pages(),
         "demand paging barely happened: {served_pages} pages served"
     );
     // Keep working post-restore: new writes fault through the handler too.
@@ -279,19 +284,22 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     for fork in &mut forks {
         assert_eq!(fork.cmd("sum 4096", "SUM "), base_sum);
     }
-    // ONE physical copy: three forks touched ≥4096 arena pages each, yet
+    // ONE physical copy: three forks touched the whole arena, yet
     // unique fills stayed far below 2× the arena — and the shmem file
     // holds exactly the filled pages, once.
     let filled = server.filled();
     let faults = server.faults.load(Ordering::SeqCst);
-    assert!(filled >= 4096, "the arena was not demand-filled: {filled}");
     assert!(
-        filled < 2 * 4096,
+        filled >= arena_host_pages(),
+        "the arena was not demand-filled: {filled}"
+    );
+    assert!(
+        filled < 2 * arena_host_pages(),
         "forks are not sharing fills: {filled} unique fills for 3 forks"
     );
     assert_eq!(
         server.resident_bytes(),
-        usize::try_from(filled).expect("fits") * 4096,
+        usize::try_from(filled).expect("fits") * page_size(),
         "the base holds copies beyond one per filled page"
     );
     // Warm-page touches by later forks resolved from the page cache with
@@ -324,11 +332,11 @@ fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     let new_fills = server.filled() - filled_before_divergence;
     assert_eq!(
         server.resident_bytes(),
-        resident_before_divergence + usize::try_from(new_fills).expect("fits") * 4096,
+        resident_before_divergence + usize::try_from(new_fills).expect("fits") * page_size(),
         "divergence leaked into the shared base"
     );
     assert!(
-        new_fills < 1024,
+        new_fills < u64::try_from(1024 * 4096 / page_size()).expect("fits"),
         "divergence wrote through to the base: {new_fills} pages appeared"
     );
 
@@ -425,11 +433,11 @@ fn many_forks_each_do_small_work_and_memory_stays_marginal() {
     let base_resident = server.resident_bytes();
     assert_eq!(
         base_resident,
-        usize::try_from(filled_pages).expect("fits") * 4096,
+        usize::try_from(filled_pages).expect("fits") * page_size(),
         "base holds more than one copy per filled page"
     );
     assert!(
-        filled_pages < 2 * 4096 + 4096,
+        filled_pages < 3 * arena_host_pages(),
         "unique fills scaled with the fleet: {filled_pages} pages for {FORKS} forks"
     );
     // … and the per-fork marginal memory is a small fraction of the

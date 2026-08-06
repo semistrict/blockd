@@ -20,7 +20,7 @@ use blockd_core::seam::{
     AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, TimerId, Verdict,
 };
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
-use blockd_hostmem::{GuestView, HostRegion, PAGE_SIZE, Uffd, UffdFeatures};
+use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 
 use crate::loopstats::{LoopStats, effect_kind, event_kind};
 use crate::peer::{PeerConfig, PeerNet};
@@ -93,7 +93,7 @@ impl VsetHost {
     }
 
     fn page_of_addr(&self, vset: VsetId, addr: usize) -> PageId {
-        let index = (addr - self.view.addr_of(0)) / PAGE_SIZE;
+        let index = (addr - self.view.addr_of(0)) / page_size();
         let per = usize::try_from(self.config.pages_per_volume).expect("fits");
         PageId {
             volume: VolumeId {
@@ -214,7 +214,7 @@ impl HostMap for MapView<'_> {
         let host = &self.vsets[&page.volume.vset];
         let index = host.page_index(page);
         host.uffd
-            .writeprotect(host.view.addr_of(index), PAGE_SIZE, true)
+            .writeprotect(host.view.addr_of(index), page_size(), true)
             .expect("capture write-protect");
         host.region.read_page(index)
     }
@@ -394,7 +394,7 @@ impl Runtime {
         thread::spawn(move || {
             while let Ok(events) = host.uffd.read_events() {
                 for event in events {
-                    let page = host.page_of_addr(vset, event.address & !(PAGE_SIZE - 1));
+                    let page = host.page_of_addr(vset, event.address & !(page_size() - 1));
                     tx.push(Msg::Ev(Event::GuestFault {
                         page,
                         write: event.write,
@@ -663,7 +663,7 @@ fn apply_effect(
             // Non-writable fills install write-protected: the next guest
             // store traps, keeping dirty tracking exact (R2.4).
             host.uffd
-                .continue_range(host.view.addr_of(index), PAGE_SIZE, !writable)
+                .continue_range(host.view.addr_of(index), page_size(), !writable)
                 .expect("continue");
         }
         Effect::FillShared { .. } => unreachable!("base sharing is not wired in e2e v1"),
@@ -677,7 +677,7 @@ fn apply_effect(
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
             let index = host.page_index(page);
             host.uffd
-                .writeprotect(host.view.addr_of(index), PAGE_SIZE, false)
+                .writeprotect(host.view.addr_of(index), page_size(), false)
                 .expect("unprotect");
         }
         Effect::WriteProtect { pages } => {
@@ -694,7 +694,7 @@ fn apply_effect(
                 let host = &vsets[&vset];
                 for_each_contiguous_run(&mut indices, |start, len| {
                     host.uffd
-                        .writeprotect(host.view.addr_of(start), len * PAGE_SIZE, true)
+                        .writeprotect(host.view.addr_of(start), len * page_size(), true)
                         .expect("write-protect");
                 });
             }

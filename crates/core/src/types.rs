@@ -86,8 +86,8 @@ id_type!(
     SegId(u64)
 );
 
-/// Size of a guest-visible page in bytes.
-pub const PAGE_SIZE: usize = 4096;
+/// Size of every memory, cache, storage, and wire page in this process.
+pub use blockd_platform::page_size;
 
 impl VolumeIdx {
     pub const MEMORY: VolumeIdx = VolumeIdx(0);

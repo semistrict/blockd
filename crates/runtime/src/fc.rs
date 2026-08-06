@@ -18,7 +18,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blockd_hostmem::{PAGE_SIZE, Uffd, recv_with_fd};
+use blockd_hostmem::{Uffd, page_size, recv_with_fd};
 
 /// One HTTP request over the Firecracker API socket.
 fn api_request(sock: &Path, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -347,10 +347,10 @@ pub fn serve_uffd(listener: UnixListener, mem_file: PathBuf, served: Arc<AtomicU
         assert!(!regions.is_empty(), "no regions in handshake: {body}");
         let uffd = Uffd::from_fd(fd.expect("uffd fd"));
         let file = std::fs::File::open(&mem_file).expect("mem file");
-        let mut page = vec![0u8; PAGE_SIZE];
+        let mut page = vec![0u8; page_size()];
         while let Ok(events) = uffd.read_events() {
             for event in events {
-                let addr = event.address as u64 & !(PAGE_SIZE as u64 - 1);
+                let addr = event.address as u64 & !(page_size() as u64 - 1);
                 let region = regions
                     .iter()
                     .find(|r| {
@@ -606,7 +606,7 @@ impl PartTable {
         mem_bytes: u64,
     ) -> Arc<PartTable> {
         Arc::new(PartTable {
-            granule: PAGE_SIZE as u64,
+            granule: page_size() as u64,
             mem_bytes,
             readahead: 0,
             filler: Filler::File(source_mem),
@@ -696,7 +696,7 @@ impl PartTable {
     fn fetch(self: &Arc<PartTable>, base: u64, fetch: &Arc<Fetch>) {
         self.filler.fill(&self.shmem, base, self.granule);
         self.filled
-            .fetch_add(self.granule / PAGE_SIZE as u64, Ordering::SeqCst);
+            .fetch_add(self.granule / page_size() as u64, Ordering::SeqCst);
         {
             let mut states = self.states.lock().expect("lock");
             // A reclaim may have cleared the table mid-fetch: the punched
@@ -725,7 +725,7 @@ fn serve_one_shmem(
     while let Ok(events) = uffd.read_events() {
         for event in events {
             let started = Instant::now();
-            let addr = event.address as u64 & !(PAGE_SIZE as u64 - 1);
+            let addr = event.address as u64 & !(page_size() as u64 - 1);
             let region = regions
                 .iter()
                 .find(|r| addr >= r.base_host_virt_addr && addr < r.base_host_virt_addr + r.size)
@@ -734,7 +734,7 @@ fn serve_one_shmem(
             fault_count.fetch_add(1, Ordering::SeqCst);
             let (uffd, latencies) = (uffd.clone(), latencies.clone());
             parts.fault(offset, move || {
-                uffd.wake(usize::try_from(addr).expect("fits"), PAGE_SIZE)
+                uffd.wake(usize::try_from(addr).expect("fits"), page_size())
                     .expect("wake");
                 latencies
                     .lock()

@@ -1,0 +1,36 @@
+name: Linux kernel integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-kernel-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  kernel:
+    name: userfaultfd and real I/O
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Linux kernel integration
+        shell: bash
+        run: scripts/run-linux-kernel-tests.sh artifacts/linux-kernel
+
+      - name: Retain failure log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-kernel-${{ github.run_id }}
+          path: artifacts/linux-kernel
+          if-no-files-found: error
+          retention-days: 30

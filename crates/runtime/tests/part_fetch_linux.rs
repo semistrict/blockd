@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
+use blockd_hostmem::page_size;
 use blockd_runtime::fc::{PartTable, upload_mem_parts};
 use blockd_runtime::{S3LatencyModel, S3Store};
 
@@ -94,9 +95,12 @@ fn a_fault_storm_fetches_distinct_parts_concurrently_and_dedupes_within() {
         for faulter in 0..3 {
             let tx = tx.clone();
             // Faults land on different pages of the part.
-            table.fault(part * PART_BYTES + faulter * 4096, move || {
-                tx.send(part).expect("send");
-            });
+            table.fault(
+                part * PART_BYTES + faulter * page_size() as u64,
+                move || {
+                    tx.send(part).expect("send");
+                },
+            );
         }
     }
     let mut woken = Vec::new();
@@ -135,7 +139,9 @@ fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
     table.fault(0, move || first.send("first").expect("send"));
     // Immediately behind it, while the fetch is in flight.
     let second = tx.clone();
-    table.fault(4096, move || second.send("second").expect("send"));
+    table.fault(page_size() as u64, move || {
+        second.send("second").expect("send");
+    });
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(10)).expect("wake"),
         "first"
@@ -147,7 +153,9 @@ fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
     // Ready now: the wake is synchronous and free.
     let third = tx.clone();
     let started = Instant::now();
-    table.fault(8192, move || third.send("third").expect("send"));
+    table.fault(2 * page_size() as u64, move || {
+        third.send("third").expect("send");
+    });
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(1)).expect("wake"),
         "third"
@@ -195,7 +203,7 @@ fn readahead_keeps_the_next_part_in_flight_for_a_sequential_reader() {
     // Part 1's demand fault triggered part 2's readahead; parts 3..6 stay
     // untouched — readahead follows demand, it does not run away.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while table.filled.load(Ordering::SeqCst) < 3 * (PART_BYTES / 4096) {
+    while table.filled.load(Ordering::SeqCst) < 3 * (PART_BYTES / page_size() as u64) {
         assert!(Instant::now() < deadline, "part 2 readahead never landed");
         std::thread::park_timeout(Duration::from_millis(5));
     }

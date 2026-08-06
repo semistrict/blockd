@@ -1,0 +1,76 @@
+name: Deterministic simulation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Sweep size
+        required: true
+        default: change
+        type: choice
+        options:
+          - change
+          - nightly
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ensemble:
+    name: ${{ matrix.preset }} shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [chaos, cluster, migration]
+        shard: [0, 1, 2, 3]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select seed range
+        id: range
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_PROFILE: ${{ github.event.inputs.profile }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          if [[ "$EVENT_NAME" == "schedule" || "$REQUESTED_PROFILE" == "nightly" ]]; then
+            count=4000
+            base=$((GITHUB_RUN_ID * 1000000))
+          else
+            count=250
+            base=0
+          fi
+          start=$((base + SHARD * count))
+          echo "start=$start" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Run simulation ensemble
+        shell: bash
+        run: >-
+          scripts/run-sim-ensemble.sh
+          "${{ matrix.preset }}"
+          "${{ steps.range.outputs.start }}"
+          "${{ steps.range.outputs.count }}"
+          "artifacts/simulation/${{ matrix.preset }}-${{ matrix.shard }}"
+
+      - name: Retain failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: simulation-${{ matrix.preset }}-${{ matrix.shard }}-${{ steps.range.outputs.start }}
+          path: artifacts/simulation/${{ matrix.preset }}-${{ matrix.shard }}
+          if-no-files-found: error
+          retention-days: 30

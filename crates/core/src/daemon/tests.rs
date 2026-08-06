@@ -2,7 +2,7 @@ use super::*;
 use crate::journal::VsetConfig;
 use crate::layout;
 use crate::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId};
-use crate::types::{PAGE_SIZE, PageNo, VolumeId, VolumeIdx};
+use crate::types::{PageNo, VolumeId, VolumeIdx, page_size};
 
 /// Record-only flows never touch the mapping.
 struct NoMem;
@@ -187,7 +187,7 @@ fn adversarial_guests_are_rejected_without_collateral() {
         effects,
         [Effect::Fill {
             page: good,
-            bytes: vec![0; PAGE_SIZE],
+            bytes: vec![0; page_size()],
             writable: false,
             share: None,
         }]
@@ -199,7 +199,7 @@ fn adversarial_guests_are_rejected_without_collateral() {
 struct ZeroMem;
 impl HostMap for ZeroMem {
     fn read_page(&self, _page: PageId) -> Vec<u8> {
-        vec![0; PAGE_SIZE]
+        vec![0; page_size()]
     }
 }
 

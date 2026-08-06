@@ -11,7 +11,7 @@ use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, Verdict};
 use blockd_core::types::{
-    HostId, PAGE_SIZE, PageId, PageNo, SegId, SimTime, VolumeId, VolumeIdx, VsetId,
+    HostId, PageId, PageNo, SegId, SimTime, VolumeId, VolumeIdx, VsetId, page_size,
 };
 use blockd_sim::rng::Pcg64;
 use blockd_sim::world::store::{ObjectStore, StoreConfig, StoreError, Version};
@@ -22,7 +22,7 @@ const VSET: VsetId = VsetId(1);
 struct PatternMem;
 impl HostMap for PatternMem {
     fn read_page(&self, page: PageId) -> Vec<u8> {
-        let mut bytes = vec![0u8; PAGE_SIZE];
+        let mut bytes = vec![0u8; page_size()];
         bytes[0] = 0xA0 ^ page.volume.idx.0;
         bytes[1] = u8::try_from(page.page.0 & 0xFF).expect("fits");
         bytes
@@ -196,7 +196,7 @@ fn seeded_host_a(local: &mut BTreeMap<String, Vec<u8>>, store: &mut ObjectStore)
         effects,
         [Effect::Fill {
             page,
-            bytes: vec![0; PAGE_SIZE],
+            bytes: vec![0; page_size()],
             writable: true,
             share: None
         }]
@@ -352,7 +352,7 @@ fn racing_restores_resolve_to_exactly_one_runner_and_fence_the_old_holder() {
             write: false,
         },
     );
-    let mut expected = vec![0u8; PAGE_SIZE];
+    let mut expected = vec![0u8; page_size()];
     expected[0] = 0xA0 ^ 1;
     expected[1] = 0;
     assert_eq!(
@@ -457,7 +457,7 @@ fn bases_fork_in_o1_and_forks_pay_only_divergence() {
             write: false,
         },
     );
-    let mut expected = vec![0u8; PAGE_SIZE];
+    let mut expected = vec![0u8; page_size()];
     expected[0] = 0xA0 ^ 1;
     expected[1] = 0;
     assert_eq!(
@@ -467,7 +467,7 @@ fn bases_fork_in_o1_and_forks_pay_only_divergence() {
             bytes: expected,
             writable: false,
             // The base page enters the shared tier (R5.3).
-            share: Some((7, 1, SegId(0), 42))
+            share: Some((7, 1, SegId(0), 46))
         }]
     );
 
@@ -606,7 +606,7 @@ fn two_hundred_forks_hold_one_resident_copy_of_each_base_page() {
         effects,
         [Effect::FillShared {
             page: diverging,
-            share: (7, 1, SegId(0), 42),
+            share: (7, 1, SegId(0), 46),
             writable: true
         }]
     );

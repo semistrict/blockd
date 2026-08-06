@@ -18,6 +18,7 @@ use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
 use blockd_core::layout;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
+use blockd_hostmem::page_size;
 use blockd_runtime::fakegcs::FakeGcs;
 use blockd_runtime::{GcsConfig, GcsStore, Runtime, RuntimeConfig, S3Store};
 
@@ -268,7 +269,7 @@ fn eviction_pressure_bounds_physical_memory_and_serves_from_disk() {
     // 32-page working set — the overcommit is real, measured on the memfd.
     let resident = rt.guest_resident_bytes(VSET);
     assert!(
-        resident <= 16 * 4096,
+        resident <= 16 * page_size(),
         "evictions did not bound physical memory: {resident} bytes resident"
     );
     // And every byte still reads back correctly — from disk segments.

@@ -19,7 +19,7 @@ use std::time::Instant;
 use blockd_core::daemon::{Daemon, DaemonConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, StoreFault, TimerId};
-use blockd_core::types::{HostId, PAGE_SIZE, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
 
 /// Pages per vset volume — a small sandbox working set.
 const PAGES_PER_VOLUME: u32 = 512;
@@ -34,7 +34,7 @@ struct ZeroMap;
 
 impl HostMap for ZeroMap {
     fn read_page(&self, _page: PageId) -> Vec<u8> {
-        vec![0u8; PAGE_SIZE]
+        vec![0u8; page_size()]
     }
 }
 

@@ -6,7 +6,7 @@
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
-use blockd_core::types::{HostId, VsetId, millis, secs};
+use blockd_core::types::{HostId, VsetId, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::world::blobdev::BlobDevConfig;
 use blockd_sim::world::store::StoreConfig;
@@ -46,6 +46,14 @@ fn assert_clean(report: &RunReport) {
     assert_eq!(report.violations, Vec::<String>::new());
 }
 
+fn page_pin<T>(page_4k: T, page_16k: T) -> T {
+    match page_size() {
+        4096 => page_4k,
+        16_384 => page_16k,
+        size => panic!("test pin missing for {size}-byte pages"),
+    }
+}
+
 #[test]
 fn backup_flows_continuously_and_unbacked_vsets_write_nothing() {
     let report = run(11, base_config());
@@ -72,7 +80,7 @@ fn backup_flows_continuously_and_unbacked_vsets_write_nothing() {
         .filter(|k| k.starts_with(&format!("{backed_prefix}m/")))
         .count();
     assert_eq!(manifests, 1, "superseded manifests are reclaimed (R4.5)");
-    assert_eq!(report.store_keys.len(), 17);
+    assert_eq!(report.store_keys.len(), page_pin(19, 20));
 }
 
 #[test]
@@ -84,11 +92,11 @@ fn store_outage_queues_backups_and_drains_after() {
     config.faults.store_outage = Some((millis(500), millis(1800)));
     let report = run(12, config);
     assert_clean(&report);
-    assert_eq!(report.counters.store_retries, 34);
+    assert_eq!(report.counters.store_retries, page_pin(34, 31));
     assert_eq!(report.counters.manifests_published, 6);
     assert_eq!(report.counters.fenced, 0);
     // Local durability was untouched throughout (R8.3): guests progressed.
-    assert_eq!(report.completed_ops, 1938);
+    assert_eq!(report.completed_ops, page_pin(1938, 1954));
 }
 
 #[test]
@@ -112,7 +120,7 @@ fn journal_rot_is_survived_via_restore_from_backup() {
     assert_eq!(report.crashes, 7);
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, 1353);
+    assert_eq!(report.completed_ops, page_pin(1353, 1179));
 }
 
 #[test]
@@ -147,9 +155,9 @@ fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
     let report = run(14, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.counters.nvme_reclaims, 36);
-    assert_eq!(report.counters.nvme_stalls, 50);
-    assert_eq!(report.completed_ops, 306);
+    assert_eq!(report.counters.nvme_reclaims, page_pin(36, 26));
+    assert_eq!(report.counters.nvme_stalls, page_pin(50, 74));
+    assert_eq!(report.completed_ops, page_pin(306, 177));
 }
 
 #[test]
@@ -166,7 +174,7 @@ fn nvme_exhaustion_without_backup_stalls_loudly_and_kills_nothing() {
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.counters.nvme_reclaims, 0, "nothing is droppable");
-    assert_eq!(report.counters.nvme_stalls, 184);
-    assert_eq!(report.completed_ops, 115);
+    assert_eq!(report.counters.nvme_stalls, page_pin(184, 195));
+    assert_eq!(report.completed_ops, page_pin(115, 45));
     assert_eq!(report.store_keys.len(), 0, "R4.4 holds under pressure too");
 }

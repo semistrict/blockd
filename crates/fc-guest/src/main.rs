@@ -8,8 +8,8 @@
 //! Protocol (one command per line on ttyS0, one reply line each; replies
 //! are uppercase so they never collide with the tty echo of commands):
 //!   ping                 → PONG
-//!   fill <seed> <pages>  → write seeded patterns over N 4 KiB pages → FILLED <fnv>
-//!   sum <pages>          → checksum the first N pages              → SUM <fnv>
+//!   fill <seed> <pages>  → write patterns over N native guest pages → FILLED <fnv>
+//!   sum <pages>          → checksum the first N native guest pages  → SUM <fnv>
 //!   mark <page> <value>  → write one word (divergence)             → MARKED
 //!   off                  → reboot(RESTART) — Firecracker exits
 
@@ -25,11 +25,11 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod guest {
+    use blockd_platform::page_size;
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Write};
 
-    const PAGE: usize = 4096;
-    const ARENA_PAGES: usize = 24 * 256; // 24 MiB working arena
+    const ARENA_PAGES: usize = 24 * 256;
 
     fn fnv(h: &mut u64, v: u64) {
         *h ^= v;
@@ -68,8 +68,8 @@ mod guest {
             .open("/dev/ttyS0")
             .expect("serial out");
 
-        let mut arena: Vec<u64> = vec![0; ARENA_PAGES * PAGE / 8];
-        let words_per_page = PAGE / 8;
+        let mut arena: Vec<u64> = vec![0; ARENA_PAGES * page_size() / 8];
+        let words_per_page = page_size() / 8;
 
         writeln!(serial_out, "READY {ARENA_PAGES}").expect("write");
         for line in BufReader::new(serial_in).lines() {

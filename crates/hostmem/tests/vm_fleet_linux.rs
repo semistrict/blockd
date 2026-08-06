@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use blockd_hostmem::{DirectFile, GuestView, HostRegion, PAGE_SIZE, PageBuf, Uffd, UffdFeatures};
+use blockd_hostmem::{DirectFile, GuestView, HostRegion, PageBuf, Uffd, UffdFeatures, page_size};
 
 const BASE_PAGES: usize = 256; // 1 MiB base image
 const VMS: usize = 32;
@@ -32,7 +32,7 @@ const PRIVATE_PAGES: usize = 64;
 const DIVERGE: usize = 8; // pages each VM writes
 
 fn base_pattern(page: usize) -> Vec<u8> {
-    let mut bytes = vec![0u8; PAGE_SIZE];
+    let mut bytes = vec![0u8; page_size()];
     for (i, b) in bytes.iter_mut().enumerate() {
         *b = (page as u8) ^ (i as u8) ^ 0xB5;
     }
@@ -81,31 +81,31 @@ impl Vm {
                 while let Ok(events) = uffd.read_events() {
                     for event in events {
                         faults.fetch_add(1, Ordering::SeqCst);
-                        let addr = event.address & !(PAGE_SIZE - 1);
+                        let addr = event.address & !(page_size() - 1);
                         if event.wp {
-                            uffd.writeprotect(addr, PAGE_SIZE, false)
+                            uffd.writeprotect(addr, page_size(), false)
                                 .expect("unprotect");
                             continue;
                         }
-                        if (base_win.addr_of(0)..base_win.addr_of(0) + BASE_PAGES * PAGE_SIZE)
+                        if (base_win.addr_of(0)..base_win.addr_of(0) + BASE_PAGES * page_size())
                             .contains(&addr)
                         {
-                            let page = (addr - base_win.addr_of(0)) / PAGE_SIZE;
+                            let page = (addr - base_win.addr_of(0)) / page_size();
                             if event.missing() {
                                 // The backing was reclaimed: "refetch from the
                                 // store" (the base image is the store here).
                                 base.write_page(page, &base_pattern(page));
                             }
-                            uffd.continue_range(addr, PAGE_SIZE, false)
+                            uffd.continue_range(addr, page_size(), false)
                                 .expect("continue base");
                         } else {
-                            let page = (addr - own_win.addr_of(0)) / PAGE_SIZE;
+                            let page = (addr - own_win.addr_of(0)) / page_size();
                             // Divergence: copy-on-write from the base image
                             // into this VM's own storage (the sim's CoW path:
                             // the page's location moves to the fork's own
                             // namespace).
                             own.write_page(page, &base_pattern(page));
-                            uffd.continue_range(addr, PAGE_SIZE, false)
+                            uffd.continue_range(addr, page_size(), false)
                                 .expect("continue own");
                         }
                     }
@@ -160,7 +160,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
     }
     assert_eq!(
         base.resident_bytes().expect("resident"),
-        BASE_PAGES * PAGE_SIZE,
+        BASE_PAGES * page_size(),
         "base image not fully physical"
     );
 
@@ -174,7 +174,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
     // 32 VMs × 1 MiB of reads: physical memory is STILL one base (R5.3).
     assert_eq!(
         base.resident_bytes().expect("resident"),
-        BASE_PAGES * PAGE_SIZE,
+        BASE_PAGES * page_size(),
         "sharing broke: fleet reads duplicated base pages"
     );
     for vm in &vms {
@@ -188,10 +188,10 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
     // windows plus the daemon view sums to ~one base, not 32.
     let ranges: Vec<(usize, usize)> = vms
         .iter()
-        .map(|vm| (vm.base_win.addr_of(0), BASE_PAGES * PAGE_SIZE))
+        .map(|vm| (vm.base_win.addr_of(0), BASE_PAGES * page_size()))
         .collect();
     let pss = pss_bytes_of(&ranges);
-    let one_base = BASE_PAGES * PAGE_SIZE;
+    let one_base = BASE_PAGES * page_size();
     assert!(
         pss <= one_base + one_base / 10,
         "Pss says the fleet holds {pss} bytes of base — more than one copy ({one_base})"
@@ -212,7 +212,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
     for (n, vm) in vms.iter().enumerate() {
         assert_eq!(
             vm.own.resident_bytes().expect("resident"),
-            DIVERGE * PAGE_SIZE,
+            DIVERGE * page_size(),
             "vm {n}: divergence cost is not exactly its writes"
         );
         // Content: the guest's word over the CoW'd base bytes.
@@ -228,7 +228,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
             .iter()
             .map(|vm| vm.own.resident_bytes().expect("resident"))
             .sum::<usize>();
-    assert_eq!(total, (BASE_PAGES + VMS * DIVERGE) * PAGE_SIZE);
+    assert_eq!(total, (BASE_PAGES + VMS * DIVERGE) * page_size());
 
     // ── Phase 4: memory pressure — evict every VM's base PTEs ───────────
     // Every VM demand-faulted the whole base during boot.
@@ -252,7 +252,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
     // a MINOR fault served zero-copy.
     assert_eq!(
         base.resident_bytes().expect("resident"),
-        BASE_PAGES * PAGE_SIZE
+        BASE_PAGES * page_size()
     );
     let before = vms[7].faults.load(Ordering::SeqCst);
     assert_eq!(vms[7].base_win.read_page(9), base_pattern(9));
@@ -266,7 +266,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
         .expect("punch");
     assert_eq!(
         base.resident_bytes().expect("resident"),
-        BASE_PAGES / 2 * PAGE_SIZE,
+        BASE_PAGES / 2 * page_size(),
         "hole punch did not free physical pages"
     );
     // A punched page is a MISSING fault: the handler "refetches" it and
@@ -277,7 +277,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
     );
     assert_eq!(
         base.resident_bytes().expect("resident"),
-        (BASE_PAGES / 2 + 1) * PAGE_SIZE
+        (BASE_PAGES / 2 + 1) * page_size()
     );
 
     // ── Phase 6: shut down half the fleet ───────────────────────────────
@@ -293,7 +293,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
             .sum::<usize>();
     assert_eq!(
         survivors_total,
-        (BASE_PAGES / 2 + 1 + (VMS / 2) * DIVERGE) * PAGE_SIZE,
+        (BASE_PAGES / 2 + 1 + (VMS / 2) * DIVERGE) * page_size(),
         "post-shutdown fleet holds unexpected physical memory"
     );
     // Survivors are untouched by their neighbors' teardown.
@@ -338,15 +338,15 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
         thread::spawn(move || {
             while let Ok(events) = uffd.read_events() {
                 for event in events {
-                    let addr = event.address & !(PAGE_SIZE - 1);
-                    let page = (addr - view.addr_of(0)) / PAGE_SIZE;
+                    let addr = event.address & !(page_size() - 1);
+                    let page = (addr - view.addr_of(0)) / page_size();
                     assert!(event.missing(), "unexpected fault kind: {event:?}");
                     let mut buf = PageBuf::new();
                     if swapped_out.load(Ordering::SeqCst) {
                         file.read_page(page, &mut buf).expect("swap-in read");
                     }
                     region.write_page(page, buf.as_slice());
-                    uffd.continue_range(addr, PAGE_SIZE, false)
+                    uffd.continue_range(addr, page_size(), false)
                         .expect("continue");
                 }
             }
@@ -359,7 +359,7 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
     }
     assert_eq!(
         region.resident_bytes().expect("resident"),
-        PAGES * PAGE_SIZE,
+        PAGES * page_size(),
         "dirty working set not physical"
     );
 
@@ -401,7 +401,7 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
     }
     assert_eq!(
         region.resident_bytes().expect("resident"),
-        PAGES / 2 * PAGE_SIZE,
+        PAGES / 2 * page_size(),
         "demand paging brought back more than was touched"
     );
 
@@ -412,7 +412,7 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
     }
     assert_eq!(
         region.resident_bytes().expect("resident"),
-        PAGES * PAGE_SIZE
+        PAGES * page_size()
     );
     std::fs::remove_file(&path).expect("cleanup");
 }

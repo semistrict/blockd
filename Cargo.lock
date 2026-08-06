@@ -12,6 +12,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "blockd-core"
 version = "0.1.0"
 dependencies = [
+ "blockd-platform",
  "lz4_flex",
 ]
 
@@ -27,11 +28,20 @@ dependencies = [
 name = "blockd-fc-guest"
 version = "0.1.0"
 dependencies = [
+ "blockd-platform",
  "libc",
 ]
 
 [[package]]
 name = "blockd-hostmem"
+version = "0.1.0"
+dependencies = [
+ "blockd-platform",
+ "libc",
+]
+
+[[package]]
+name = "blockd-platform"
 version = "0.1.0"
 dependencies = [
  "libc",

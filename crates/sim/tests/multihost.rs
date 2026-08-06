@@ -5,7 +5,7 @@
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::types::{VsetId, micros, millis, secs};
+use blockd_core::types::{VsetId, micros, millis, page_size, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, run};
 use blockd_sim::harness::Sabotage;
 use blockd_sim::rng::Ppm;
@@ -20,6 +20,14 @@ fn assert_clean(report: &ClusterReport) {
     assert_eq!(report.violations, Vec::<String>::new());
 }
 
+fn page_pin<T>(page_4k: T, page_16k: T) -> T {
+    match page_size() {
+        4096 => page_4k,
+        16_384 => page_16k,
+        size => panic!("test pin missing for {size}-byte pages"),
+    }
+}
+
 #[test]
 fn host_death_restores_orphans_elsewhere_with_racing_claims() {
     let report = run(31, base_config());
@@ -31,7 +39,7 @@ fn host_death_restores_orphans_elsewhere_with_racing_claims() {
     // The recovered point was exactly the head's manifest at death (R4.3).
     assert_eq!(report.loss_bound_verified, 1);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, 4361);
+    assert_eq!(report.completed_ops, page_pin(4374, 4253));
 }
 
 #[test]
@@ -73,7 +81,7 @@ fn migration_moves_a_nonbacked_vset_losslessly() {
     // non-backed vset wrote nothing to the store (R4.4), so zero restores.
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, 1773);
+    assert_eq!(report.completed_ops, page_pin(1773, 1615));
     // R7.1: the guest-observed pause — source pause through destination
     // resume — stays far inside the 500 ms budget.
     assert!(
@@ -99,7 +107,7 @@ fn source_death_mid_drain_costs_the_nonbacked_vset_loudly() {
     // The destination's guest died at its first peer fetch the dead source
     // could not answer (the sanctioned R7.3 loss).
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, 581);
+    assert_eq!(report.completed_ops, page_pin(581, 617));
 }
 
 /// R6.2: a restore onto a host with none of the vset's bytes reaches its
@@ -262,7 +270,7 @@ fn hydration_drains_the_tail_and_releases_the_source() {
     // The post-release crash recovers a daemon with nothing to say — and
     // the two-runners check stays silent.
     assert_eq!(report.recoveries, 1);
-    assert_eq!(report.completed_ops, 1614);
+    assert_eq!(report.completed_ops, page_pin(1614, 1549));
 }
 
 /// The recovery side of the two-sided handoff (R7.2): a source that
@@ -284,7 +292,7 @@ fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
     // released and reclaimed.
     assert_eq!(report.releases, 1);
     assert_eq!(report.blobs_per_host[0], 0);
-    assert_eq!(report.completed_ops, 1348);
+    assert_eq!(report.completed_ops, page_pin(1348, 1515));
 }
 
 /// A crash that tears the handoff marker means the migration never
@@ -306,7 +314,7 @@ fn torn_handoff_marker_means_the_migration_never_happened() {
     assert_eq!(report.recoveries, 1);
     // The vset still lives on the source: its blobs are there.
     assert!(report.blobs_per_host[0] > 0);
-    assert_eq!(report.completed_ops, 1460);
+    assert_eq!(report.completed_ops, page_pin(1460, 1545));
 }
 
 /// R7.3's mirror: the DESTINATION crashes mid-drain. Its durable records
@@ -330,7 +338,7 @@ fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
     // Released and reclaimed: the source holds nothing.
     assert_eq!(report.blobs_per_host[0], 0);
     // Well past the old die-loudly count (592): the guest lived on.
-    assert_eq!(report.completed_ops, 1508);
+    assert_eq!(report.completed_ops, page_pin(1508, 1643));
 }
 
 /// R8.3 on the demand-fill path: a store outage while a restored vset is
@@ -406,7 +414,7 @@ fn migration_survives_a_lossy_duplicating_peer_channel() {
         report.peer_drops,
         report.peer_dups
     );
-    assert_eq!(report.completed_ops, 1463);
+    assert_eq!(report.completed_ops, page_pin(1463, 1565));
 }
 
 #[test]
@@ -477,8 +485,8 @@ fn restore_waits_out_a_store_outage() {
     };
     let report = run(31, config);
     assert_clean(&report);
-    assert_eq!(report.restores, 2);
-    assert_eq!(report.claims_lost, 0);
+    assert_eq!(report.restores, page_pin(2, 1));
+    assert_eq!(report.claims_lost, page_pin(0, 1));
     assert_eq!(report.guest_deaths, 0);
     // Neither restore beat the outage: the kill was at 1500ms, the window
     // lifted at 2400ms — the first verdict took at least the difference.
@@ -487,7 +495,7 @@ fn restore_waits_out_a_store_outage() {
         "restore finished during the outage: {} ns",
         report.max_restore_ns
     );
-    assert_eq!(report.completed_ops, 3903);
+    assert_eq!(report.completed_ops, page_pin(3903, 3978));
 }
 
 /// R6.2's prefetch is a bet, and a rotten resume-set object must cost
@@ -518,7 +526,7 @@ fn a_rotten_resume_set_is_ignored_not_fatal() {
         report.max_restore_ns
     );
     assert_eq!(report.prefetch_fills, 0);
-    assert_eq!(report.completed_ops, 690);
+    assert_eq!(report.completed_ops, page_pin(690, 605));
 }
 
 /// A vset large enough that its map genuinely shards into leaves. Low
@@ -569,7 +577,7 @@ fn restores_hydrate_multi_leaf_maps_lazily() {
     );
     // The map really was sharded, and really hydrated span by span.
     assert!(report.leaf_fills > 0, "no leaves hydrated");
-    assert_eq!(report.completed_ops, 24845);
+    assert_eq!(report.completed_ops, page_pin(24845, 24533));
 }
 
 /// Migration of a multi-leaf vset: the offer stays small, the destination
@@ -597,7 +605,7 @@ fn migration_hydrates_multi_leaf_maps_from_the_source() {
     // throughput concern, not a correctness one, and is asserted by the
     // small-map release tests).
     assert!(report.hydrate_fills > 0);
-    assert_eq!(report.completed_ops, 29162);
+    assert_eq!(report.completed_ops, page_pin(29162, 28795));
 }
 
 /// A leaf object rotten in the store makes exactly its span unservable:
@@ -619,5 +627,5 @@ fn a_rotten_leaf_kills_its_span_loudly_and_nothing_else() {
     assert_eq!(report.restores, 1);
     // The reborn guest's verification pass hit the dead span: loud death.
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, 24315);
+    assert_eq!(report.completed_ops, page_pin(24315, 24134));
 }

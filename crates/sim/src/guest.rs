@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 use blockd_core::journal::VsetConfig;
 use blockd_core::seam::ReqId;
-use blockd_core::types::{PAGE_SIZE, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
 
 use crate::rng::{Pcg64, Ppm};
 
@@ -23,12 +23,12 @@ use crate::rng::{Pcg64, Ppm};
 /// comparison; three of four words stay zero so pages stay compressible
 /// (R8.4 is real compression).
 pub fn page_pattern(page: PageId, vol_seq: u64) -> Vec<u8> {
-    let mut bytes = vec![0u8; PAGE_SIZE];
+    let mut bytes = vec![0u8; page_size()];
     if vol_seq == 0 {
         return bytes;
     }
     bytes[0..8].copy_from_slice(&vol_seq.to_le_bytes());
-    for word in (1..PAGE_SIZE / 8).step_by(4) {
+    for word in (1..page_size() / 8).step_by(4) {
         let mut mix = 0xcbf2_9ce4_8422_2325u64;
         for v in [
             page.volume.vset.0,

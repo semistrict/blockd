@@ -5,7 +5,7 @@ use super::{Daemon, Pending};
 use crate::layout;
 use crate::seam::{Effect, HostMap, ReqId, StoreFault};
 use crate::segment::{PageLoc, open_entry};
-use crate::types::{Gen, PAGE_SIZE, PageId, VolumeId, VsetId};
+use crate::types::{Gen, PageId, VolumeId, VsetId, page_size};
 
 impl Daemon {
     pub(super) fn fault(
@@ -135,7 +135,7 @@ impl Daemon {
                         self.counters.zero_fills += 1;
                         out.push(Effect::Fill {
                             page,
-                            bytes: vec![0; PAGE_SIZE],
+                            bytes: vec![0; page_size()],
                             writable: write,
                             share: None,
                         });

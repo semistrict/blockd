@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+test-page-size = ["blockd-platform/test-page-size"]
+
 [lints]
 workspace = true
 
 [dependencies]
+blockd-platform = { path = "../platform" }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-encode", "safe-decode", "std"] }

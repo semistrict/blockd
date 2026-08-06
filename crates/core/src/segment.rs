@@ -9,7 +9,7 @@
 //! corruption (R8.1) — there is nothing to trust beyond the checksums.
 
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, open_frame, seal_frame};
-use crate::types::{Gen, PAGE_SIZE, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
+use crate::types::{Gen, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size};
 
 pub const MAGIC_SEG_HDR: u32 = u32::from_le_bytes(*b"BSH1");
 pub const MAGIC_SEG_ENT: u32 = u32::from_le_bytes(*b"BSE1");
@@ -29,7 +29,7 @@ pub struct PageLoc {
     pub len: u32,
 }
 
-const HDR_PAYLOAD: usize = 2 + 8 + 8 + 8 + 4; // version, vset, fence, seg, entry count
+const HDR_PAYLOAD: usize = 2 + 4 + 8 + 8 + 8 + 4; // version, page size, vset, fence, seg, count
 
 /// Every page a segment holds: identity, generation, and byte range.
 pub type SegmentEntries = Vec<(PageId, Gen, PageLoc)>;
@@ -57,7 +57,7 @@ impl SegmentBuilder {
 
     /// Append one page. `page_bytes` must be exactly one page.
     pub fn add(&mut self, page: PageId, generation: Gen, page_bytes: &[u8]) {
-        assert_eq!(page_bytes.len(), PAGE_SIZE, "segments store whole pages");
+        assert_eq!(page_bytes.len(), page_size(), "segments store whole pages");
         assert_eq!(page.volume.vset, self.vset, "segment is per-vset");
         let stored = lz4_flex::block::compress(page_bytes);
         let mut e = Enc::new();
@@ -86,7 +86,8 @@ impl SegmentBuilder {
     /// Finish the blob: bytes plus every entry's location.
     pub fn finish(self) -> (Vec<u8>, SegmentEntries) {
         let mut h = Enc::new();
-        h.u16(1); // version
+        h.u16(2); // version
+        h.u32(u32::try_from(page_size()).expect("page size fits u32"));
         h.u64(self.vset.0);
         h.u64(self.fence);
         h.u64(self.seg.0);
@@ -102,8 +103,8 @@ impl SegmentBuilder {
 /// the page identity, generation and the decompressed page bytes.
 pub fn open_entry(vset: VsetId, bytes: &[u8]) -> Result<(PageId, Gen, Vec<u8>), DecodeError> {
     let (page, generation, stored) = parse_entry(vset, bytes)?;
-    let raw = lz4_flex::block::decompress(stored, PAGE_SIZE).map_err(|_| DecodeError)?;
-    if raw.len() != PAGE_SIZE {
+    let raw = lz4_flex::block::decompress(stored, page_size()).map_err(|_| DecodeError)?;
+    if raw.len() != page_size() {
         return Err(DecodeError);
     }
     Ok((page, generation, raw))
@@ -140,7 +141,10 @@ pub fn scan_segment(bytes: &[u8]) -> Result<(VsetId, u64, SegId, SegmentEntries)
     let payload = open_frame(MAGIC_SEG_HDR, &bytes[..hdr_end])?;
     let mut d = Dec::new(payload);
     let version = d.u16()?;
-    if version != 1 {
+    if version != 2 {
+        return Err(DecodeError);
+    }
+    if d.u32()? != u32::try_from(page_size()).expect("page size fits u32") {
         return Err(DecodeError);
     }
     let vset = VsetId(d.u64()?);
@@ -185,7 +189,7 @@ pub fn scan_segment(bytes: &[u8]) -> Result<(VsetId, u64, SegId, SegmentEntries)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::crc32c;
+    use crate::format::{crc32c, open_frame, seal_frame};
 
     fn sample_page(volume: u8, page: u32) -> PageId {
         PageId {
@@ -199,7 +203,7 @@ mod tests {
 
     #[allow(clippy::cast_possible_truncation)]
     fn pattern_page(fill: u8) -> Vec<u8> {
-        (0..PAGE_SIZE).map(|i| fill ^ (i as u8)).collect()
+        (0..page_size()).map(|i| fill ^ (i as u8)).collect()
     }
 
     fn sample_segment() -> (Vec<u8>, SegmentEntries) {
@@ -240,8 +244,30 @@ mod tests {
         // Pins the whole stack including lz4 output (R10.2): a dependency
         // update that changes compressed bytes is a storage format change
         // and must be seen.
-        assert_eq!(blob.len(), 664);
-        assert_eq!(crc32c(&blob), 0xF6E7_53AE);
+        let expected = match page_size() {
+            4096 => (668, 0xDF52_B4D5),
+            16_384 => (766, 0xE87B_B6DD),
+            size => panic!("byte pin missing for {size}-byte pages"),
+        };
+        assert_eq!((blob.len(), crc32c(&blob)), expected);
+    }
+
+    #[test]
+    fn segments_reject_a_different_system_page_size() {
+        let (blob, _) = sample_segment();
+        let header_len = FRAME_HEADER + HDR_PAYLOAD;
+        let mut payload = open_frame(MAGIC_SEG_HDR, &blob[..header_len])
+            .expect("segment header")
+            .to_vec();
+        let incompatible = if page_size() == 4096 {
+            16_384u32
+        } else {
+            4096u32
+        };
+        payload[2..6].copy_from_slice(&incompatible.to_le_bytes());
+        let mut incompatible = seal_frame(MAGIC_SEG_HDR, &payload);
+        incompatible.extend_from_slice(&blob[header_len..]);
+        assert!(scan_segment(&incompatible).is_err());
     }
 
     #[test]

@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::mapleaf::LeafPtr;
 use crate::segment::PageLoc;
-use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use crate::types::{
+    Epoch, Gen, HostId, JournalSeq, PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size,
+};
 
 pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
 
@@ -84,7 +86,8 @@ pub struct JournalRecord {
 impl JournalRecord {
     pub fn encode(&self, vset: VsetId) -> Vec<u8> {
         let mut e = Enc::new();
-        e.u16(3); // version
+        e.u16(4); // version
+        e.u32(u32::try_from(page_size()).expect("page size fits u32"));
         e.u64(vset.0);
         e.u64(self.seq.0);
         e.u64(self.fence);
@@ -140,7 +143,10 @@ impl JournalRecord {
     pub fn decode(vset: VsetId, bytes: &[u8]) -> Result<JournalRecord, DecodeError> {
         let payload = open_frame(MAGIC_JOURNAL, bytes)?;
         let mut d = Dec::new(payload);
-        if d.u16()? != 3 {
+        if d.u16()? != 4 {
+            return Err(DecodeError);
+        }
+        if d.u32()? != u32::try_from(page_size()).expect("page size fits u32") {
             return Err(DecodeError);
         }
         if d.u64()? != vset.0 {
@@ -232,7 +238,7 @@ impl JournalRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::crc32c;
+    use crate::format::{crc32c, open_frame, seal_frame};
     use crate::types::SegId;
 
     fn sample_page(volume: u8, page: u32) -> PageId {
@@ -306,8 +312,12 @@ mod tests {
         let bytes = record.encode(VsetId(0xA1));
         assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
         // Byte pin (R10.2): any change here is a storage format change.
-        assert_eq!(bytes.len(), 206);
-        assert_eq!(crc32c(&bytes), 0x5C1E_CF77);
+        let expected = match page_size() {
+            4096 => (210, 0xB331_2082),
+            16_384 => (210, 0xE607_F736),
+            size => panic!("byte pin missing for {size}-byte pages"),
+        };
+        assert_eq!((bytes.len(), crc32c(&bytes)), expected);
     }
 
     #[test]
@@ -329,8 +339,24 @@ mod tests {
         assert!(JournalRecord::decode(VsetId(0xA2), &bytes).is_err());
     }
 
+    #[test]
+    fn records_reject_a_different_system_page_size() {
+        let bytes = sample_record().encode(VsetId(0xA1));
+        let mut payload = open_frame(MAGIC_JOURNAL, &bytes)
+            .expect("record frame")
+            .to_vec();
+        let incompatible = if page_size() == 4096 {
+            16_384u32
+        } else {
+            4096u32
+        };
+        payload[2..6].copy_from_slice(&incompatible.to_le_bytes());
+        let incompatible = seal_frame(MAGIC_JOURNAL, &payload);
+        assert!(JournalRecord::decode(VsetId(0xA1), &incompatible).is_err());
+    }
+
     /// The record for a LARGE vset must stay small: a million written
-    /// pages (a 4 GiB vset at 4 KiB pages) is unremarkable in production,
+    /// pages is unremarkable in production,
     /// and the record is written per capture and uploaded per publish —
     /// its size must be O(delta + leaves), never O(pages). Before the map
     /// was sharded, this map's only representation was 45 MB of inline
