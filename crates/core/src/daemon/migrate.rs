@@ -230,11 +230,30 @@ impl Daemon {
         });
     }
 
+    /// R11.1 guard: operations on a HELD vset are only valid from its
+    /// recorded outbound destination — accepts commit the handoff, fetches
+    /// read live pages, `Released` triggers reclaim. Absent state is not
+    /// rejected here: each arm keeps its own absent-state semantics (the
+    /// loud R7.3 miss, the idempotent re-ack).
+    fn rejects_counterparty(&mut self, vset: VsetId, from: HostId) -> bool {
+        let wrong = self
+            .vsets
+            .get(&vset)
+            .is_some_and(|state| state.outbound != Some(from));
+        if wrong {
+            self.counters.peer_rejected += 1;
+        }
+        wrong
+    }
+
     /// A peer message arrived (authenticated cluster member, R11.1).
     pub(super) fn peer(&mut self, from: HostId, msg: PeerMsg, out: &mut Vec<Effect>) {
         match msg {
             PeerMsg::MigrateOffer { vset, record } => self.migrate_in(from, vset, &record, out),
             PeerMsg::MigrateAccept { vset } => {
+                if self.rejects_counterparty(vset, from) {
+                    return;
+                }
                 let Some(state) = self.vsets.get_mut(&vset) else {
                     return;
                 };
@@ -256,7 +275,11 @@ impl Daemon {
                 len,
             } => {
                 // Serve from local storage — outbound vsets keep serving
-                // until released (R7.2); absent state answers None.
+                // until released (R7.2); absent state answers None (the
+                // requester's loud R7.3 miss).
+                if self.rejects_counterparty(vset, from) {
+                    return;
+                }
                 let our_io = self.io();
                 self.pending.insert(
                     our_io,
@@ -281,6 +304,9 @@ impl Daemon {
                 id,
             } => {
                 // Serve leaves like ranges: from local storage, verbatim.
+                if self.rejects_counterparty(vset, from) {
+                    return;
+                }
                 let our_io = self.io();
                 self.pending.insert(
                     our_io,
@@ -309,6 +335,11 @@ impl Daemon {
                 }
             }
             PeerMsg::Released { vset } => {
+                // `Released` is the reclaim trigger: no ack for a rejected
+                // sender; the legitimate one keeps retrying.
+                if self.rejects_counterparty(vset, from) {
+                    return;
+                }
                 self.released(vset, out);
                 // Always ack — a duplicate release after reclamation must
                 // still stop the sender.
@@ -334,6 +365,9 @@ impl Daemon {
         let Some(state) = self.vsets.remove(&vset) else {
             return;
         };
+        // Remember the incarnation that just died here: a late duplicate
+        // offer at or below this fence must never resurrect it.
+        self.released_fences.insert(vset, state.fence);
         for (fence, seg, _) in state.seg_blobs {
             out.push(Effect::BlobDelete {
                 name: layout::segment_blob(vset, fence, seg),
@@ -379,6 +413,15 @@ impl Daemon {
         let Ok(record) = JournalRecord::decode(vset, record) else {
             return; // damaged in flight: the source will keep serving
         };
+        if let Some(&released) = self.released_fences.get(&vset)
+            && record.fence <= released
+        {
+            // A stale offer of an incarnation this host already ran and
+            // released (late channel duplicate): adopting it would raise a
+            // second runner from a dead record (R7.2).
+            self.counters.peer_rejected += 1;
+            return;
+        }
         let crate::journal::RecordKind::Checkpoint { epoch, vmstate } = record.kind else {
             return; // migration always offers a whole point
         };

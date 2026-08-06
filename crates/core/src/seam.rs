@@ -16,6 +16,57 @@
 //! Everything durable crosses this seam as raw bytes. The world never
 //! pre-verifies anything: damaged bytes come back exactly as stored, and the
 //! daemon's own frame checks (R8.1) are the only line of defense.
+//!
+//! # Interpreter obligations
+//!
+//! What an interpreter (the simulation's world model, the runtime host, or
+//! anything else) owes the daemon. The daemon's correctness proofs assume
+//! exactly this much — an interpreter that provides less silently voids
+//! them; one that provides more (the simulation applies everything
+//! synchronously, in order, instantaneously) proves nothing about a weaker
+//! interpreter. Divergence between interpreters lives here or nowhere.
+//!
+//! **Memory effects** ([`Effect::Fill`], [`Effect::FillShared`],
+//! [`Effect::Unprotect`], [`Effect::WriteProtect`], [`Effect::Evict`]):
+//! applied in emission order per page, before any later effect of the same
+//! step that touches the same page. Capture reads through [`HostMap`] MUST
+//! write-protect a page before reading it, so a concurrent guest store
+//! either lands in the returned bytes or traps after them — never between
+//! (the runtime's MMU provides this; the simulation's parked-vCPU model
+//! mirrors it). A fill installed write-protected under a blocked writer
+//! re-traps as a write-protect fault (real uffd's double fault); the
+//! simulation models the retry explicitly.
+//!
+//! **Blob effects**: reads and writes may run concurrently and complete in
+//! any order — write-once names make that safe, and the daemon only reads
+//! names whose `BlobWriteDone` it has seen. [`Effect::BlobDelete`]s MUST
+//! apply in emission order relative to each other: reclaim deletes a
+//! vset's records before its handoff marker, and recovery's reading of
+//! "records without a marker" as ownership depends on that order surviving
+//! a crash mid-reclaim. Deletes need not be ordered against reads or
+//! writes. A completed `BlobWriteDone` means durable through power loss —
+//! file AND directory entries (the runtime fsyncs the parent chain).
+//!
+//! **Store effects**: freely concurrent, any completion order. Completions
+//! are truthful: `Ok` means the store's answer, `Err(Unavailable)` means
+//! the outcome is UNKNOWN (the operation may have applied — every caller
+//! path must be idempotent under retry, and is).
+//!
+//! **Crash cut**: a crash may cut an effect batch at any prefix, and
+//! within the surviving prefix an in-flight blob write may land whole,
+//! vanish, or tear (the simulation's crash fates). Recovery must tolerate
+//! every such cut; the delete-ordering rule above is what keeps the cuts
+//! it cannot tolerate unreachable. Known model gap: the simulation applies
+//! deletes instantly and cannot yet express a crash BETWEEN two deletes of
+//! one batch — the runtime's single delete lane provides the order the
+//! sim assumes.
+//!
+//! **Events**: delivery order between sources (faults, timers, completions,
+//! peers) is unconstrained — the proofs quantify over orderings by seed.
+//! [`Event::Timer`] fires no earlier than its `after`; it may fire
+//! arbitrarily late. Peer delivery is at-least-once with duplication;
+//! every peer handler is idempotent and, since R11.1, authorizes its
+//! counterparty in the protocol, not the transport.
 
 use crate::journal::VsetConfig;
 use crate::types::{Epoch, HostId, PageId, SegId, VolumeId, VsetId};
@@ -229,6 +280,9 @@ pub enum TimerId {
     /// Re-issue a peer fetch that has gone unanswered (a lost `FetchRange`
     /// or `Page` must not hang a guest forever).
     PeerRetry(IoId),
+    /// Re-issue demand fills parked by a store outage (R8.3: an outage is
+    /// not absence — the blocked guests wait it out, they are not killed).
+    FillRetry(VsetId),
     /// Post-migration hydration tick (R7.1's tail drain): pull pages whose
     /// locations still reference the source until none remain, then release
     /// the source.

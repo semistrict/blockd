@@ -63,6 +63,11 @@ pub enum Sabotage {
     /// two-sided handoff is durable — a crash then recovers it runnable
     /// while the destination also runs (the double-run R7.2 forbids).
     EagerHandoffAck,
+    /// A host that is NOT the migration destination sends `Released` to
+    /// the source mid-drain (cluster harness only). Unguarded, the source
+    /// reclaims a live vset's tail out from under the real destination —
+    /// the guard must reject the wrong counterparty (R11.1).
+    RogueRelease,
 }
 
 #[derive(Clone, Debug)]

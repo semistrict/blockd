@@ -5,7 +5,7 @@ use super::{Daemon, Pending};
 use crate::layout;
 use crate::seam::{Effect, HostMap, ReqId, StoreFault};
 use crate::segment::{PageLoc, open_entry};
-use crate::types::{Gen, PAGE_SIZE, PageId, VolumeId};
+use crate::types::{Gen, PAGE_SIZE, PageId, VolumeId, VsetId};
 
 impl Daemon {
     pub(super) fn fault(&mut self, page: PageId, write: bool, out: &mut Vec<Effect>) {
@@ -394,6 +394,21 @@ impl Daemon {
         result: Result<Option<(u64, Vec<u8>)>, StoreFault>,
         out: &mut Vec<Effect>,
     ) {
+        // An outage is not absence (R8.3): the store heals, and a parked
+        // guest is recoverable where a killed one is not. Park the fault
+        // (its cache slot stays reserved) and re-issue on the retry timer.
+        // Absence and damage stay loud below (R8.1).
+        if matches!(result, Err(StoreFault::Unavailable))
+            && let Some(vset) = self.vsets.get_mut(&page.volume.vset)
+        {
+            vset.store_fill_retry.push((page, write, generation, loc));
+            self.counters.store_retries += 1;
+            out.push(Effect::SetTimer {
+                timer: crate::seam::TimerId::FillRetry(page.volume.vset),
+                after: self.config.backup_retry,
+            });
+            return;
+        }
         let bytes = match result {
             Ok(Some((_, bytes))) => Some(bytes),
             _ => None,
@@ -402,6 +417,38 @@ impl Daemon {
             self.serve_fill(page, write, loc, raw, out);
         } else {
             self.fill_exhausted(page, out);
+        }
+    }
+
+    /// Re-issue the demand fills a store outage parked: their guests are
+    /// still blocked, and the fetch that parks again re-arms the timer.
+    pub(super) fn fill_retry_tick(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get_mut(&vset) else {
+            return; // fenced or released while parked: the guests died with it
+        };
+        let parked = std::mem::take(&mut state.store_fill_retry);
+        for (page, write, generation, loc) in parked {
+            let io = self.io();
+            self.pending.insert(
+                io,
+                Pending::StoreFetch {
+                    page,
+                    write,
+                    generation,
+                    loc,
+                },
+            );
+            let key = if loc.base != 0 {
+                crate::layout::base_segment_key(loc.base, loc.fence, loc.seg)
+            } else {
+                crate::layout::segment_key(page.volume.vset, loc.fence, loc.seg)
+            };
+            out.push(Effect::StoreGetRange {
+                io,
+                key,
+                offset: u64::from(loc.offset),
+                len: u64::from(loc.len),
+            });
         }
     }
 }

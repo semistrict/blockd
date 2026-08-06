@@ -7,6 +7,7 @@ use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{VsetId, micros, millis, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, run};
+use blockd_sim::harness::Sabotage;
 use blockd_sim::rng::Ppm;
 
 /// The library preset, by reference: the `sweep` binary drives the same
@@ -330,6 +331,56 @@ fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
     assert_eq!(report.blobs_per_host[0], 0);
     // Well past the old die-loudly count (592): the guest lived on.
     assert_eq!(report.completed_ops, 1508);
+}
+
+/// R8.3 on the demand-fill path: a store outage while a restored vset is
+/// still serving cold pages from the store PARKS the blocked faults and
+/// re-issues them after the heal. An outage is not absence — before this
+/// held, `store_fill_done` collapsed `Err(Unavailable)` into "page exists
+/// nowhere" and killed the guest.
+#[test]
+fn store_outage_during_cold_serving_parks_fills_until_heal() {
+    let config = ClusterConfig {
+        vset_config: VsetConfig {
+            disk_volumes: 2,
+            pages_per_volume: 64,
+            backed_up: true,
+        },
+        // base_config kills host 0 at 1500ms; the raced restore completes
+        // shortly after and serves cold from the store. The outage then
+        // lands on the remaining cold demand fills.
+        store_outage: Some((millis(1900), millis(2600))),
+        horizon: secs(5),
+        ..base_config()
+    };
+    let report = run(31, config);
+    assert_clean(&report);
+    assert_eq!(report.restores, 1);
+    assert_eq!(report.guest_deaths, 0);
+    // Non-vacuous: the outage really intersected demand fills — these are
+    // parked faults that would have been guest deaths.
+    assert!(report.store_retries > 0, "outage never hit the fill path");
+}
+
+/// R11.1: `Released` is the reclaim trigger, so the source accepts it only
+/// from its recorded destination. A forged release from a third host
+/// mid-drain must be refused — unguarded, it reclaims the live vset's tail
+/// out from under the real destination.
+#[test]
+fn a_rogue_release_is_refused_and_the_drain_completes() {
+    let config = ClusterConfig {
+        hosts: 3,
+        sabotage: Some(Sabotage::RogueRelease),
+        ..migrate_config()
+    };
+    let report = run(7, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    // The forgery arrived and was refused; the REAL release still landed.
+    assert_eq!(report.peer_rejected, 1);
+    assert_eq!(report.releases, 1);
+    assert_eq!(report.blobs_per_host[0], 0);
 }
 
 /// Migration completes losslessly over a channel that drops a quarter of

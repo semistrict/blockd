@@ -89,6 +89,11 @@ pub struct Counters {
     pub checkpoints_done: u64,
     pub syncs_acked: u64,
     pub guest_rejected: u64,
+    /// Peer messages refused by a protocol guard (R11.1): a `Released` or
+    /// fetch from the wrong counterparty, or a stale re-offer of a
+    /// released incarnation. Authorization lives in the protocol, not
+    /// merely the transport.
+    pub peer_rejected: u64,
     pub blobs_deleted: u64,
     /// Manifests made durable in the object store (R4.2).
     pub manifests_published: u64,
@@ -423,6 +428,9 @@ struct Vset {
     ckpt_done: BTreeMap<ReqId, Epoch>,
     ckpt_done_order: VecDeque<ReqId>,
     pending_syncs: Vec<(ReqId, u64)>,
+    /// Demand fills parked by a store outage (R8.3), re-issued by the
+    /// `FillRetry` timer: each entry's guest is blocked on it.
+    store_fill_retry: Vec<(PageId, bool, Gen, crate::segment::PageLoc)>,
     /// Highest sync barrier covered by a durable record's watermark (R3.8).
     durable_watermark: u64,
     next_gen: u64,
@@ -512,6 +520,7 @@ impl Vset {
             ckpt_done: BTreeMap::new(),
             ckpt_done_order: VecDeque::new(),
             pending_syncs: Vec::new(),
+            store_fill_retry: Vec::new(),
             durable_watermark: 0,
             next_gen: 0,
             next_seq: 0,
@@ -583,6 +592,12 @@ pub struct Daemon {
     waiters: VecDeque<(PageId, bool)>,
     /// Restores waiting out a store outage (R8.3), vset → admin req.
     restore_retries: BTreeMap<VsetId, ReqId>,
+    /// The fence each released (migrated-away) vset last ran at here. A
+    /// late duplicate `MigrateOffer` carrying a record at or below this
+    /// fence is a dead incarnation — adopting it would resurrect a second
+    /// runner (R7.2). In-memory only: a crash forgets, and the reclaimed
+    /// disk plus the placement authority guard the residual.
+    released_fences: BTreeMap<VsetId, u64>,
     /// Local bytes written and not yet deleted (the daemon wrote every byte,
     /// so it does its own accounting; R2.7).
     local_bytes: u64,
@@ -613,6 +628,7 @@ impl Daemon {
             pending: BTreeMap::new(),
             waiters: VecDeque::new(),
             restore_retries: BTreeMap::new(),
+            released_fences: BTreeMap::new(),
             local_bytes: 0,
             counters: Counters::default(),
         };
@@ -651,6 +667,7 @@ impl Daemon {
             Event::Timer(TimerId::ResumeSet(vset)) => self.resume_set_flush(vset, &mut out),
             Event::Timer(TimerId::MigrateOffer(vset)) => self.migrate_offer_tick(vset, &mut out),
             Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, &mut out),
+            Event::Timer(TimerId::FillRetry(vset)) => self.fill_retry_tick(vset, &mut out),
             Event::Timer(TimerId::Hydrate(vset)) => self.hydrate_tick(vset, &mut out),
             Event::Timer(TimerId::RestoreRetry(vset)) => self.restore_retry(vset, &mut out),
             Event::Timer(TimerId::LeafRetry(vset)) => self.leaf_retry(vset, &mut out),

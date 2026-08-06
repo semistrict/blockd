@@ -110,6 +110,12 @@ pub struct ClusterReport {
     pub hydrate_fills: u64,
     /// Map leaves hydrated lazily across all live daemons.
     pub leaf_fills: u64,
+    /// Store operations deferred by an outage (R8.3) across live daemons —
+    /// publishes, claims, and parked demand fills.
+    pub store_retries: u64,
+    /// Peer messages refused by a protocol guard (R11.1) across live
+    /// daemons.
+    pub peer_rejected: u64,
     /// Blobs left on each host's device at the end of the run.
     pub blobs_per_host: Vec<usize>,
 }
@@ -311,24 +317,18 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
         .violations
         .extend(std::mem::take(&mut c.oracle.violations));
     c.report.completed_ops = c.guests.values().map(|g| g.completed).sum();
-    c.report.prefetch_fills = c
-        .hosts
-        .iter()
-        .filter_map(|h| h.daemon.as_ref())
-        .map(|d| d.counters.prefetch_fills)
-        .sum();
-    c.report.hydrate_fills = c
-        .hosts
-        .iter()
-        .filter_map(|h| h.daemon.as_ref())
-        .map(|d| d.counters.hydrate_fills)
-        .sum();
-    c.report.leaf_fills = c
-        .hosts
-        .iter()
-        .filter_map(|h| h.daemon.as_ref())
-        .map(|d| d.counters.leaf_fills)
-        .sum();
+    let sum = |read: fn(&blockd_core::daemon::Counters) -> u64| -> u64 {
+        c.hosts
+            .iter()
+            .filter_map(|h| h.daemon.as_ref())
+            .map(|d| read(&d.counters))
+            .sum()
+    };
+    c.report.prefetch_fills = sum(|k| k.prefetch_fills);
+    c.report.hydrate_fills = sum(|k| k.hydrate_fills);
+    c.report.leaf_fills = sum(|k| k.leaf_fills);
+    c.report.store_retries = sum(|k| k.store_retries);
+    c.report.peer_rejected = sum(|k| k.peer_rejected);
     c.report.blobs_per_host = c.hosts.iter().map(|h| h.bdev.blob_count()).collect();
     c.report
 }
@@ -1438,6 +1438,21 @@ impl Cluster {
                 // source (R7.1: memory arrives post-copy).
                 let source = self.placement.insert(vset, host).expect("was placed");
                 self.migrated_from.insert(vset, source);
+                if self.config.sabotage == Some(Sabotage::RogueRelease)
+                    && let Some(rogue) = (0..self.config.hosts).find(|&h| h != host && h != source)
+                {
+                    // Mid-drain forged release from a non-destination: the
+                    // source's guard must refuse it or the real
+                    // destination's tail dies with the reclaimed state.
+                    self.kernel.schedule_after(
+                        millis(1),
+                        Ev::PeerDeliver {
+                            from: rogue,
+                            to: source,
+                            msg: blockd_core::seam::PeerMsg::Released { vset },
+                        },
+                    );
+                }
                 self.hosts[usize::from(host)]
                     .mems
                     .insert(vset, VsetMem::default());
