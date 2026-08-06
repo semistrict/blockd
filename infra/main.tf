@@ -95,6 +95,16 @@ data "google_compute_image" "ubuntu" {
   project = "ubuntu-os-cloud"
 }
 
+# Keep daemon blobs off the boot filesystem. Each host gets its own durable
+# SSD volume; provisioning formats it as XFS only when it is blank and mounts
+# it at /var/opt/blockd/blobs.
+resource "google_compute_disk" "data" {
+  for_each = local.hosts
+  name     = "blockd-demo-${each.key}-data"
+  type     = "pd-ssd"
+  size     = var.data_disk_size_gb
+}
+
 resource "google_compute_instance" "host" {
   for_each     = local.hosts
   name         = "blockd-demo-${each.key}"
@@ -107,6 +117,12 @@ resource "google_compute_instance" "host" {
       size  = 50
       type  = "pd-ssd"
     }
+  }
+
+  attached_disk {
+    source      = google_compute_disk.data[each.key].id
+    device_name = "blockd-data"
+    mode        = "READ_WRITE"
   }
 
   # Firecracker needs /dev/kvm: nested virtualization, Intel-only.

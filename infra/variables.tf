@@ -23,6 +23,17 @@ variable "machine_type" {
   default     = "n2-standard-4"
 }
 
+variable "data_disk_size_gb" {
+  description = "Size of each host's dedicated XFS blob volume"
+  type        = number
+  default     = 50
+
+  validation {
+    condition     = var.data_disk_size_gb >= 10
+    error_message = "data_disk_size_gb must be at least 10 GB."
+  }
+}
+
 variable "spot" {
   description = "Run the VMs as Spot instances (cheaper, preemptible)"
   type        = bool

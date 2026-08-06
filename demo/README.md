@@ -53,9 +53,14 @@ with everything in it):
 tofu -chdir=infra destroy -var project=YOUR_PROJECT_ID
 ```
 
-Cost while up: two Spot `n2-standard-4` (~$0.10/h each), two 50GB
-pd-ssd, cents of GCS. The APIs are VPC-internal only; `run.sh` reaches
-them through an IAP SSH tunnel.
+Each host has a 50GB SSD boot disk plus a separate 50GB SSD data disk.
+Provisioning formats only the dedicated data disk as XFS and mounts it at
+`/var/opt/blockd/blobs`; the boot filesystem is never reformatted. Override
+the data size with `-var data_disk_size_gb=N`.
+
+Cost while up: two Spot `n2-standard-4` (~$0.10/h each), four 50GB
+pd-ssd volumes, and cents of GCS. The APIs are VPC-internal only; `run.sh`
+reaches them through an IAP SSH tunnel.
 
 Extra validation on a VM (the store adapter against the real bucket):
 

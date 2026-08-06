@@ -8,12 +8,94 @@ set -euo pipefail
 exec >> /var/log/blockd-provision.log 2>&1
 
 READY=/var/opt/blockd/.ready
+echo "$(date -u) provisioning starts"
+
+export DEBIAN_FRONTEND=noninteractive
+APT_UPDATED=0
+apt_update() {
+  if [ "$APT_UPDATED" = 0 ]; then
+    apt-get update
+    APT_UPDATED=1
+  fi
+}
+
+# The daemon's dedicated data disk. Never infer this device from enumeration:
+# the GCE device name gives it a stable path and prevents the boot disk from
+# ever becoming a formatting candidate.
+BLOB_DEVICE=/dev/disk/by-id/google-blockd-data
+BLOB_MOUNT=/var/opt/blockd/blobs
+systemctl stop blockd-demod 2>/dev/null || true
+if ! command -v mkfs.xfs >/dev/null 2>&1; then
+  apt_update
+  apt-get install -y xfsprogs
+fi
+
+udevadm settle
+for _ in $(seq 1 30); do
+  [ -b "$BLOB_DEVICE" ] && break
+  sleep 1
+done
+if [ ! -b "$BLOB_DEVICE" ]; then
+  echo "dedicated data disk did not appear at $BLOB_DEVICE"
+  exit 1
+fi
+
+ROOT_SOURCE=$(findmnt -n -o SOURCE /)
+ROOT_REAL=$(readlink -f "$ROOT_SOURCE")
+ROOT_PARENT=$(lsblk -nro PKNAME "$ROOT_REAL" | head -n 1)
+BLOB_REAL=$(readlink -f "$BLOB_DEVICE")
+if [ "$BLOB_REAL" = "$ROOT_REAL" ] || [ "$BLOB_REAL" = "/dev/$ROOT_PARENT" ]; then
+  echo "refusing to use root device $ROOT_SOURCE as the blob volume"
+  exit 1
+fi
+
+BLOB_SIGNATURES=$(wipefs -n --noheadings --output TYPE "$BLOB_DEVICE" | xargs)
+BLOB_WAS_BLANK=0
+case "$BLOB_SIGNATURES" in
+  "")
+    echo "$(date -u) formatting blank blob volume as XFS"
+    mkfs.xfs -s size=4096 -L blockd-blobs "$BLOB_DEVICE"
+    BLOB_WAS_BLANK=1
+    ;;
+  xfs)
+    echo "$(date -u) existing XFS blob volume found"
+    ;;
+  *)
+    echo "refusing to overwrite $BLOB_DEVICE: found signatures $BLOB_SIGNATURES"
+    exit 1
+    ;;
+esac
+
+mkdir -p "$BLOB_MOUNT"
+# On an in-place infrastructure upgrade, preserve any blobs that predate the
+# dedicated disk. The boot-disk copy is deliberately left untouched beneath
+# the mount point until an operator chooses to remove it.
+if [ "$BLOB_WAS_BLANK" = 1 ] && ! mountpoint -q "$BLOB_MOUNT" \
+    && find "$BLOB_MOUNT" -mindepth 1 -print -quit | grep -q .; then
+  BLOB_STAGING=/mnt/blockd-blobs
+  mkdir -p "$BLOB_STAGING"
+  mount "$BLOB_DEVICE" "$BLOB_STAGING"
+  cp -a "$BLOB_MOUNT/." "$BLOB_STAGING/"
+  sync -f "$BLOB_STAGING"
+  umount "$BLOB_STAGING"
+fi
+BLOB_UUID=$(blkid -s UUID -o value "$BLOB_DEVICE")
+sed -i '\|[[:space:]]/var/opt/blockd/blobs[[:space:]]|d' /etc/fstab
+printf 'UUID=%s %s xfs defaults,noatime,nofail 0 2\n' "$BLOB_UUID" "$BLOB_MOUNT" >> /etc/fstab
+if ! mountpoint -q "$BLOB_MOUNT"; then
+  mount "$BLOB_MOUNT"
+fi
+if [ "$(findmnt -n -o FSTYPE --target "$BLOB_MOUNT")" != xfs ]; then
+  echo "$BLOB_MOUNT is not mounted as XFS"
+  exit 1
+fi
+systemctl enable --now fstrim.timer
+
 if [ -f "$READY" ]; then
   systemctl start blockd-demod || true
   echo "$(date -u) already provisioned"
   exit 0
 fi
-echo "$(date -u) provisioning starts"
 
 meta() {
   curl -sf -H 'Metadata-Flavor: Google' \
@@ -27,9 +109,8 @@ REPO=$(meta blockd-repo)
 REPO_REF=$(meta blockd-repo-ref)
 SELF_IP=$([ "$HOST_ID" = 0 ] && echo "$PEER0" || echo "$PEER1")
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y build-essential curl git pkg-config libseccomp-dev cpio
+apt_update
+apt-get install -y build-essential curl git pkg-config libseccomp-dev cpio xfsprogs
 
 # Rust, system-wide (the toolchain the repo pins).
 export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
@@ -89,7 +170,7 @@ KERNEL=="userfaultfd", MODE="0666"
 EOF
 udevadm control --reload-rules && udevadm trigger || true
 
-mkdir -p /var/opt/blockd/blobs /var/opt/blockd/scratch
+mkdir -p /var/opt/blockd/scratch
 cat > /var/opt/blockd/demod.conf <<EOF
 host = $HOST_ID
 api = $SELF_IP:7000
@@ -109,8 +190,10 @@ EOF
 cat > /etc/systemd/system/blockd-demod.service <<EOF
 [Unit]
 Description=blockd demo daemon
-After=network-online.target
+After=network-online.target local-fs.target
 Wants=network-online.target
+RequiresMountsFor=/var/opt/blockd/blobs
+ConditionPathIsMountPoint=/var/opt/blockd/blobs
 
 [Service]
 ExecStart=/opt/blockd/target/release/demod /var/opt/blockd/demod.conf
