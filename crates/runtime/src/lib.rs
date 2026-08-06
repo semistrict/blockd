@@ -20,6 +20,8 @@ mod gcs;
 #[cfg(target_os = "linux")]
 mod host;
 #[cfg(target_os = "linux")]
+mod loopstats;
+#[cfg(target_os = "linux")]
 mod peer;
 #[cfg(target_os = "linux")]
 mod s3;
@@ -28,6 +30,8 @@ mod store;
 pub use gcs::{GcsConfig, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
 pub use host::{Runtime, RuntimeConfig};
+#[cfg(target_os = "linux")]
+pub use loopstats::LoopStats;
 #[cfg(target_os = "linux")]
 pub use peer::{PeerConfig, PeerNet};
 #[cfg(target_os = "linux")]

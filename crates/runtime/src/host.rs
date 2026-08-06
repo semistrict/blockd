@@ -22,6 +22,7 @@ use blockd_core::seam::{
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, PAGE_SIZE, Uffd, UffdFeatures};
 
+use crate::loopstats::{LoopStats, effect_kind, event_kind};
 use crate::peer::{PeerConfig, PeerNet};
 use crate::store::ObjectStore;
 
@@ -119,6 +120,9 @@ struct Shared {
     incidents: Mutex<Vec<String>>,
     /// The daemon's counters, copied out after every step (R9.2).
     counters: Mutex<blockd_core::daemon::Counters>,
+    /// Loop-thread time attribution (R9.2's perf side): decide vs effect
+    /// execution vs idle, by kind.
+    stats: LoopStats,
     next_req: AtomicU64,
 }
 
@@ -206,6 +210,7 @@ impl Runtime {
             sync_waiters: Mutex::new(BTreeMap::new()),
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(blockd_core::daemon::Counters::default()),
+            stats: LoopStats::default(),
             next_req: AtomicU64::new(1),
         });
 
@@ -216,41 +221,7 @@ impl Runtime {
             })
         });
 
-        // Timer thread: real clock, feeding Timer events back in.
-        let (timer_tx, timer_rx) = channel::<(TimerId, u64)>();
-        {
-            let tx = tx.clone();
-            thread::spawn(move || timer_loop(&timer_rx, &tx));
-        }
-
-        // Store workers: object-store round-trips run here, never on the
-        // event loop — a store put at real latency on the loop thread
-        // would stall fault resolution for every vset (the daemon is
-        // sans-IO precisely so completions can arrive as events).
-        let (store_tx, store_rx) = channel::<StoreJob>();
-        {
-            let store_rx = Arc::new(Mutex::new(store_rx));
-            for _ in 0..STORE_WORKERS {
-                let store = store.clone();
-                let tx = tx.clone();
-                let store_rx = store_rx.clone();
-                thread::spawn(move || store_worker_loop(&store_rx, store.as_ref(), &tx));
-            }
-        }
-
-        // Local blob I/O has the same completion-event contract as object
-        // storage. Keep disk reads, writes, fsyncs, and deletes off the event
-        // loop so one slow filesystem operation cannot stall guest faults.
-        let (blob_tx, blob_rx) = channel::<BlobJob>();
-        {
-            let blob_rx = Arc::new(Mutex::new(blob_rx));
-            for _ in 0..BLOB_WORKERS {
-                let blob_dir = config.blob_dir.clone();
-                let tx = tx.clone();
-                let blob_rx = blob_rx.clone();
-                thread::spawn(move || blob_worker_loop(&blob_rx, &blob_dir, &tx));
-            }
-        }
+        let (store_tx, blob_tx, timer_tx) = spawn_io_workers(&config.blob_dir, store, &tx);
 
         // The event loop: the daemon lives here.
         let loop_thread = {
@@ -261,6 +232,8 @@ impl Runtime {
             thread::spawn(move || {
                 let apply = |effects: Vec<Effect>| {
                     for effect in effects {
+                        let kind = effect_kind(&effect);
+                        let started = Instant::now();
                         apply_effect(
                             effect,
                             &shared,
@@ -272,11 +245,17 @@ impl Runtime {
                             peers.as_ref(),
                             self_id,
                         );
+                        shared
+                            .stats
+                            .record_effect(kind, elapsed_ns(started.elapsed()));
                     }
                 };
                 apply(boot_effects);
                 loop {
-                    let event = match rx.recv() {
+                    let blocked = Instant::now();
+                    let msg = rx.recv();
+                    shared.stats.record_idle(elapsed_ns(blocked.elapsed()));
+                    let event = match msg {
                         Ok(Msg::Ev(event)) => event,
                         Ok(Msg::Quiesced(vset)) => {
                             let vmstate = {
@@ -289,11 +268,16 @@ impl Runtime {
                         }
                         Ok(Msg::Stop) | Err(_) => break,
                     };
+                    let kind = event_kind(&event);
+                    let started = Instant::now();
                     let effects = {
                         let vsets = shared.vsets.lock().expect("lock");
                         daemon.step(event, &MapView { vsets: &vsets })
                     };
                     *shared.counters.lock().expect("lock") = daemon.counters;
+                    shared
+                        .stats
+                        .record_decide(kind, elapsed_ns(started.elapsed()));
                     apply(effects);
                 }
             })
@@ -308,6 +292,11 @@ impl Runtime {
             peers,
             loop_thread: Some(loop_thread),
         }
+    }
+
+    /// Loop-thread time attribution: decide vs effects vs idle, by kind.
+    pub fn loop_stats(&self) -> &LoopStats {
+        &self.shared.stats
     }
 
     /// Peer frames dropped on the floor so far (queue full or peer down)
@@ -836,12 +825,27 @@ fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Sender
         let event = match job {
             BlobJob::Write { io, name, bytes } => {
                 let path = root.join(name);
-                std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
+                let parent = path.parent().expect("has parent");
+                std::fs::create_dir_all(parent).expect("mkdir");
                 std::fs::write(&path, bytes).expect("blob write");
-                std::fs::File::open(path)
+                std::fs::File::open(&path)
                     .expect("open")
                     .sync_all()
                     .expect("fsync");
+                // Durability includes the directory entries: a record acked
+                // as durable must survive power loss of a freshly created
+                // path, so fsync every directory up to the blob root.
+                let mut dir = parent;
+                loop {
+                    std::fs::File::open(dir)
+                        .expect("open dir")
+                        .sync_all()
+                        .expect("fsync dir");
+                    if dir == root {
+                        break;
+                    }
+                    dir = dir.parent().expect("under root");
+                }
                 Event::BlobWriteDone { io }
             }
             BlobJob::Read { io, name } => {
@@ -983,6 +987,57 @@ fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Sender<Msg>) {
     }
 }
 
+/// Spawn everything that does blocking I/O on the daemon's behalf; only
+/// senders come back — completions return to the loop as events.
+///
+/// - Timer thread: real clock, feeding `Timer` events back in.
+/// - Store workers: object-store round-trips run here, never on the
+///   event loop — a store put at real latency on the loop thread would
+///   stall fault resolution for every vset (the daemon is sans-IO
+///   precisely so completions can arrive as events).
+/// - Blob workers: local blob I/O has the same completion-event
+///   contract — one slow filesystem operation (fsync included) must not
+///   stall guest faults.
+fn spawn_io_workers(
+    blob_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    tx: &Sender<Msg>,
+) -> (Sender<StoreJob>, Sender<BlobJob>, Sender<(TimerId, u64)>) {
+    let (timer_tx, timer_rx) = channel::<(TimerId, u64)>();
+    {
+        let tx = tx.clone();
+        thread::spawn(move || timer_loop(&timer_rx, &tx));
+    }
+
+    let (store_tx, store_rx) = channel::<StoreJob>();
+    {
+        let store_rx = Arc::new(Mutex::new(store_rx));
+        for _ in 0..STORE_WORKERS {
+            let store = store.clone();
+            let tx = tx.clone();
+            let store_rx = store_rx.clone();
+            thread::spawn(move || store_worker_loop(&store_rx, store.as_ref(), &tx));
+        }
+    }
+
+    let (blob_tx, blob_rx) = channel::<BlobJob>();
+    {
+        let blob_rx = Arc::new(Mutex::new(blob_rx));
+        for _ in 0..BLOB_WORKERS {
+            let blob_dir = blob_dir.to_path_buf();
+            let tx = tx.clone();
+            let blob_rx = blob_rx.clone();
+            thread::spawn(move || blob_worker_loop(&blob_rx, &blob_dir, &tx));
+        }
+    }
+
+    (store_tx, blob_tx, timer_tx)
+}
+
+fn elapsed_ns(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).expect("fits")
+}
+
 fn scan_blobs(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1026,6 +1081,7 @@ mod tests {
             sync_waiters: Mutex::new(BTreeMap::new()),
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(blockd_core::daemon::Counters::default()),
+            stats: LoopStats::default(),
             next_req: AtomicU64::new(1),
         });
         let (store_tx, _store_rx) = channel();
