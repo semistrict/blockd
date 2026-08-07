@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
 use blockd_core::head::{HeadRecord, ManifestPtr};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout;
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, Verdict};
 use blockd_core::types::{HostId, PageId, SimTime, VsetId, micros, millis};
@@ -33,6 +33,15 @@ pub enum PeerKind {
     Leaf,
     Released,
     ReleasedAck,
+    ReplicaPut,
+    ReplicaPutAck,
+    ReplicaCommit,
+    ReplicaCommitAck,
+    ReplicaStatus,
+    ReplicaStatusReply,
+    ReplicaUploadDone,
+    ReplicaRelease,
+    ReplicaReleaseAck,
 }
 
 impl PeerKind {
@@ -47,6 +56,15 @@ impl PeerKind {
             PeerMsg::Leaf { .. } => PeerKind::Leaf,
             PeerMsg::Released { .. } => PeerKind::Released,
             PeerMsg::ReleasedAck { .. } => PeerKind::ReleasedAck,
+            PeerMsg::ReplicaPut { .. } => PeerKind::ReplicaPut,
+            PeerMsg::ReplicaPutAck { .. } => PeerKind::ReplicaPutAck,
+            PeerMsg::ReplicaCommit { .. } => PeerKind::ReplicaCommit,
+            PeerMsg::ReplicaCommitAck { .. } => PeerKind::ReplicaCommitAck,
+            PeerMsg::ReplicaStatus { .. } => PeerKind::ReplicaStatus,
+            PeerMsg::ReplicaStatusReply { .. } => PeerKind::ReplicaStatusReply,
+            PeerMsg::ReplicaUploadDone { .. } => PeerKind::ReplicaUploadDone,
+            PeerMsg::ReplicaRelease { .. } => PeerKind::ReplicaRelease,
+            PeerMsg::ReplicaReleaseAck { .. } => PeerKind::ReplicaReleaseAck,
         }
     }
 }
@@ -85,6 +103,11 @@ pub struct ClusterConfig {
     pub peer_drop: (u64, u64),
     /// Peer-message duplication odds, same convention.
     pub peer_dup: (u64, u64),
+    /// Deterministic directional link outages: `(begin, end, from, to)`.
+    /// Sends attempted in the half-open window are dropped and counted.
+    pub peer_link_outages: Vec<(u64, u64, u16, u16)>,
+    /// Stable, explicit rare branches to force in a deterministic run.
+    pub fault_points: Vec<FaultPoint>,
     /// Store outage window (R8.3): every store operation fails inside it.
     pub store_outage: Option<(u64, u64)>,
     /// Flip a bit in every stored resume-set object at this instant
@@ -108,6 +131,30 @@ pub struct ClusterConfig {
     pub sabotage: Option<Sabotage>,
     /// Override the guests' sync share of the op mix (`None` = default).
     pub guest_sync_share: Option<crate::rng::Ppm>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FaultPoint {
+    ReplicaRetryTimer,
+    DuplicateAck,
+    StatusReconciliation,
+    ReleaseOverlap,
+    AssignmentCasRace,
+    StoreUnknownResult,
+    RestartScan,
+    CrashPeerAfterCommitBeforeAck,
+    CrashPrimaryAfterAckBeforeSyncOk,
+    CrashPrimaryAfterSyncOk,
+    CrashPeerAfterUploadBeforeHead,
+    CrashPrimaryAfterHeadBeforeRelease,
+    CrashPrimaryBeforeTransitionCas,
+    CrashPrimaryAfterSeedBeforeActiveCas,
+    CrashPrimaryAfterActiveCasBeforeCommit,
+    CrashPrimaryBeforeClosureCapture,
+    CrashPrimaryAfterClosureCapture,
+    CrashPrimaryDuringArtifactTransfer,
+    CrashPeerAfterDataFlushBeforeCommit,
+    CrashPeerDuringUpload,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -134,6 +181,20 @@ pub struct ClusterReport {
     /// Peer messages the nemesis dropped / duplicated (fault coverage).
     pub peer_drops: u64,
     pub peer_dups: u64,
+    pub peer_link_clogs: u64,
+    pub host_crashes: u64,
+    pub disk_crash_applied: u64,
+    pub disk_crash_dropped: u64,
+    pub disk_crash_torn: u64,
+    pub disk_bitflips: u64,
+    pub store_unavailable: u64,
+    pub store_cas_conflicts: u64,
+    pub fault_coverage: BTreeMap<FaultPoint, u64>,
+    pub sync_samples: u64,
+    pub sync_latency_p50_ns: u64,
+    pub sync_latency_p95_ns: u64,
+    pub sync_latency_p99_ns: u64,
+    pub sync_latency_max_ns: u64,
     /// Host crash-and-restart recoveries completed.
     pub recoveries: u64,
     /// `Released` deliveries: hydration drained a migrated vset's tail and
@@ -162,6 +223,18 @@ pub struct ClusterReport {
     /// end at (0, 0) — convergence, not just safety.
     pub parked_end: usize,
     pub hydrating_end: usize,
+    pub replica_bytes: u64,
+    pub replica_commits: u64,
+    pub replica_store_bytes: u64,
+    pub replica_unlinks: u64,
+    pub replica_network_bytes: u64,
+    pub replica_logical_bytes: u64,
+    pub replica_nonactive_bytes: u64,
+    pub replica_replacement_bytes: u64,
+    pub replica_cleanup_rewrite_bytes: u64,
+    pub replica_artifact_flushes: u64,
+    pub replica_commit_flushes: u64,
+    pub replica_rotations: u64,
     /// Blobs left on each host's device at the end of the run.
     pub blobs_per_host: Vec<usize>,
 }
@@ -256,6 +329,8 @@ struct Cluster {
     oracle: Oracle,
     next_req: u64,
     sync_reqs: BTreeMap<ReqId, VsetId>,
+    sync_started: BTreeMap<ReqId, SimTime>,
+    sync_latencies: Vec<u64>,
     admin_reqs: BTreeMap<ReqId, VsetId>,
     /// Head manifest pointer captured at the kill instant, per orphan.
     expected_ptr: BTreeMap<VsetId, Option<ManifestPtr>>,
@@ -287,6 +362,7 @@ struct Cluster {
     report: ClusterReport,
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
     let kernel = Kernel::new(seed);
     let store = ObjectStore::new(config.store.clone());
@@ -295,6 +371,14 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
     for h in 0..config.hosts {
         let mut daemon_config = config.daemon.clone();
         daemon_config.host = HostId(h);
+        if let Some(placement) = daemon_config.replica_placement.as_mut()
+            && let Some(candidate) = placement
+                .roster
+                .iter()
+                .find(|candidate| candidate.host == HostId(h))
+        {
+            placement.local_failure_domain = candidate.failure_domain;
+        }
         let (daemon, effects) = Daemon::new(daemon_config);
         hosts.push(HostState {
             daemon: Some(daemon),
@@ -315,6 +399,8 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
         oracle: Oracle::new(),
         next_req: 0,
         sync_reqs: BTreeMap::new(),
+        sync_started: BTreeMap::new(),
+        sync_latencies: Vec::new(),
         admin_reqs: BTreeMap::new(),
         refaults: Vec::new(),
         pending_offers: BTreeMap::new(),
@@ -363,6 +449,20 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
         .violations
         .extend(std::mem::take(&mut c.oracle.violations));
     c.report.completed_ops = c.guests.values().map(|g| g.completed).sum();
+    c.sync_latencies.sort_unstable();
+    c.report.sync_samples = c.sync_latencies.len() as u64;
+    let percentile = |pct: usize| {
+        if c.sync_latencies.is_empty() {
+            0
+        } else {
+            let index = ((c.sync_latencies.len() - 1) * pct) / 100;
+            c.sync_latencies[index]
+        }
+    };
+    c.report.sync_latency_p50_ns = percentile(50);
+    c.report.sync_latency_p95_ns = percentile(95);
+    c.report.sync_latency_p99_ns = percentile(99);
+    c.report.sync_latency_max_ns = c.sync_latencies.last().copied().unwrap_or(0);
     let sum = |read: fn(&blockd_core::daemon::Counters) -> u64| -> u64 {
         c.hosts
             .iter()
@@ -383,11 +483,56 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
     c.report.hydrating_end = live()
         .map(blockd_core::daemon::Daemon::hydrating_vsets)
         .sum();
+    c.report.replica_bytes = sum(|k| k.replica_bytes);
+    c.report.replica_commits = sum(|k| k.replica_commits);
+    c.report.replica_store_bytes = sum(|k| k.replica_store_bytes);
+    c.report.replica_unlinks = sum(|k| k.replica_unlinks);
+    c.report.replica_network_bytes = sum(|k| k.replica_network_bytes);
+    c.report.replica_logical_bytes = sum(|k| k.replica_logical_bytes);
+    c.report.replica_nonactive_bytes = sum(|k| k.replica_nonactive_bytes);
+    c.report.replica_replacement_bytes = sum(|k| k.replica_replacement_bytes);
+    c.report.replica_cleanup_rewrite_bytes = sum(|k| k.replica_cleanup_rewrite_bytes);
+    c.report.replica_artifact_flushes = sum(|k| k.replica_artifact_flushes);
+    c.report.replica_commit_flushes = sum(|k| k.replica_commit_flushes);
+    c.report.replica_rotations = sum(|k| k.replica_rotations);
+    c.report.disk_crash_applied = c
+        .hosts
+        .iter()
+        .map(|host| host.bdev.counters.crash_applied)
+        .sum();
+    c.report.disk_crash_dropped = c
+        .hosts
+        .iter()
+        .map(|host| host.bdev.counters.crash_dropped)
+        .sum();
+    c.report.disk_crash_torn = c
+        .hosts
+        .iter()
+        .map(|host| host.bdev.counters.crash_torn)
+        .sum();
+    c.report.disk_bitflips = c.hosts.iter().map(|host| host.bdev.counters.bitflips).sum();
+    c.report.store_unavailable = c.store.counters.unavailable;
+    c.report.store_cas_conflicts = c.store.counters.cas_conflicts;
     c.report.blobs_per_host = c.hosts.iter().map(|h| h.bdev.blob_count()).collect();
     c.report
 }
 
 impl Cluster {
+    fn fault_enabled(&self, point: FaultPoint) -> bool {
+        self.config.fault_points.contains(&point)
+    }
+
+    fn hit_fault(&mut self, point: FaultPoint) {
+        if self.fault_enabled(point) {
+            *self.report.fault_coverage.entry(point).or_default() += 1;
+        }
+    }
+
+    fn fault_pending(&self, point: FaultPoint) -> bool {
+        self.fault_enabled(point)
+            && self.report.fault_coverage.get(&point).copied().unwrap_or(0) == 0
+    }
+
     fn req(&mut self) -> ReqId {
         let req = ReqId(self.next_req);
         self.next_req += 1;
@@ -438,7 +583,7 @@ impl Cluster {
     fn vset_config_for(&self, vset: VsetId) -> VsetConfig {
         let mut config = self.config.vset_config;
         if vset.0 <= u64::from(self.config.nonbacked_vsets) {
-            config.backed_up = false;
+            config.durability = DurabilityMode::Local;
         }
         config
     }
@@ -526,9 +671,28 @@ impl Cluster {
                     guest.paused = false;
                     self.unpark(host, vset);
                 }
-                Effect::SyncOk { req } => self.sync_done(req, true),
+                Effect::SyncOk { req } => {
+                    if self.fault_pending(FaultPoint::CrashPrimaryAfterAckBeforeSyncOk) {
+                        self.hit_fault(FaultPoint::CrashPrimaryAfterAckBeforeSyncOk);
+                        self.crash_host(host);
+                        break;
+                    }
+                    self.sync_done(req, true);
+                    if self.fault_pending(FaultPoint::CrashPrimaryAfterSyncOk) {
+                        self.hit_fault(FaultPoint::CrashPrimaryAfterSyncOk);
+                        self.crash_host(host);
+                        break;
+                    }
+                }
                 Effect::SyncFailed { req } => self.sync_done(req, false),
                 Effect::BlobWrite { io, name, bytes } => {
+                    if self.fault_pending(FaultPoint::CrashPrimaryBeforeClosureCapture)
+                        && !self.sync_reqs.is_empty()
+                    {
+                        self.hit_fault(FaultPoint::CrashPrimaryBeforeClosureCapture);
+                        self.crash_host(host);
+                        break;
+                    }
                     if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() && name.ends_with("/handoff")
                     {
                         eprintln!(
@@ -564,6 +728,88 @@ impl Cluster {
                             inc,
                             bdev_io,
                             io,
+                        },
+                    );
+                }
+                Effect::ReplicaAppend {
+                    io,
+                    source,
+                    vset,
+                    assignment_epoch,
+                    generation,
+                    bytes,
+                } => {
+                    let now = self.kernel.now();
+                    let name = layout::replica_spool_segment_blob(
+                        source,
+                        vset,
+                        assignment_epoch,
+                        generation,
+                    );
+                    let state = &mut self.hosts[usize::from(host)];
+                    let (bdev_io, at) =
+                        state
+                            .bdev
+                            .submit_append(now, self.kernel.rng(), name, bytes);
+                    self.kernel.schedule_at(
+                        at,
+                        Ev::BdevWriteDone {
+                            host,
+                            inc,
+                            bdev_io,
+                            io,
+                        },
+                    );
+                }
+                Effect::ReplicaDelete {
+                    io,
+                    source,
+                    vset,
+                    assignment_epoch,
+                    through_generation,
+                } => {
+                    for generation in 0..=through_generation {
+                        self.hosts[usize::from(host)].bdev.delete(
+                            &layout::replica_spool_segment_blob(
+                                source,
+                                vset,
+                                assignment_epoch,
+                                generation,
+                            ),
+                        );
+                    }
+                    self.kernel.schedule_at(
+                        self.kernel.now(),
+                        Ev::Daemon {
+                            host,
+                            inc,
+                            event: Event::BlobWriteDone { io },
+                        },
+                    );
+                }
+                Effect::ReplicaTruncate {
+                    io,
+                    source,
+                    vset,
+                    assignment_epoch,
+                    generation,
+                    len,
+                } => {
+                    self.hosts[usize::from(host)].bdev.truncate(
+                        &layout::replica_spool_segment_blob(
+                            source,
+                            vset,
+                            assignment_epoch,
+                            generation,
+                        ),
+                        usize::try_from(len).expect("fits"),
+                    );
+                    self.kernel.schedule_at(
+                        self.kernel.now(),
+                        Ev::Daemon {
+                            host,
+                            inc,
+                            event: Event::BlobWriteDone { io },
                         },
                     );
                 }
@@ -615,6 +861,9 @@ impl Cluster {
                     } else {
                         after
                     };
+                    if matches!(timer, blockd_core::seam::TimerId::Replica { .. }) {
+                        self.hit_fault(FaultPoint::ReplicaRetryTimer);
+                    }
                     self.kernel.schedule_after(
                         after,
                         Ev::Daemon {
@@ -625,9 +874,30 @@ impl Cluster {
                     );
                 }
                 Effect::StorePut { io, key, bytes } => {
+                    if self.fault_pending(FaultPoint::CrashPeerDuringUpload)
+                        && !matches!(layout::parse_key(&key), Some(layout::StoreKey::Head { .. }))
+                    {
+                        self.hit_fault(FaultPoint::CrashPeerDuringUpload);
+                        self.crash_host(host);
+                        break;
+                    }
                     let now = self.kernel.now();
                     let (at, result) = self.store.put(now, self.kernel.rng(), &key, bytes);
-                    let result = result.map(|v| v.0).map_err(store_fault);
+                    let inject_unknown = self.fault_enabled(FaultPoint::StoreUnknownResult)
+                        && self
+                            .report
+                            .fault_coverage
+                            .get(&FaultPoint::StoreUnknownResult)
+                            .copied()
+                            .unwrap_or(0)
+                            == 0
+                        && result.is_ok();
+                    let result = if inject_unknown {
+                        self.hit_fault(FaultPoint::StoreUnknownResult);
+                        Err(blockd_core::seam::StoreFault::Unavailable)
+                    } else {
+                        result.map(|v| v.0).map_err(store_fault)
+                    };
                     self.kernel.schedule_at(
                         at,
                         Ev::Daemon {
@@ -644,6 +914,64 @@ impl Cluster {
                     bytes,
                 } => {
                     let now = self.kernel.now();
+                    let proposed_head = layout::parse_key(&key)
+                        .and_then(|parsed| match parsed {
+                            layout::StoreKey::Head { vset } => Some(vset),
+                            _ => None,
+                        })
+                        .and_then(|vset| HeadRecord::decode(vset, &bytes).ok());
+                    let proposed_stash = proposed_head.as_ref().and_then(|head| head.stash);
+                    let crash_before_transition = self
+                        .fault_pending(FaultPoint::CrashPrimaryBeforeTransitionCas)
+                        && proposed_stash.is_some_and(|stash| {
+                            stash.assignment_epoch > 1 && stash.transition_peer.is_some()
+                        });
+                    let crash_before_active = self
+                        .fault_pending(FaultPoint::CrashPrimaryAfterSeedBeforeActiveCas)
+                        && proposed_stash.is_some_and(|stash| {
+                            stash.assignment_epoch > 1 && stash.transition_peer.is_none()
+                        });
+                    if crash_before_transition || crash_before_active {
+                        let point = if crash_before_transition {
+                            FaultPoint::CrashPrimaryBeforeTransitionCas
+                        } else {
+                            FaultPoint::CrashPrimaryAfterSeedBeforeActiveCas
+                        };
+                        self.hit_fault(point);
+                        self.crash_host(host);
+                        break;
+                    }
+                    let assignment_race = self.fault_enabled(FaultPoint::AssignmentCasRace)
+                        && !self.store.is_out()
+                        && self
+                            .report
+                            .fault_coverage
+                            .get(&FaultPoint::AssignmentCasRace)
+                            .copied()
+                            .unwrap_or(0)
+                            == 0
+                        && HeadRecord::decode(
+                            layout::parse_key(&key)
+                                .and_then(|parsed| match parsed {
+                                    layout::StoreKey::Head { vset } => Some(vset),
+                                    _ => None,
+                                })
+                                .unwrap_or(VsetId(0)),
+                            &bytes,
+                        )
+                        .ok()
+                        .and_then(|head| head.stash)
+                        .is_some_and(|stash| stash.transition_peer.is_some());
+                    if assignment_race {
+                        let _ = self.store.put_cas(
+                            now,
+                            self.kernel.rng(),
+                            &key,
+                            expected.map(Version),
+                            bytes.clone(),
+                        );
+                        self.hit_fault(FaultPoint::AssignmentCasRace);
+                    }
                     let (at, result) = self.store.put_cas(
                         now,
                         self.kernel.rng(),
@@ -721,11 +1049,51 @@ impl Cluster {
                             continue;
                         }
                     }
+                    let transfer_crash = if self
+                        .fault_pending(FaultPoint::CrashPrimaryAfterClosureCapture)
+                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaStatus { .. })
+                    {
+                        Some(FaultPoint::CrashPrimaryAfterClosureCapture)
+                    } else if self.fault_pending(FaultPoint::CrashPrimaryDuringArtifactTransfer)
+                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaPut { .. })
+                    {
+                        Some(FaultPoint::CrashPrimaryDuringArtifactTransfer)
+                    } else if self.fault_pending(FaultPoint::CrashPeerAfterDataFlushBeforeCommit)
+                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaPutAck { .. })
+                    {
+                        Some(FaultPoint::CrashPeerAfterDataFlushBeforeCommit)
+                    } else {
+                        None
+                    };
+                    if let Some(point) = transfer_crash {
+                        self.hit_fault(point);
+                        self.crash_host(host);
+                        break;
+                    }
+                    if self.fault_pending(FaultPoint::CrashPeerAfterCommitBeforeAck)
+                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaCommitAck { .. })
+                    {
+                        self.hit_fault(FaultPoint::CrashPeerAfterCommitBeforeAck);
+                        self.crash_host(host);
+                        break;
+                    }
                     // The cluster network: peers reach each other with a
                     // small latency; a dead destination just never answers
                     // (handled at delivery). Loss and duplication draw
                     // from the RNG only when configured, so reliable
                     // configs replay byte-identically.
+                    let now = self.kernel.now().nanos();
+                    if self
+                        .config
+                        .peer_link_outages
+                        .iter()
+                        .any(|&(begin, end, from, target)| {
+                            from == host && target == to.0 && begin <= now && now < end
+                        })
+                    {
+                        self.report.peer_link_clogs += 1;
+                        continue;
+                    }
                     let (drop_n, drop_d) = self.config.peer_drop;
                     if drop_n > 0 && self.kernel.rng().below(drop_d) < drop_n {
                         self.report.peer_drops += 1;
@@ -740,6 +1108,64 @@ impl Cluster {
                             msg: msg.clone(),
                         },
                     );
+                    if self.fault_pending(FaultPoint::CrashPeerAfterUploadBeforeHead)
+                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaUploadDone { .. })
+                    {
+                        self.hit_fault(FaultPoint::CrashPeerAfterUploadBeforeHead);
+                        self.crash_host(host);
+                        break;
+                    }
+                    if self.fault_pending(FaultPoint::CrashPrimaryAfterHeadBeforeRelease)
+                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaRelease { .. })
+                    {
+                        self.hit_fault(FaultPoint::CrashPrimaryAfterHeadBeforeRelease);
+                        self.crash_host(host);
+                        break;
+                    }
+                    if self.fault_pending(FaultPoint::CrashPrimaryAfterActiveCasBeforeCommit)
+                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaStatus { .. })
+                        && self
+                            .store
+                            .peek(&layout::head_key(VsetId(1)))
+                            .and_then(|bytes| HeadRecord::decode(VsetId(1), bytes).ok())
+                            .and_then(|head| head.stash)
+                            .is_some_and(|stash| {
+                                stash.assignment_epoch > 1
+                                    && stash.transition_peer.is_none()
+                                    && stash.active_peer == to
+                            })
+                    {
+                        self.hit_fault(FaultPoint::CrashPrimaryAfterActiveCasBeforeCommit);
+                        self.crash_host(host);
+                        break;
+                    }
+                    if matches!(msg, blockd_core::seam::PeerMsg::ReplicaStatusReply { .. }) {
+                        self.hit_fault(FaultPoint::StatusReconciliation);
+                    }
+                    let forced_duplicate = match msg {
+                        blockd_core::seam::PeerMsg::ReplicaPutAck { .. }
+                        | blockd_core::seam::PeerMsg::ReplicaCommitAck { .. }
+                        | blockd_core::seam::PeerMsg::ReplicaReleaseAck { .. } => {
+                            Some(FaultPoint::DuplicateAck)
+                        }
+                        blockd_core::seam::PeerMsg::ReplicaRelease { .. } => {
+                            Some(FaultPoint::ReleaseOverlap)
+                        }
+                        _ => None,
+                    }
+                    .filter(|point| self.fault_enabled(*point));
+                    if let Some(point) = forced_duplicate {
+                        self.hit_fault(point);
+                        let delay = self.kernel.rng().range(micros(50), micros(500));
+                        self.kernel.schedule_after(
+                            delay,
+                            Ev::PeerDeliver {
+                                from: host,
+                                to: to.0,
+                                msg: msg.clone(),
+                            },
+                        );
+                    }
                     let (dup_n, dup_d) = self.config.peer_dup;
                     if dup_n > 0 && self.kernel.rng().below(dup_d) < dup_n {
                         self.report.peer_dups += 1;
@@ -1056,6 +1482,7 @@ impl Cluster {
         if state.daemon.take().is_none() {
             return;
         }
+        self.report.host_crashes += 1;
         state.inc += 1;
         state.bdev.crash(self.kernel.rng());
         state.mems.clear();
@@ -1079,6 +1506,7 @@ impl Cluster {
         if self.dead.contains(&host) || self.hosts[usize::from(host)].daemon.is_some() {
             return;
         }
+        self.hit_fault(FaultPoint::RestartScan);
         let scan: Vec<(String, Vec<u8>)> = self.hosts[usize::from(host)]
             .bdev
             .scan()
@@ -1086,6 +1514,14 @@ impl Cluster {
             .collect();
         let mut daemon_config = self.config.daemon.clone();
         daemon_config.host = HostId(host);
+        if let Some(placement) = daemon_config.replica_placement.as_mut()
+            && let Some(candidate) = placement
+                .roster
+                .iter()
+                .find(|candidate| candidate.host == HostId(host))
+        {
+            placement.local_failure_domain = candidate.failure_domain;
+        }
         let (daemon, verdicts, effects) = Daemon::recover(
             daemon_config,
             scan.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
@@ -1192,6 +1628,7 @@ impl Cluster {
             Err(volume) => {
                 let req = self.req();
                 self.sync_reqs.insert(req, vset);
+                self.sync_started.insert(req, self.kernel.now());
                 self.guests.get_mut(&vset).expect("guest exists").state =
                     GuestState::Syncing { req, volume };
                 self.step_daemon(host, Event::GuestSync { req, volume });
@@ -1375,6 +1812,10 @@ impl Cluster {
         if waiting != req || !ok {
             return;
         }
+        if let Some(started) = self.sync_started.remove(&req) {
+            self.sync_latencies
+                .push(self.kernel.now().nanos().saturating_sub(started.nanos()));
+        }
         if guest.paused {
             guest.state = GuestState::SyncParked { volume };
             return;
@@ -1439,7 +1880,9 @@ impl Cluster {
                 "R4.3: {vset:?} restored to {got:?}, head at death said {expected:?}"
             )),
         }
-        self.oracle.allow_sync_loss(vset);
+        if self.vset_config_for(vset).durability == DurabilityMode::Backup {
+            self.oracle.allow_sync_loss(vset);
+        }
         match verdict {
             Verdict::Resume { vmstate, .. } => {
                 self.oracle.on_resume(vset, vmstate);

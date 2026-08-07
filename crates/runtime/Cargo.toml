@@ -20,11 +20,14 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [dependencies]
+base64 = "0.22.1"
 blockd-core = { path = "../core" }
 blockd-hostmem = { path = "../hostmem" }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 # The differential recovery test replays simulation-produced blob sets
 # through the runtime's on-disk scan path.
 blockd-sim = { path = "../sim" }
+rcgen = { version = "0.14.7", default-features = false, features = ["ring"] }

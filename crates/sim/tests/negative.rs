@@ -4,7 +4,7 @@
 //! every honest run vacuously.
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::types::{HostId, millis, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, Sabotage, run};
 use blockd_sim::world::blobdev::BlobDevConfig;
@@ -20,6 +20,7 @@ fn base_config() -> HarnessConfig {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 25,
+            replica_placement: None,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::s3(),
@@ -28,7 +29,7 @@ fn base_config() -> HarnessConfig {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 16,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         horizon: secs(2),
         think: (millis(1), millis(5)),
@@ -97,7 +98,7 @@ fn oracle_catches_a_source_that_skips_the_durable_handoff() {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 16,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         nonbacked_vsets: 0,
         daemon: DaemonConfig {
@@ -108,6 +109,7 @@ fn oracle_catches_a_source_that_skips_the_durable_handoff() {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 25,
+            replica_placement: None,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::s3(),
@@ -121,6 +123,8 @@ fn oracle_catches_a_source_that_skips_the_durable_handoff() {
         migrate_mean_interval: 0,
         peer_drop: (0, 1),
         peer_dup: (0, 1),
+        peer_link_outages: vec![],
+        fault_points: vec![],
         store_outage: None,
         rot_resume_set_at: None,
         rot_leaves_at: None,

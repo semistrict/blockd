@@ -311,6 +311,8 @@ type KeyVersions = (u64, BTreeMap<u64, String>);
 pub struct S3Store {
     pub s3: S3Sim,
     registry: Mutex<BTreeMap<String, KeyVersions>>,
+    outage: std::sync::atomic::AtomicBool,
+    data_outage: std::sync::atomic::AtomicBool,
 }
 
 impl Default for S3Store {
@@ -326,7 +328,29 @@ impl S3Store {
         S3Store {
             s3: S3Sim::new(),
             registry: Mutex::new(BTreeMap::new()),
+            outage: std::sync::atomic::AtomicBool::new(false),
+            data_outage: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub fn set_outage(&self, unavailable: bool) {
+        self.outage.store(unavailable, Ordering::SeqCst);
+    }
+
+    /// Fault injection for a stalled data plane while the small fenced head
+    /// control plane remains available. This models the condition replacement
+    /// must tolerate: peer uploads cannot make progress, but assignment CASes
+    /// still linearize.
+    pub fn set_data_outage(&self, unavailable: bool) {
+        self.data_outage.store(unavailable, Ordering::SeqCst);
+    }
+
+    fn unavailable(&self) -> bool {
+        self.outage.load(Ordering::SeqCst)
+    }
+
+    fn data_unavailable(&self, key: &str) -> bool {
+        self.data_outage.load(Ordering::SeqCst) && !key.ends_with("/head")
     }
 
     fn record_put(&self, key: &str, etag: String) -> u64 {
@@ -356,6 +380,9 @@ impl S3Store {
 
     /// Unconditional put (segments, manifests, resume sets).
     pub fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, blockd_core::seam::StoreFault> {
+        if self.unavailable() || self.data_unavailable(key) {
+            return Err(blockd_core::seam::StoreFault::Unavailable);
+        }
         let etag = self
             .s3
             .put_object(key, bytes, None, false)
@@ -371,6 +398,9 @@ impl S3Store {
         expected: Option<u64>,
         bytes: Vec<u8>,
     ) -> Result<u64, blockd_core::seam::StoreFault> {
+        if self.unavailable() {
+            return Err(blockd_core::seam::StoreFault::Unavailable);
+        }
         let result = match expected {
             None => self.s3.put_object(key, bytes, None, true),
             Some(version) => {
@@ -398,6 +428,9 @@ impl S3Store {
     }
 
     pub fn get(&self, key: &str) -> GetResult {
+        if self.unavailable() || self.data_unavailable(key) {
+            return Err(blockd_core::seam::StoreFault::Unavailable);
+        }
         match self.s3.get_object(key, None) {
             Ok((etag, body)) => Ok(Some((self.version_of(key, &etag), body))),
             Err(S3Error::NoSuchKey) => Ok(None),
@@ -406,6 +439,9 @@ impl S3Store {
     }
 
     pub fn get_range(&self, key: &str, offset: u64, len: u64) -> GetResult {
+        if self.unavailable() || self.data_unavailable(key) {
+            return Err(blockd_core::seam::StoreFault::Unavailable);
+        }
         match self.s3.get_object(key, Some((offset, offset + len - 1))) {
             Ok((etag, body)) => Ok(Some((self.version_of(key, &etag), body))),
             Err(S3Error::NoSuchKey | S3Error::InvalidRange) => Ok(None),
@@ -414,6 +450,9 @@ impl S3Store {
     }
 
     pub fn delete(&self, key: &str) {
+        if self.unavailable() || self.data_unavailable(key) {
+            return;
+        }
         self.s3.delete_object(key);
     }
 }
@@ -442,5 +481,50 @@ impl crate::store::ObjectStore for S3Store {
 
     fn delete(&self, key: &str) {
         S3Store::delete(self, key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blockd_core::seam::StoreFault;
+
+    #[test]
+    fn injected_outage_rejects_reads_and_writes_without_mutating_objects() {
+        let store = S3Store::new();
+        let version = store.put("stable", vec![1, 2, 3]).expect("initial put");
+        store.set_outage(true);
+
+        assert_eq!(store.get("stable"), Err(StoreFault::Unavailable));
+        assert_eq!(
+            store.get_range("stable", 0, 1),
+            Err(StoreFault::Unavailable)
+        );
+        assert_eq!(store.put("new", vec![4]), Err(StoreFault::Unavailable));
+        assert_eq!(
+            store.put_cas("stable", Some(version), vec![9]),
+            Err(StoreFault::Unavailable)
+        );
+        store.delete("stable");
+
+        store.set_outage(false);
+        assert_eq!(store.get("stable"), Ok(Some((version, vec![1, 2, 3]))));
+        assert_eq!(store.get("new"), Ok(None));
+    }
+
+    #[test]
+    fn data_outage_keeps_head_get_and_cas_available() {
+        let store = S3Store::new();
+        let head = "v/0000000000000001/head";
+        let version = store.put_cas(head, None, vec![1]).expect("create head");
+        store.set_data_outage(true);
+
+        assert_eq!(
+            store.put("v/1/segment", vec![2]),
+            Err(StoreFault::Unavailable)
+        );
+        assert_eq!(store.get("v/1/segment"), Err(StoreFault::Unavailable));
+        assert_eq!(store.get(head), Ok(Some((version, vec![1]))));
+        assert_eq!(store.put_cas(head, Some(version), vec![3]), Ok(version + 1));
     }
 }

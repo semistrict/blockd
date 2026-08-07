@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, StoreFault, TimerId};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
 
@@ -169,6 +169,64 @@ impl World {
                 self.blobs.insert(name, bytes);
                 local.push_back(Event::BlobWriteDone { io });
             }
+            Effect::ReplicaAppend {
+                io,
+                source,
+                vset,
+                assignment_epoch,
+                generation,
+                bytes,
+            } => {
+                self.blobs
+                    .entry(blockd_core::layout::replica_spool_segment_blob(
+                        source,
+                        vset,
+                        assignment_epoch,
+                        generation,
+                    ))
+                    .or_default()
+                    .extend(bytes);
+                local.push_back(Event::BlobWriteDone { io });
+            }
+            Effect::ReplicaDelete {
+                io,
+                source,
+                vset,
+                assignment_epoch,
+                through_generation,
+            } => {
+                for generation in 0..=through_generation {
+                    self.blobs
+                        .remove(&blockd_core::layout::replica_spool_segment_blob(
+                            source,
+                            vset,
+                            assignment_epoch,
+                            generation,
+                        ));
+                }
+                local.push_back(Event::BlobWriteDone { io });
+            }
+            Effect::ReplicaTruncate {
+                io,
+                source,
+                vset,
+                assignment_epoch,
+                generation,
+                len,
+            } => {
+                if let Some(bytes) =
+                    self.blobs
+                        .get_mut(&blockd_core::layout::replica_spool_segment_blob(
+                            source,
+                            vset,
+                            assignment_epoch,
+                            generation,
+                        ))
+                {
+                    bytes.truncate(usize::try_from(len).expect("fits"));
+                }
+                local.push_back(Event::BlobWriteDone { io });
+            }
             Effect::BlobRead { io, name } => {
                 local.push_back(Event::BlobReadDone {
                     io,
@@ -288,7 +346,7 @@ fn drive(vsets: u64) -> World {
     let config = VsetConfig {
         disk_volumes: 1,
         pages_per_volume: PAGES_PER_VOLUME,
-        backed_up: false,
+        durability: DurabilityMode::Local,
     };
     let mut world = World::new(DaemonConfig {
         host: HostId(0),
@@ -298,6 +356,7 @@ fn drive(vsets: u64) -> World {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 500,
+        replica_placement: None,
     });
     for n in 0..vsets {
         world.step(
@@ -357,6 +416,7 @@ fn profile_huge_vset_capture_stall() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 500,
+        replica_placement: None,
     });
     world.step(
         Event::Admin(AdminCmd::CreateVset {
@@ -365,7 +425,7 @@ fn profile_huge_vset_capture_stall() {
             config: VsetConfig {
                 disk_volumes: 1,
                 pages_per_volume: HUGE_PAGES,
-                backed_up: false,
+                durability: DurabilityMode::Local,
             },
             from_base: None,
         }),

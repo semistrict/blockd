@@ -55,7 +55,7 @@ impl Daemon {
         // Bases are store objects: only the backed-up mode may write them
         // (R4.4 is absolute for the other mode), and only a pinned whole
         // checkpoint (or disk-only point) can be kept.
-        if !state.ready || !state.config.backed_up || state.keep.is_some() {
+        if !state.ready || !state.config.durability.uses_store() || state.keep.is_some() {
             out.push(Effect::Admin(AdminReply::AdminFailed { req }));
             return;
         }
@@ -383,7 +383,8 @@ impl Daemon {
         };
         state.fork_verdict = Some(verdict);
         state.mutation_seq = record.capture_seq;
-        state.durable_watermark = 0;
+        state.local_covered_through = 0;
+        state.sync_ack_through = 0;
         state.next_gen = overlay.values().map(|(g, _)| g.0 + 1).max().unwrap_or(0);
         state.page_locs = overlay.clone();
         state.rebuild_seg_live();

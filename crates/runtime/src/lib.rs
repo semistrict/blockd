@@ -22,8 +22,8 @@ mod gcs;
 mod host;
 #[cfg(target_os = "linux")]
 mod loopstats;
-#[cfg(target_os = "linux")]
 mod peer;
+mod replica_recovery;
 #[cfg(target_os = "linux")]
 mod s3;
 mod store;
@@ -34,8 +34,10 @@ pub use gcs::{GcsConfig, GcsStats, GcsStore};
 pub use host::{Runtime, RuntimeConfig};
 #[cfg(target_os = "linux")]
 pub use loopstats::LoopStats;
-#[cfg(target_os = "linux")]
-pub use peer::{PeerConfig, PeerNet};
+pub use peer::{PeerConfig, PeerNet, PeerTlsConfig};
+pub use replica_recovery::{
+    InstallReplicaRecoveryError, InstalledReplicaRecovery, install_replica_recovery,
+};
 #[cfg(target_os = "linux")]
 pub use s3::{ListObjectsV2Output, S3Error, S3LatencyModel, S3Sim, S3Stats, S3Store};
 pub use store::{GetResult, ObjectStore};

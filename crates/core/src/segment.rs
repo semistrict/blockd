@@ -14,6 +14,10 @@ use crate::types::{Gen, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page
 pub const MAGIC_SEG_HDR: u32 = u32::from_le_bytes(*b"BSH1");
 pub const MAGIC_SEG_ENT: u32 = u32::from_le_bytes(*b"BSE1");
 
+/// Hard ceiling shared by local capture, peer transfer, and object-store
+/// publication. It leaves ample envelope room below R4.6's 64 MiB cap.
+pub const MAX_SEGMENT_BYTES: usize = 32 * 1024 * 1024;
+
 /// Where a page's durable bytes live: a byte range of one segment blob
 /// covering the page's whole framed entry. Ranged reads of exactly this span
 /// are the fault path.
@@ -30,6 +34,11 @@ pub struct PageLoc {
 }
 
 const HDR_PAYLOAD: usize = 2 + 4 + 8 + 8 + 8 + 4; // version, page size, vset, fence, seg, count
+const ENTRY_PAYLOAD_FIXED: usize = 1 + 4 + 8 + 4;
+
+fn max_entry_bytes() -> usize {
+    FRAME_HEADER + ENTRY_PAYLOAD_FIXED + lz4_flex::block::get_maximum_output_size(page_size())
+}
 
 /// Every page a segment holds: identity, generation, and byte range.
 pub type SegmentEntries = Vec<(PageId, Gen, PageLoc)>;
@@ -83,6 +92,10 @@ impl SegmentBuilder {
         self.entries.is_empty()
     }
 
+    fn can_add_page(&self) -> bool {
+        FRAME_HEADER + HDR_PAYLOAD + self.body.len() + max_entry_bytes() <= MAX_SEGMENT_BYTES
+    }
+
     /// Finish the blob: bytes plus every entry's location.
     pub fn finish(self) -> (Vec<u8>, SegmentEntries) {
         let mut h = Enc::new();
@@ -96,6 +109,59 @@ impl SegmentBuilder {
         debug_assert_eq!(blob.len(), FRAME_HEADER + HDR_PAYLOAD);
         blob.extend_from_slice(&self.body);
         (blob, self.entries)
+    }
+}
+
+/// Builds one capture's page entries into consecutive, independently bounded
+/// segment blobs. Rotation happens before an entry, so an entry is never split.
+#[derive(Debug)]
+pub struct SegmentBatchBuilder {
+    vset: VsetId,
+    fence: u64,
+    current: SegmentBuilder,
+    finished: Vec<(SegId, Vec<u8>, SegmentEntries)>,
+}
+
+impl SegmentBatchBuilder {
+    pub fn new(vset: VsetId, fence: u64, first_seg: SegId) -> Self {
+        Self {
+            vset,
+            fence,
+            current: SegmentBuilder::new(vset, fence, first_seg),
+            finished: Vec::new(),
+        }
+    }
+
+    pub fn add(&mut self, page: PageId, generation: Gen, page_bytes: &[u8]) {
+        if !self.current.is_empty() && !self.current.can_add_page() {
+            self.rotate();
+        }
+        self.current.add(page, generation, page_bytes);
+    }
+
+    fn rotate(&mut self) {
+        let next = SegId(
+            self.current
+                .seg
+                .0
+                .checked_add(1)
+                .expect("segment id overflow"),
+        );
+        let current = std::mem::replace(
+            &mut self.current,
+            SegmentBuilder::new(self.vset, self.fence, next),
+        );
+        let seg = current.seg;
+        let (blob, entries) = current.finish();
+        debug_assert!(blob.len() <= MAX_SEGMENT_BYTES);
+        self.finished.push((seg, blob, entries));
+    }
+
+    pub fn finish(mut self) -> Vec<(SegId, Vec<u8>, SegmentEntries)> {
+        if !self.current.is_empty() {
+            self.rotate();
+        }
+        self.finished
     }
 }
 
@@ -188,6 +254,8 @@ pub fn scan_segment(bytes: &[u8]) -> Result<(VsetId, u64, SegId, SegmentEntries)
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::format::{crc32c, open_frame, seal_frame};
 
@@ -211,6 +279,80 @@ mod tests {
         b.add(sample_page(0, 3), Gen(7), &pattern_page(0x55));
         b.add(sample_page(1, 0), Gen(9), &pattern_page(0xAA));
         b.finish()
+    }
+
+    #[test]
+    fn a_batch_splits_incompressible_pages_without_losing_or_repeating_any() {
+        let vset = VsetId(0xA1);
+        // Enough pseudo-random pages to exceed the cap even if LZ4 happens to
+        // shave a little from each one.
+        let pages = MAX_SEGMENT_BYTES / page_size() + 100;
+        let mut batch = SegmentBatchBuilder::new(vset, 6, SegId(10));
+        let mut expected = Vec::with_capacity(pages);
+        for n in 0..pages {
+            let page = sample_page(0, u32::try_from(n).expect("test page fits"));
+            let generation = Gen(u64::try_from(n).expect("test generation fits"));
+            let mut x = u64::try_from(n).expect("page count fits") ^ 0xA076_1D64_78BD_642F;
+            let raw: Vec<u8> = (0..page_size())
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    u8::try_from(x & 0xFF).expect("masked to a byte")
+                })
+                .collect();
+            batch.add(page, generation, &raw);
+            expected.push((page, generation));
+        }
+        let blobs = batch.finish();
+        assert!(blobs.len() >= 2, "cap-crossing batch must rotate");
+        let mut actual = Vec::new();
+        for (expected_seg, blob, locs) in blobs {
+            assert!(blob.len() <= MAX_SEGMENT_BYTES);
+            let (got_vset, fence, got_seg, scanned) = scan_segment(&blob).expect("segment scans");
+            assert_eq!((got_vset, fence, got_seg), (vset, 6, expected_seg));
+            assert_eq!(scanned, locs);
+            actual.extend(
+                locs.into_iter()
+                    .map(|(page, generation, _)| (page, generation)),
+            );
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn one_mib_delta_is_one_bounded_exactly_reconstructable_closure() {
+        let vset = VsetId(0xA1);
+        let pages = (1024 * 1024) / page_size();
+        let mut batch = SegmentBatchBuilder::new(vset, 6, SegId(40));
+        let mut expected = BTreeMap::new();
+        for n in 0..pages {
+            let page = sample_page(0, u32::try_from(n).expect("page fits"));
+            let mut x = u64::try_from(n).expect("fits") ^ 0xE703_7ED1_A0B4_28DB;
+            let raw: Vec<u8> = (0..page_size())
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    u8::try_from(x & 0xFF).expect("byte")
+                })
+                .collect();
+            expected.insert(page, raw.clone());
+            batch.add(page, Gen(u64::try_from(n).expect("fits")), &raw);
+        }
+        assert_eq!(expected.len() * page_size(), 1024 * 1024);
+        let blobs = batch.finish();
+        assert_eq!(blobs.len(), 1);
+        let (_, blob, locs) = &blobs[0];
+        assert!(blob.len() <= MAX_SEGMENT_BYTES);
+        for (page, generation, loc) in locs {
+            let start = usize::try_from(loc.offset).expect("offset fits");
+            let end = start + usize::try_from(loc.len).expect("length fits");
+            let (got_page, got_generation, bytes) =
+                open_entry(vset, &blob[start..end]).expect("entry");
+            assert_eq!((got_page, got_generation), (*page, *generation));
+            assert_eq!(bytes, expected[page]);
+        }
     }
 
     #[test]

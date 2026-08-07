@@ -5,6 +5,8 @@
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
 use blockd_core::seam::StoreFault;
@@ -18,6 +20,39 @@ fn store_against(endpoint: &str) -> GcsStore {
         endpoint: endpoint.to_owned(),
         metadata_endpoint: endpoint.to_owned(),
     })
+}
+
+fn control(endpoint: &str, path: &str) {
+    let address = endpoint.strip_prefix("http://").expect("HTTP endpoint");
+    let mut stream = TcpStream::connect(address).expect("connect control");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send control");
+    let mut response = [0u8; 512];
+    let read = stream.read(&mut response).expect("read control");
+    let response = String::from_utf8_lossy(&response[..read]);
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+}
+
+#[test]
+fn availability_controls_distinguish_fencing_from_immutable_data() {
+    let (_, endpoint) = FakeGcs::start();
+    let store = store_against(&endpoint);
+    store.put("v/01/head", b"head".to_vec()).expect("head");
+    store.put("v/01/data", b"data".to_vec()).expect("data");
+
+    control(&endpoint, "/__control/data-outage/on");
+    assert!(matches!(store.get("v/01/head"), Ok(Some(_))));
+    assert_eq!(store.get("v/01/data"), Err(StoreFault::Unavailable));
+    control(&endpoint, "/__control/data-outage/off");
+    assert!(matches!(store.get("v/01/data"), Ok(Some(_))));
+
+    control(&endpoint, "/__control/outage/on");
+    assert_eq!(store.get("v/01/head"), Err(StoreFault::Unavailable));
+    control(&endpoint, "/__control/outage/off");
+    assert!(matches!(store.get("v/01/head"), Ok(Some(_))));
 }
 
 /// The store contract, end to end against the stateful fake: create-only

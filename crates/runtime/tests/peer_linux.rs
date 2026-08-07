@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use blockd_core::seam::{IoId, PeerMsg};
-use blockd_core::types::{HostId, SegId, VsetId};
+use blockd_core::seam::{IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo};
+use blockd_core::types::{HostId, JournalSeq, SegId, VsetId};
 use blockd_runtime::{PeerConfig, PeerNet};
 
 /// A bound-then-released ephemeral port: still free momentarily after.
@@ -30,7 +30,12 @@ fn net(
     peers: BTreeMap<HostId, SocketAddr>,
 ) -> (Arc<PeerNet>, Receiver<(HostId, PeerMsg)>) {
     let (tx, rx) = channel();
-    let config = PeerConfig { listen, peers };
+    let config = PeerConfig {
+        listen,
+        peers,
+        outbound_protocol_versions: BTreeMap::new(),
+        tls: None,
+    };
     let host = PeerNet::start(&config, HostId(9), move |from, msg| {
         let _ = tx.send((from, msg));
     });
@@ -38,6 +43,15 @@ fn net(
 }
 
 fn sample_msgs() -> Vec<PeerMsg> {
+    let artifact = ReplicaArtifact::Segment {
+        fence: 4,
+        seg: SegId(8),
+    };
+    let info = ReplicaCommitInfo {
+        writer_fence: 4,
+        seq: JournalSeq(9),
+        sync_covered_through: 12,
+    };
     vec![
         PeerMsg::MigrateOffer {
             vset: VsetId(7),
@@ -69,6 +83,55 @@ fn sample_msgs() -> Vec<PeerMsg> {
         },
         PeerMsg::Released { vset: VsetId(7) },
         PeerMsg::ReleasedAck { vset: VsetId(7) },
+        PeerMsg::ReplicaPut {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            artifact,
+            checksum: 0xAABB_CCDD,
+            bytes: vec![0x5A; 1024],
+        },
+        PeerMsg::ReplicaPutAck {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            artifact,
+            checksum: 0xAABB_CCDD,
+        },
+        PeerMsg::ReplicaCommit {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            info,
+            required: vec![artifact],
+            record: vec![0xC3; 128],
+        },
+        PeerMsg::ReplicaCommitAck {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            info,
+        },
+        PeerMsg::ReplicaStatus {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+        },
+        PeerMsg::ReplicaStatusReply {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            committed: Some(info),
+        },
+        PeerMsg::ReplicaUploadDone {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            info,
+        },
+        PeerMsg::ReplicaRelease {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            through: info,
+        },
+        PeerMsg::ReplicaReleaseAck {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            through: info,
+        },
     ]
 }
 

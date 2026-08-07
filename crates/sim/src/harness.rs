@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use blockd_core::daemon::{Counters, Daemon, DaemonConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout::{self, BlobName};
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, Verdict};
 use blockd_core::types::{PageId, SimTime, VsetId, micros, millis};
@@ -382,7 +382,11 @@ pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(Str
 impl Harness {
     fn vset_config_for(&self, vset: VsetId) -> VsetConfig {
         let mut config = self.config.vset_config;
-        config.backed_up = vset.0 <= u64::from(self.config.backed_vsets);
+        config.durability = if vset.0 <= u64::from(self.config.backed_vsets) {
+            DurabilityMode::Backup
+        } else {
+            DurabilityMode::Local
+        };
         config
     }
 
@@ -532,6 +536,80 @@ impl Harness {
                         },
                     );
                 }
+                Effect::ReplicaAppend {
+                    io,
+                    source,
+                    vset,
+                    assignment_epoch,
+                    generation,
+                    bytes,
+                } => {
+                    let now = self.kernel.now();
+                    let name = layout::replica_spool_segment_blob(
+                        source,
+                        vset,
+                        assignment_epoch,
+                        generation,
+                    );
+                    let (bdev_io, at) =
+                        self.bdev.submit_append(now, self.kernel.rng(), name, bytes);
+                    self.kernel.schedule_at(
+                        at,
+                        Ev::BdevWriteDone {
+                            inc: self.inc,
+                            bdev_io,
+                            io,
+                        },
+                    );
+                }
+                Effect::ReplicaDelete {
+                    io,
+                    source,
+                    vset,
+                    assignment_epoch,
+                    through_generation,
+                } => {
+                    for generation in 0..=through_generation {
+                        self.bdev.delete(&layout::replica_spool_segment_blob(
+                            source,
+                            vset,
+                            assignment_epoch,
+                            generation,
+                        ));
+                    }
+                    self.kernel.schedule_at(
+                        self.kernel.now(),
+                        Ev::Daemon {
+                            inc: self.inc,
+                            event: Event::BlobWriteDone { io },
+                        },
+                    );
+                }
+                Effect::ReplicaTruncate {
+                    io,
+                    source,
+                    vset,
+                    assignment_epoch,
+                    generation,
+                    len,
+                } => {
+                    self.bdev.truncate(
+                        &layout::replica_spool_segment_blob(
+                            source,
+                            vset,
+                            assignment_epoch,
+                            generation,
+                        ),
+                        usize::try_from(len).expect("fits"),
+                    );
+                    self.kernel.schedule_at(
+                        self.kernel.now(),
+                        Ev::Daemon {
+                            inc: self.inc,
+                            event: Event::BlobWriteDone { io },
+                        },
+                    );
+                }
                 Effect::BlobRead { io, name } => {
                     let now = self.kernel.now();
                     let (at, bytes) = self.bdev.read(now, self.kernel.rng(), &name);
@@ -663,7 +741,7 @@ impl Harness {
                     if let Some(guest) = self.guests.get_mut(&vset) {
                         guest.state = GuestState::Dead;
                     }
-                    if self.vset_config_for(vset).backed_up {
+                    if self.vset_config_for(vset).durability.uses_store() {
                         let req = self.req();
                         self.admin_reqs.insert(req, AdminKind::Restore(vset));
                         self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
@@ -1188,7 +1266,7 @@ impl Harness {
                     guest.reborn(0, true);
                     self.schedule_guest(vset);
                 }
-                None if self.vset_config_for(vset).backed_up => {
+                None if self.vset_config_for(vset).durability.uses_store() => {
                     // Recovery defers the verdict until the head confirms
                     // ownership; the guest waits for `VsetRecovered` (or a
                     // fence followed by a restore).
@@ -1203,7 +1281,7 @@ impl Harness {
                     self.guests.get_mut(&vset).expect("listed").state = GuestState::Dead;
                     // Backed-up vsets come back from the store (R6.1): the
                     // control plane requests a restore.
-                    if self.vset_config_for(vset).backed_up {
+                    if self.vset_config_for(vset).durability.uses_store() {
                         let req = self.req();
                         self.admin_reqs.insert(req, AdminKind::Restore(vset));
                         self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));

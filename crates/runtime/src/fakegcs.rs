@@ -38,6 +38,10 @@ pub struct FakeGcs {
     /// Added to every object request (not token requests): emulates a
     /// real store's round-trip so cadence bugs reproduce locally.
     pub latency_ms: AtomicU64,
+    /// Test-only availability controls. Data outage preserves `/head` so
+    /// placement/fencing can continue while immutable uploads are stalled.
+    pub outage: std::sync::atomic::AtomicBool,
+    pub data_outage: std::sync::atomic::AtomicBool,
 }
 
 impl FakeGcs {
@@ -60,6 +64,8 @@ impl FakeGcs {
             seen: Mutex::new(Vec::new()),
             faults: Mutex::new(Vec::new()),
             latency_ms: AtomicU64::new(0),
+            outage: std::sync::atomic::AtomicBool::new(false),
+            data_outage: std::sync::atomic::AtomicBool::new(false),
         });
         let server = fake.clone();
         thread::spawn(move || {
@@ -87,10 +93,36 @@ impl FakeGcs {
                 respond(&mut stream, 200, &[], body.as_bytes());
                 continue;
             }
+            if seen.path == "/__control/outage/on" {
+                self.outage.store(true, Ordering::SeqCst);
+                respond(&mut stream, 200, &[], b"ok");
+                continue;
+            }
+            if seen.path == "/__control/outage/off" {
+                self.outage.store(false, Ordering::SeqCst);
+                respond(&mut stream, 200, &[], b"ok");
+                continue;
+            }
+            if seen.path == "/__control/data-outage/on" {
+                self.data_outage.store(true, Ordering::SeqCst);
+                respond(&mut stream, 200, &[], b"ok");
+                continue;
+            }
+            if seen.path == "/__control/data-outage/off" {
+                self.data_outage.store(false, Ordering::SeqCst);
+                respond(&mut stream, 200, &[], b"ok");
+                continue;
+            }
             self.seen.lock().expect("lock").push(seen.clone());
             let latency = self.latency_ms.load(Ordering::SeqCst);
             if latency > 0 {
                 thread::sleep(std::time::Duration::from_millis(latency));
+            }
+            if self.outage.load(Ordering::SeqCst)
+                || (self.data_outage.load(Ordering::SeqCst) && !seen.path.ends_with("/head"))
+            {
+                respond_to(&seen.method, &mut stream, 503, &[], b"unavailable");
+                continue;
             }
             if let Some(fault) = {
                 let mut faults = self.faults.lock().expect("lock");

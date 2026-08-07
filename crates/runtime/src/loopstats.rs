@@ -34,7 +34,7 @@ pub(crate) fn event_kind(event: &Event) -> usize {
         Event::GuestPaused { .. } => 2,
         Event::PeerDelivered { .. } => 3,
         Event::Admin(_) => 4,
-        Event::BlobWriteDone { .. } => 5,
+        Event::BlobWriteDone { .. } | Event::ReplicaDeleteFailed { .. } => 5,
         Event::BlobReadDone { .. } => 6,
         Event::StorePutDone { .. } => 7,
         Event::StoreGetDone { .. } => 8,
@@ -42,7 +42,7 @@ pub(crate) fn event_kind(event: &Event) -> usize {
     }
 }
 
-pub(crate) const EFFECT_KINDS: [&str; 24] = [
+pub(crate) const EFFECT_KINDS: [&str; 27] = [
     "Fill",
     "FillShared",
     "FillFailed",
@@ -54,6 +54,9 @@ pub(crate) const EFFECT_KINDS: [&str; 24] = [
     "SyncOk",
     "SyncFailed",
     "BlobWrite",
+    "ReplicaAppend",
+    "ReplicaDelete",
+    "ReplicaTruncate",
     "BlobRead",
     "BlobReadRange",
     "BlobDelete",
@@ -82,19 +85,22 @@ pub(crate) fn effect_kind(effect: &Effect) -> usize {
         Effect::SyncOk { .. } => 8,
         Effect::SyncFailed { .. } => 9,
         Effect::BlobWrite { .. } => 10,
-        Effect::BlobRead { .. } => 11,
-        Effect::BlobReadRange { .. } => 12,
-        Effect::BlobDelete { .. } => 13,
-        Effect::SetTimer { .. } => 14,
-        Effect::StorePut { .. } => 15,
-        Effect::StoreCas { .. } => 16,
-        Effect::StoreGet { .. } => 17,
-        Effect::StoreGetRange { .. } => 18,
-        Effect::StoreDelete { .. } => 19,
-        Effect::VsetFenced { .. } => 20,
-        Effect::Admin(_) => 21,
-        Effect::PeerSend { .. } => 22,
-        Effect::Abort { .. } => 23,
+        Effect::ReplicaAppend { .. } => 11,
+        Effect::ReplicaDelete { .. } => 12,
+        Effect::ReplicaTruncate { .. } => 13,
+        Effect::BlobRead { .. } => 14,
+        Effect::BlobReadRange { .. } => 15,
+        Effect::BlobDelete { .. } => 16,
+        Effect::SetTimer { .. } => 17,
+        Effect::StorePut { .. } => 18,
+        Effect::StoreCas { .. } => 19,
+        Effect::StoreGet { .. } => 20,
+        Effect::StoreGetRange { .. } => 21,
+        Effect::StoreDelete { .. } => 22,
+        Effect::VsetFenced { .. } => 23,
+        Effect::Admin(_) => 24,
+        Effect::PeerSend { .. } => 25,
+        Effect::Abort { .. } => 26,
     }
 }
 

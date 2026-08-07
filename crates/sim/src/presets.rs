@@ -6,7 +6,8 @@
 //! forever).
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::placement::PeerCandidate;
 use blockd_core::types::{HostId, millis, secs};
 
 use crate::cluster::ClusterConfig;
@@ -28,6 +29,7 @@ pub fn single_host_base() -> HarnessConfig {
             // 25 ticks × 20 ms = 500 ms: reachable inside sim horizons, so
             // the wedge watch is exercised, not decorative.
             wedge_ticks: 25,
+            replica_placement: None,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::s3(),
@@ -36,7 +38,7 @@ pub fn single_host_base() -> HarnessConfig {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 16,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         horizon: secs(2),
         think: (millis(1), millis(5)),
@@ -83,6 +85,7 @@ pub fn cluster_kill_race() -> ClusterConfig {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 25,
+            replica_placement: None,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::s3(),
@@ -90,7 +93,7 @@ pub fn cluster_kill_race() -> ClusterConfig {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 16,
-            backed_up: true,
+            durability: DurabilityMode::Backup,
         },
         nonbacked_vsets: 0,
         horizon: secs(4),
@@ -103,6 +106,8 @@ pub fn cluster_kill_race() -> ClusterConfig {
         migrate_mean_interval: 0,
         peer_drop: (0, 1),
         peer_dup: (0, 1),
+        peer_link_outages: vec![],
+        fault_points: vec![],
         store_outage: None,
         rot_resume_set_at: None,
         rot_leaves_at: None,
@@ -133,4 +138,144 @@ pub fn migration_chaos() -> ClusterConfig {
         race_restore: false,
         ..cluster_kill_race()
     }
+}
+
+/// Three hosts with one deterministic passive target per vset, lossy peer
+/// links, and a prolonged S3 outage. Sync liveness depends on the peer commit,
+/// while eventual upload/release exercises the no-rewrite cleanup path.
+pub fn peer_stash_chaos() -> ClusterConfig {
+    let mut config = cluster_kill_race();
+    config.vset_count = 3;
+    config.nonbacked_vsets = 0;
+    config.vset_config.durability = DurabilityMode::PeerStashed;
+    config.daemon.replica_placement = Some(blockd_core::daemon::ReplicaPlacementConfig {
+        membership_epoch: 1,
+        local_failure_domain: 1,
+        roster: (0..config.hosts)
+            .map(|host| PeerCandidate {
+                host: HostId(host),
+                weight: host + 1,
+                failure_domain: host + 1,
+                drained: false,
+            })
+            .collect(),
+    });
+    config.kill_hosts_at.clear();
+    config.race_restore = false;
+    config.peer_drop = (1, 12);
+    config.peer_dup = (1, 10);
+    config.store_outage = Some((millis(400), millis(2200)));
+    config.guest_sync_share = Some(crate::rng::Ppm::percent(35));
+    config
+}
+
+/// Active-peer process/disk loss long enough to force a fenced B-to-C
+/// replacement, followed by restart scanning of the old peer residue.
+pub fn peer_attrition() -> ClusterConfig {
+    let mut config = peer_stash_chaos();
+    config.vset_count = 1;
+    config.horizon = secs(2);
+    config.peer_drop = (0, 1);
+    config.peer_dup = (0, 1);
+    config.store_outage = None;
+    config.restart_delay = (millis(700), millis(800));
+    let roster = &config
+        .daemon
+        .replica_placement
+        .as_ref()
+        .expect("peer placement")
+        .roster;
+    let active = blockd_core::placement::rank_stash_candidates(
+        1,
+        HostId(0),
+        1,
+        blockd_core::types::VsetId(1),
+        roster,
+    )[0];
+    config.crash_hosts_at = vec![(millis(400), active.0)];
+    config
+}
+
+/// Directional partitions in both directions of the initial active link,
+/// composed with a control/data-store outage and reliable links elsewhere.
+pub fn swizzle_peer_links() -> ClusterConfig {
+    let mut config = peer_stash_chaos();
+    config.vset_count = 1;
+    config.horizon = secs(2);
+    config.peer_drop = (0, 1);
+    config.peer_dup = (0, 1);
+    let roster = &config
+        .daemon
+        .replica_placement
+        .as_ref()
+        .expect("peer placement")
+        .roster;
+    let active = blockd_core::placement::rank_stash_candidates(
+        1,
+        HostId(0),
+        1,
+        blockd_core::types::VsetId(1),
+        roster,
+    )[0];
+    config.peer_link_outages = vec![
+        (millis(300), millis(650), 0, active.0),
+        (millis(700), millis(1050), active.0, 0),
+    ];
+    config.store_outage = Some((millis(1100), millis(1450)));
+    config
+}
+
+/// Aggressive deterministic rare-branch preset. Every named point must
+/// report nonzero coverage or the test fails rather than calling it chaos.
+pub fn peer_stash_rare() -> ClusterConfig {
+    let mut config = peer_attrition();
+    config.horizon = secs(8);
+    let crashed = config.crash_hosts_at[0].1;
+    config.crash_hosts_at = vec![(secs(2), crashed)];
+    config.peer_drop = (1, 12);
+    config.peer_dup = (1, 10);
+    config.store_outage = Some((millis(200), millis(800)));
+    config.fault_points = vec![
+        crate::cluster::FaultPoint::ReplicaRetryTimer,
+        crate::cluster::FaultPoint::DuplicateAck,
+        crate::cluster::FaultPoint::StatusReconciliation,
+        crate::cluster::FaultPoint::AssignmentCasRace,
+        crate::cluster::FaultPoint::StoreUnknownResult,
+        crate::cluster::FaultPoint::RestartScan,
+    ];
+    config
+}
+
+/// Four-host placement failure: B is lost, then C is lost during its seed,
+/// so the next fenced assignment epoch selects only D. Both old peers return
+/// later and must not regain send authority.
+pub fn placement_fear() -> ClusterConfig {
+    let mut config = peer_attrition();
+    config.hosts = 4;
+    config.horizon = secs(4);
+    config.restart_delay = (millis(900), millis(1000));
+    let roster: Vec<_> = (0..config.hosts)
+        .map(|host| PeerCandidate {
+            host: HostId(host),
+            weight: host + 1,
+            failure_domain: host + 1,
+            drained: false,
+        })
+        .collect();
+    config
+        .daemon
+        .replica_placement
+        .as_mut()
+        .expect("placement")
+        .roster
+        .clone_from(&roster);
+    let ranked = blockd_core::placement::rank_stash_candidates(
+        1,
+        HostId(0),
+        1,
+        blockd_core::types::VsetId(1),
+        &roster,
+    );
+    config.crash_hosts_at = vec![(millis(400), ranked[0].0), (millis(750), ranked[1].0)];
+    config
 }

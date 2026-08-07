@@ -11,6 +11,7 @@
 
 use super::{Daemon, Pending, Publish};
 use crate::head::{HeadRecord, ManifestPtr};
+use crate::journal::DurabilityMode;
 use crate::layout;
 use crate::seam::{Effect, HostMap, StoreFault, TimerId};
 use crate::segment::scan_segment;
@@ -23,7 +24,7 @@ impl Daemon {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
         };
-        if !state.config.backed_up || state.publish.is_some() {
+        if state.config.durability != DurabilityMode::Backup || state.publish.is_some() {
             return;
         }
         let Some(head_version) = state.head_version else {
@@ -272,6 +273,8 @@ impl Daemon {
                         holder: self.config.host,
                         fence: state.fence,
                         manifest: Some(ptr),
+                        stash: state.stash_assignment,
+                        retired_stashes: state.retired_stashes.clone(),
                     };
                     let expected = state.head_version;
                     let io = self.io();
@@ -293,7 +296,13 @@ impl Daemon {
                     };
                     state.head_version = Some(version);
                     state.backed = Some(ptr);
+                    let published_sync = state
+                        .publish
+                        .as_ref()
+                        .map_or(0, |publish| publish.record.sync_covered_through);
+                    state.sync_ack_through = state.sync_ack_through.max(published_sync);
                     state.publish = None;
+                    self.drain_sync_acks(vset, out);
                     self.store_cleanup(vset, out);
                     self.maybe_publish(vset, out);
                 }
@@ -336,9 +345,14 @@ impl Daemon {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
         };
-        if state.config.backed_up && !state.ready && state.create_req.is_some() {
+        if state.config.durability.uses_store() && !state.ready && state.create_req.is_some() {
             // Creation-time head claim still owed.
             self.head_create(vset_id, out);
+            return;
+        }
+        if state.config.durability.requires_peer_sync() {
+            self.maybe_peer_head_publish(vset_id, out);
+            self.replica_tick(vset_id, out);
             return;
         }
         self.maybe_publish(vset_id, out);
@@ -346,6 +360,15 @@ impl Daemon {
 
     /// Claim a brand-new head at vset creation (create-if-absent CAS).
     pub(super) fn head_create(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
+        let stash = self
+            .vsets
+            .get(&vset_id)
+            .is_some_and(|state| state.config.durability.requires_peer_sync())
+            .then(|| self.initial_stash_assignment(vset_id))
+            .flatten();
+        if let Some(state) = self.vsets.get_mut(&vset_id) {
+            state.stash_assignment = stash;
+        }
         let head = HeadRecord {
             vset: vset_id,
             holder: self.config.host,
@@ -353,6 +376,8 @@ impl Daemon {
             // content field is informational and corrected on first publish.
             fence: 0,
             manifest: None,
+            stash,
+            retired_stashes: Vec::new(),
         };
         let io = self.io();
         self.pending
@@ -402,6 +427,7 @@ impl Daemon {
     }
 
     /// Head re-read after local recovery: detect takeover (R6.4).
+    #[allow(clippy::too_many_lines)]
     pub(super) fn head_refresh_done(
         &mut self,
         vset_id: VsetId,
@@ -420,12 +446,66 @@ impl Daemon {
                     self.fence_vset(vset_id, out);
                     return;
                 };
+                let expected_membership = self
+                    .config
+                    .replica_placement
+                    .as_ref()
+                    .map(|placement| placement.membership_epoch);
+                if state.config.durability == DurabilityMode::PeerStashed
+                    && (expected_membership.is_none()
+                        || head.stash.map(|stash| stash.membership_epoch) != expected_membership)
+                {
+                    // Differently configured hosts must not interpret the
+                    // same assignment epoch differently.
+                    self.fence_vset(vset_id, out);
+                    return;
+                }
+                let releasable_retired: Vec<_> = head.manifest.map_or_else(Vec::new, |manifest| {
+                    head.retired_stashes
+                        .iter()
+                        .copied()
+                        .filter(|retired| {
+                            (retired.through.writer_fence, retired.through.seq)
+                                <= (manifest.fence, manifest.seq)
+                        })
+                        .collect()
+                });
                 if head.holder == self.config.host {
+                    let assignment_changed = state.stash_assignment != head.stash;
                     state.head_version = Some(version);
                     state.backed = head.manifest;
+                    state.stash_assignment = head.stash;
+                    state.retired_stashes = head.retired_stashes;
+                    if assignment_changed {
+                        // Reads and timers from the losing assignment CAS may
+                        // still complete. Cancel their scoped send state so a
+                        // late local read cannot emit bytes to the old target;
+                        // maybe_replicate below re-derives from this head.
+                        state.replica_send = None;
+                        state.peer_artifacts.clear();
+                        state.peer_committed = None;
+                        state.peer_committed_record = None;
+                        state.peer_upload_done = None;
+                    }
                     if let Some(ptr) = head.manifest {
                         state.store_manifests.insert((ptr.fence, ptr.seq));
                     }
+                    let releasable_active = head.manifest.and_then(|manifest| {
+                        state.best_record.as_ref().and_then(|record| {
+                            ((record.fence, record.seq, record.capture_seq)
+                                == (manifest.fence, manifest.seq, manifest.capture_seq))
+                                .then(|| {
+                                    state.stash_assignment.map(|assignment| {
+                                        (
+                                            assignment.active_peer,
+                                            assignment.active_assignment_epoch,
+                                            Self::commit_info(record),
+                                        )
+                                    })
+                                })
+                                .flatten()
+                        })
+                    });
                     if let Some(verdict) = state.pending_verdict.take() {
                         // Serve only if local truth is at least as new as
                         // the backup; journal damage can leave it behind, in
@@ -452,6 +532,18 @@ impl Daemon {
                         }
                     }
                     self.maybe_publish(vset_id, out);
+                    self.maybe_replicate(vset_id, out);
+                    self.maybe_peer_head_publish(vset_id, out);
+                    if let Some(release) = releasable_active {
+                        self.queue_replica_release(vset_id, release);
+                    }
+                    for retired in releasable_retired {
+                        self.queue_replica_release(
+                            vset_id,
+                            (retired.peer, retired.assignment_epoch, retired.through),
+                        );
+                    }
+                    self.replica_release_retry(vset_id, out);
                 } else {
                     self.fence_vset(vset_id, out);
                 }

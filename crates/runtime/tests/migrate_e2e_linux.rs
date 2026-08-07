@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig, S3Store};
@@ -54,6 +54,7 @@ fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 500,
+            replica_placement: None,
         },
         blob_dir: temp_dir(tag),
         peer: Some(peer),
@@ -154,10 +155,14 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
     let peer_a = PeerConfig {
         listen: addr_a,
         peers: roster.clone(),
+        outbound_protocol_versions: BTreeMap::new(),
+        tls: None,
     };
     let peer_b = PeerConfig {
         listen: addr_b,
         peers: roster,
+        outbound_protocol_versions: BTreeMap::new(),
+        tls: None,
     };
     let store = Arc::new(S3Store::new());
     let a = Runtime::new(&runtime_config("host-a", 0, peer_a), store.clone());
@@ -168,7 +173,7 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
     let vc = VsetConfig {
         disk_volumes: 2,
         pages_per_volume: 64,
-        backed_up: false,
+        durability: DurabilityMode::Local,
     };
     a.create_vset(VSET, vc);
     let mut workload = Workload::new(0xB10C_D001, vc);

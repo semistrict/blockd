@@ -98,7 +98,7 @@ impl Daemon {
         // tail off a source may not chain-migrate — its record would point
         // the new destination at segments the middle host never had.
         if !state.ready
-            || state.config.backed_up
+            || state.config.durability.uses_store()
             || state.outbound.is_some()
             || state.migrate.is_some()
             || state.peer_source.is_some()
@@ -247,6 +247,7 @@ impl Daemon {
     }
 
     /// A peer message arrived (authenticated cluster member, R11.1).
+    #[allow(clippy::too_many_lines)]
     pub(super) fn peer(
         &mut self,
         from: HostId,
@@ -345,6 +346,15 @@ impl Daemon {
                     state.peer_source = None;
                 }
             }
+            msg @ (PeerMsg::ReplicaPut { .. }
+            | PeerMsg::ReplicaPutAck { .. }
+            | PeerMsg::ReplicaCommit { .. }
+            | PeerMsg::ReplicaCommitAck { .. }
+            | PeerMsg::ReplicaStatus { .. }
+            | PeerMsg::ReplicaStatusReply { .. }
+            | PeerMsg::ReplicaUploadDone { .. }
+            | PeerMsg::ReplicaRelease { .. }
+            | PeerMsg::ReplicaReleaseAck { .. }) => self.replica_peer(from, msg, out),
         }
     }
 
@@ -458,7 +468,8 @@ impl Daemon {
         self.fence_floors.insert(vset, state.fence);
         state.epoch = Epoch(epoch.0);
         state.mutation_seq = record.capture_seq;
-        state.durable_watermark = record.synced_through;
+        state.local_covered_through = record.sync_covered_through;
+        state.adopt_local_ack_if_allowed();
         state.next_seq = record.seq.0 + 1;
         state.next_gen = record
             .overlay

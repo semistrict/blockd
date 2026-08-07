@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts};
@@ -32,7 +32,11 @@ fn vset_config(backed: bool) -> VsetConfig {
     VsetConfig {
         disk_volumes: 1,
         pages_per_volume: VSET_PAGES,
-        backed_up: backed,
+        durability: if backed {
+            DurabilityMode::Backup
+        } else {
+            DurabilityMode::Local
+        },
     }
 }
 
@@ -96,11 +100,14 @@ impl Demod {
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 500,
+                replica_placement: None,
             },
             blob_dir: cfg.blob_dir.clone(),
             peer: Some(PeerConfig {
                 listen: cfg.peer_listen,
                 peers: cfg.peers.clone(),
+                outbound_protocol_versions: BTreeMap::new(),
+                tls: None,
             }),
         };
         let rt = Runtime::new(&runtime_config, store.clone());
