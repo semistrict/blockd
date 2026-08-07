@@ -27,6 +27,7 @@ fn free_addr() -> SocketAddr {
 }
 
 fn net(
+    self_id: HostId,
     listen: SocketAddr,
     peers: BTreeMap<HostId, SocketAddr>,
 ) -> (Arc<PeerNet>, Receiver<(HostId, PeerMsg)>) {
@@ -37,7 +38,10 @@ fn net(
         outbound_protocol_versions: BTreeMap::new(),
         tls: None,
     };
-    let host = PeerNet::start(&config, HostId(9), move |from, msg| {
+    // The net must know its own roster identity: sender state is seeded
+    // for every OTHER roster member, and `connections()` reports exactly
+    // those — a bogus self id would leak the host itself into the list.
+    let host = PeerNet::start(&config, self_id, move |from, msg| {
         let _ = tx.send((from, msg));
     });
     (host, rx)
@@ -143,8 +147,8 @@ fn every_variant_crosses_the_wire_with_its_sender() {
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(addr_a, roster.clone());
-    let (_b, rx_b) = net(addr_b, roster);
+    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone());
+    let (_b, rx_b) = net(HostId(1), addr_b, roster);
 
     for msg in sample_msgs() {
         a.send(HostId(0), HostId(1), &msg);
@@ -166,7 +170,7 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(addr_a, roster.clone());
+    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone());
 
     // No listener at addr_b yet: this frame is dropped on the floor.
     a.send(HostId(0), HostId(1), &PeerMsg::Released { vset: VsetId(1) });
@@ -174,7 +178,7 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
     assert!(a.dropped_sends.load(Ordering::SeqCst) >= 1);
     assert_eq!(a.connections(), vec![(HostId(1), false)]);
 
-    let (_b, rx_b) = net(addr_b, roster);
+    let (_b, rx_b) = net(HostId(1), addr_b, roster);
     // The sender's dead connection is discovered on the next write; the
     // retry after that reconnects. Send a few — at least one must land.
     for _ in 0..5 {
@@ -199,7 +203,7 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
 fn a_corrupt_frame_closes_its_connection_without_wedging() {
     let addr_b = free_addr();
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(1), addr_b)].into_iter().collect();
-    let (_b, rx_b) = net(addr_b, roster.clone());
+    let (_b, rx_b) = net(HostId(1), addr_b, roster.clone());
 
     // A raw connection writing garbage: dropped without a delivery.
     let mut raw = TcpStream::connect(addr_b).expect("connect");
@@ -214,7 +218,7 @@ fn a_corrupt_frame_closes_its_connection_without_wedging() {
     let addr_a = free_addr();
     let mut full = roster;
     full.insert(HostId(0), addr_a);
-    let (a, _rx_a) = net(addr_a, full);
+    let (a, _rx_a) = net(HostId(0), addr_a, full);
     a.send(HostId(0), HostId(1), &PeerMsg::Released { vset: VsetId(3) });
     let (_, got) = rx_b
         .recv_timeout(Duration::from_secs(5))
@@ -230,8 +234,8 @@ fn a_segment_sized_payload_round_trips() {
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(addr_a, roster.clone());
-    let (_b, rx_b) = net(addr_b, roster);
+    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone());
+    let (_b, rx_b) = net(HostId(1), addr_b, roster);
 
     let payload: Vec<u8> = (0..8 * 1024 * 1024u32)
         .map(|i| u8::try_from((i * 31) % 256).expect("fits"))
