@@ -469,12 +469,34 @@ impl Uffd {
     /// (Firecracker's does); this runtime serves with blocking reads, so
     /// clear it.
     pub fn from_fd(fd: OwnedFd) -> Uffd {
-        // SAFETY: fcntl on our now-owned fd.
-        unsafe {
-            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-            libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        let uffd = Uffd { fd };
+        uffd.set_nonblocking(false).expect("configure userfaultfd");
+        uffd
+    }
+
+    /// Adopt a foreign userfaultfd for a readiness-driven event loop.
+    /// Reads return `WouldBlock` after the queued events have drained.
+    pub fn from_fd_nonblocking(fd: OwnedFd) -> Uffd {
+        let uffd = Uffd { fd };
+        uffd.set_nonblocking(true).expect("configure userfaultfd");
+        uffd
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        // SAFETY: fcntl on our owned fd.
+        let flags = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(errno("fcntl(F_GETFL)"));
         }
-        Uffd { fd }
+        let flags = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        if unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags) } < 0 {
+            return Err(errno("fcntl(F_SETFL)"));
+        }
+        Ok(())
     }
 
     /// `UFFDIO_COPY`: allocate-and-copy `bytes` into the faulting range.
@@ -651,9 +673,10 @@ impl Uffd {
         Ok(())
     }
 
-    /// Block until at least one fault is pending, then return EVERY event
-    /// the kernel hands back: a uffd read fills the buffer with as many
-    /// queued `uffd_msg`s as fit (blocking only for the first), so a
+    /// Read EVERY currently queued event. A blocking descriptor waits for
+    /// the first event; a nonblocking descriptor returns `WouldBlock` when
+    /// empty. A uffd read fills the buffer with as many queued `uffd_msg`s
+    /// as fit, so a
     /// reader that parsed just one would consume and silently drop the
     /// rest — leaving those faulters parked in the kernel forever.
     /// (Message layout checked against the uapi header by the ABI probe:
@@ -692,6 +715,12 @@ impl Uffd {
     }
 }
 
+impl AsRawFd for Uffd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
 /// Punch a hole in any file (`FALLOC_FL_PUNCH_HOLE`): frees the page-cache
 /// pages and disk blocks of the range. For a shared-memory file backing
 /// guest mappings this is the backing-reclaim primitive — private
@@ -726,10 +755,7 @@ pub fn file_resident_bytes(file: &std::fs::File) -> io::Result<usize> {
 /// Receive one message and (optionally) one file descriptor over a unix
 /// stream — `recvmsg` with `SCM_RIGHTS`. This is how Firecracker hands its
 /// page-fault handler the guest-memory uffd at snapshot restore.
-pub fn recv_with_fd(
-    stream: &std::os::unix::net::UnixStream,
-    buf: &mut [u8],
-) -> io::Result<(usize, Option<OwnedFd>)> {
+pub fn recv_with_fd(stream: &impl AsRawFd, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>)> {
     const CMSG_SPACE: usize = 64;
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),

@@ -96,6 +96,28 @@ fault series expose count and cumulative duration without histogram buckets;
 this preserves per-vset diagnosis without multiplying every live vset by every
 bucket. Retired vsets disappear from the point-in-time exposition.
 
+The control API is an Axum HTTP/1.1 server running on Tokio. Request bodies are
+limited to 1 KiB and requests time out after five minutes. VM operations are
+synchronous at the Firecracker/runtime boundary, so handlers dispatch them to
+Tokio's blocking pool behind an eight-per-host semaphore; `/status` and
+`/metrics` use a separate two-slot observation lane, while socket acceptance,
+header parsing, and response writes stay on the async runtime. Inbound migration
+continuations have a separate 32-slot bound so they cannot starve foreground
+operations. A timed-out operation cannot be forcibly cancelled and continues
+to hold its semaphore permit until it finishes. The API has no authentication
+and must be bound to an internal management network.
+
+Peer TCP uses one readiness-driven Tokio loop per host with bounded outbound
+queues. Guest-memory and shared-memory userfaultfds, plus the Firecracker Unix
+handshakes, also use readiness-driven tasks instead of one reader thread per
+VM. GCS and OTLP use asynchronous DNS, TCP, TLS, and response-body streaming.
+Daemon object-store effects and cold snapshot fetches each have bounded async
+queues with at most eight requests in flight. Local reads/writes, `fsync`,
+directory `fsync`, Firecracker process control, and local snapshot fills remain
+blocking kernel or library APIs; they run only on dedicated bounded lanes or
+the bounded VM-operation bridge, never on the daemon event loop or an async
+network executor.
+
 The daemon configuration accepts `cache_pages`, `writeback_interval_ms`,
 `backup_retry_ms`, `disk_capacity_bytes`, `disk_headroom_bytes`, and
 `wedge_ticks`. Defaults preserve the demo profile, but production deployments
@@ -104,8 +126,7 @@ volume; filesystem free space remains a separate reconciliation signal.
 
 OTLP trace export is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` or
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set. Export uses OTLP/HTTP protobuf and
-the SDK's background batch processor, reusing the daemon's synchronous HTTP
-and TLS stack. Standard settings including
+the SDK's background batch processor. Standard settings including
 `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`,
 `OTEL_EXPORTER_OTLP_HEADERS`, and the signal-specific variants are honored.
 Inbound W3C `traceparent` and `tracestate` headers establish the parent of each

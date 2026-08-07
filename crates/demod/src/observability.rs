@@ -29,41 +29,53 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, fmt};
 
 const DEFAULT_FILTER: &str = "demod=info,blockd_runtime=info";
-const MAX_OTLP_RESPONSE_BYTES: u64 = 1024 * 1024;
+const MAX_OTLP_RESPONSE_BYTES: usize = 1024 * 1024;
 
-struct UreqClient {
-    agent: ureq::Agent,
+struct AsyncHttpClient {
+    client: reqwest::Client,
 }
 
-impl UreqClient {
-    fn new() -> UreqClient {
-        let config = ureq::config::Config::builder()
-            .timeout_global(Some(Duration::from_secs(10)))
-            .build();
-        UreqClient {
-            agent: config.new_agent(),
+impl AsyncHttpClient {
+    fn new() -> AsyncHttpClient {
+        AsyncHttpClient {
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("OTLP HTTP client"),
         }
     }
 }
 
-impl Debug for UreqClient {
+impl Debug for AsyncHttpClient {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("UreqClient").finish_non_exhaustive()
+        formatter
+            .debug_struct("AsyncHttpClient")
+            .finish_non_exhaustive()
     }
 }
 
 #[async_trait::async_trait]
-impl HttpClient for UreqClient {
+impl HttpClient for AsyncHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        let request = request.map(|body| body.to_vec());
-        let mut response = self.agent.run(request)?;
+        let (parts, body) = request.into_parts();
+        let mut outgoing = self
+            .client
+            .request(parts.method, parts.uri.to_string())
+            .body(body);
+        for (name, value) in &parts.headers {
+            outgoing = outgoing.header(name, value);
+        }
+        let mut response = outgoing.send().await?;
         let status = response.status();
-        let headers = std::mem::take(response.headers_mut());
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_OTLP_RESPONSE_BYTES)
-            .read_to_vec()?;
+        let headers = response.headers().clone();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > MAX_OTLP_RESPONSE_BYTES {
+                return Err("OTLP response exceeded 1 MiB".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
         let mut result = Response::builder().status(status).body(Bytes::from(body))?;
         *result.headers_mut() = headers;
         Ok(result)
@@ -86,8 +98,8 @@ impl Drop for TelemetryGuard {
 }
 
 /// Install JSON logging and, when explicitly configured, batched OTLP/HTTP
-/// trace export. The blocking exporter is driven by the SDK's background
-/// thread; request threads only enqueue completed spans.
+/// trace export. The exporter uses an asynchronous HTTP client; request
+/// handlers only enqueue completed spans.
 pub fn init(host: Option<u16>) -> TelemetryGuard {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
@@ -97,7 +109,7 @@ pub fn init(host: Option<u16>) -> TelemetryGuard {
     let provider = if otlp_enabled() {
         let exporter = SpanExporter::builder()
             .with_http()
-            .with_http_client(UreqClient::new())
+            .with_http_client(AsyncHttpClient::new())
             .build()
             .expect("OTLP trace exporter configuration");
         let service_name =
@@ -151,7 +163,7 @@ pub struct Metrics {
 pub struct RequestMetrics {
     metrics: Arc<Metrics>,
     method: String,
-    route: &'static str,
+    route: String,
     started: Instant,
     status: u16,
 }
@@ -167,11 +179,11 @@ impl Drop for RequestMetrics {
         self.metrics.http_in_flight.dec();
         self.metrics
             .http_requests
-            .with_label_values(&[&self.method, self.route, &self.status.to_string()])
+            .with_label_values(&[&self.method, &self.route, &self.status.to_string()])
             .inc();
         self.metrics
             .http_duration
-            .with_label_values(&[&self.method, self.route])
+            .with_label_values(&[&self.method, &self.route])
             .observe(self.started.elapsed().as_secs_f64());
     }
 }
@@ -280,12 +292,12 @@ impl Metrics {
         }
     }
 
-    pub fn start_request(self: &Arc<Metrics>, method: &str, route: &'static str) -> RequestMetrics {
+    pub fn start_request(self: &Arc<Metrics>, method: &str, route: &str) -> RequestMetrics {
         self.http_in_flight.inc();
         RequestMetrics {
             metrics: self.clone(),
             method: method.to_owned(),
-            route,
+            route: route.to_owned(),
             started: Instant::now(),
             // A panic or early return is an internal failure, not a success.
             status: 500,

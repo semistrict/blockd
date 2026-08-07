@@ -20,11 +20,15 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [dependencies]
+async-trait = "0.1.91"
 blockd-core = { path = "../core" }
 blockd-hostmem = { path = "../hostmem" }
+axum = { version = "0.8.9", features = ["http1", "tokio"] }
+futures-util = "0.3.33"
 tracing = "0.1.44"
-ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["hickory-dns", "http2", "rustls"] }
 rustix = { version = "0.38.44", features = ["fs"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # The differential recovery test replays simulation-produced blob sets

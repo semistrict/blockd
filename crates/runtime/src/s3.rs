@@ -418,29 +418,49 @@ impl S3Store {
     }
 }
 
+#[async_trait::async_trait]
 impl crate::store::ObjectStore for S3Store {
-    fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, blockd_core::seam::StoreFault> {
-        S3Store::put(self, key, bytes)
+    async fn put(
+        self: std::sync::Arc<Self>,
+        key: String,
+        bytes: Vec<u8>,
+    ) -> Result<u64, blockd_core::seam::StoreFault> {
+        tokio::task::spawn_blocking(move || S3Store::put(&self, &key, bytes))
+            .await
+            .expect("S3 simulation task")
     }
 
-    fn put_cas(
-        &self,
-        key: &str,
+    async fn put_cas(
+        self: std::sync::Arc<Self>,
+        key: String,
         expected: Option<u64>,
         bytes: Vec<u8>,
     ) -> Result<u64, blockd_core::seam::StoreFault> {
-        S3Store::put_cas(self, key, expected, bytes)
+        tokio::task::spawn_blocking(move || S3Store::put_cas(&self, &key, expected, bytes))
+            .await
+            .expect("S3 simulation task")
     }
 
-    fn get(&self, key: &str) -> crate::store::GetResult {
-        S3Store::get(self, key)
+    async fn get(self: std::sync::Arc<Self>, key: String) -> crate::store::GetResult {
+        tokio::task::spawn_blocking(move || S3Store::get(&self, &key))
+            .await
+            .expect("S3 simulation task")
     }
 
-    fn get_range(&self, key: &str, offset: u64, len: u64) -> crate::store::GetResult {
-        S3Store::get_range(self, key, offset, len)
+    async fn get_range(
+        self: std::sync::Arc<Self>,
+        key: String,
+        offset: u64,
+        len: u64,
+    ) -> crate::store::GetResult {
+        tokio::task::spawn_blocking(move || S3Store::get_range(&self, &key, offset, len))
+            .await
+            .expect("S3 simulation task")
     }
 
-    fn delete(&self, key: &str) {
-        S3Store::delete(self, key);
+    async fn delete(self: std::sync::Arc<Self>, key: String) {
+        tokio::task::spawn_blocking(move || S3Store::delete(&self, &key))
+            .await
+            .expect("S3 simulation task");
     }
 }

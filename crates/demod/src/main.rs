@@ -41,7 +41,8 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-fn main() {
+#[tokio::main]
+async fn main() {
     use std::sync::Arc;
 
     use blockd_runtime::fakegcs::FakeGcs;
@@ -63,15 +64,13 @@ fn main() {
                 tracing::info!(latency_ms = ms, "fake GCS latency configured");
             }
             tracing::info!(%endpoint, "fake GCS serving");
-            loop {
-                std::thread::park();
-            }
+            std::future::pending::<()>().await;
         }
         Some(path) => {
             let cfg = config::DemodConfig::load(path);
             let _telemetry = observability::init(Some(cfg.host.0));
             let state = Arc::new(vm::Demod::start(cfg));
-            api::serve(&state);
+            api::serve(state).await;
         }
         None => {
             let _telemetry = observability::init(None);

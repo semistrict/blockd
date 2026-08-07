@@ -18,11 +18,12 @@
 //! bearer token, refreshed early; the demo VMs run with a service account
 //! scoped to the one bucket.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use blockd_core::seam::StoreFault;
+use tokio::sync::Mutex;
 
 use crate::metrics::{AtomicHistogram, HistogramSnapshot};
 use crate::store::{GetResult, ObjectStore};
@@ -33,10 +34,6 @@ const MAX_OBJECT: u64 = 64 * 1024 * 1024 + 4096;
 
 /// Refresh the token while this much of its lifetime remains.
 const TOKEN_SLACK: Duration = Duration::from_mins(5);
-
-/// Match the runtime's store-worker concurrency so a burst can reuse one
-/// established connection per worker instead of paying new TLS handshakes.
-const IDLE_CONNECTIONS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct GcsConfig {
@@ -119,7 +116,7 @@ struct CachedToken {
 
 pub struct GcsStore {
     cfg: GcsConfig,
-    agent: ureq::Agent,
+    client: reqwest::Client,
     token: Mutex<Option<CachedToken>>,
     pub stats: GcsStats,
 }
@@ -192,16 +189,15 @@ fn abort(context: &str, detail: &str) -> ! {
 
 impl GcsStore {
     pub fn new(cfg: GcsConfig) -> GcsStore {
-        let config = ureq::config::Config::builder()
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(2)))
-            .timeout_global(Some(Duration::from_secs(30)))
-            .max_idle_connections(IDLE_CONNECTIONS)
-            .max_idle_connections_per_host(IDLE_CONNECTIONS)
-            .build();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(8)
+            .build()
+            .expect("GCS HTTP client");
         GcsStore {
             cfg,
-            agent: config.new_agent(),
+            client,
             token: Mutex::new(None),
             stats: GcsStats::default(),
         }
@@ -217,61 +213,62 @@ impl GcsStore {
     }
 
     /// A bearer token with at least [`TOKEN_SLACK`] of life left.
-    fn token(&self) -> Result<String, StoreFault> {
+    async fn token(&self) -> Result<String, StoreFault> {
+        // Serialize refreshes so an expiry burst sends one metadata request,
+        // not one per concurrent object request. This is an async mutex: no
+        // executor thread is occupied while the metadata request is in flight.
+        let mut cached = self.token.lock().await;
+        if let Some(token) = cached.as_ref()
+            && token.expires_at > Instant::now() + TOKEN_SLACK
         {
-            let cached = self.token.lock().expect("lock");
-            if let Some(t) = cached.as_ref()
-                && t.expires_at > Instant::now() + TOKEN_SLACK
-            {
-                return Ok(t.bearer.clone());
-            }
+            return Ok(token.bearer.clone());
         }
-        self.refresh_token()
-    }
-
-    fn refresh_token(&self) -> Result<String, StoreFault> {
         let started = Instant::now();
-        let result = self.refresh_token_inner();
+        let result = self.refresh_token_inner().await;
         self.stats
             .observe(5, outcome_of(&result), started.elapsed());
-        result
+        if let Ok((bearer, expires_in)) = result {
+            *cached = Some(CachedToken {
+                bearer: bearer.clone(),
+                expires_at: Instant::now() + Duration::from_secs(expires_in),
+            });
+            Ok(bearer)
+        } else {
+            Err(StoreFault::Unavailable)
+        }
     }
 
-    fn refresh_token_inner(&self) -> Result<String, StoreFault> {
+    async fn refresh_token_inner(&self) -> Result<(String, u64), StoreFault> {
         let url = format!(
             "{}/computeMetadata/v1/instance/service-accounts/default/token",
             self.cfg.metadata_endpoint
         );
         self.stats.token_refreshes.fetch_add(1, Ordering::SeqCst);
         let result = self
-            .agent
+            .client
             .get(&url)
             .header("Metadata-Flavor", "Google")
-            .call();
-        let Ok(mut resp) = result else {
+            .send()
+            .await;
+        let Ok(resp) = result else {
             return Err(StoreFault::Unavailable);
         };
-        if resp.status().as_u16() != 200 {
+        if resp.status() != reqwest::StatusCode::OK {
             return Err(StoreFault::Unavailable);
         }
-        let Ok(body) = resp.body_mut().read_to_string() else {
+        let Ok(body) = resp.text().await else {
             return Err(StoreFault::Unavailable);
         };
         let Some((bearer, expires_in)) = parse_token_json(&body) else {
             abort("metadata token", "unparseable token response");
         };
-        let mut cached = self.token.lock().expect("lock");
-        *cached = Some(CachedToken {
-            bearer: bearer.clone(),
-            expires_at: Instant::now() + Duration::from_secs(expires_in),
-        });
-        Ok(bearer)
+        Ok((bearer, expires_in))
     }
 
     /// One authorized request with the single 401-refresh-retry. Transport
     /// errors and transient statuses become `Unavailable`; everything else
     /// is returned for the caller's status mapping.
-    fn request(
+    async fn request(
         &self,
         method: &str,
         key: &str,
@@ -281,36 +278,24 @@ impl GcsStore {
         let url = self.object_url(key);
         let mut refreshed = false;
         loop {
-            let bearer = self.token()?;
-            let auth = format!("Bearer {bearer}");
-            let result = if let Some(bytes) = body {
-                assert_eq!(method, "PUT", "only puts carry a body");
-                let mut req = self.agent.put(&url).header("Authorization", &auth);
-                for (name, value) in headers {
-                    req = req.header(*name, value);
-                }
-                req.send(bytes)
-            } else {
-                let mut req = match method {
-                    "GET" => self.agent.get(&url),
-                    "HEAD" => self.agent.head(&url),
-                    "DELETE" => self.agent.delete(&url),
-                    other => unreachable!("unsupported method {other}"),
-                }
-                .header("Authorization", &auth);
-                for (name, value) in headers {
-                    req = req.header(*name, value);
-                }
-                req.call()
-            };
-            let Ok(mut resp) = result else {
+            let bearer = self.token().await?;
+            let method = reqwest::Method::from_bytes(method.as_bytes())
+                .expect("supported object-store method");
+            let mut request = self.client.request(method, &url).bearer_auth(&bearer);
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            if let Some(bytes) = body {
+                request = request.body(bytes.to_vec());
+            }
+            let Ok(mut resp) = request.send().await else {
                 self.stats.unavailable.fetch_add(1, Ordering::SeqCst);
                 return Err(StoreFault::Unavailable);
             };
             let status = resp.status().as_u16();
             if status == 401 && !refreshed {
                 refreshed = true;
-                self.token.lock().expect("lock").take();
+                self.token.lock().await.take();
                 continue;
             }
             if matches!(status, 408 | 429 | 500..=599) {
@@ -322,15 +307,29 @@ impl GcsStore {
                 .get("x-goog-generation")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            let Ok(body) = resp
-                .body_mut()
-                .with_config()
-                .limit(MAX_OBJECT)
-                .read_to_vec()
-            else {
-                self.stats.unavailable.fetch_add(1, Ordering::SeqCst);
-                return Err(StoreFault::Unavailable);
-            };
+            if resp
+                .content_length()
+                .is_some_and(|length| length > MAX_OBJECT)
+            {
+                abort("response body", "object exceeds maximum size");
+            }
+            let mut body = Vec::new();
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        let next = body.len().saturating_add(chunk.len());
+                        if u64::try_from(next).unwrap_or(u64::MAX) > MAX_OBJECT {
+                            abort("response body", "object exceeds maximum size");
+                        }
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        self.stats.unavailable.fetch_add(1, Ordering::SeqCst);
+                        return Err(StoreFault::Unavailable);
+                    }
+                }
+            }
             return Ok(GcsResponse {
                 status,
                 generation,
@@ -348,8 +347,8 @@ impl GcsStore {
 
     /// The current generation of a key (`None` = absent) — what fills in
     /// `CasConflict::actual` after a 412.
-    fn head_generation(&self, key: &str) -> Result<Option<u64>, StoreFault> {
-        let resp = self.request("HEAD", key, &[], None)?;
+    async fn head_generation(&self, key: &str) -> Result<Option<u64>, StoreFault> {
+        let resp = self.request("HEAD", key, &[], None).await?;
         match resp.status {
             200 => Ok(Some(Self::generation_or_abort("HEAD", &resp))),
             404 => Ok(None),
@@ -358,57 +357,97 @@ impl GcsStore {
     }
 }
 
+#[async_trait]
 impl ObjectStore for GcsStore {
-    fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, StoreFault> {
+    async fn put(
+        self: std::sync::Arc<Self>,
+        key: String,
+        bytes: Vec<u8>,
+    ) -> Result<u64, StoreFault> {
+        GcsStore::put(&self, &key, bytes).await
+    }
+
+    async fn put_cas(
+        self: std::sync::Arc<Self>,
+        key: String,
+        expected: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<u64, StoreFault> {
+        GcsStore::put_cas(&self, &key, expected, bytes).await
+    }
+
+    async fn get(self: std::sync::Arc<Self>, key: String) -> GetResult {
+        GcsStore::get(&self, &key).await
+    }
+
+    async fn get_range(
+        self: std::sync::Arc<Self>,
+        key: String,
+        offset: u64,
+        len: u64,
+    ) -> GetResult {
+        GcsStore::get_range(&self, &key, offset, len).await
+    }
+
+    async fn delete(self: std::sync::Arc<Self>, key: String) {
+        GcsStore::delete(&self, &key).await;
+    }
+}
+
+impl GcsStore {
+    pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, StoreFault> {
         let started = Instant::now();
-        let result = self.put_inner(key, &bytes);
+        let result = self.put_inner(key, &bytes).await;
         self.stats
             .observe(0, outcome_of(&result), started.elapsed());
         result
     }
 
-    fn put_cas(&self, key: &str, expected: Option<u64>, bytes: Vec<u8>) -> Result<u64, StoreFault> {
+    pub async fn put_cas(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<u64, StoreFault> {
         let started = Instant::now();
-        let result = self.put_cas_inner(key, expected, &bytes);
+        let result = self.put_cas_inner(key, expected, &bytes).await;
         self.stats
             .observe(1, outcome_of(&result), started.elapsed());
         result
     }
 
-    fn get(&self, key: &str) -> GetResult {
+    pub async fn get(&self, key: &str) -> GetResult {
         let started = Instant::now();
-        let result = self.get_inner(key);
+        let result = self.get_inner(key).await;
         self.stats
             .observe(2, outcome_of(&result), started.elapsed());
         result
     }
 
-    fn get_range(&self, key: &str, offset: u64, len: u64) -> GetResult {
+    pub async fn get_range(&self, key: &str, offset: u64, len: u64) -> GetResult {
         let started = Instant::now();
-        let result = self.get_range_inner(key, offset, len);
+        let result = self.get_range_inner(key, offset, len).await;
         self.stats
             .observe(3, outcome_of(&result), started.elapsed());
         result
     }
 
-    fn delete(&self, key: &str) {
+    pub async fn delete(&self, key: &str) {
         let started = Instant::now();
         self.stats.deletes.fetch_add(1, Ordering::SeqCst);
         // Fire-and-forget (R4.5): a failed delete leaks one superseded
         // object; the daemon never re-drives deletes, so neither do we.
-        let result = self.request("DELETE", key, &[], None).map(|_| ());
+        let result = self.request("DELETE", key, &[], None).await.map(|_| ());
         self.stats
             .observe(4, outcome_of(&result), started.elapsed());
     }
-}
 
-impl GcsStore {
-    fn put_inner(&self, key: &str, bytes: &[u8]) -> Result<u64, StoreFault> {
+    async fn put_inner(&self, key: &str, bytes: &[u8]) -> Result<u64, StoreFault> {
         self.stats.puts.fetch_add(1, Ordering::SeqCst);
         self.stats
             .bytes_up
             .fetch_add(bytes.len() as u64, Ordering::SeqCst);
-        let resp = self.request("PUT", key, &[], Some(bytes))?;
+        let resp = self.request("PUT", key, &[], Some(bytes)).await?;
         match resp.status {
             200 => Ok(Self::generation_or_abort("PUT", &resp)),
             status => abort(
@@ -421,7 +460,7 @@ impl GcsStore {
         }
     }
 
-    fn put_cas_inner(
+    async fn put_cas_inner(
         &self,
         key: &str,
         expected: Option<u64>,
@@ -433,7 +472,7 @@ impl GcsStore {
             .fetch_add(bytes.len() as u64, Ordering::SeqCst);
         let precondition = expected.unwrap_or(0).to_string();
         let headers = [("x-goog-if-generation-match", precondition)];
-        let resp = self.request("PUT", key, &headers, Some(bytes))?;
+        let resp = self.request("PUT", key, &headers, Some(bytes)).await?;
         match resp.status {
             200 => Ok(Self::generation_or_abort("CAS PUT", &resp)),
             // The condition failed: someone else holds the key. Any
@@ -444,7 +483,7 @@ impl GcsStore {
                     .precondition_failures
                     .fetch_add(1, Ordering::SeqCst);
                 Err(StoreFault::CasConflict {
-                    actual: self.head_generation(key)?,
+                    actual: self.head_generation(key).await?,
                 })
             }
             status => abort(
@@ -457,9 +496,9 @@ impl GcsStore {
         }
     }
 
-    fn get_inner(&self, key: &str) -> GetResult {
+    async fn get_inner(&self, key: &str) -> GetResult {
         self.stats.gets.fetch_add(1, Ordering::SeqCst);
-        let resp = self.request("GET", key, &[], None)?;
+        let resp = self.request("GET", key, &[], None).await?;
         match resp.status {
             200 => {
                 self.stats
@@ -473,12 +512,12 @@ impl GcsStore {
         }
     }
 
-    fn get_range_inner(&self, key: &str, offset: u64, len: u64) -> GetResult {
+    async fn get_range_inner(&self, key: &str, offset: u64, len: u64) -> GetResult {
         assert!(len > 0, "zero-length range read");
         self.stats.ranged_gets.fetch_add(1, Ordering::SeqCst);
         let range = format!("bytes={offset}-{}", offset + len - 1);
         let headers = [("Range", range)];
-        let resp = self.request("GET", key, &headers, None)?;
+        let resp = self.request("GET", key, &headers, None).await?;
         match resp.status {
             // 206 is the ranged answer; 200 with offset 0 is a server
             // electing to return the whole (small) object — truncate.
@@ -545,20 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn connection_pool_matches_worker_concurrency() {
-        let store = GcsStore::new(GcsConfig {
+    fn client_configuration_builds() {
+        let _store = GcsStore::new(GcsConfig {
             bucket: "bucket".to_owned(),
             prefix: String::new(),
             endpoint: "http://127.0.0.1".to_owned(),
             metadata_endpoint: "http://127.0.0.1".to_owned(),
         });
-        assert_eq!(
-            store.agent.config().max_idle_connections(),
-            IDLE_CONNECTIONS
-        );
-        assert_eq!(
-            store.agent.config().max_idle_connections_per_host(),
-            IDLE_CONNECTIONS
-        );
     }
 }

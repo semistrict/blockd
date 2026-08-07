@@ -14,7 +14,7 @@ use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
-use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts};
+use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts_async};
 use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, PeerConfig, Runtime, RuntimeConfig};
 
 use crate::config::DemodConfig;
@@ -161,8 +161,12 @@ impl Demod {
         // vmstate. Drop it so the next boot re-fetches.
         self.servers.lock().expect("lock").remove("base");
         self.publish_snapshot("base", &vmstate, &mem);
-        self.store
-            .put("base/sum", sum.clone().into_bytes())
+        tokio::runtime::Handle::current()
+            .block_on(GcsStore::put(
+                self.store.as_ref(),
+                "base/sum",
+                sum.clone().into_bytes(),
+            ))
             .expect("publish sum");
         sum
     }
@@ -170,16 +174,23 @@ impl Demod {
     /// Upload a snapshot (vmstate + memory parts) under `prefix`.
     #[tracing::instrument(skip(self, vmstate, mem), fields(snapshot_prefix = prefix))]
     fn publish_snapshot(&self, prefix: &str, vmstate: &Path, mem: &Path) {
-        let parts = upload_mem_parts(
-            self.store.as_ref(),
-            mem,
-            &format!("{prefix}/mem"),
+        // Control operations run in the API's bounded blocking lane because
+        // Firecracker and durable files are synchronous. Their GCS futures are
+        // still driven by Tokio; this worker only waits for completion.
+        let parts = tokio::runtime::Handle::current().block_on(upload_mem_parts_async(
+            self.store.clone() as Arc<dyn ObjectStore>,
+            mem.to_owned(),
+            format!("{prefix}/mem"),
             PART_BYTES,
-        );
+        ));
         assert_eq!(parts, u64::from(MEM_MIB) * 1024 * 1024 / PART_BYTES);
         let bytes = std::fs::read(vmstate).expect("vmstate file");
-        self.store
-            .put(&format!("{prefix}/vmstate"), bytes)
+        tokio::runtime::Handle::current()
+            .block_on(GcsStore::put(
+                self.store.as_ref(),
+                &format!("{prefix}/vmstate"),
+                bytes,
+            ))
             .expect("publish vmstate");
     }
 
@@ -223,9 +234,11 @@ impl Demod {
     fn boot_from(&self, id: u64, prefix: &str) -> FcVm {
         let fill = self.ensure_server(prefix);
         let vmstate = self.cfg.scratch.join(format!("vm{id}.vmstate"));
-        let (_, bytes) = self
-            .store
-            .get(&format!("{prefix}/vmstate"))
+        let (_, bytes) = tokio::runtime::Handle::current()
+            .block_on(GcsStore::get(
+                self.store.as_ref(),
+                &format!("{prefix}/vmstate"),
+            ))
             .expect("store up")
             .expect("vmstate published");
         std::fs::write(&vmstate, bytes).expect("write vmstate");
@@ -381,8 +394,8 @@ impl Demod {
     /// Destination side of a migration: accept the vset (guest memory
     /// pre-created), then — once the handoff lands — restore the microVM
     /// from the snapshot the source published.
-    #[tracing::instrument(skip(self), fields(vm_id = id))]
-    pub fn expect(self: &Arc<Demod>, id: u64) {
+    #[tracing::instrument(skip(self, ready), fields(vm_id = id))]
+    pub fn expect(self: &Arc<Demod>, id: u64, ready: impl FnOnce()) {
         self.rt.expect_migration(VsetId(id), vset_config(false));
         self.vms.lock().expect("lock").insert(
             id,
@@ -393,26 +406,21 @@ impl Demod {
                 fc: None,
             },
         );
-        let this = self.clone();
-        let parent = tracing::Span::current();
-        std::thread::spawn(move || {
-            parent.in_scope(|| {
-                let span = tracing::info_span!("migration.receive", vm_id = id);
-                span.in_scope(|| {
-                    let verdict = this.rt.wait_migrated_in(VsetId(id));
-                    assert!(
-                        matches!(verdict, Verdict::Resume { .. }),
-                        "migration verdict {verdict:?}"
-                    );
-                    let mut fc = this.boot_from(id, &format!("vm{id}/mig"));
-                    fc.cmd("ping", "PONG");
-                    let mut vms = this.vms.lock().expect("lock");
-                    let vm = vms.get_mut(&id).expect("expected vm");
-                    vm.fc = Some(Arc::new(Mutex::new(fc)));
-                    "running".clone_into(&mut vm.state);
-                    tracing::info!(vm_id = id, "inbound migration resumed");
-                });
-            });
+        ready();
+        let span = tracing::info_span!("migration.receive", vm_id = id);
+        span.in_scope(|| {
+            let verdict = self.rt.wait_migrated_in(VsetId(id));
+            assert!(
+                matches!(verdict, Verdict::Resume { .. }),
+                "migration verdict {verdict:?}"
+            );
+            let mut fc = self.boot_from(id, &format!("vm{id}/mig"));
+            fc.cmd("ping", "PONG");
+            let mut vms = self.vms.lock().expect("lock");
+            let vm = vms.get_mut(&id).expect("expected vm");
+            vm.fc = Some(Arc::new(Mutex::new(fc)));
+            "running".clone_into(&mut vm.state);
+            tracing::info!(vm_id = id, "inbound migration resumed");
         });
     }
 

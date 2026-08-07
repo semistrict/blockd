@@ -19,6 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blockd_hostmem::{Uffd, page_size, recv_with_fd};
+use futures_util::{FutureExt as _, StreamExt as _};
+use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc;
 
 /// One HTTP request over the Firecracker API socket.
 fn api_request(sock: &Path, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -442,18 +445,32 @@ impl ShmemServer {
             server.faults.clone(),
             server.fault_latency.clone(),
         );
-        thread::spawn(move || {
-            loop {
-                let Ok((stream, _)) = listener.accept() else {
-                    return;
-                };
-                let (parts, fault_count, latencies) =
-                    (parts.clone(), fault_count.clone(), latencies.clone());
-                thread::spawn(move || {
-                    serve_one_shmem(&stream, &parts, &fault_count, &latencies);
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking shmem listener");
+        thread::Builder::new()
+            .name("blockd-shmem-uffd".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .build()
+                    .expect("shmem UFFD runtime");
+                runtime.block_on(async move {
+                    let listener =
+                        tokio::net::UnixListener::from_std(listener).expect("async shmem listener");
+                    loop {
+                        let Ok((stream, _)) = listener.accept().await else {
+                            return;
+                        };
+                        let (parts, fault_count, latencies) =
+                            (parts.clone(), fault_count.clone(), latencies.clone());
+                        tokio::spawn(async move {
+                            serve_one_shmem(&stream, &parts, &fault_count, &latencies).await;
+                        });
+                    }
                 });
-            }
-        });
+            })
+            .expect("spawn shmem UFFD runtime");
         server
     }
 
@@ -511,7 +528,7 @@ enum Filler {
 
 impl Filler {
     /// Fill the granule starting at `base` into the shmem file.
-    fn fill(&self, shmem: &std::fs::File, base: u64, granule: u64) {
+    fn fill_local(&self, shmem: &std::fs::File, base: u64, granule: u64) {
         use std::os::unix::fs::FileExt;
         match self {
             Filler::File(path) => {
@@ -520,20 +537,28 @@ impl Filler {
                 source.read_exact_at(&mut bytes, base).expect("source read");
                 shmem.write_all_at(&bytes, base).expect("populate");
             }
-            Filler::Store {
-                store,
-                prefix,
-                part_bytes,
-            } => {
-                let part = base / part_bytes;
-                let key = format!("{prefix}/{part:08}");
-                let (_, bytes) = store
-                    .get(&key)
-                    .expect("store up")
-                    .expect("part object exists");
-                shmem.write_all_at(&bytes, base).expect("populate");
-            }
+            Filler::Store { .. } => unreachable!("store fills are asynchronous"),
         }
+    }
+
+    async fn fetch_store(&self, base: u64) -> Vec<u8> {
+        let Filler::Store {
+            store,
+            prefix,
+            part_bytes,
+        } = self
+        else {
+            unreachable!("only store-backed tables queue fetches");
+        };
+        let part = base / part_bytes;
+        let key = format!("{prefix}/{part:08}");
+        let (_, bytes) = store
+            .clone()
+            .get(key)
+            .await
+            .expect("store up")
+            .expect("part object exists");
+        bytes
     }
 }
 
@@ -590,7 +615,7 @@ impl Fetch {
 /// The part-fetch engine behind [`ShmemServer`]: the cold path must never
 /// serialize on the store's latency. Concurrent faults on one part share a
 /// single in-flight fetch (one `GetObject` no matter how many forks storm
-/// it); distinct parts fetch concurrently on their own threads; and each
+/// it); distinct parts fetch concurrently on a bounded async executor; and each
 /// demand fault keeps the next `readahead` parts in flight, so a
 /// sequential reader streams at transfer speed instead of stalling
 /// per-part. Fault callers hand over a wake action and never block —
@@ -605,7 +630,12 @@ pub struct PartTable {
     /// Pages filled from the source (unique work — the R5.3 measure).
     pub filled: Arc<AtomicU64>,
     states: Mutex<BTreeMap<u64, PartState>>,
+    fetch_tx: Option<mpsc::Sender<FetchJob>>,
 }
+
+type FetchJob = (u64, Arc<Fetch>);
+
+const PART_FETCH_WORKERS: usize = 8;
 
 impl PartTable {
     /// Warm local tier: page-granular fills from the snapshot memory file.
@@ -624,6 +654,7 @@ impl PartTable {
             shmem: shmem.clone(),
             filled: Arc::new(AtomicU64::new(0)),
             states: Mutex::new(BTreeMap::new()),
+            fetch_tx: None,
         })
     }
 
@@ -637,7 +668,8 @@ impl PartTable {
         mem_bytes: u64,
         readahead: u64,
     ) -> Arc<PartTable> {
-        Arc::new(PartTable {
+        let (fetch_tx, fetch_rx) = mpsc::channel::<FetchJob>(256);
+        let table = Arc::new(PartTable {
             granule: part_bytes,
             mem_bytes,
             readahead,
@@ -649,7 +681,20 @@ impl PartTable {
             shmem: shmem.clone(),
             filled: Arc::new(AtomicU64::new(0)),
             states: Mutex::new(BTreeMap::new()),
-        })
+            fetch_tx: Some(fetch_tx),
+        });
+        let weak = Arc::downgrade(&table);
+        thread::Builder::new()
+            .name("blockd-part-fetch-io".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("part fetch I/O runtime");
+                runtime.block_on(part_fetch_loop(fetch_rx, weak));
+            })
+            .expect("spawn part fetch I/O runtime");
+        table
     }
 
     /// A demand fault at `offset`: run `waker` once the containing part is
@@ -663,7 +708,7 @@ impl PartTable {
             // find it.
             let mut states = self.states.lock().expect("lock");
             if !matches!(states.get(&base), Some(PartState::Ready)) {
-                self.filler.fill(&self.shmem, base, self.granule);
+                self.filler.fill_local(&self.shmem, base, self.granule);
                 self.filled.fetch_add(1, Ordering::SeqCst);
                 states.insert(base, PartState::Ready);
             }
@@ -685,8 +730,8 @@ impl PartTable {
         }
     }
 
-    /// The part's fetch to park on (`None` = already populated), starting
-    /// one on a fresh thread if this is the first fault to reach it.
+    /// The part's fetch to park on (`None` = already populated), queueing
+    /// one on the bounded fetch pool if this is the first fault to reach it.
     fn state_of(self: &Arc<PartTable>, base: u64) -> Option<Arc<Fetch>> {
         let mut states = self.states.lock().expect("lock");
         if let Some(state) = states.get(&base) {
@@ -698,14 +743,23 @@ impl PartTable {
         let fetch = Fetch::new();
         states.insert(base, PartState::Fetching(fetch.clone()));
         drop(states);
-        let (table, started) = (self.clone(), fetch.clone());
-        thread::spawn(move || table.fetch(base, &started));
+        self.fetch_tx
+            .as_ref()
+            .expect("store-backed table has a fetch executor")
+            .try_send((base, fetch.clone()))
+            .expect("part fetch executor lives with table");
         Some(fetch)
     }
 
-    /// Fetch one part (on its own thread) and wake everyone parked on it.
-    fn fetch(self: &Arc<PartTable>, base: u64, fetch: &Arc<Fetch>) {
-        self.filler.fill(&self.shmem, base, self.granule);
+    /// Fetch one part and wake everyone parked on it.
+    async fn fetch(self: Arc<Self>, base: u64, fetch: Arc<Fetch>) {
+        use std::os::unix::fs::FileExt;
+
+        let bytes = self.filler.fetch_store(base).await;
+        let shmem = self.shmem.clone();
+        tokio::task::spawn_blocking(move || shmem.write_all_at(&bytes, base).expect("populate"))
+            .await
+            .expect("snapshot populate task");
         self.filled
             .fetch_add(self.granule / page_size() as u64, Ordering::SeqCst);
         {
@@ -721,19 +775,63 @@ impl PartTable {
     }
 }
 
-fn serve_one_shmem(
-    stream: &UnixStream,
+async fn part_fetch_loop(mut rx: mpsc::Receiver<FetchJob>, table: std::sync::Weak<PartTable>) {
+    let concurrency = Arc::new(tokio::sync::Semaphore::new(PART_FETCH_WORKERS));
+    while let Some((base, fetch)) = rx.recv().await {
+        let permit = concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("part fetch executor open");
+        let Some(table) = table.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            if std::panic::AssertUnwindSafe(table.fetch(base, fetch))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                tracing::error!(part_base = base, "snapshot part fetch failed");
+            }
+        });
+    }
+}
+
+async fn serve_one_shmem(
+    stream: &tokio::net::UnixStream,
     parts: &Arc<PartTable>,
     fault_count: &AtomicU64,
     latencies: &Arc<crate::metrics::AtomicHistogram>,
 ) {
     let mut buf = vec![0u8; 65536];
-    let (n, fd) = recv_with_fd(stream, &mut buf).expect("recv uffd");
+    let (n, fd) = loop {
+        stream.readable().await.expect("uffd handshake readiness");
+        match stream.try_io(tokio::io::Interest::READABLE, || {
+            recv_with_fd(stream, &mut buf)
+        }) {
+            Ok(result) => break result,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("recv uffd: {error}"),
+        }
+    };
     let body = String::from_utf8_lossy(&buf[..n]).into_owned();
     let regions = parse_regions(&body);
     assert!(!regions.is_empty(), "no regions in handshake: {body}");
-    let uffd = Arc::new(Uffd::from_fd(fd.expect("uffd fd")));
-    while let Ok(events) = uffd.read_events() {
+    let uffd = Arc::new(
+        AsyncFd::new(Uffd::from_fd_nonblocking(fd.expect("uffd fd")))
+            .expect("register userfaultfd"),
+    );
+    loop {
+        let Ok(mut ready) = uffd.readable().await else {
+            return;
+        };
+        let events = match ready.try_io(|inner| inner.get_ref().read_events()) {
+            Ok(Ok(events)) => events,
+            Ok(Err(_)) => return,
+            Err(_) => continue,
+        };
         for event in events {
             let started = Instant::now();
             let addr = event.address as u64 & !(page_size() as u64 - 1);
@@ -745,7 +843,8 @@ fn serve_one_shmem(
             fault_count.fetch_add(1, Ordering::SeqCst);
             let (uffd, latencies) = (uffd.clone(), latencies.clone());
             parts.fault(offset, move || {
-                uffd.wake(usize::try_from(addr).expect("fits"), page_size())
+                uffd.get_ref()
+                    .wake(usize::try_from(addr).expect("fits"), page_size())
                     .expect("wake");
                 latencies.observe(started.elapsed());
             });
@@ -757,7 +856,7 @@ fn serve_one_shmem(
 /// segment objects under `prefix` (each well inside the 64 MiB object
 /// contract, R4.6). Returns the part count.
 pub fn upload_mem_parts(
-    store: &dyn crate::store::ObjectStore,
+    store: &crate::s3::S3Store,
     mem_path: &Path,
     prefix: &str,
     part_bytes: u64,
@@ -771,4 +870,34 @@ pub fn upload_mem_parts(
         part += 1;
     }
     part
+}
+
+/// Asynchronous production uploader. File reading stays on Tokio's blocking
+/// pool because regular files have no portable readiness API; object-store
+/// requests themselves are async and capped at the same eight-way concurrency
+/// as daemon store effects.
+pub async fn upload_mem_parts_async(
+    store: Arc<dyn crate::store::ObjectStore>,
+    mem_path: PathBuf,
+    prefix: String,
+    part_bytes: u64,
+) -> u64 {
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(mem_path).expect("mem file"))
+        .await
+        .expect("snapshot read task");
+    let chunks: Vec<Vec<u8>> = bytes
+        .chunks(usize::try_from(part_bytes).expect("fits"))
+        .map(<[u8]>::to_vec)
+        .collect();
+    let count = u64::try_from(chunks.len()).expect("part count fits");
+    futures_util::stream::iter(chunks.into_iter().enumerate())
+        .map(|(part, bytes)| {
+            let store = store.clone();
+            let key = format!("{prefix}/{part:08}");
+            async move { store.put(key, bytes).await.expect("upload part") }
+        })
+        .buffer_unordered(PART_FETCH_WORKERS)
+        .collect::<Vec<_>>()
+        .await;
+    count
 }

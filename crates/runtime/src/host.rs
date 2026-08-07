@@ -6,10 +6,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +22,8 @@ use blockd_core::seam::{
 };
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
+use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc;
 
 use crate::loopstats::{LoopStats, effect_kind, event_kind};
 use crate::metrics::{AtomicHistogram, HistogramSnapshot};
@@ -44,6 +47,14 @@ struct VsetHost {
     uffd: Arc<Uffd>,
     ctl: GuestCtl,
     fault_latency: [AtomicHistogram; FaultSource::COUNT],
+}
+
+struct SharedUffd(Arc<Uffd>);
+
+impl AsRawFd for SharedUffd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
 }
 
 #[derive(Default)]
@@ -323,12 +334,55 @@ pub struct Runtime {
     admin_backlog: Mutex<VecDeque<AdminReply>>,
     blob_dir: PathBuf,
     peers: Option<Arc<PeerNet>>,
+    fault_io: FaultIo,
     loop_thread: Option<thread::JoinHandle<()>>,
+}
+
+struct FaultIo {
+    handle: tokio::runtime::Handle,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FaultIo {
+    fn shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_fault_io_runtime() -> FaultIo {
+    let (ready_tx, ready_rx) = sync_channel(1);
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let thread = thread::Builder::new()
+        .name("blockd-fault-io".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .expect("fault I/O runtime");
+            ready_tx
+                .send(runtime.handle().clone())
+                .expect("runtime owner alive");
+            runtime.block_on(async {
+                let _ = shutdown_rx.await;
+            });
+        })
+        .expect("spawn fault I/O runtime");
+    FaultIo {
+        handle: ready_rx.recv().expect("fault I/O runtime started"),
+        shutdown: Some(shutdown),
+        thread: Some(thread),
+    }
 }
 
 impl Runtime {
     /// A fresh daemon on an empty (or to-be-ignored) blob directory.
-    // Ownership transfer: the store workers clone from it.
+    // Ownership transfer: the async store executor clones from it.
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(config: &RuntimeConfig, store: Arc<dyn ObjectStore>) -> Runtime {
         let (daemon, effects) = Daemon::new(config.daemon.clone());
@@ -407,6 +461,7 @@ impl Runtime {
                 tx.push(Msg::Ev(Event::PeerDelivered { from, msg }));
             })
         });
+        let fault_io = spawn_fault_io_runtime();
 
         let IoLanes {
             store: store_tx,
@@ -489,6 +544,7 @@ impl Runtime {
             admin_backlog: Mutex::new(VecDeque::new()),
             blob_dir: config.blob_dir.clone(),
             peers,
+            fault_io,
             loop_thread: Some(loop_thread),
         }
     }
@@ -616,9 +672,21 @@ impl Runtime {
     fn spawn_fault_reader(&self, vset: VsetId, host: Arc<VsetHost>) {
         let tx = self.tx.clone();
         let shared = self.shared.clone();
-        // Exits when the vset's uffd closes (the vset was dropped).
-        thread::spawn(move || {
-            while let Ok(events) = host.uffd.read_events() {
+        host.uffd
+            .set_nonblocking(true)
+            .expect("nonblocking userfaultfd");
+        self.fault_io.handle.spawn(async move {
+            let uffd =
+                AsyncFd::new(SharedUffd(host.uffd.clone())).expect("register runtime userfaultfd");
+            loop {
+                let Ok(mut ready) = uffd.readable().await else {
+                    return;
+                };
+                let events = match ready.try_io(|inner| inner.get_ref().0.read_events()) {
+                    Ok(Ok(events)) => events,
+                    Ok(Err(_)) => return,
+                    Err(_) => continue,
+                };
                 for event in events {
                     let page = host.page_of_addr(vset, event.address & !(page_size() - 1));
                     let span = tracing::debug_span!(
@@ -947,6 +1015,7 @@ impl Drop for Runtime {
         if let Some(handle) = self.loop_thread.take() {
             let _ = handle.join();
         }
+        self.fault_io.shutdown();
     }
 }
 
@@ -1077,7 +1146,7 @@ fn update_active_operations(shared: &Shared, stats: &blockd_core::daemon::Daemon
 fn apply_effect(
     effect: Effect,
     shared: &Arc<Shared>,
-    store_tx: &Sender<StoreJob>,
+    store_tx: &mpsc::Sender<StoreJob>,
     blob_tx: &Sender<BlobJob>,
     blob_delete_tx: &Sender<BlobJob>,
     timer_tx: &Sender<(TimerId, u64)>,
@@ -1232,7 +1301,9 @@ fn apply_effect(
             let _ = timer_tx.send((timer, after));
         }
         Effect::StorePut { io, key, bytes } => {
-            let _ = store_tx.send(StoreJob::Put { io, key, bytes });
+            store_tx
+                .try_send(StoreJob::Put { io, key, bytes })
+                .expect("store queue capacity exceeds daemon pipeline");
         }
         Effect::StoreCas {
             io,
@@ -1240,15 +1311,19 @@ fn apply_effect(
             expected,
             bytes,
         } => {
-            let _ = store_tx.send(StoreJob::Cas {
-                io,
-                key,
-                expected,
-                bytes,
-            });
+            store_tx
+                .try_send(StoreJob::Cas {
+                    io,
+                    key,
+                    expected,
+                    bytes,
+                })
+                .expect("store queue capacity exceeds daemon pipeline");
         }
         Effect::StoreGet { io, key } => {
-            let _ = store_tx.send(StoreJob::Get { io, key });
+            store_tx
+                .try_send(StoreJob::Get { io, key })
+                .expect("store queue capacity exceeds daemon pipeline");
         }
         Effect::StoreGetRange {
             io,
@@ -1256,15 +1331,19 @@ fn apply_effect(
             offset,
             len,
         } => {
-            let _ = store_tx.send(StoreJob::GetRange {
-                io,
-                key,
-                offset,
-                len,
-            });
+            store_tx
+                .try_send(StoreJob::GetRange {
+                    io,
+                    key,
+                    offset,
+                    len,
+                })
+                .expect("store queue capacity exceeds daemon pipeline");
         }
         Effect::StoreDelete { key } => {
-            let _ = store_tx.send(StoreJob::Delete { key });
+            store_tx
+                .try_send(StoreJob::Delete { key })
+                .expect("store queue capacity exceeds daemon pipeline");
         }
         Effect::VsetFenced { vset } => {
             tracing::warn!(vset_id = vset.0, "vset fenced by a newer assignment");
@@ -1330,6 +1409,7 @@ fn for_each_contiguous_run(indices: &mut Vec<usize>, mut visit: impl FnMut(usize
 /// what is outstanding (one publish per vset, deduped cold fetches); this
 /// only caps the parallelism of what it issues.
 const STORE_WORKERS: usize = 8;
+const STORE_QUEUE_CAPACITY: usize = 1024;
 
 /// Local disks can service independent segment reads concurrently. This is
 /// also the upper bound on simultaneous fsyncs issued by the runtime.
@@ -1471,48 +1551,56 @@ enum StoreJob {
     },
 }
 
-fn store_worker_loop(
-    rx: &Arc<Mutex<Receiver<StoreJob>>>,
-    store: &dyn ObjectStore,
-    tx: &Arc<LoopQueue>,
+async fn store_worker_loop(
+    mut rx: mpsc::Receiver<StoreJob>,
+    store: Arc<dyn ObjectStore>,
+    tx: Arc<LoopQueue>,
 ) {
-    loop {
-        let Ok(job) = rx.lock().expect("lock").recv() else {
-            return;
-        };
-        let event = match job {
-            StoreJob::Put { io, key, bytes } => Event::StorePutDone {
-                io,
-                result: store.put(&key, bytes),
-            },
-            StoreJob::Cas {
-                io,
-                key,
-                expected,
-                bytes,
-            } => Event::StorePutDone {
-                io,
-                result: store.put_cas(&key, expected, bytes),
-            },
-            StoreJob::Get { io, key } => Event::StoreGetDone {
-                io,
-                result: store.get(&key),
-            },
-            StoreJob::GetRange {
-                io,
-                key,
-                offset,
-                len,
-            } => Event::StoreGetDone {
-                io,
-                result: store.get_range(&key, offset, len),
-            },
-            StoreJob::Delete { key } => {
-                store.delete(&key);
-                continue;
-            }
-        };
-        tx.push(Msg::Ev(event));
+    let concurrency = Arc::new(tokio::sync::Semaphore::new(STORE_WORKERS));
+    while let Some(job) = rx.recv().await {
+        let permit = concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("store executor open");
+        let store = store.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let event = match job {
+                StoreJob::Put { io, key, bytes } => Event::StorePutDone {
+                    io,
+                    result: store.put(key, bytes).await,
+                },
+                StoreJob::Cas {
+                    io,
+                    key,
+                    expected,
+                    bytes,
+                } => Event::StorePutDone {
+                    io,
+                    result: store.put_cas(key, expected, bytes).await,
+                },
+                StoreJob::Get { io, key } => Event::StoreGetDone {
+                    io,
+                    result: store.get(key).await,
+                },
+                StoreJob::GetRange {
+                    io,
+                    key,
+                    offset,
+                    len,
+                } => Event::StoreGetDone {
+                    io,
+                    result: store.get_range(key, offset, len).await,
+                },
+                StoreJob::Delete { key } => {
+                    store.delete(key).await;
+                    return;
+                }
+            };
+            tx.push(Msg::Ev(event));
+        });
     }
 }
 
@@ -1545,14 +1633,13 @@ fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Arc<LoopQueue>) {
     }
 }
 
-/// Spawn everything that does blocking I/O on the daemon's behalf; only
+/// Spawn the asynchronous store executor and the blocking local-I/O workers;
+/// only
 /// senders come back — completions return to the loop as events.
 ///
 /// - Timer thread: real clock, feeding `Timer` events back in.
-/// - Store workers: object-store round-trips run here, never on the
-///   event loop — a store put at real latency on the loop thread would
-///   stall fault resolution for every vset (the daemon is sans-IO
-///   precisely so completions can arrive as events).
+/// - Store executor: object-store sockets are polled by Tokio with eight
+///   requests in flight at most; completions return as daemon events.
 /// - Blob workers: local blob I/O has the same completion-event
 ///   contract — one slow filesystem operation (fsync included) must not
 ///   stall guest faults.
@@ -1568,15 +1655,20 @@ fn spawn_io_workers(
         thread::spawn(move || timer_loop(&timer_rx, &tx));
     }
 
-    let (store_tx, store_rx) = channel::<StoreJob>();
+    let (store_tx, store_rx) = mpsc::channel::<StoreJob>(STORE_QUEUE_CAPACITY);
     {
-        let store_rx = Arc::new(Mutex::new(store_rx));
-        for _ in 0..STORE_WORKERS {
-            let store = store.clone();
-            let tx = tx.clone();
-            let store_rx = store_rx.clone();
-            thread::spawn(move || store_worker_loop(&store_rx, store.as_ref(), &tx));
-        }
+        let store = store.clone();
+        let tx = tx.clone();
+        thread::Builder::new()
+            .name("blockd-store-io".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("store I/O runtime");
+                runtime.block_on(store_worker_loop(store_rx, store, tx));
+            })
+            .expect("spawn store I/O runtime");
     }
 
     let (blob_tx, blob_rx) = channel::<BlobJob>();
@@ -1615,7 +1707,7 @@ fn spawn_io_workers(
 
 /// The job senders `spawn_io_workers` hands back, one per lane.
 struct IoLanes {
-    store: Sender<StoreJob>,
+    store: mpsc::Sender<StoreJob>,
     blob: Sender<BlobJob>,
     blob_delete: Sender<BlobJob>,
     timer: Sender<(TimerId, u64)>,
@@ -1668,7 +1760,7 @@ mod tests {
     #[test]
     fn queued_blob_io_does_not_block_followup_effects() {
         let shared = test_shared();
-        let (store_tx, _store_rx) = channel();
+        let (store_tx, _store_rx) = mpsc::channel(1);
         // No worker receives from this channel: it models every disk worker
         // being occupied by a slow filesystem operation.
         let (blob_tx, blob_rx) = channel();

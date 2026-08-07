@@ -5,12 +5,20 @@
 //! durability, no auth, one process's memory.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
+use axum::response::Response;
+use futures_util::stream;
+
+const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024 + 4096;
 
 /// One parsed request, recorded for assertions.
 #[derive(Clone, Debug)]
@@ -38,6 +46,8 @@ pub struct FakeGcs {
     /// Added to every object request (not token requests): emulates a
     /// real store's round-trip so cadence bugs reproduce locally.
     pub latency_ms: AtomicU64,
+    in_flight: AtomicU64,
+    pub max_in_flight: AtomicU64,
 }
 
 impl FakeGcs {
@@ -49,7 +59,10 @@ impl FakeGcs {
 
     /// Serve on a specific address (the demo's shared local store).
     pub fn start_on(addr: SocketAddr) -> (Arc<FakeGcs>, String) {
-        let listener = TcpListener::bind(addr).expect("bind fake gcs");
+        let listener = std::net::TcpListener::bind(addr).expect("bind fake gcs");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let addr = listener.local_addr().expect("addr");
         let fake = Arc::new(FakeGcs {
             objects: Mutex::new(BTreeMap::new()),
@@ -60,59 +73,33 @@ impl FakeGcs {
             seen: Mutex::new(Vec::new()),
             faults: Mutex::new(Vec::new()),
             latency_ms: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            max_in_flight: AtomicU64::new(0),
         });
         let server = fake.clone();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { return };
-                let server = server.clone();
-                thread::spawn(move || server.serve(stream));
-            }
-        });
+        thread::Builder::new()
+            .name("blockd-fake-gcs".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .expect("fake GCS runtime");
+                runtime.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("async fake GCS listener");
+                    let app = Router::new()
+                        .fallback(handle)
+                        .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
+                        .with_state(server);
+                    axum::serve(listener, app).await.expect("serve fake GCS");
+                });
+            })
+            .expect("spawn fake GCS");
         (fake, format!("http://{addr}"))
     }
 
-    fn serve(&self, mut stream: TcpStream) {
-        loop {
-            let Some((seen, body)) = read_request(&mut stream) else {
-                return;
-            };
-            if seen.path.starts_with("/computeMetadata/") {
-                self.tokens_served.fetch_add(1, Ordering::SeqCst);
-                let n = self.tokens_served.load(Ordering::SeqCst);
-                let body = format!(
-                    "{{\"access_token\":\"token-{n}\",\"expires_in\":{},\"token_type\":\"Bearer\"}}",
-                    self.token_expires_in.load(Ordering::SeqCst)
-                );
-                respond(&mut stream, 200, &[], body.as_bytes());
-                continue;
-            }
-            self.seen.lock().expect("lock").push(seen.clone());
-            let latency = self.latency_ms.load(Ordering::SeqCst);
-            if latency > 0 {
-                thread::sleep(std::time::Duration::from_millis(latency));
-            }
-            if let Some(fault) = {
-                let mut faults = self.faults.lock().expect("lock");
-                if faults.is_empty() {
-                    None
-                } else {
-                    Some(faults.remove(0))
-                }
-            } {
-                match fault {
-                    Fault::Status(status) => {
-                        respond_to(&seen.method, &mut stream, status, &[], b"scripted");
-                        continue;
-                    }
-                    Fault::DropConnection => return,
-                }
-            }
-            self.object_request(&mut stream, &seen, body);
-        }
-    }
-
-    fn object_request(&self, stream: &mut TcpStream, seen: &Seen, body: Vec<u8>) {
+    fn object_response(&self, seen: &Seen, body: Vec<u8>) -> Response {
         let key = seen.path.trim_start_matches('/').to_owned();
         let mut objects = self.objects.lock().expect("lock");
         match seen.method.as_str() {
@@ -122,30 +109,24 @@ impl FakeGcs {
                     let want: u64 = want.parse().expect("precondition is a number");
                     let held = current.unwrap_or(0);
                     if want != held {
-                        respond(stream, 412, &[], b"precondition failed");
-                        return;
+                        return response(412, &[], b"precondition failed".to_vec());
                     }
                 }
                 let generation = self.next_gen.fetch_add(1, Ordering::SeqCst);
                 objects.insert(key, (generation, body));
-                let generation = generation.to_string();
-                respond(
-                    stream,
+                response(
                     200,
-                    &[("x-goog-generation", generation.as_str())],
-                    b"",
-                );
+                    &[("x-goog-generation", generation.to_string())],
+                    Vec::new(),
+                )
             }
             "GET" | "HEAD" => {
                 let Some((generation, bytes)) = objects.get(&key) else {
-                    respond_to(&seen.method, stream, 404, &[], b"NoSuchKey");
-                    return;
+                    return response_for(&seen.method, 404, &[], b"NoSuchKey".to_vec());
                 };
-                let generation = generation.to_string();
-                let headers = [("x-goog-generation", generation.as_str())];
+                let headers = [("x-goog-generation", generation.to_string())];
                 if seen.method == "HEAD" {
-                    respond(stream, 200, &headers, b"");
-                    return;
+                    return response(200, &headers, Vec::new());
                 }
                 if let Some(range) = seen.headers.get("range") {
                     let spec = range.strip_prefix("bytes=").expect("range shape");
@@ -153,84 +134,109 @@ impl FakeGcs {
                     let first: usize = first.parse().expect("number");
                     let last: usize = last.parse().expect("number");
                     if first >= bytes.len() {
-                        respond(stream, 416, &[], b"InvalidRange");
-                        return;
+                        return response(416, &[], b"InvalidRange".to_vec());
                     }
                     let end = (last + 1).min(bytes.len());
-                    respond(stream, 206, &headers, &bytes[first..end]);
-                    return;
+                    return response(206, &headers, bytes[first..end].to_vec());
                 }
-                respond(stream, 200, &headers, bytes);
+                response(200, &headers, bytes.clone())
             }
             "DELETE" => {
                 objects.remove(&key);
-                respond(stream, 204, &[], b"");
+                response(204, &[], Vec::new())
             }
-            other => panic!("unexpected method {other}"),
+            _ => response(405, &[], b"method not allowed".to_vec()),
         }
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<(Seen, Vec<u8>)> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    while !buf.ends_with(b"\r\n\r\n") {
-        match stream.read(&mut byte) {
-            Ok(1) => buf.push(byte[0]),
-            _ => return None,
+async fn handle(
+    State(server): State<Arc<FakeGcs>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if uri.path().starts_with("/computeMetadata/") {
+        let n = server.tokens_served.fetch_add(1, Ordering::SeqCst) + 1;
+        let body = format!(
+            "{{\"access_token\":\"token-{n}\",\"expires_in\":{},\"token_type\":\"Bearer\"}}",
+            server.token_expires_in.load(Ordering::SeqCst)
+        );
+        return response(200, &[], body.into_bytes());
+    }
+    let seen = Seen {
+        method: method.to_string(),
+        path: uri.path().to_owned(),
+        headers: headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect(),
+    };
+    server.seen.lock().expect("lock").push(seen.clone());
+    let current = server.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    server.max_in_flight.fetch_max(current, Ordering::SeqCst);
+    let _in_flight = InFlight(&server.in_flight);
+    let latency = server.latency_ms.load(Ordering::SeqCst);
+    if latency > 0 {
+        tokio::time::sleep(Duration::from_millis(latency)).await;
+    }
+    let fault = {
+        let mut faults = server.faults.lock().expect("lock");
+        if faults.is_empty() {
+            None
+        } else {
+            Some(faults.remove(0))
         }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines = text.lines();
-    let request = lines.next()?;
-    let mut parts = request.split_whitespace();
-    let method = parts.next()?.to_owned();
-    let path = parts.next()?.to_owned();
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+    };
+    match fault {
+        Some(Fault::Status(status)) => {
+            response_for(&seen.method, status, &[], b"scripted".to_vec())
         }
+        Some(Fault::DropConnection) => dropped_connection_response(),
+        None => server.object_response(&seen, body.to_vec()),
     }
-    let length: usize = headers
-        .get("content-length")
-        .map_or(0, |v| v.parse().expect("length"));
-    let mut body = vec![0u8; length];
-    if length > 0 {
-        stream.read_exact(&mut body).ok()?;
-    }
-    Some((
-        Seen {
-            method,
-            path,
-            headers,
-        },
-        body,
-    ))
 }
 
-fn respond(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &[u8]) {
-    let mut resp = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\n", body.len());
+struct InFlight<'a>(&'a AtomicU64);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn response(status: u16, headers: &[(&str, String)], body: Vec<u8>) -> Response {
+    let mut builder = Response::builder().status(StatusCode::from_u16(status).expect("status"));
     for (name, value) in headers {
-        write!(resp, "{name}: {value}\r\n").expect("string write");
+        builder = builder.header(*name, value);
     }
-    resp.push_str("\r\n");
-    let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.write_all(body);
+    builder.body(Body::from(body)).expect("response")
 }
 
-/// HEAD responses must carry no body bytes or the keep-alive stream
-/// desyncs; everything else answers normally.
-fn respond_to(
-    method: &str,
-    stream: &mut TcpStream,
-    status: u16,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) {
-    if method == "HEAD" {
-        respond(stream, status, headers, b"");
-    } else {
-        respond(stream, status, headers, body);
-    }
+fn response_for(method: &str, status: u16, headers: &[(&str, String)], body: Vec<u8>) -> Response {
+    response(
+        status,
+        headers,
+        if method == "HEAD" { Vec::new() } else { body },
+    )
+}
+
+/// Start a successful response and fail its body. Hyper terminates the HTTP/1
+/// message mid-stream, exercising the client's transport error path rather
+/// than its status mapping.
+fn dropped_connection_response() -> Response {
+    let body = Body::from_stream(stream::once(async {
+        Err::<Bytes, std::io::Error>(std::io::Error::other("scripted connection drop"))
+    }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONNECTION, "close")
+        .body(body)
+        .expect("response")
 }
