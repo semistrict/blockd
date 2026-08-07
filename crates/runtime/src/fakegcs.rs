@@ -48,6 +48,10 @@ pub struct FakeGcs {
     pub latency_ms: AtomicU64,
     in_flight: AtomicU64,
     pub max_in_flight: AtomicU64,
+    /// Test-only availability controls. Data outage preserves `/head` so
+    /// placement/fencing can continue while immutable uploads are stalled.
+    pub outage: std::sync::atomic::AtomicBool,
+    pub data_outage: std::sync::atomic::AtomicBool,
 }
 
 impl FakeGcs {
@@ -75,6 +79,8 @@ impl FakeGcs {
             latency_ms: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
             max_in_flight: AtomicU64::new(0),
+            outage: std::sync::atomic::AtomicBool::new(false),
+            data_outage: std::sync::atomic::AtomicBool::new(false),
         });
         let server = fake.clone();
         thread::Builder::new()
@@ -165,6 +171,16 @@ async fn handle(
         );
         return response(200, &[], body.into_bytes());
     }
+    match uri.path() {
+        "/__control/outage/on" => server.outage.store(true, Ordering::SeqCst),
+        "/__control/outage/off" => server.outage.store(false, Ordering::SeqCst),
+        "/__control/data-outage/on" => server.data_outage.store(true, Ordering::SeqCst),
+        "/__control/data-outage/off" => server.data_outage.store(false, Ordering::SeqCst),
+        _ => {}
+    }
+    if uri.path().starts_with("/__control/") {
+        return response(200, &[], b"ok".to_vec());
+    }
     let seen = Seen {
         method: method.to_string(),
         path: uri.path().to_owned(),
@@ -185,6 +201,11 @@ async fn handle(
     let latency = server.latency_ms.load(Ordering::SeqCst);
     if latency > 0 {
         tokio::time::sleep(Duration::from_millis(latency)).await;
+    }
+    if server.outage.load(Ordering::SeqCst)
+        || (server.data_outage.load(Ordering::SeqCst) && !seen.path.ends_with("/head"))
+    {
+        return response_for(&seen.method, 503, &[], b"unavailable".to_vec());
     }
     let fault = {
         let mut faults = server.faults.lock().expect("lock");

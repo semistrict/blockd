@@ -5,7 +5,7 @@
 //! the daemon exactly as production faults do.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::layout;
 use blockd_core::seam::{
     AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, TimerId, Verdict,
 };
@@ -36,6 +37,13 @@ pub struct RuntimeConfig {
     pub blob_dir: PathBuf,
     /// Peer transport (`None` = a host that never migrates).
     pub peer: Option<PeerConfig>,
+}
+
+fn assert_peer_stash_transport(config: VsetConfig, authenticated: bool) {
+    assert!(
+        config.durability != DurabilityMode::PeerStashed || authenticated,
+        "peer-stashed durability requires mutually authenticated TLS"
+    );
 }
 
 /// One vset's guest memory on this host: the region (daemon view), the
@@ -293,6 +301,8 @@ struct Shared {
     /// The daemon's counters, copied out after every step (R9.2).
     counters: Mutex<blockd_core::daemon::Counters>,
     daemon_stats: Mutex<blockd_core::daemon::DaemonStats>,
+    replica_metrics: Mutex<Vec<blockd_core::daemon::ReplicaVsetMetrics>>,
+    replica_spool_metrics: Mutex<Vec<blockd_core::daemon::ReplicaSpoolMetrics>>,
     /// Loop-thread time attribution (R9.2's perf side): decide vs effect
     /// execution vs idle, by kind.
     stats: LoopStats,
@@ -335,6 +345,7 @@ pub struct Runtime {
     blob_dir: PathBuf,
     peers: Option<Arc<PeerNet>>,
     fault_io: FaultIo,
+    authenticated_peers: bool,
     loop_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -410,6 +421,10 @@ impl Runtime {
         );
         let mut hosts = BTreeMap::new();
         for (&vset, &vc) in vset_configs {
+            assert_peer_stash_transport(
+                vc,
+                config.peer.as_ref().is_some_and(|peer| peer.tls.is_some()),
+            );
             hosts.insert(vset, VsetHost::new(vc));
         }
         let runtime = Runtime::start(daemon, effects, hosts, config, &store);
@@ -438,6 +453,8 @@ impl Runtime {
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(blockd_core::daemon::Counters::default()),
             daemon_stats: Mutex::new(daemon_stats),
+            replica_metrics: Mutex::new(daemon.replica_metrics()),
+            replica_spool_metrics: Mutex::new(daemon.replica_spool_metrics()),
             stats: LoopStats::default(),
             fault_in_flight: Mutex::new(BTreeMap::new()),
             operation_latency: std::array::from_fn(|_| {
@@ -467,6 +484,7 @@ impl Runtime {
             store: store_tx,
             blob: blob_tx,
             blob_delete: blob_delete_tx,
+            replica: replica_tx,
             timer: timer_tx,
         } = spawn_io_workers(&config.blob_dir, store, &tx, &shared);
 
@@ -487,6 +505,7 @@ impl Runtime {
                             &store_tx,
                             &blob_tx,
                             &blob_delete_tx,
+                            &replica_tx,
                             &timer_tx,
                             &admin_tx,
                             &tx,
@@ -529,6 +548,9 @@ impl Runtime {
                     update_backup_lag(&shared, &daemon_stats);
                     update_active_operations(&shared, &daemon_stats);
                     *shared.daemon_stats.lock().expect("lock") = daemon_stats;
+                    *shared.replica_metrics.lock().expect("lock") = daemon.replica_metrics();
+                    *shared.replica_spool_metrics.lock().expect("lock") =
+                        daemon.replica_spool_metrics();
                     shared
                         .stats
                         .record_decide(kind, elapsed_ns(started.elapsed()));
@@ -545,6 +567,7 @@ impl Runtime {
             blob_dir: config.blob_dir.clone(),
             peers,
             fault_io,
+            authenticated_peers: config.peer.as_ref().is_some_and(|peer| peer.tls.is_some()),
             loop_thread: Some(loop_thread),
         }
     }
@@ -749,10 +772,11 @@ impl Runtime {
 
     #[tracing::instrument(
         skip(self, config),
-        fields(vset_id = vset.0, backed = config.backed_up)
+        fields(vset_id = vset.0, backed = config.durability == DurabilityMode::Backup)
     )]
     pub fn create_vset(&self, vset: VsetId, config: VsetConfig) {
         let started = Instant::now();
+        assert_peer_stash_transport(config, self.authenticated_peers);
         let host = VsetHost::new(config);
         self.shared
             .vsets
@@ -798,10 +822,11 @@ impl Runtime {
     /// Restore a backed-up vset from the store onto this host (R6.1).
     #[tracing::instrument(
         skip(self, config),
-        fields(vset_id = vset.0, backed = config.backed_up)
+        fields(vset_id = vset.0, backed = config.durability == DurabilityMode::Backup)
     )]
     pub fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
         let started = Instant::now();
+        assert_peer_stash_transport(config, self.authenticated_peers);
         let host = VsetHost::new(config);
         self.shared
             .vsets
@@ -836,6 +861,7 @@ impl Runtime {
     /// effects (fills, the eventual resume) index this host's vsets and
     /// would find nothing otherwise.
     pub fn expect_migration(&self, vset: VsetId, config: VsetConfig) {
+        assert_peer_stash_transport(config, self.authenticated_peers);
         let host = VsetHost::new(config);
         self.shared
             .vsets
@@ -882,6 +908,18 @@ impl Runtime {
     /// The daemon's own counters (R9.2), as of the last step.
     pub fn counters(&self) -> blockd_core::daemon::Counters {
         *self.shared.counters.lock().expect("lock")
+    }
+
+    pub fn replica_metrics(&self) -> Vec<blockd_core::daemon::ReplicaVsetMetrics> {
+        self.shared.replica_metrics.lock().expect("lock").clone()
+    }
+
+    pub fn replica_spool_metrics(&self) -> Vec<blockd_core::daemon::ReplicaSpoolMetrics> {
+        self.shared
+            .replica_spool_metrics
+            .lock()
+            .expect("lock")
+            .clone()
     }
 
     pub fn incidents(&self) -> Vec<String> {
@@ -1149,6 +1187,7 @@ fn apply_effect(
     store_tx: &mpsc::Sender<StoreJob>,
     blob_tx: &Sender<BlobJob>,
     blob_delete_tx: &Sender<BlobJob>,
+    replica_tx: &Sender<BlobJob>,
     timer_tx: &Sender<(TimerId, u64)>,
     admin_tx: &Sender<AdminReply>,
     tx: &Arc<LoopQueue>,
@@ -1269,6 +1308,71 @@ fn apply_effect(
             blob_tx
                 .send(BlobJob::Write { io, name, bytes })
                 .expect("blob workers alive");
+        }
+        Effect::ReplicaAppend {
+            io,
+            source,
+            vset,
+            assignment_epoch,
+            generation,
+            bytes,
+        } => {
+            replica_tx
+                .send(BlobJob::Append {
+                    io,
+                    name: layout::replica_spool_segment_blob(
+                        source,
+                        vset,
+                        assignment_epoch,
+                        generation,
+                    ),
+                    bytes,
+                })
+                .expect("replica worker alive");
+        }
+        Effect::ReplicaDelete {
+            io,
+            source,
+            vset,
+            assignment_epoch,
+            through_generation,
+        } => {
+            replica_tx
+                .send(BlobJob::DeleteManyDurable {
+                    io,
+                    names: (0..=through_generation)
+                        .map(|generation| {
+                            layout::replica_spool_segment_blob(
+                                source,
+                                vset,
+                                assignment_epoch,
+                                generation,
+                            )
+                        })
+                        .collect(),
+                })
+                .expect("replica worker alive");
+        }
+        Effect::ReplicaTruncate {
+            io,
+            source,
+            vset,
+            assignment_epoch,
+            generation,
+            len,
+        } => {
+            replica_tx
+                .send(BlobJob::Truncate {
+                    io,
+                    name: layout::replica_spool_segment_blob(
+                        source,
+                        vset,
+                        assignment_epoch,
+                        generation,
+                    ),
+                    len,
+                })
+                .expect("replica worker alive");
         }
         Effect::BlobRead { io, name } => {
             blob_tx
@@ -1421,6 +1525,11 @@ enum BlobJob {
         name: String,
         bytes: Vec<u8>,
     },
+    Append {
+        io: IoId,
+        name: String,
+        bytes: Vec<u8>,
+    },
     Read {
         io: IoId,
         name: String,
@@ -1434,8 +1543,18 @@ enum BlobJob {
     Delete {
         name: String,
     },
+    DeleteManyDurable {
+        io: IoId,
+        names: Vec<String>,
+    },
+    Truncate {
+        io: IoId,
+        name: String,
+        len: u64,
+    },
 }
 
+#[allow(clippy::too_many_lines)]
 fn blob_worker_loop(
     rx: &Arc<Mutex<Receiver<BlobJob>>>,
     root: &Path,
@@ -1476,6 +1595,30 @@ fn blob_worker_loop(
                 shared.local_io_latency[0][0].observe(started.elapsed());
                 Some(Event::BlobWriteDone { io })
             }
+            BlobJob::Append { io, name, bytes } => {
+                let path = root.join(name);
+                let parent = path.parent().expect("has parent");
+                std::fs::create_dir_all(parent).expect("mkdir");
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .expect("open replica spool");
+                file.write_all(&bytes).expect("append replica frame");
+                file.sync_all().expect("fsync replica spool");
+                let mut dir = parent;
+                loop {
+                    std::fs::File::open(dir)
+                        .expect("open dir")
+                        .sync_all()
+                        .expect("fsync dir");
+                    if dir == root {
+                        break;
+                    }
+                    dir = dir.parent().expect("under root");
+                }
+                Some(Event::BlobWriteDone { io })
+            }
             BlobJob::Read { io, name } => {
                 let started = Instant::now();
                 shared.local_io_in_flight[1].fetch_add(1, Ordering::Relaxed);
@@ -1514,6 +1657,44 @@ fn blob_worker_loop(
                 shared.local_io_in_flight[3].fetch_sub(1, Ordering::Relaxed);
                 shared.local_io_latency[3][0].observe(started.elapsed());
                 None
+            }
+            BlobJob::DeleteManyDurable { io, names } => {
+                let result = (|| -> std::io::Result<()> {
+                    let mut parents = std::collections::BTreeSet::new();
+                    for name in names {
+                        let path = root.join(name);
+                        parents.insert(path.parent().expect("has parent").to_path_buf());
+                        match std::fs::remove_file(path) {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    for parent in parents {
+                        let mut dir = parent;
+                        loop {
+                            std::fs::File::open(&dir)?.sync_all()?;
+                            if dir == root {
+                                break;
+                            }
+                            dir = dir.parent().expect("under root").to_path_buf();
+                        }
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => Some(Event::BlobWriteDone { io }),
+                    Err(_) => Some(Event::ReplicaDeleteFailed { io }),
+                }
+            }
+            BlobJob::Truncate { io, name, len } => {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(root.join(name))
+                    .expect("open torn replica spool");
+                file.set_len(len).expect("truncate replica tail");
+                file.sync_all().expect("fsync replica truncation");
+                Some(Event::BlobWriteDone { io })
             }
         };
         if let Some(event) = event {
@@ -1697,10 +1878,22 @@ fn spawn_io_workers(
         thread::spawn(move || blob_worker_loop(&blob_delete_rx, &blob_dir, &tx, &shared));
     }
 
+    // Replica appends are ordered. The core permits one append in flight per
+    // spool, and this lane preserves submission order across real fsyncs.
+    let (replica_tx, replica_rx) = channel::<BlobJob>();
+    {
+        let replica_rx = Arc::new(Mutex::new(replica_rx));
+        let blob_dir = blob_dir.to_path_buf();
+        let tx = tx.clone();
+        let shared = shared.clone();
+        thread::spawn(move || blob_worker_loop(&replica_rx, &blob_dir, &tx, &shared));
+    }
+
     IoLanes {
         store: store_tx,
         blob: blob_tx,
         blob_delete: blob_delete_tx,
+        replica: replica_tx,
         timer: timer_tx,
     }
 }
@@ -1710,6 +1903,7 @@ struct IoLanes {
     store: mpsc::Sender<StoreJob>,
     blob: Sender<BlobJob>,
     blob_delete: Sender<BlobJob>,
+    replica: Sender<BlobJob>,
     timer: Sender<(TimerId, u64)>,
 }
 
@@ -1728,6 +1922,8 @@ mod tests {
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(blockd_core::daemon::Counters::default()),
             daemon_stats: Mutex::new(blockd_core::daemon::DaemonStats::default()),
+            replica_metrics: Mutex::new(Vec::new()),
+            replica_spool_metrics: Mutex::new(Vec::new()),
             stats: LoopStats::default(),
             fault_in_flight: Mutex::new(BTreeMap::new()),
             operation_latency: std::array::from_fn(|_| {
@@ -1765,6 +1961,7 @@ mod tests {
         // being occupied by a slow filesystem operation.
         let (blob_tx, blob_rx) = channel();
         let (blob_delete_tx, _blob_delete_rx) = channel();
+        let (replica_tx, _replica_rx) = channel();
         let (timer_tx, timer_rx) = channel();
         let (admin_tx, _admin_rx) = channel();
         let tx = LoopQueue::new();
@@ -1779,6 +1976,7 @@ mod tests {
             &store_tx,
             &blob_tx,
             &blob_delete_tx,
+            &replica_tx,
             &timer_tx,
             &admin_tx,
             &tx,
@@ -1795,6 +1993,7 @@ mod tests {
             &store_tx,
             &blob_tx,
             &blob_delete_tx,
+            &replica_tx,
             &timer_tx,
             &admin_tx,
             &tx,
@@ -1818,6 +2017,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn blob_worker_writes_durably_and_reads_ranges() {
         let root = std::env::temp_dir().join(format!(
             "blockd-blob-worker-{}-{:?}",
@@ -1865,8 +2065,104 @@ mod tests {
             if bytes == b"cdef"
         ));
 
+        job_tx
+            .send(BlobJob::Append {
+                io: IoId(3),
+                name: "r/0000/0000000000000007/0000000000000001.spool".to_owned(),
+                bytes: b"first".to_vec(),
+            })
+            .expect("send append");
+        assert!(matches!(
+            msg_queue.pop(),
+            Msg::Ev(Event::BlobWriteDone { io: IoId(3) })
+        ));
+        job_tx
+            .send(BlobJob::Append {
+                io: IoId(4),
+                name: "r/0000/0000000000000007/0000000000000001.spool".to_owned(),
+                bytes: b"second".to_vec(),
+            })
+            .expect("send append");
+        assert!(matches!(
+            msg_queue.pop(),
+            Msg::Ev(Event::BlobWriteDone { io: IoId(4) })
+        ));
+        assert_eq!(
+            std::fs::read(root.join("r/0000/0000000000000007/0000000000000001.spool"))
+                .expect("spool exists"),
+            b"firstsecond"
+        );
+        job_tx
+            .send(BlobJob::Truncate {
+                io: IoId(5),
+                name: "r/0000/0000000000000007/0000000000000001.spool".to_owned(),
+                len: 5,
+            })
+            .expect("send durable tail truncation");
+        assert!(matches!(
+            msg_queue.pop(),
+            Msg::Ev(Event::BlobWriteDone { io: IoId(5) })
+        ));
+        assert_eq!(
+            std::fs::read(root.join("r/0000/0000000000000007/0000000000000001.spool"))
+                .expect("truncated spool exists"),
+            b"first"
+        );
+        job_tx
+            .send(BlobJob::DeleteManyDurable {
+                io: IoId(6),
+                names: vec!["r/0000/0000000000000007/0000000000000001.spool".to_owned()],
+            })
+            .expect("send durable delete");
+        assert!(matches!(
+            msg_queue.pop(),
+            Msg::Ev(Event::BlobWriteDone { io: IoId(6) })
+        ));
+        assert!(
+            !root
+                .join("r/0000/0000000000000007/0000000000000001.spool")
+                .exists()
+        );
+
         drop(job_tx);
         worker.join().expect("worker");
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_delete_does_not_acknowledge_a_failed_unlink() {
+        let root = std::env::temp_dir().join(format!(
+            "blockd-blob-delete-failure-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let undeletable_as_file = root.join("nested/not-a-file");
+        std::fs::create_dir_all(&undeletable_as_file).expect("create directory target");
+        let (job_tx, job_rx) = channel();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let msg_queue = LoopQueue::new();
+        let worker = {
+            let root = root.clone();
+            let msg_queue = msg_queue.clone();
+            let shared = test_shared();
+            thread::spawn(move || blob_worker_loop(&job_rx, &root, &msg_queue, &shared))
+        };
+
+        job_tx
+            .send(BlobJob::DeleteManyDurable {
+                io: IoId(77),
+                names: vec!["nested/not-a-file".to_owned()],
+            })
+            .expect("send failing durable delete");
+        let completion = msg_queue.pop();
+        drop(job_tx);
+        let _ = worker.join();
+        std::fs::remove_dir_all(root).expect("cleanup");
+
+        assert!(matches!(
+            completion,
+            Msg::Ev(Event::ReplicaDeleteFailed { io: IoId(77) })
+        ));
     }
 }

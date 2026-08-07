@@ -236,7 +236,7 @@ impl Daemon {
         // Ack now only if a durable record's watermark already covers this
         // barrier (R3.8) — the watermark, not merely a covering capture, is
         // what recovery honors.
-        if vset.durable_watermark >= barrier {
+        if vset.sync_ack_through >= barrier {
             self.counters.syncs_acked += 1;
             out.push(Effect::SyncOk { req });
             return;
@@ -360,7 +360,7 @@ impl Daemon {
         let backed = self
             .vsets
             .get(&page.volume.vset)
-            .is_some_and(|v| v.config.backed_up);
+            .is_some_and(|v| v.config.durability.uses_store());
         if backed {
             let io = self.io();
             self.pending.insert(

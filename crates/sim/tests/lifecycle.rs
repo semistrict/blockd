@@ -4,7 +4,7 @@
 //! are exact; any drift is a real behavior change.
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::types::{micros, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::rng::Ppm;
@@ -347,7 +347,7 @@ fn big_maps_cost_deltas_not_size() {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 8_000,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         think: (micros(5), micros(25)),
         horizon: secs(1),
@@ -413,7 +413,7 @@ fn steady_overwrites_dont_amplify_disk_space() {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 4_096,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         think: (micros(10), micros(50)),
         horizon: secs(2),

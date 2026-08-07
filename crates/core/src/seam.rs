@@ -129,6 +129,20 @@ pub enum StoreFault {
     CasConflict { actual: Option<u64> },
 }
 
+/// Typed identity of an immutable artifact placed in a passive peer spool.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ReplicaArtifact {
+    Segment { fence: u64, seg: SegId },
+    Leaf { fence: u64, id: u64 },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReplicaCommitInfo {
+    pub writer_fence: u64,
+    pub seq: crate::types::JournalSeq,
+    pub sync_covered_through: u64,
+}
+
 /// Daemon-to-daemon messages (the mTLS peer protocol, R11.1 — membership
 /// and encryption are the runtime's layer; the simulation models cluster
 /// membership as the set of reachable hosts).
@@ -137,11 +151,16 @@ pub enum PeerMsg {
     /// Post-copy migration offer (R7.1): the final captured record's exact
     /// bytes. The sender has already made its outbound handoff durable
     /// (R7.2: durable on both sides before either acts).
-    MigrateOffer { vset: VsetId, record: Vec<u8> },
+    MigrateOffer {
+        vset: VsetId,
+        record: Vec<u8>,
+    },
     /// The destination's accept: its side of the handoff is durable and its
     /// guest is resuming. The source now serves fetches and never runs the
     /// guest again.
-    MigrateAccept { vset: VsetId },
+    MigrateAccept {
+        vset: VsetId,
+    },
     /// Demand fetch of one page entry from a peer (the peer tier of R2.3).
     FetchRange {
         io: IoId,
@@ -153,7 +172,10 @@ pub enum PeerMsg {
     },
     /// Peer fetch response: raw stored bytes, damage included (the reader
     /// verifies, R8.1). `None` = the peer no longer has it.
-    Page { io: IoId, bytes: Option<Vec<u8>> },
+    Page {
+        io: IoId,
+        bytes: Option<Vec<u8>>,
+    },
     /// Fetch one map leaf blob from a peer (post-copy hydration of a
     /// migrated vset's map, R7.1). `base` is 0 for the vset's own
     /// namespace, else the base whose leaf this is.
@@ -165,13 +187,75 @@ pub enum PeerMsg {
         id: u64,
     },
     /// Leaf fetch response: the blob's raw bytes, damage included.
-    Leaf { io: IoId, bytes: Option<Vec<u8>> },
+    Leaf {
+        io: IoId,
+        bytes: Option<Vec<u8>>,
+    },
     /// The destination holds every byte it needs: the source may reclaim
     /// the vset's local state.
-    Released { vset: VsetId },
+    Released {
+        vset: VsetId,
+    },
     /// The source's acknowledgment of `Released` (which is retried until
     /// acked; a source that already reclaimed still acks).
-    ReleasedAck { vset: VsetId },
+    ReleasedAck {
+        vset: VsetId,
+    },
+    /// Store one immutable artifact on the assigned passive peer. An
+    /// identical retry re-acks without another append.
+    ReplicaPut {
+        vset: VsetId,
+        assignment_epoch: u64,
+        artifact: ReplicaArtifact,
+        checksum: u32,
+        bytes: Vec<u8>,
+    },
+    ReplicaPutAck {
+        vset: VsetId,
+        assignment_epoch: u64,
+        artifact: ReplicaArtifact,
+        checksum: u32,
+    },
+    /// Commit one exact recovery record after every required artifact is
+    /// stable on this peer or already truthfully known in the store.
+    ReplicaCommit {
+        vset: VsetId,
+        assignment_epoch: u64,
+        info: ReplicaCommitInfo,
+        required: Vec<ReplicaArtifact>,
+        record: Vec<u8>,
+    },
+    ReplicaCommitAck {
+        vset: VsetId,
+        assignment_epoch: u64,
+        info: ReplicaCommitInfo,
+    },
+    ReplicaStatus {
+        vset: VsetId,
+        assignment_epoch: u64,
+    },
+    ReplicaStatusReply {
+        vset: VsetId,
+        assignment_epoch: u64,
+        committed: Option<ReplicaCommitInfo>,
+    },
+    /// The passive peer uploaded every object needed by this commit. The
+    /// primary may now perform the small fenced head publication.
+    ReplicaUploadDone {
+        vset: VsetId,
+        assignment_epoch: u64,
+        info: ReplicaCommitInfo,
+    },
+    ReplicaRelease {
+        vset: VsetId,
+        assignment_epoch: u64,
+        through: ReplicaCommitInfo,
+    },
+    ReplicaReleaseAck {
+        vset: VsetId,
+        assignment_epoch: u64,
+        through: ReplicaCommitInfo,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -271,6 +355,19 @@ pub enum TimerId {
     /// Backup/claim retry for one vset after a store fault (R8.3: copies
     /// queue, with backpressure — never loss).
     Backup(VsetId),
+    /// Retry the currently unacknowledged passive-replica protocol message.
+    Replica {
+        vset: VsetId,
+        generation: u64,
+    },
+    /// Retry a release until the passive peer confirms durable unlink.
+    ReplicaRelease(VsetId),
+    /// Retry a passive peer's asynchronous spool-to-store upload.
+    ReplicaUpload {
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+    },
     /// End of the post-resume recording window (R6.2): the pages faulted
     /// so far become the vset's recorded resume set.
     ResumeSet(VsetId),
@@ -330,6 +427,12 @@ pub enum Event {
     Admin(AdminCmd),
     /// A blob write became durable.
     BlobWriteDone {
+        io: IoId,
+    },
+    /// A passive-replica spool unlink did not complete. The receiver leaves
+    /// the residue authoritative and permits the source's release retry to
+    /// issue another durable delete.
+    ReplicaDeleteFailed {
         io: IoId,
     },
     /// A blob (or range) read completed: raw stored bytes, damage included;
@@ -419,6 +522,34 @@ pub enum Effect {
         io: IoId,
         name: String,
         bytes: Vec<u8>,
+    },
+    /// Append one verified frame to a typed passive-replica spool and make
+    /// the append durable before completing `io`.
+    ReplicaAppend {
+        io: IoId,
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    /// Durably unlink every generation through the named one before
+    /// completing `io`.
+    ReplicaDelete {
+        io: IoId,
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        through_generation: u64,
+    },
+    /// Truncate a crash-torn replica tail to the last verified frame.
+    ReplicaTruncate {
+        io: IoId,
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        generation: u64,
+        len: u64,
     },
     /// Read a whole blob.
     BlobRead {

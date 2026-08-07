@@ -46,7 +46,7 @@ that honest for long-lived vsets: a segment at least half dead has its
 live pages rewritten forward on the writeback cadence, so disk stays
 within ~2× live data and each rewritten byte reclaims at least one. The
 record is the atomic consistency point (R3.5), and its monotone
-`synced_through` watermark is what makes sync ordering survive record
+`sync_covered_through` watermark is what makes sync ordering survive record
 reclamation (R3.8) — a bare covers-sync flag provably loses it; the
 simulation found this. Each record is written twice (`.rec` + `.recm`):
 the newest record is the sole carrier of its newly-acked syncs, and the
@@ -91,7 +91,7 @@ patched `UffdShmem` memory backend
 handler-owned shared-memory file MAP_PRIVATE, so clean pages are shared
 page-cache pages and divergence is kernel copy-on-write.
 
-### Durability is local; the store is backup
+### Durability is local; the store is backup; protected sync uses one peer
 
 Captures complete on local NVMe only (R3.6); backup copies locally durable
 state to the store continuously as writeback commits it, never gated on
@@ -100,6 +100,40 @@ Restore fetches a bounded number of small objects (head, manifest, resume
 set) before the guest's first instruction; pages follow on demand with a
 recorded resume set prefetched (R6.2). Fault sources prefer local NVMe,
 then a peer, then the store (R2.3).
+
+Peer-stashed durability changes only the acknowledgment point of guest disk
+sync. The primary appends the exact compressed recovery closure to one passive
+peer and waits for that peer's durable commit footer. It does not wait for S3,
+does not copy guest RAM, and does not fan out to the peer's placement
+candidates. The passive peer subsequently uploads those same stored bytes;
+the primary performs only the small fenced manifest/head publication. Once the
+head covers the peer commit, cleanup unlinks wholly covered sealed spool files
+without compaction or data rewrite.
+
+The per-vset head remains the global authority. Besides holder and writer
+fence, a peer-stashed head records one active stash, an assignment epoch, and
+at most one transition stash. Hosts derive an ordered candidate list from a
+versioned authenticated roster with deterministic weighted rendezvous hashing;
+the list is placement preference, never replication. A failed active stash
+puts the vset in degraded mode: new sync replies queue, one replacement is
+named by head CAS, only the outstanding closure is seeded there, and a second
+head CAS activates it after a covering durable commit. Recovery inventories
+the head's active and transition peers plus S3 and accepts only a complete,
+verified closure. A stash never gains permission to run the guest.
+
+Peer traffic is mutually authenticated TLS. The exact verified leaf
+certificate maps to a roster host ID, and a frame whose claimed sender differs
+from that identity closes the connection. Rollout is a separate fail-closed
+control-plane policy: disabled by default, then one failure domain, then a
+salted deterministic percentage of vsets. Expansion aborts on any false ACK,
+recovery mismatch, non-active-peer byte, cleanup rewrite, or 80% spool-capacity
+alert. A production gate separately records completion of transport,
+capacity-alert, recovery-drill, and downgrade checks.
+
+The recovery drill inventories only peers named by the fenced head, verifies a
+complete closure in quarantine, claims ownership by head CAS, refences and
+publishes the recovery point, atomically promotes the local directory, starts
+the guest, and releases stale peer residue through the normal watermark path.
 
 ### Migration is a durable two-sided handoff
 
@@ -127,7 +161,10 @@ Three tiers, in the repo and green:
   multi-host clusters, crashes, torn writes, bit rot, store outages, CAS
   races, unsynchronized clocks — replayable byte-for-byte from a seed
   (R10.1), checked against ghost-history oracles with negative tests
-  proving the oracles bite.
+  proving the oracles bite. Correctness workloads compose with independently
+  verified network, attrition, disk, store, and placement fault workloads;
+  targeted crash grids cover each replica commit, publication, release, and
+  replacement boundary before large deterministic seed ensembles run.
 - **Real-kernel machinery** (`crates/hostmem`, `crates/runtime`): the same
   daemon state machine driven against real userfaultfd, memfds, O_DIRECT
   disk I/O and an S3-shaped store in a Linux VM, with physical memory

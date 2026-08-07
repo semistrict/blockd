@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::head::HeadRecord;
-use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
+use blockd_core::journal::{DurabilityMode, JournalRecord, RecordKind, VsetConfig};
 use blockd_core::layout;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
@@ -50,6 +50,7 @@ fn runtime_config(tag: &str, cache_pages: usize) -> RuntimeConfig {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 500,
+            replica_placement: None,
         },
         blob_dir: temp_dir(tag),
         peer: None,
@@ -60,7 +61,11 @@ fn vset_config(disk_volumes: u8, pages_per_volume: u32, backed_up: bool) -> Vset
     VsetConfig {
         disk_volumes,
         pages_per_volume,
-        backed_up,
+        durability: if backed_up {
+            DurabilityMode::Backup
+        } else {
+            DurabilityMode::Local
+        },
     }
 }
 

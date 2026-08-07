@@ -21,7 +21,7 @@ use blockd_sim::{cluster, harness, presets};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: sweep <chaos|cluster|migration> <start-seed> <count>\n\
+        "usage: sweep <chaos|cluster|migration|peer-stash|peer-rare> <start-seed> <count>\n\
          optional environment:\n\
          BLOCKD_SWEEP_ARTIFACT_DIR=<path>  retain replay data for failures\n\
          BLOCKD_SWEEP_REQUIRE_COVERAGE=1   fail if the range misses preset faults"
@@ -42,6 +42,7 @@ struct Coverage {
     migrations: u64,
     peer_drops: u64,
     peer_dups: u64,
+    peer_faults: u64,
 }
 
 impl Coverage {
@@ -57,6 +58,7 @@ impl Coverage {
         self.migrations += other.migrations;
         self.peer_drops += other.peer_drops;
         self.peer_dups += other.peer_dups;
+        self.peer_faults += other.peer_faults;
     }
 
     fn missing_for(&self, preset: &str) -> Vec<&'static str> {
@@ -76,6 +78,7 @@ impl Coverage {
                 (self.peer_drops, "peer message drop"),
                 (self.peer_dups, "peer message duplicate"),
             ],
+            "peer-stash" | "peer-rare" => vec![(self.peer_faults, "peer-stash fault")],
             _ => unreachable!("preset validated in main"),
         };
         required
@@ -168,6 +171,33 @@ fn run_one(preset: &str, seed: u64) -> Outcome {
                 report: format!("{report:#?}"),
             }
         }
+        "peer-stash" | "peer-rare" => {
+            let config = if preset == "peer-stash" {
+                presets::peer_stash_chaos()
+            } else {
+                presets::peer_stash_rare()
+            };
+            let config_debug = format!("{config:#?}");
+            let report = cluster::run(seed, config);
+            Outcome {
+                trace_hash: report.trace_hash,
+                violations: report.violations.clone(),
+                completed_ops: report.completed_ops,
+                coverage: Coverage {
+                    runs: 1,
+                    completed_ops: report.completed_ops,
+                    crashes: report.host_crashes,
+                    store_retries: report.store_retries,
+                    recoveries: report.recoveries,
+                    peer_drops: report.peer_drops,
+                    peer_dups: report.peer_dups,
+                    peer_faults: report.fault_coverage.values().sum(),
+                    ..Coverage::default()
+                },
+                config: config_debug,
+                report: format!("{report:#?}"),
+            }
+        }
         _ => unreachable!("preset validated in main"),
     }
 }
@@ -222,7 +252,10 @@ fn main() -> ExitCode {
     let [_, preset, start, count] = args.as_slice() else {
         return usage();
     };
-    if !matches!(preset.as_str(), "chaos" | "cluster" | "migration") {
+    if !matches!(
+        preset.as_str(),
+        "chaos" | "cluster" | "migration" | "peer-stash" | "peer-rare"
+    ) {
         return usage();
     }
     let (Ok(start), Ok(count)) = (start.parse::<u64>(), count.parse::<u64>()) else {
@@ -318,6 +351,10 @@ mod tests {
                 "peer message drop",
                 "peer message duplicate"
             ]
+        );
+        assert_eq!(
+            Coverage::default().missing_for("peer-stash"),
+            ["peer-stash fault"]
         );
     }
 

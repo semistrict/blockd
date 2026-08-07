@@ -26,7 +26,7 @@
 //!   bytes, verbatim (R8.4: transfers move stored bytes unchanged)
 //! - `b/<base:016x>/…` — bases (lineage milestone)
 
-use crate::types::{JournalSeq, SegId, VsetId};
+use crate::types::{HostId, JournalSeq, SegId, VsetId};
 
 pub fn journal_blob(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
     format!("v/{:016x}/j/{fence:016x}-{:016x}.rec", vset.0, seq.0)
@@ -106,6 +106,29 @@ pub fn base_segment_key(base: u64, fence: u64, seg: SegId) -> String {
 /// this host gave the vset away and may only serve peer fetches for it.
 pub fn handoff_blob(vset: VsetId) -> String {
     format!("v/{:016x}/handoff", vset.0)
+}
+
+/// Generation zero of an append-only passive-replica spool. Kept as the
+/// original spelling for on-disk compatibility.
+pub fn replica_spool_blob(source: HostId, vset: VsetId, assignment_epoch: u64) -> String {
+    replica_spool_segment_blob(source, vset, assignment_epoch, 0)
+}
+
+/// One bounded append-only spool generation. Callers supply typed fields
+/// only; no network-provided path is accepted. Generation zero retains the
+/// pre-rotation name, while later generations sort after it numerically.
+pub fn replica_spool_segment_blob(
+    source: HostId,
+    vset: VsetId,
+    assignment_epoch: u64,
+    generation: u64,
+) -> String {
+    let suffix = if generation == 0 {
+        format!("{assignment_epoch:016x}.spool")
+    } else {
+        format!("{assignment_epoch:016x}-{generation:016x}.spool")
+    };
+    format!("r/{:04x}/{:016x}/{suffix}", source.0, vset.0)
 }
 
 /// Parse an object-store key back into its meaning (GC's mark phase).
@@ -231,9 +254,37 @@ pub enum BlobName {
     Handoff {
         vset: VsetId,
     },
+    ReplicaSpool {
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        generation: u64,
+    },
 }
 
 pub fn parse_blob(name: &str) -> Option<BlobName> {
+    if let Some(rest) = name.strip_prefix("r/") {
+        let mut parts = rest.split('/');
+        let source = HostId(u16::from_str_radix(parts.next()?, 16).ok()?);
+        let vset = VsetId(u64::from_str_radix(parts.next()?, 16).ok()?);
+        let file = parts.next()?.strip_suffix(".spool")?;
+        let (assignment, generation) = match file.split_once('-') {
+            None => (file, 0),
+            Some((assignment, generation)) => {
+                (assignment, u64::from_str_radix(generation, 16).ok()?)
+            }
+        };
+        let assignment_epoch = u64::from_str_radix(assignment, 16).ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(BlobName::ReplicaSpool {
+            source,
+            vset,
+            assignment_epoch,
+            generation,
+        });
+    }
     let rest = name.strip_prefix("v/")?;
     let (vset_hex, rest) = rest.split_once('/')?;
     let vset = VsetId(u64::from_str_radix(vset_hex, 16).ok()?);
@@ -286,6 +337,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn names_are_pinned_and_parse_back() {
         let vset = VsetId(0x0BAD_CAFE);
         assert_eq!(
@@ -306,6 +358,32 @@ mod tests {
             "v/000000000badcafe/s/0000000000000002-0000000000000003"
         );
         assert_eq!(vset_prefix(vset), "v/000000000badcafe/");
+        assert_eq!(
+            replica_spool_blob(HostId(3), vset, 9),
+            "r/0003/000000000badcafe/0000000000000009.spool"
+        );
+        assert_eq!(
+            parse_blob("r/0003/000000000badcafe/0000000000000009.spool"),
+            Some(BlobName::ReplicaSpool {
+                source: HostId(3),
+                vset,
+                assignment_epoch: 9,
+                generation: 0,
+            })
+        );
+        assert_eq!(
+            replica_spool_segment_blob(HostId(3), vset, 9, 2),
+            "r/0003/000000000badcafe/0000000000000009-0000000000000002.spool"
+        );
+        assert_eq!(
+            parse_blob("r/0003/000000000badcafe/0000000000000009-0000000000000002.spool"),
+            Some(BlobName::ReplicaSpool {
+                source: HostId(3),
+                vset,
+                assignment_epoch: 9,
+                generation: 2,
+            })
+        );
         assert_eq!(
             leaf_blob(vset, 2, 7),
             "v/000000000badcafe/l/0000000000000002-0000000000000007.map"

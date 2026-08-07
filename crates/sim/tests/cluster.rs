@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout;
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, Verdict};
 use blockd_core::types::{
@@ -33,7 +33,7 @@ fn config() -> VsetConfig {
     VsetConfig {
         disk_volumes: 1,
         pages_per_volume: 4,
-        backed_up: true,
+        durability: DurabilityMode::Backup,
     }
 }
 
@@ -46,6 +46,7 @@ fn daemon(host: u16) -> Daemon {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
+        replica_placement: None,
     })
     .0
 }
@@ -537,7 +538,7 @@ fn two_hundred_forks_hold_one_resident_copy_of_each_base_page() {
     );
 
     let fork_config = VsetConfig {
-        backed_up: false, // forks read shared data, write nothing (R4.4)
+        durability: DurabilityMode::Local, // forks read shared data, write nothing (R4.4)
         ..config()
     };
     for (req, fork) in (100u64..).zip(0..200u64) {

@@ -297,6 +297,74 @@ impl ObjectStore {
 }
 
 #[cfg(test)]
+mod assignment_tests {
+    use blockd_core::head::{HeadRecord, StashAssignment};
+    use blockd_core::layout;
+    use blockd_core::types::{HostId, VsetId};
+
+    use super::*;
+    use crate::rng::Pcg64;
+
+    #[test]
+    fn competing_assignment_cas_writes_linearize_to_exactly_one_winner() {
+        let vset = VsetId(9);
+        let key = layout::head_key(vset);
+        let base = HeadRecord {
+            vset,
+            holder: HostId(0),
+            fence: 4,
+            manifest: None,
+            stash: Some(StashAssignment {
+                assignment_epoch: 1,
+                active_peer: HostId(1),
+                active_assignment_epoch: 1,
+                transition_peer: None,
+                membership_epoch: 7,
+            }),
+            retired_stashes: Vec::new(),
+        };
+        let mut store = ObjectStore::new(StoreConfig::s3());
+        let mut rng = Pcg64::new(71, 0);
+        let (_, created) = store.put_cas(SimTime::ZERO, &mut rng, &key, None, base.encode());
+        let version = created.expect("create head");
+
+        let proposal = |transition_peer| HeadRecord {
+            stash: Some(StashAssignment {
+                assignment_epoch: 2,
+                active_peer: HostId(1),
+                active_assignment_epoch: 1,
+                transition_peer: Some(transition_peer),
+                membership_epoch: 7,
+            }),
+            ..base.clone()
+        };
+        let (_, first) = store.put_cas(
+            SimTime::ZERO,
+            &mut rng,
+            &key,
+            Some(version),
+            proposal(HostId(2)).encode(),
+        );
+        let (_, second) = store.put_cas(
+            SimTime::ZERO,
+            &mut rng,
+            &key,
+            Some(version),
+            proposal(HostId(3)).encode(),
+        );
+        assert!(first.is_ok());
+        assert!(matches!(second, Err(StoreError::CasConflict { .. })));
+
+        let (_, stored) = store.get(SimTime::ZERO, &mut rng, &key);
+        let (_, bytes) = stored.expect("read").expect("head");
+        let head = HeadRecord::decode(vset, &bytes).expect("valid head");
+        let assignment = head.stash.expect("assignment");
+        assert_eq!(assignment.assignment_epoch, 2);
+        assert_eq!(assignment.transition_peer, Some(HostId(2)));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use blockd_core::format::{open_frame, seal_frame};

@@ -19,13 +19,44 @@ use crate::types::{
 
 pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
 
+/// Immutable durability policy of a vset (R4.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum DurabilityMode {
+    /// Durable on this host only; never writes cluster-owned objects.
+    Local = 0,
+    /// Local durability with asynchronous object-store backup.
+    Backup = 1,
+    /// Backup plus guest-sync acknowledgment gated on one passive peer.
+    PeerStashed = 2,
+}
+
+impl DurabilityMode {
+    pub const fn uses_store(self) -> bool {
+        matches!(self, Self::Backup | Self::PeerStashed)
+    }
+
+    pub const fn requires_peer_sync(self) -> bool {
+        matches!(self, Self::PeerStashed)
+    }
+
+    fn decode(version: u16, value: u8) -> Result<Self, DecodeError> {
+        match (version, value) {
+            (4 | 5, 0) => Ok(Self::Local),
+            (4 | 5, 1) => Ok(Self::Backup),
+            (5, 2) => Ok(Self::PeerStashed),
+            _ => Err(DecodeError),
+        }
+    }
+}
+
 /// Immutable configuration of a vset, carried in every record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VsetConfig {
     pub disk_volumes: u8,
     pub pages_per_volume: u32,
     /// The one durability knob, set at creation, immutable (R4.1).
-    pub backed_up: bool,
+    pub durability: DurabilityMode,
 }
 
 impl VsetConfig {
@@ -68,7 +99,7 @@ pub struct JournalRecord {
     /// across records, so it survives reclamation of the record that
     /// originally covered a sync. Recovery must never choose a resume point
     /// older than the highest watermark it can see.
-    pub synced_through: u64,
+    pub sync_covered_through: u64,
     /// Map entries newer than their span's leaf (bounded by the writer's
     /// overlay cap). Overlay wins over leaf on lookup.
     pub overlay: BTreeMap<PageId, (Gen, PageLoc)>,
@@ -86,7 +117,7 @@ pub struct JournalRecord {
 impl JournalRecord {
     pub fn encode(&self, vset: VsetId) -> Vec<u8> {
         let mut e = Enc::new();
-        e.u16(4); // version
+        e.u16(5); // version
         e.u32(u32::try_from(page_size()).expect("page size fits u32"));
         e.u64(vset.0);
         e.u64(self.seq.0);
@@ -104,7 +135,7 @@ impl JournalRecord {
             }
         }
         e.u64(self.capture_seq);
-        e.u64(self.synced_through);
+        e.u64(self.sync_covered_through);
         match self.migrated_from {
             None => {
                 e.u8(0);
@@ -117,7 +148,7 @@ impl JournalRecord {
         }
         e.u8(self.config.disk_volumes);
         e.u32(self.config.pages_per_volume);
-        e.u8(u8::from(self.config.backed_up));
+        e.u8(self.config.durability as u8);
         e.u32(u32::try_from(self.overlay.len()).expect("overlay count fits u32"));
         for (page, (generation, loc)) in &self.overlay {
             e.u8(page.volume.idx.0);
@@ -143,7 +174,8 @@ impl JournalRecord {
     pub fn decode(vset: VsetId, bytes: &[u8]) -> Result<JournalRecord, DecodeError> {
         let payload = open_frame(MAGIC_JOURNAL, bytes)?;
         let mut d = Dec::new(payload);
-        if d.u16()? != 4 {
+        let version = d.u16()?;
+        if !matches!(version, 4 | 5) {
             return Err(DecodeError);
         }
         if d.u32()? != u32::try_from(page_size()).expect("page size fits u32") {
@@ -163,7 +195,7 @@ impl JournalRecord {
             _ => return Err(DecodeError),
         };
         let capture_seq = d.u64()?;
-        let synced_through = d.u64()?;
+        let sync_covered_through = d.u64()?;
         let migrated_from = match (d.u8()?, d.u16()?) {
             (0, 0) => None,
             (1, source) => Some(HostId(source)),
@@ -172,11 +204,7 @@ impl JournalRecord {
         let config = VsetConfig {
             disk_volumes: d.u8()?,
             pages_per_volume: d.u32()?,
-            backed_up: match d.u8()? {
-                0 => false,
-                1 => true,
-                _ => return Err(DecodeError),
-            },
+            durability: DurabilityMode::decode(version, d.u8()?)?,
         };
         let count = d.u32()?;
         let mut overlay = BTreeMap::new();
@@ -222,7 +250,7 @@ impl JournalRecord {
             fence,
             kind,
             capture_seq,
-            synced_through,
+            sync_covered_through,
             overlay,
             leaves,
             migrated_from,
@@ -283,7 +311,7 @@ mod tests {
             config: VsetConfig {
                 disk_volumes: 2,
                 pages_per_volume: 16,
-                backed_up: true,
+                durability: DurabilityMode::Backup,
             },
             seq: JournalSeq(5),
             fence: 6,
@@ -292,7 +320,7 @@ mod tests {
                 vmstate: 41,
             },
             capture_seq: 99,
-            synced_through: 90,
+            sync_covered_through: 90,
             overlay: pages,
             leaves: BTreeMap::from([(
                 0x100,
@@ -313,8 +341,8 @@ mod tests {
         assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
         // Byte pin (R10.2): any change here is a storage format change.
         let expected = match page_size() {
-            4096 => (210, 0xB331_2082),
-            16_384 => (210, 0xE607_F736),
+            4096 => (210, 0x12DF_6CBD),
+            16_384 => (210, 0x47E9_BB09),
             size => panic!("byte pin missing for {size}-byte pages"),
         };
         assert_eq!((bytes.len(), crc32c(&bytes)), expected);
@@ -353,6 +381,34 @@ mod tests {
         payload[2..6].copy_from_slice(&incompatible.to_le_bytes());
         let incompatible = seal_frame(MAGIC_JOURNAL, &payload);
         assert!(JournalRecord::decode(VsetId(0xA1), &incompatible).is_err());
+    }
+
+    #[test]
+    fn version_four_records_keep_their_original_durability_meaning() {
+        for durability in [DurabilityMode::Local, DurabilityMode::Backup] {
+            let mut record = sample_record();
+            record.config.durability = durability;
+            let encoded = record.encode(VsetId(0xA1));
+            let mut payload = open_frame(MAGIC_JOURNAL, &encoded)
+                .expect("new record opens")
+                .to_vec();
+            payload[0..2].copy_from_slice(&4u16.to_le_bytes());
+            let legacy = seal_frame(MAGIC_JOURNAL, &payload);
+            assert_eq!(JournalRecord::decode(VsetId(0xA1), &legacy), Ok(record));
+        }
+    }
+
+    #[test]
+    fn version_four_cannot_claim_peer_stashed_durability() {
+        let mut record = sample_record();
+        record.config.durability = DurabilityMode::PeerStashed;
+        let encoded = record.encode(VsetId(0xA1));
+        let mut payload = open_frame(MAGIC_JOURNAL, &encoded)
+            .expect("new record opens")
+            .to_vec();
+        payload[0..2].copy_from_slice(&4u16.to_le_bytes());
+        let legacy = seal_frame(MAGIC_JOURNAL, &payload);
+        assert!(JournalRecord::decode(VsetId(0xA1), &legacy).is_err());
     }
 
     /// The record for a LARGE vset must stay small: a million written
@@ -423,7 +479,7 @@ mod tests {
             config: VsetConfig {
                 disk_volumes: 0,
                 pages_per_volume: total,
-                backed_up: true,
+                durability: DurabilityMode::Backup,
             },
             seq: JournalSeq(9),
             fence: 3,
@@ -432,7 +488,7 @@ mod tests {
                 vmstate: 42,
             },
             capture_seq: u64::from(total),
-            synced_through: 0,
+            sync_covered_through: 0,
             overlay,
             leaves,
             migrated_from: None,

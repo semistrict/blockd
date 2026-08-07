@@ -351,7 +351,7 @@ mod tests {
         VsetConfig {
             disk_volumes: 1,
             pages_per_volume: 2,
-            backed_up: false,
+            durability: blockd_core::journal::DurabilityMode::Local,
         }
     }
 

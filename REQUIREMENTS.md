@@ -129,16 +129,20 @@ them; grouped by what would break if they were dropped.
   can never observe that disk at a state older than the sync point, and
   every captured disk state is a crash-consistent point of that device's
   write history — nothing written after a sync barrier is present unless
-  everything before it is. The durability domain is the host's local disk,
-  exactly as for any checkpoint (R3.6): a partial checkpoint need not
-  survive host loss, but the ordering guarantee holds across daemon crash
-  and restart.
+  everything before it is. In local and ordinary backup mode the durability
+  domain is the host's local disk, exactly as for any checkpoint (R3.6): a
+  partial checkpoint need not survive host loss, but the ordering guarantee
+  holds across daemon crash and restart. Peer-stashed mode strengthens only
+  the durability domain as specified by R4.7; it does not change the device
+  ordering or checkpoint semantics.
 
-## R4 — Durability: local first, S3 is backup
+## R4 — Durability: local first, S3 is backup, one optional peer protects sync
 
-- **R4.1** One durability knob per vset, at creation, immutable: backed up
-  to the object store, or not. Both modes are first-class; nothing else
-  about durability is configuration.
+- **R4.1** One durability knob per vset, at creation, immutable: local only,
+  asynchronously backed up to the object store, or asynchronously backed up
+  with guest syncs additionally protected by one passive peer. All three
+  modes are first-class; placement of that peer is mutable operational state,
+  not another durability mode.
 - **R4.2** The object store is **backup**: an asynchronous background copy
   of locally durable state, flowing continuously as writeback commits it —
   not gated on checkpoints. Its one non-backup use is
@@ -167,6 +171,27 @@ them; grouped by what would break if they were dropped.
   system requires of it only: strong read-after-write consistency,
   conditional writes (compare-and-swap by version), and objects up to
   64 MiB. Anything speaking that contract (S3, GCS) must work.
+- **R4.7** In peer-stashed mode a guest sync is acknowledged only after its
+  disk recovery closure is durable on the primary and on exactly one passive
+  peer, or after an equal or newer point has already been published by the
+  object store. The closure is the stored, compressed immutable artifacts and
+  record needed to cold-boot at the barrier; it is neither guest RAM nor every
+  provisioned page. The peer is recovery storage, not an owner or runner. Loss
+  of both primary and active stash before the object store catches up is the
+  declared two-machine failure boundary.
+- **R4.8** Peer-stashed data flows primary to one active stash and from that
+  stash to the object store. Candidate peers and virtual-node placement must
+  never cause steady-state fanout. When the active stash is unavailable, new
+  sync acknowledgments stop until one replacement has durably committed a
+  covering baseline and its assignment is published by the same fenced head
+  authority as R6.3. Sequential machine failures before that repair completes
+  are outside R4.7's single-failure guarantee.
+- **R4.9** A passive stash retains committed residue until an object-store head
+  CAS publishes an equal or newer recovery point. Reclamation is explicit,
+  monotone, and implemented by unlinking wholly covered sealed spool files;
+  it never rewrites live residue or deletes it by age. Capacity exhaustion
+  stalls new protected syncs and is observable rather than evicting unbacked
+  data.
 
 ## R5 — Lineage: bases and forks
 
@@ -190,11 +215,15 @@ them; grouped by what would break if they were dropped.
 
 ## R6 — Restore and placement
 
-- **R6.1** Any backed-up vset can be brought back on any host of the
+- **R6.1** Any object-store-backed vset can be brought back on any host of the
   cluster from the object store alone, at its newest backed-up recovery
   point (R8.2) — restored if that point is a whole checkpoint, cold-booted
   at sync consistency otherwise: no prior local state, no reachable
-  previous host, and no requirement that a checkpoint was ever taken.
+  previous host, and no requirement that a checkpoint was ever taken. A
+  peer-stashed vset whose newest protected sync is ahead of that point instead
+  requires a complete verified closure from its recorded stash assignment; it
+  must never silently present the older object-store point as satisfying the
+  stronger guarantee.
 - **R6.2** A restore onto a host with none of the vset's bytes reaches the
   guest's first instruction in under 200 ms from a warm object store,
   independent of vset size — by fetching only what the resume touches (a
@@ -220,6 +249,13 @@ them; grouped by what would break if they were dropped.
 - **R6.5** The control plane's only obligations are liveness policy (when to
   claim), placement preference, roster and certificates, and never reusing a
   vset id.
+- **R6.6** The fenced per-vset head is also the durable authority for the one
+  active stash assignment and any in-progress replacement. Health observations
+  and deterministic virtual-node rankings are placement inputs, not authority.
+  An assignment change is a rare conditional head update and never enters the
+  steady-state guest sync path. During replacement the head names both the old
+  active peer and the single transition peer so recovery can inventory exactly
+  the possible holders without searching the cluster.
 
 ## R7 — Migration
 
@@ -259,7 +295,10 @@ them; grouped by what would break if they were dropped.
   local or peer copy — which is fault-path reality, not a durability
   failure; a vset whose working bytes are on its host or a peer runs
   through the outage untouched, and the source-preference order (R2.3)
-  is what keeps that population large.
+  is what keeps that population large. In peer-stashed mode, a healthy stash
+  lets guest syncs continue through the outage while bounded, observable
+  residue grows. Loss of that stash stalls new sync acknowledgments until
+  replacement completes; it never permits an optimistic acknowledgment.
 - **R8.4** Bytes are stored compressed **on local disk and in S3 alike**,
   and stay compressed in flight between tiers — one scheme end-to-end, so
   transfers move stored bytes verbatim and the fault path pays at most one
@@ -274,8 +313,13 @@ them; grouped by what would break if they were dropped.
   patched Firecracker, root, and kernel swap off — nothing else stateful.
 - **R9.2** The operable minimum of observability: per-vset fault latency by
   source, hydration progress, the backup lag, dirty rate, memory and disk
-  pressure, assignment claims and fences — as Prometheus series with a
-  fixed, bounded label vocabulary. The pressure signals are load-bearing,
+  pressure, assignment claims and fences, and for peer-stashed vsets the
+  active/transition peer, assignment epoch, protected-sync lag, spool bytes
+  and capacity, stalled syncs, retries, integrity rejects, replacement bytes,
+  and cleanup unlinks — as Prometheus series with a fixed, bounded label
+  vocabulary. Steady-state bytes sent to non-active peers and bytes rewritten
+  by stash cleanup are invariant counters and must remain zero. The pressure
+  signals are load-bearing,
   not best-effort: with no admission refusal (R2.5) and no kills, they are
   the *only* trigger for relief, and their absence under pressure is
   itself a defect.

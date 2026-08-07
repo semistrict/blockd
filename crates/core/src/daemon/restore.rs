@@ -105,6 +105,14 @@ impl Daemon {
             fail(out);
             return;
         };
+        if head.stash.is_some() {
+            // A peer-stashed head does not record the peer's protected-sync
+            // watermark. The assigned peer may therefore hold a newer
+            // recovery point than the published manifest. Only the operator
+            // inventory path can compare both copies before claiming.
+            fail(out);
+            return;
+        }
         let Some(ptr) = head.manifest else {
             // Nothing ever backed up: nothing to restore (R6.1 applies to
             // backed-up recovery points).
@@ -117,6 +125,8 @@ impl Daemon {
             // Informational; the authoritative fence is the CAS version.
             fence: 0,
             manifest: Some(ptr),
+            stash: head.stash,
+            retired_stashes: head.retired_stashes,
         };
         let io = self.io();
         self.pending
@@ -217,7 +227,7 @@ impl Daemon {
         // The manifest is the newest backed-up recovery point (R6.1): its
         // kind decides the recovery style (R4.3).
         let resume = matches!(record.kind, RecordKind::Checkpoint { .. })
-            && record.capture_seq >= record.synced_through;
+            && record.capture_seq >= record.sync_covered_through;
         let mut chosen = record;
         let verdict = if resume {
             let RecordKind::Checkpoint { epoch, vmstate } = chosen.kind else {
@@ -248,7 +258,10 @@ impl Daemon {
             state.epoch = Epoch(0);
         }
         state.mutation_seq = chosen.capture_seq;
-        state.durable_watermark = chosen.synced_through;
+        state.local_covered_through = chosen.sync_covered_through;
+        // The chosen record was fetched through the published manifest, so
+        // it satisfies the stronger mode without consulting a peer.
+        state.sync_ack_through = chosen.sync_covered_through;
         state.next_seq = chosen.seq.0 + 1;
         state.next_seg = 0; // fresh fence namespace: no collisions possible
         state.next_gen = chosen
@@ -434,7 +447,8 @@ impl Daemon {
             .collect();
         // Own-namespace leaves fetched from the store are, by definition,
         // already backed — as are the segments they reference.
-        let backed = state.config.backed_up && state.peer_source.is_none() && ptr.base == 0;
+        let backed =
+            state.config.durability.uses_store() && state.peer_source.is_none() && ptr.base == 0;
         if backed {
             state.backed_leaves.insert((ptr.fence, ptr.id));
             state.backed_segs.extend(segs.iter().copied());
@@ -498,7 +512,7 @@ impl Daemon {
         };
         // R4.4: only backed-up vsets may write objects; and a fenced or
         // outbound vset has no business publishing anything.
-        if !state.config.backed_up || !state.ready || state.outbound.is_some() {
+        if !state.config.durability.uses_store() || !state.ready || state.outbound.is_some() {
             return;
         }
         let bytes = encode_resume_set(vset, &pages);

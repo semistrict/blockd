@@ -12,8 +12,8 @@
 //! verbatim, damage included (R8.1: the reader decides).
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::seam::{IoId, PeerMsg};
-use crate::types::{HostId, SegId, VsetId};
+use crate::seam::{IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo};
+use crate::types::{HostId, JournalSeq, SegId, VsetId};
 
 pub const MAGIC_PEER: u32 = u32::from_le_bytes(*b"BPM1");
 
@@ -43,10 +43,83 @@ fn decode_opt_bytes(d: &mut Dec) -> Result<Option<Vec<u8>>, DecodeError> {
     }
 }
 
+fn artifact(e: &mut Enc, artifact: ReplicaArtifact) {
+    match artifact {
+        ReplicaArtifact::Segment { fence, seg } => {
+            e.u8(0);
+            e.u64(fence);
+            e.u64(seg.0);
+        }
+        ReplicaArtifact::Leaf { fence, id } => {
+            e.u8(1);
+            e.u64(fence);
+            e.u64(id);
+        }
+    }
+}
+
+fn decode_artifact(d: &mut Dec) -> Result<ReplicaArtifact, DecodeError> {
+    match d.u8()? {
+        0 => Ok(ReplicaArtifact::Segment {
+            fence: d.u64()?,
+            seg: SegId(d.u64()?),
+        }),
+        1 => Ok(ReplicaArtifact::Leaf {
+            fence: d.u64()?,
+            id: d.u64()?,
+        }),
+        _ => Err(DecodeError),
+    }
+}
+
+fn commit_info(e: &mut Enc, info: ReplicaCommitInfo) {
+    e.u64(info.writer_fence);
+    e.u64(info.seq.0);
+    e.u64(info.sync_covered_through);
+}
+
+fn decode_commit_info(d: &mut Dec) -> Result<ReplicaCommitInfo, DecodeError> {
+    Ok(ReplicaCommitInfo {
+        writer_fence: d.u64()?,
+        seq: JournalSeq(d.u64()?),
+        sync_covered_through: d.u64()?,
+    })
+}
+
 /// Encode one message as a sealed frame carrying the sender's identity.
+#[allow(clippy::too_many_lines)]
 pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
+    encode_peer_version(from, msg, 2).expect("current protocol encodes every message")
+}
+
+/// Encode for a peer whose rolling-deployment protocol version is known by
+/// the control plane. Version 1 carries only the original migration messages;
+/// peer-stash messages fail closed until both endpoints support version 2.
+#[allow(clippy::too_many_lines)]
+pub fn encode_peer_version(
+    from: HostId,
+    msg: &PeerMsg,
+    version: u16,
+) -> Result<Vec<u8>, DecodeError> {
+    if !matches!(version, 1 | 2)
+        || (version == 1
+            && matches!(
+                msg,
+                PeerMsg::ReplicaPut { .. }
+                    | PeerMsg::ReplicaPutAck { .. }
+                    | PeerMsg::ReplicaCommit { .. }
+                    | PeerMsg::ReplicaCommitAck { .. }
+                    | PeerMsg::ReplicaStatus { .. }
+                    | PeerMsg::ReplicaStatusReply { .. }
+                    | PeerMsg::ReplicaUploadDone { .. }
+                    | PeerMsg::ReplicaRelease { .. }
+                    | PeerMsg::ReplicaReleaseAck { .. }
+            ))
+    {
+        return Err(DecodeError);
+    }
     let mut e = Enc::new();
-    e.u16(1); // version
+    e.u16(version);
     e.u16(from.0);
     match msg {
         PeerMsg::MigrateOffer { vset, record } => {
@@ -107,18 +180,132 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
             e.u8(7);
             e.u64(vset.0);
         }
+        PeerMsg::ReplicaPut {
+            vset,
+            assignment_epoch,
+            artifact: id,
+            checksum,
+            bytes,
+        } => {
+            e.u8(8);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            artifact(&mut e, *id);
+            e.u32(*checksum);
+            e.u32(u32::try_from(bytes.len()).expect("artifact fits u32"));
+            e.bytes(bytes);
+        }
+        PeerMsg::ReplicaPutAck {
+            vset,
+            assignment_epoch,
+            artifact: id,
+            checksum,
+        } => {
+            e.u8(9);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            artifact(&mut e, *id);
+            e.u32(*checksum);
+        }
+        PeerMsg::ReplicaCommit {
+            vset,
+            assignment_epoch,
+            info,
+            required,
+            record,
+        } => {
+            e.u8(10);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            commit_info(&mut e, *info);
+            e.u32(u32::try_from(required.len()).expect("required count fits u32"));
+            for id in required {
+                artifact(&mut e, *id);
+            }
+            e.u32(u32::try_from(record.len()).expect("record fits u32"));
+            e.bytes(record);
+        }
+        PeerMsg::ReplicaCommitAck {
+            vset,
+            assignment_epoch,
+            info,
+        } => {
+            e.u8(11);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            commit_info(&mut e, *info);
+        }
+        PeerMsg::ReplicaStatus {
+            vset,
+            assignment_epoch,
+        } => {
+            e.u8(12);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+        }
+        PeerMsg::ReplicaStatusReply {
+            vset,
+            assignment_epoch,
+            committed,
+        } => {
+            e.u8(13);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            match committed {
+                None => e.u8(0),
+                Some(info) => {
+                    e.u8(1);
+                    commit_info(&mut e, *info);
+                }
+            }
+        }
+        PeerMsg::ReplicaUploadDone {
+            vset,
+            assignment_epoch,
+            info,
+        } => {
+            e.u8(14);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            commit_info(&mut e, *info);
+        }
+        PeerMsg::ReplicaRelease {
+            vset,
+            assignment_epoch,
+            through,
+        } => {
+            e.u8(15);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            commit_info(&mut e, *through);
+        }
+        PeerMsg::ReplicaReleaseAck {
+            vset,
+            assignment_epoch,
+            through,
+        } => {
+            e.u8(16);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            commit_info(&mut e, *through);
+        }
     }
-    seal_frame(MAGIC_PEER, &e.finish())
+    Ok(seal_frame(MAGIC_PEER, &e.finish()))
 }
 
 /// Verify and decode one frame. Any damage, unknown version, unknown
 /// discriminant, or trailing bytes is one answer: corrupt — the transport
 /// drops the frame (and typically the connection) and the retry timers
 /// re-drive.
+#[allow(clippy::too_many_lines)]
 pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
+    if bytes.len() > crate::format::FRAME_HEADER + MAX_PEER_PAYLOAD as usize {
+        return Err(DecodeError);
+    }
     let payload = open_frame(MAGIC_PEER, bytes)?;
     let mut d = Dec::new(payload);
-    if d.u16()? != 1 {
+    let version = d.u16()?;
+    if !matches!(version, 1 | 2) {
         return Err(DecodeError);
     }
     let from = HostId(d.u16()?);
@@ -161,6 +348,80 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
         7 => PeerMsg::ReleasedAck {
             vset: VsetId(d.u64()?),
         },
+        8 if version == 2 => {
+            let vset = VsetId(d.u64()?);
+            let assignment_epoch = d.u64()?;
+            let artifact = decode_artifact(&mut d)?;
+            let checksum = d.u32()?;
+            let len = usize::try_from(d.u32()?).expect("u32 fits usize");
+            PeerMsg::ReplicaPut {
+                vset,
+                assignment_epoch,
+                artifact,
+                checksum,
+                bytes: d.bytes(len)?.to_vec(),
+            }
+        }
+        9 if version == 2 => PeerMsg::ReplicaPutAck {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+            artifact: decode_artifact(&mut d)?,
+            checksum: d.u32()?,
+        },
+        10 if version == 2 => {
+            let vset = VsetId(d.u64()?);
+            let assignment_epoch = d.u64()?;
+            let info = decode_commit_info(&mut d)?;
+            let count = d.u32()?;
+            if count > 1_000_000 {
+                return Err(DecodeError);
+            }
+            let mut required = Vec::new();
+            for _ in 0..count {
+                required.push(decode_artifact(&mut d)?);
+            }
+            let len = usize::try_from(d.u32()?).expect("u32 fits usize");
+            PeerMsg::ReplicaCommit {
+                vset,
+                assignment_epoch,
+                info,
+                required,
+                record: d.bytes(len)?.to_vec(),
+            }
+        }
+        11 if version == 2 => PeerMsg::ReplicaCommitAck {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+            info: decode_commit_info(&mut d)?,
+        },
+        12 if version == 2 => PeerMsg::ReplicaStatus {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+        },
+        13 if version == 2 => PeerMsg::ReplicaStatusReply {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+            committed: match d.u8()? {
+                0 => None,
+                1 => Some(decode_commit_info(&mut d)?),
+                _ => return Err(DecodeError),
+            },
+        },
+        14 if version == 2 => PeerMsg::ReplicaUploadDone {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+            info: decode_commit_info(&mut d)?,
+        },
+        15 if version == 2 => PeerMsg::ReplicaRelease {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+            through: decode_commit_info(&mut d)?,
+        },
+        16 if version == 2 => PeerMsg::ReplicaReleaseAck {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+            through: decode_commit_info(&mut d)?,
+        },
         _ => return Err(DecodeError),
     };
     d.finish()?;
@@ -172,7 +433,18 @@ mod tests {
     use super::*;
     use crate::format::crc32c;
 
+    #[allow(clippy::too_many_lines)]
     fn samples() -> Vec<PeerMsg> {
+        let segment = ReplicaArtifact::Segment {
+            fence: 4,
+            seg: SegId(12),
+        };
+        let leaf = ReplicaArtifact::Leaf { fence: 4, id: 8 };
+        let info = ReplicaCommitInfo {
+            writer_fence: 4,
+            seq: JournalSeq(13),
+            sync_covered_through: 99,
+        };
         vec![
             PeerMsg::MigrateOffer {
                 vset: VsetId(7),
@@ -212,6 +484,60 @@ mod tests {
             },
             PeerMsg::Released { vset: VsetId(7) },
             PeerMsg::ReleasedAck { vset: VsetId(7) },
+            PeerMsg::ReplicaPut {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                artifact: segment,
+                checksum: 0xAABB_CCDD,
+                bytes: vec![0x5A; 31],
+            },
+            PeerMsg::ReplicaPutAck {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                artifact: segment,
+                checksum: 0xAABB_CCDD,
+            },
+            PeerMsg::ReplicaCommit {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                info,
+                required: vec![segment, leaf],
+                record: vec![0xC3; 27],
+            },
+            PeerMsg::ReplicaCommitAck {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                info,
+            },
+            PeerMsg::ReplicaStatus {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+            },
+            PeerMsg::ReplicaStatusReply {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                committed: None,
+            },
+            PeerMsg::ReplicaStatusReply {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                committed: Some(info),
+            },
+            PeerMsg::ReplicaUploadDone {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                info,
+            },
+            PeerMsg::ReplicaRelease {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                through: info,
+            },
+            PeerMsg::ReplicaReleaseAck {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                through: info,
+            },
         ]
     }
 
@@ -224,6 +550,27 @@ mod tests {
     }
 
     #[test]
+    fn rolling_version_one_carries_old_messages_and_rejects_peer_stash() {
+        let samples = samples();
+        for msg in samples.iter().take(10) {
+            let framed = encode_peer_version(HostId(2), msg, 1).expect("v1 migration message");
+            assert_eq!(
+                &framed[crate::format::FRAME_HEADER..crate::format::FRAME_HEADER + 2],
+                &1u16.to_le_bytes()
+            );
+            assert_eq!(decode_peer(&framed), Ok((HostId(2), msg.clone())));
+        }
+        for msg in samples.iter().skip(10) {
+            assert!(
+                encode_peer_version(HostId(2), msg, 1).is_err(),
+                "peer-stash message must fail closed for a v1 destination: {msg:?}"
+            );
+        }
+        assert!(encode_peer_version(HostId(2), &samples[0], 0).is_err());
+        assert!(encode_peer_version(HostId(2), &samples[0], 3).is_err());
+    }
+
+    #[test]
     fn frames_are_byte_pinned() {
         // The concatenation of every sample frame pins the whole layout
         // (R10.2): any encoding change must be seen and decided.
@@ -231,47 +578,39 @@ mod tests {
             .iter()
             .flat_map(|msg| encode_peer(HostId(2), msg))
             .collect();
-        assert_eq!(bytes.len(), 1123);
-        assert_eq!(crc32c(&bytes), 0x8031_8DA2);
+        assert_eq!(bytes.len(), 1745);
+        assert_eq!(crc32c(&bytes), 0x7FE0_7441);
     }
 
     #[test]
-    fn any_single_bit_flip_is_rejected() {
-        let framed = encode_peer(
-            HostId(1),
-            &PeerMsg::FetchRange {
-                io: IoId(1),
-                vset: VsetId(2),
-                fence: 3,
-                seg: SegId(4),
-                offset: 5,
-                len: 6,
-            },
-        );
-        for bit in 0..framed.len() * 8 {
-            let mut damaged = framed.clone();
-            damaged[bit / 8] ^= 1 << (bit % 8);
-            assert!(
-                decode_peer(&damaged).is_err(),
-                "flip of bit {bit} went undetected"
-            );
+    fn any_single_bit_flip_of_every_variant_is_rejected() {
+        for (variant, message) in samples().iter().enumerate() {
+            let framed = encode_peer(HostId(1), message);
+            for bit in 0..framed.len() * 8 {
+                let mut damaged = framed.clone();
+                damaged[bit / 8] ^= 1 << (bit % 8);
+                assert!(
+                    decode_peer(&damaged).is_err(),
+                    "variant {variant} flip of bit {bit} went undetected"
+                );
+            }
         }
     }
 
     #[test]
     fn unknown_versions_discriminants_and_trailers_are_rejected() {
-        // Version 2 does not exist.
+        // Version 3 does not exist.
         let mut e = Enc::new();
+        e.u16(3);
         e.u16(2);
-        e.u16(1);
         e.u8(1);
         e.u64(7);
         assert!(decode_peer(&seal_frame(MAGIC_PEER, &e.finish())).is_err());
-        // Discriminant 8 does not exist.
+        // Discriminant 17 does not exist.
         let mut e = Enc::new();
-        e.u16(1);
-        e.u16(1);
-        e.u8(8);
+        e.u16(2);
+        e.u16(2);
+        e.u8(17);
         e.u64(7);
         assert!(decode_peer(&seal_frame(MAGIC_PEER, &e.finish())).is_err());
         // A presence byte outside {0, 1} is corrupt.
@@ -290,5 +629,28 @@ mod tests {
         e.u64(7);
         e.u8(0xFF);
         assert!(decode_peer(&seal_frame(MAGIC_PEER, &e.finish())).is_err());
+    }
+
+    #[test]
+    fn version_one_frames_remain_readable_but_cannot_claim_replica_messages() {
+        let msg = PeerMsg::MigrateAccept { vset: VsetId(7) };
+        let encoded = encode_peer(HostId(2), &msg);
+        let mut payload = open_frame(MAGIC_PEER, &encoded)
+            .expect("new peer frame opens")
+            .to_vec();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes());
+        let legacy = seal_frame(MAGIC_PEER, &payload);
+        assert_eq!(decode_peer(&legacy), Ok((HostId(2), msg)));
+
+        let replica = PeerMsg::ReplicaStatus {
+            vset: VsetId(7),
+            assignment_epoch: 3,
+        };
+        let encoded = encode_peer(HostId(2), &replica);
+        let mut payload = open_frame(MAGIC_PEER, &encoded)
+            .expect("new peer frame opens")
+            .to_vec();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes());
+        assert!(decode_peer(&seal_frame(MAGIC_PEER, &payload)).is_err());
     }
 }

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{Runtime, RuntimeConfig, S3Store};
 
@@ -53,7 +53,7 @@ fn vset_config() -> VsetConfig {
     VsetConfig {
         disk_volumes: 1,
         pages_per_volume: PAGES_PER_VOLUME,
-        backed_up: false,
+        durability: DurabilityMode::Local,
     }
 }
 
@@ -92,6 +92,7 @@ fn run_phase(noisy: usize) -> PhaseResult {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 500,
+            replica_placement: None,
         },
         blob_dir: scratch_dir(&format!("k{noisy}")),
         peer: None,

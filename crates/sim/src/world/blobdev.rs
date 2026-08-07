@@ -76,9 +76,15 @@ pub struct BlobDevCounters {
 pub struct BlobDev {
     config: BlobDevConfig,
     blobs: BTreeMap<String, Vec<u8>>,
-    inflight: BTreeMap<BdevIo, (String, Vec<u8>)>,
+    inflight: BTreeMap<BdevIo, (String, Vec<u8>, WriteKind)>,
     next_io: u64,
     pub counters: BlobDevCounters,
+}
+
+#[derive(Clone, Copy)]
+enum WriteKind {
+    New,
+    Append,
 }
 
 impl BlobDev {
@@ -106,7 +112,7 @@ impl BlobDev {
         bytes: Vec<u8>,
     ) -> (BdevIo, SimTime) {
         assert!(
-            !self.blobs.contains_key(&name) && !self.inflight.values().any(|(n, _)| *n == name),
+            !self.blobs.contains_key(&name) && !self.inflight.values().any(|(n, _, _)| *n == name),
             "blob name reused: {name}"
         );
         let latency = self.latency(
@@ -117,17 +123,47 @@ impl BlobDev {
         );
         let io = BdevIo(self.next_io);
         self.next_io += 1;
-        self.inflight.insert(io, (name, bytes));
+        self.inflight.insert(io, (name, bytes, WriteKind::New));
+        (io, now.after(latency))
+    }
+
+    /// Submit one append to an existing or new spool blob. Only one append
+    /// per name may be in flight, matching the ordered runtime lane.
+    pub fn submit_append(
+        &mut self,
+        now: SimTime,
+        rng: &mut Pcg64,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> (BdevIo, SimTime) {
+        assert!(
+            !self.inflight.values().any(|(n, _, _)| *n == name),
+            "concurrent append to blob: {name}"
+        );
+        let latency = self.latency(
+            rng,
+            self.config.write_latency_min,
+            self.config.write_latency_max,
+            bytes.len(),
+        );
+        let io = BdevIo(self.next_io);
+        self.next_io += 1;
+        self.inflight.insert(io, (name, bytes, WriteKind::Append));
         (io, now.after(latency))
     }
 
     /// Make a submitted write durable. Panics on unknown io — a crash clears
     /// in-flight ios, and completing one twice is a harness bug.
     pub fn complete_write(&mut self, io: BdevIo) {
-        let (name, bytes) = self.inflight.remove(&io).expect("completing unknown io");
+        let (name, bytes, kind) = self.inflight.remove(&io).expect("completing unknown io");
         self.counters.writes_completed += 1;
         self.counters.bytes_written += bytes.len() as u64;
-        self.blobs.insert(name, bytes);
+        match kind {
+            WriteKind::New => {
+                self.blobs.insert(name, bytes);
+            }
+            WriteKind::Append => self.blobs.entry(name).or_default().extend(bytes),
+        }
     }
 
     /// Read a whole blob: the stored bytes, verbatim, damage included.
@@ -183,17 +219,32 @@ impl BlobDev {
         self.blobs.remove(name).is_some()
     }
 
+    pub fn truncate(&mut self, name: &str, len: usize) -> bool {
+        let Some(bytes) = self.blobs.get_mut(name) else {
+            return false;
+        };
+        bytes.truncate(len);
+        true
+    }
+
     /// Power loss / daemon death: every in-flight write independently lands
     /// whole, vanishes, or lands torn to a random prefix. Completed writes
     /// are untouched. Returns each blob's fate for the oracle.
     pub fn crash(&mut self, rng: &mut Pcg64) -> Vec<(String, CrashFate)> {
         let inflight = std::mem::take(&mut self.inflight);
         let mut fates = Vec::new();
-        for (_, (name, bytes)) in inflight {
+        for (_, (name, bytes, kind)) in inflight {
             let fate = match rng.below(3) {
                 0 => {
                     self.counters.crash_applied += 1;
-                    self.blobs.insert(name.clone(), bytes);
+                    match kind {
+                        WriteKind::New => {
+                            self.blobs.insert(name.clone(), bytes);
+                        }
+                        WriteKind::Append => {
+                            self.blobs.entry(name.clone()).or_default().extend(bytes);
+                        }
+                    }
                     CrashFate::Applied
                 }
                 1 => {
@@ -203,7 +254,16 @@ impl BlobDev {
                 _ => {
                     let kept = usize::try_from(rng.below(bytes.len() as u64 + 1)).expect("fits");
                     self.counters.crash_torn += 1;
-                    self.blobs.insert(name.clone(), bytes[..kept].to_vec());
+                    match kind {
+                        WriteKind::New => {
+                            self.blobs.insert(name.clone(), bytes[..kept].to_vec());
+                        }
+                        WriteKind::Append => self
+                            .blobs
+                            .entry(name.clone())
+                            .or_default()
+                            .extend_from_slice(&bytes[..kept]),
+                    }
                     CrashFate::Torn { kept }
                 }
             };

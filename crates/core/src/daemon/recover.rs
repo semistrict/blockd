@@ -1,12 +1,14 @@
 //! Recovery (R8.2): rebuild a daemon from durable state alone, with an
 //! explicit per-vset verdict.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::{Daemon, DaemonConfig, Vset};
+use super::{Daemon, DaemonConfig, PassiveReplica, ReplicaKey, Vset};
+use crate::format::crc32c;
 use crate::journal::{JournalRecord, RecordKind};
 use crate::layout::{self, BlobName};
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
+use crate::replica_spool::scan_replica_spool;
 use crate::seam::{Effect, Verdict};
 use crate::types::{JournalSeq, PageId, SegId, VolumeId, VsetId};
 
@@ -50,16 +52,35 @@ impl Daemon {
         // could land on the same fence and collide with the wreckage's
         // surviving write-once names. Adoption goes strictly above this.
         let mut fence_floors: BTreeMap<VsetId, u64> = BTreeMap::new();
+        let mut replica_blobs: BTreeMap<ReplicaKey, BTreeMap<u64, &'a [u8]>> = BTreeMap::new();
         for (name, bytes) in scan {
             let Some(parsed) = layout::parse_blob(name) else {
                 continue;
             };
+            if let BlobName::ReplicaSpool {
+                source,
+                vset,
+                assignment_epoch,
+                generation,
+            } = parsed
+            {
+                replica_blobs
+                    .entry(ReplicaKey {
+                        source,
+                        vset,
+                        assignment_epoch,
+                    })
+                    .or_default()
+                    .insert(generation, bytes);
+                continue;
+            }
             let vset = match parsed {
                 BlobName::Journal { vset, .. }
                 | BlobName::Segment { vset, .. }
                 | BlobName::Leaf { vset, .. }
                 | BlobName::BaseLeaf { vset, .. }
                 | BlobName::Handoff { vset } => vset,
+                BlobName::ReplicaSpool { .. } => unreachable!("handled above"),
             };
             if let BlobName::Journal { fence, .. }
             | BlobName::Segment { fence, .. }
@@ -119,11 +140,88 @@ impl Daemon {
                         f.handoff = Some(h.to);
                     }
                 }
+                BlobName::ReplicaSpool { .. } => unreachable!("handled above"),
             }
+        }
+
+        let mut recovered_replicas: BTreeMap<ReplicaKey, PassiveReplica> = BTreeMap::new();
+        let mut replica_truncations: BTreeMap<ReplicaKey, (u64, u64)> = BTreeMap::new();
+        let mut replica_bytes = 0u64;
+        let mut recovered_rotations = 0u64;
+        for (key, generations) in replica_blobs {
+            let Some((&current_generation, current_bytes)) = generations.last_key_value() else {
+                continue;
+            };
+            // A generation boundary is only a filename boundary; frames form
+            // one ordered log so later commits may reference earlier data.
+            let mut combined = Vec::new();
+            let mut boundaries = Vec::new();
+            for (&generation, bytes) in &generations {
+                let start = combined.len();
+                combined.extend_from_slice(bytes);
+                boundaries.push((generation, start, bytes.len()));
+            }
+            let Ok(scan) = scan_replica_spool(&combined) else {
+                continue;
+            };
+            let current_file_bytes = if scan.truncated_tail {
+                let Some(&(generation, start, _)) = boundaries
+                    .iter()
+                    .find(|(_, start, len)| scan.valid_len < start.saturating_add(*len))
+                else {
+                    continue;
+                };
+                // The ordered append lane cannot create a later generation
+                // after an incomplete append. Refuse impossible residue.
+                if generation != current_generation {
+                    continue;
+                }
+                let valid_in_generation = scan.valid_len.saturating_sub(start) as u64;
+                replica_truncations.insert(key, (generation, valid_in_generation));
+                valid_in_generation
+            } else {
+                current_bytes.len() as u64
+            };
+            let artifacts = scan
+                .artifacts
+                .into_iter()
+                .map(|(id, frame)| (id, (frame.checksum, frame.bytes)))
+                .collect();
+            let uncommitted_artifacts = scan.uncommitted_artifacts;
+            let last_commit = scan.commits.last();
+            let committed = last_commit.map(|commit| (commit.info, crc32c(&commit.record)));
+            let upload = last_commit.map(|commit| super::ReplicaUpload {
+                info: commit.info,
+                todo: commit.required.clone(),
+                record: commit.record.clone(),
+                inflight: false,
+            });
+            replica_bytes = replica_bytes.saturating_add(scan.valid_len as u64);
+            recovered_rotations = recovered_rotations.saturating_add(current_generation);
+            recovered_replicas.insert(
+                key,
+                PassiveReplica {
+                    artifacts,
+                    uncommitted_artifacts,
+                    committed,
+                    pending_commit: None,
+                    upload,
+                    upload_queue: VecDeque::new(),
+                    uploaded_artifacts: BTreeSet::new(),
+                    upload_done: None,
+                    append_inflight: false,
+                    stored_bytes: scan.valid_len as u64,
+                    current_generation,
+                    current_file_bytes,
+                },
+            );
         }
 
         let (mut daemon, mut effects) = Daemon::new(config);
         daemon.fence_floors = fence_floors;
+        daemon.replicas = recovered_replicas;
+        daemon.counters.replica_bytes = replica_bytes;
+        daemon.counters.replica_rotations = recovered_rotations;
         let mut verdicts = BTreeMap::new();
         let mut recovered_bytes: u64 = 0;
         for (vset_id, f) in found {
@@ -173,7 +271,7 @@ impl Daemon {
             let watermark = f
                 .records
                 .iter()
-                .map(|r| r.synced_through)
+                .map(|r| r.sync_covered_through)
                 .max()
                 .unwrap_or(0);
             let resume = Some(cold.clone())
@@ -185,7 +283,8 @@ impl Daemon {
             state.next_seq = f.max_seq;
             state.next_seg = f.max_seg;
             state.next_leaf = f.max_leaf;
-            state.durable_watermark = watermark;
+            state.local_covered_through = watermark;
+            state.adopt_local_ack_if_allowed();
 
             let (verdict, chosen) = if let Some(c) = resume {
                 let RecordKind::Checkpoint { epoch, vmstate } = c.kind else {
@@ -245,7 +344,8 @@ impl Daemon {
                 })
                 .collect();
             state.best = Some((chosen.capture_seq, chosen.seq));
-            state.durable_watermark = watermark.max(chosen.synced_through);
+            state.local_covered_through = watermark.max(chosen.sync_covered_through);
+            state.adopt_local_ack_if_allowed();
             // Every on-disk record name, with its watermark where intact
             // (corrupt records contribute nothing and are reclaimable).
             state.record_ws = f
@@ -256,7 +356,7 @@ impl Daemon {
                         .records
                         .iter()
                         .find(|r| r.seq == seq && r.fence == fence)
-                        .map_or(0, |r| r.synced_through);
+                        .map_or(0, |r| r.sync_covered_through);
                     (seq, (fence, w))
                 })
                 .collect();
@@ -296,7 +396,7 @@ impl Daemon {
                 daemon.vsets.insert(vset_id, state);
                 continue;
             }
-            let backed = state.config.backed_up;
+            let backed = state.config.durability.uses_store();
             if backed {
                 // A backed-up vset may not serve yet: journal damage can
                 // leave local state BEHIND the backup, and serving it would
@@ -325,6 +425,33 @@ impl Daemon {
             }
         }
         daemon.local_bytes = recovered_bytes;
+        let replica_keys: Vec<_> = daemon.replicas.keys().copied().collect();
+        for key in replica_keys {
+            if daemon.replica_authorized(key.source, key.vset, key.assignment_epoch) {
+                if let Some(&(generation, len)) = replica_truncations.get(&key) {
+                    let io = daemon.io();
+                    daemon
+                        .pending
+                        .insert(io, super::Pending::ReplicaTailTruncate { key, generation });
+                    daemon
+                        .replicas
+                        .get_mut(&key)
+                        .expect("recovered replica")
+                        .append_inflight = true;
+                    effects.push(Effect::ReplicaTruncate {
+                        io,
+                        source: key.source,
+                        vset: key.vset,
+                        assignment_epoch: key.assignment_epoch,
+                        generation,
+                        len,
+                    });
+                }
+                daemon.replica_upload_step(key, &mut effects);
+            } else {
+                daemon.replicas.remove(&key);
+            }
+        }
         (daemon, verdicts, effects)
     }
 }

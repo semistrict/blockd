@@ -4,7 +4,7 @@
 //! cluster runs.
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::types::{VsetId, micros, millis, page_size, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, PeerKind, run};
 use blockd_sim::harness::Sabotage;
@@ -51,6 +51,311 @@ fn cluster_runs_replay_byte_for_byte() {
     }
 }
 
+#[test]
+fn peer_stash_syncs_survive_lossy_links_and_a_store_outage() {
+    let report = run(73, blockd_sim::presets::peer_stash_chaos());
+    assert_clean(&report);
+    assert!(
+        report.completed_ops > 20,
+        "guest sync path wedged: {report:?}"
+    );
+    assert!(report.replica_bytes > 0, "no recovery bytes reached a peer");
+    assert!(
+        report.replica_commits > 0,
+        "no durable peer commit completed"
+    );
+    assert!(
+        report.replica_store_bytes > 0,
+        "the passive peer never resumed its S3 upload"
+    );
+    assert_eq!(report.replica_nonactive_bytes, 0);
+    assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+}
+
+#[test]
+fn peer_stash_runs_replay_byte_for_byte() {
+    let config = blockd_sim::presets::peer_stash_chaos();
+    let a = run(73, config.clone());
+    let b = run(73, config);
+    assert_eq!(a, b);
+}
+
+#[test]
+fn healthy_peer_stash_uses_one_active_target_and_unlink_only_cleanup() {
+    let mut config = blockd_sim::presets::peer_stash_chaos();
+    config.peer_drop = (0, 1);
+    config.peer_dup = (0, 1);
+    config.store_outage = None;
+    config.vset_count = 1;
+    config.horizon = blockd_core::types::millis(80);
+    config.think = (
+        blockd_core::types::millis(8),
+        blockd_core::types::millis(12),
+    );
+    let report = run(91, config);
+    assert_clean(&report);
+    assert!(report.replica_logical_bytes > 0);
+    assert!(report.replica_network_bytes > 0);
+    assert!(report.replica_store_bytes > 0);
+    assert!(report.replica_artifact_flushes > 0);
+    assert!(report.replica_commit_flushes > 0);
+    assert!(report.replica_unlinks > 0, "{report:?}");
+    assert_eq!(report.replica_nonactive_bytes, 0);
+    assert_eq!(report.replica_replacement_bytes, 0);
+    assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+}
+
+#[test]
+fn peer_attrition_hits_restart_and_fenced_replacement_edges() {
+    let report = run(117, blockd_sim::presets::peer_attrition());
+    assert_clean(&report);
+    assert_eq!(report.host_crashes, 1, "{report:?}");
+    assert_eq!(report.recoveries, 1, "{report:?}");
+    assert!(report.replica_replacement_bytes > 0, "{report:?}");
+    assert_eq!(report.replica_nonactive_bytes, 0);
+    assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+}
+
+#[test]
+fn directional_link_and_store_faults_report_nonzero_coverage() {
+    let report = run(119, blockd_sim::presets::swizzle_peer_links());
+    assert_clean(&report);
+    assert!(report.peer_link_clogs > 0, "{report:?}");
+    assert!(report.store_unavailable > 0, "{report:?}");
+    assert!(report.store_retries > 0, "{report:?}");
+    assert_eq!(report.replica_nonactive_bytes, 0);
+    assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+}
+
+#[test]
+fn rare_peer_fault_points_all_activate_and_replay_exactly() {
+    use blockd_sim::cluster::FaultPoint;
+
+    let config = blockd_sim::presets::peer_stash_rare();
+    let first = run(127, config.clone());
+    let replay = run(127, config);
+    assert_eq!(first, replay);
+    assert_clean(&first);
+    for point in [
+        FaultPoint::ReplicaRetryTimer,
+        FaultPoint::DuplicateAck,
+        FaultPoint::StatusReconciliation,
+        FaultPoint::AssignmentCasRace,
+        FaultPoint::StoreUnknownResult,
+        FaultPoint::RestartScan,
+    ] {
+        assert!(
+            first.fault_coverage.get(&point).copied().unwrap_or(0) > 0,
+            "fault point {point:?} was not reached: {first:?}"
+        );
+    }
+    assert!(first.peer_drops > 0);
+    assert!(first.peer_dups > 0);
+    assert!(first.store_unavailable > 0);
+    assert!(first.store_cas_conflicts > 0);
+    assert_eq!(first.replica_nonactive_bytes, 0);
+    assert_eq!(first.replica_cleanup_rewrite_bytes, 0);
+}
+
+#[test]
+fn release_overlap_fault_point_is_idempotent_and_unlink_only() {
+    use blockd_sim::cluster::FaultPoint;
+
+    let mut config = blockd_sim::presets::peer_stash_chaos();
+    config.peer_drop = (0, 1);
+    config.peer_dup = (0, 1);
+    config.store_outage = None;
+    config.vset_count = 1;
+    config.horizon = blockd_core::types::millis(80);
+    config.think = (
+        blockd_core::types::millis(8),
+        blockd_core::types::millis(12),
+    );
+    config.fault_points = vec![FaultPoint::ReleaseOverlap];
+    let report = run(131, config);
+    assert_clean(&report);
+    assert!(
+        report
+            .fault_coverage
+            .get(&FaultPoint::ReleaseOverlap)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "{report:?}"
+    );
+    assert!(report.replica_unlinks > 0);
+    assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+}
+
+#[test]
+fn peer_sync_latency_percentiles_cover_healthy_outage_and_replacement() {
+    let scenarios = [
+        ("healthy", {
+            let mut config = blockd_sim::presets::peer_stash_chaos();
+            config.peer_drop = (0, 1);
+            config.peer_dup = (0, 1);
+            config.store_outage = None;
+            config.vset_count = 1;
+            config.horizon = blockd_core::types::secs(1);
+            config
+        }),
+        ("store-outage", blockd_sim::presets::peer_stash_chaos()),
+        ("replacement", blockd_sim::presets::peer_attrition()),
+    ];
+    for (name, config) in scenarios {
+        let report = run(137, config);
+        assert_clean(&report);
+        assert!(report.sync_samples > 0, "{name}: {report:?}");
+        // A sync with no new writes may correctly complete at the same
+        // simulated instant. Require a non-zero observed tail instead of
+        // assuming that more than half the generated syncs transfer data.
+        assert!(report.sync_latency_max_ns > 0, "{name}: {report:?}");
+        assert!(report.sync_latency_p50_ns <= report.sync_latency_p95_ns);
+        assert!(report.sync_latency_p95_ns <= report.sync_latency_p99_ns);
+        assert!(report.sync_latency_p99_ns <= report.sync_latency_max_ns);
+        assert!(report.replica_network_bytes > 0, "{name}: {report:?}");
+        eprintln!(
+            "{name}: sync n={} p50={}ns p95={}ns p99={}ns max={}ns peer={}B store={}B replacement={}B",
+            report.sync_samples,
+            report.sync_latency_p50_ns,
+            report.sync_latency_p95_ns,
+            report.sync_latency_p99_ns,
+            report.sync_latency_max_ns,
+            report.replica_network_bytes,
+            report.replica_store_bytes,
+            report.replica_replacement_bytes,
+        );
+    }
+}
+
+#[test]
+fn failed_seed_peer_advances_to_one_next_candidate_and_late_peers_stay_stale() {
+    let report = run(149, blockd_sim::presets::placement_fear());
+    assert_clean(&report);
+    assert_eq!(report.host_crashes, 2, "{report:?}");
+    assert_eq!(report.recoveries, 2, "{report:?}");
+    assert!(report.replica_replacement_bytes > 0, "{report:?}");
+    assert_eq!(report.replica_nonactive_bytes, 0, "{report:?}");
+    assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+    assert!(report.completed_ops > 50, "{report:?}");
+}
+
+#[test]
+fn replica_commit_and_publication_crash_boundaries_recover_cleanly() {
+    use blockd_sim::cluster::FaultPoint;
+
+    for (seed, point) in [
+        (151, FaultPoint::CrashPeerAfterCommitBeforeAck),
+        (153, FaultPoint::CrashPrimaryAfterAckBeforeSyncOk),
+        (155, FaultPoint::CrashPrimaryAfterSyncOk),
+        (157, FaultPoint::CrashPeerAfterUploadBeforeHead),
+        (159, FaultPoint::CrashPrimaryAfterHeadBeforeRelease),
+    ] {
+        let mut config = blockd_sim::presets::peer_stash_chaos();
+        config.vset_count = 1;
+        config.horizon = blockd_core::types::secs(3);
+        config.peer_drop = (1, 12);
+        config.peer_dup = (1, 10);
+        config.store_outage = None;
+        config.restart_delay = (
+            blockd_core::types::millis(10),
+            blockd_core::types::millis(20),
+        );
+        if point == FaultPoint::CrashPrimaryAfterHeadBeforeRelease {
+            config.horizon = blockd_core::types::millis(80);
+            config.think = (
+                blockd_core::types::millis(8),
+                blockd_core::types::millis(12),
+            );
+        }
+        config.fault_points = vec![point];
+        let report = run(seed, config);
+        assert_clean(&report);
+        assert_eq!(
+            report.fault_coverage.get(&point).copied(),
+            Some(1),
+            "{point:?}: {report:?}"
+        );
+        assert_eq!(report.host_crashes, 1, "{point:?}: {report:?}");
+        assert_eq!(report.recoveries, 1, "{point:?}: {report:?}");
+        assert!(report.completed_ops > 20, "{point:?}: {report:?}");
+        assert!(report.peer_drops > 0, "{point:?}: {report:?}");
+        assert!(report.peer_dups > 0, "{point:?}: {report:?}");
+        assert_eq!(report.replica_nonactive_bytes, 0);
+        assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+    }
+}
+
+#[test]
+fn replica_capture_transfer_and_upload_crash_boundaries_recover_cleanly() {
+    use blockd_sim::cluster::FaultPoint;
+
+    for (seed, point) in [
+        (167, FaultPoint::CrashPrimaryBeforeClosureCapture),
+        (169, FaultPoint::CrashPrimaryAfterClosureCapture),
+        (171, FaultPoint::CrashPrimaryDuringArtifactTransfer),
+        (173, FaultPoint::CrashPeerAfterDataFlushBeforeCommit),
+        (175, FaultPoint::CrashPeerDuringUpload),
+    ] {
+        let mut config = blockd_sim::presets::peer_stash_chaos();
+        config.vset_count = 1;
+        config.horizon = blockd_core::types::secs(3);
+        config.peer_drop = (1, 12);
+        config.peer_dup = (1, 10);
+        config.store_outage = None;
+        config.restart_delay = (
+            blockd_core::types::millis(10),
+            blockd_core::types::millis(20),
+        );
+        config.fault_points = vec![point];
+        let report = run(seed, config);
+        assert_clean(&report);
+        assert_eq!(
+            report.fault_coverage.get(&point).copied(),
+            Some(1),
+            "{point:?}: {report:?}"
+        );
+        assert_eq!(report.host_crashes, 1, "{point:?}: {report:?}");
+        assert_eq!(report.recoveries, 1, "{point:?}: {report:?}");
+        assert!(report.completed_ops > 20, "{point:?}: {report:?}");
+        assert!(report.peer_drops > 0, "{point:?}: {report:?}");
+        assert!(report.peer_dups > 0, "{point:?}: {report:?}");
+        assert_eq!(report.replica_nonactive_bytes, 0);
+        assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+    }
+}
+
+#[test]
+fn replacement_cas_crash_boundaries_resume_from_the_fenced_head() {
+    use blockd_sim::cluster::FaultPoint;
+
+    for (seed, point) in [
+        (161, FaultPoint::CrashPrimaryBeforeTransitionCas),
+        (163, FaultPoint::CrashPrimaryAfterSeedBeforeActiveCas),
+        (165, FaultPoint::CrashPrimaryAfterActiveCasBeforeCommit),
+    ] {
+        let mut config = blockd_sim::presets::peer_attrition();
+        config.horizon = blockd_core::types::secs(4);
+        config.peer_drop = (1, 12);
+        config.peer_dup = (1, 10);
+        config.fault_points = vec![point];
+        let report = run(seed, config);
+        assert_clean(&report);
+        assert_eq!(
+            report.fault_coverage.get(&point).copied(),
+            Some(1),
+            "{point:?}: {report:?}"
+        );
+        assert!(report.host_crashes >= 2, "{point:?}: {report:?}");
+        assert!(report.recoveries >= 2, "{point:?}: {report:?}");
+        assert!(report.completed_ops > 20, "{point:?}: {report:?}");
+        assert!(report.peer_drops > 0, "{point:?}: {report:?}");
+        assert!(report.peer_dups > 0, "{point:?}: {report:?}");
+        assert_eq!(report.replica_nonactive_bytes, 0, "{point:?}: {report:?}");
+        assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
+    }
+}
+
 /// Two hosts, one non-backed-up vset (the mode that must migrate, R7.2)
 /// under load, migrated mid-run.
 fn migrate_config() -> ClusterConfig {
@@ -60,7 +365,7 @@ fn migrate_config() -> ClusterConfig {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 16,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         kill_hosts_at: vec![],
         drop_peer: None,
@@ -124,7 +429,7 @@ fn restores_meet_the_200ms_budget_and_prefetch_the_resume_set() {
             vset_config: VsetConfig {
                 disk_volumes: 2,
                 pages_per_volume,
-                backed_up: true,
+                durability: DurabilityMode::Backup,
             },
             drop_peer: None,
             race_restore: false,
@@ -359,7 +664,7 @@ fn store_outage_during_cold_serving_parks_fills_until_heal() {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 64,
-            backed_up: true,
+            durability: DurabilityMode::Backup,
         },
         // base_config kills host 0 at 1500ms; the raced restore completes
         // shortly after and serves cold from the store. The outage then
@@ -422,7 +727,7 @@ fn a_leaf_blackout_parks_faults_loudly_and_the_heal_serves_them_all() {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 5_000,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         migrate_at: Some((millis(1200), VsetId(1), 1)),
         drop_peer: Some((PeerKind::Leaf, millis(1150), millis(2400))),
@@ -587,7 +892,7 @@ fn a_rotten_resume_set_is_ignored_not_fatal() {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 16,
-            backed_up: true,
+            durability: DurabilityMode::Backup,
         },
         drop_peer: None,
         race_restore: false,
@@ -624,7 +929,7 @@ fn multi_leaf_config() -> ClusterConfig {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 5_000,
-            backed_up: true,
+            durability: DurabilityMode::Backup,
         },
         think: (micros(20), micros(100)),
         guest_sync_share: Some(Ppm(1_000)),
@@ -671,7 +976,7 @@ fn migration_hydrates_multi_leaf_maps_from_the_source() {
         vset_config: VsetConfig {
             disk_volumes: 2,
             pages_per_volume: 5_000,
-            backed_up: false,
+            durability: DurabilityMode::Local,
         },
         migrate_at: Some((millis(1200), VsetId(1), 1)),
         ..multi_leaf_config()
