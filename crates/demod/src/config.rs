@@ -15,6 +15,12 @@
 //! scratch = /var/opt/blockd/scratch
 //! shmem_dir = /dev/shm
 //! fc_dir = /var/tmp/blockd-fc
+//! cache_pages = 4096
+//! writeback_interval_ms = 10
+//! backup_retry_ms = 100
+//! disk_capacity_bytes = 107374182400
+//! disk_headroom_bytes = 10737418240
+//! wedge_ticks = 500
 //! ```
 
 use std::collections::BTreeMap;
@@ -37,11 +43,21 @@ pub struct DemodConfig {
     pub scratch: PathBuf,
     pub shmem_dir: PathBuf,
     pub fc_dir: PathBuf,
+    pub cache_pages: usize,
+    pub writeback_interval_ms: u64,
+    pub backup_retry_ms: u64,
+    pub disk_capacity_bytes: Option<u64>,
+    pub disk_headroom_bytes: u64,
+    pub wedge_ticks: u64,
 }
 
 impl DemodConfig {
     pub fn load(path: &str) -> DemodConfig {
         let text = std::fs::read_to_string(path).expect("config file");
+        Self::parse(&text)
+    }
+
+    fn parse(text: &str) -> DemodConfig {
         let mut kv: BTreeMap<String, String> = BTreeMap::new();
         for line in text.lines() {
             let line = line.trim();
@@ -56,6 +72,12 @@ impl DemodConfig {
                 .unwrap_or_else(|| panic!("config missing `{key}`"))
                 .clone()
         };
+        let optional = |key: &str| kv.get(key).cloned();
+        let parse_or = |key: &str, default: u64| -> u64 {
+            optional(key).map_or(default, |value| {
+                value.parse().unwrap_or_else(|_| panic!("invalid `{key}`"))
+            })
+        };
         let mut peers = BTreeMap::new();
         for (key, value) in &kv {
             if let Some(id) = key.strip_prefix("peer.") {
@@ -64,6 +86,26 @@ impl DemodConfig {
                     value.parse().expect("peer addr"),
                 );
             }
+        }
+        let cache_pages =
+            usize::try_from(parse_or("cache_pages", 4096)).expect("cache_pages fits this platform");
+        let writeback_interval_ms = parse_or("writeback_interval_ms", 10);
+        let backup_retry_ms = parse_or("backup_retry_ms", 100);
+        let disk_capacity_bytes = optional("disk_capacity_bytes")
+            .map(|value| value.parse().expect("invalid `disk_capacity_bytes`"));
+        let disk_headroom_bytes = parse_or("disk_headroom_bytes", 0);
+        let wedge_ticks = parse_or("wedge_ticks", 500);
+        assert!(cache_pages > 0, "cache_pages must be positive");
+        assert!(
+            writeback_interval_ms > 0,
+            "writeback_interval_ms must be positive"
+        );
+        assert!(backup_retry_ms > 0, "backup_retry_ms must be positive");
+        if let Some(capacity) = disk_capacity_bytes {
+            assert!(
+                disk_headroom_bytes < capacity,
+                "disk_headroom_bytes must be smaller than disk_capacity_bytes"
+            );
         }
         DemodConfig {
             host: HostId(get("host").parse().expect("host id")),
@@ -78,6 +120,52 @@ impl DemodConfig {
             scratch: get("scratch").into(),
             shmem_dir: get("shmem_dir").into(),
             fc_dir: get("fc_dir").into(),
+            cache_pages,
+            writeback_interval_ms,
+            backup_retry_ms,
+            disk_capacity_bytes,
+            disk_headroom_bytes,
+            wedge_ticks,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REQUIRED: &str = "\
+host = 2
+api = 127.0.0.1:7000
+peer_listen = 127.0.0.1:7001
+gcs_endpoint = http://127.0.0.1:7099
+gcs_metadata = http://127.0.0.1:7098
+gcs_bucket = test
+gcs_prefix = data/
+blob_dir = /tmp/blobs
+scratch = /tmp/scratch
+shmem_dir = /dev/shm
+fc_dir = /tmp/fc
+";
+
+    #[test]
+    fn operational_settings_have_safe_defaults_and_can_be_overridden() {
+        let defaults = DemodConfig::parse(REQUIRED);
+        assert_eq!(defaults.cache_pages, 4096);
+        assert_eq!(defaults.writeback_interval_ms, 10);
+        assert_eq!(defaults.backup_retry_ms, 100);
+        assert_eq!(defaults.disk_capacity_bytes, None);
+        assert_eq!(defaults.disk_headroom_bytes, 0);
+        assert_eq!(defaults.wedge_ticks, 500);
+
+        let configured = DemodConfig::parse(&format!(
+            "{REQUIRED}\ncache_pages = 8192\nwriteback_interval_ms = 25\nbackup_retry_ms = 250\ndisk_capacity_bytes = 1000000\ndisk_headroom_bytes = 100000\nwedge_ticks = 40\n"
+        ));
+        assert_eq!(configured.cache_pages, 8192);
+        assert_eq!(configured.writeback_interval_ms, 25);
+        assert_eq!(configured.backup_retry_ms, 250);
+        assert_eq!(configured.disk_capacity_bytes, Some(1_000_000));
+        assert_eq!(configured.disk_headroom_bytes, 100_000);
+        assert_eq!(configured.wedge_ticks, 40);
     }
 }

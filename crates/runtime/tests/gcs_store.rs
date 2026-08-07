@@ -90,6 +90,20 @@ fn the_store_contract_holds_against_generation_semantics() {
             .all(|s| s.path.starts_with("/demo-bucket/blockd/")),
         "every object request under bucket + prefix"
     );
+
+    let latency = store.stats.latency();
+    let samples = |operation: &str, outcome: &str| {
+        latency
+            .iter()
+            .find(|item| item.operation == operation && item.outcome == outcome)
+            .expect("latency series")
+            .histogram
+            .count
+    };
+    assert_eq!(samples("conditional_put", "success"), 2);
+    assert_eq!(samples("conditional_put", "conflict"), 3);
+    assert_eq!(samples("put", "success"), 1);
+    assert!(samples("get", "success") >= 2);
 }
 
 /// A 412 is followed by a HEAD to fill in `actual` — visible on the wire.

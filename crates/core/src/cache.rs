@@ -155,6 +155,26 @@ impl Cache {
         self.entries.len()
     }
 
+    /// Configured private + shared cache capacity in pages.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Slots promised to fills whose bytes have not landed yet.
+    pub fn reserved_count(&self) -> usize {
+        self.reserved
+    }
+
+    /// Host-wide pages dirtied since their last durable capture.
+    pub fn dirty_count(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// Host-wide pages whose newest content is not durable yet.
+    pub fn unstable_count(&self) -> usize {
+        self.unstable.len()
+    }
+
     fn unlink(&mut self, page: PageId, entry: &Entry) {
         self.victims
             .remove(&(class(page), entry.generation, entry.touched, page));

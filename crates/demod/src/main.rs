@@ -11,6 +11,7 @@
 //!   POST /vm/{id}/migrate?to=H     live-migrate the vset; VM re-restores
 //!   POST /vm/{id}/restore          (after host death) backed vset restore
 //!   GET  /status                   vms, counters, store bill
+//!   GET  /metrics                  Prometheus text exposition
 //!
 //! Usage: `demod <config>` or `demod fake-gcs <addr>`.
 //!
@@ -27,6 +28,9 @@
 mod api;
 #[cfg(target_os = "linux")]
 mod config;
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod observability;
 #[cfg(target_os = "linux")]
 mod vm;
 
@@ -51,24 +55,27 @@ fn main() {
                 .parse()
                 .expect("addr");
             let (fake, endpoint) = FakeGcs::start_on(addr);
+            let _telemetry = observability::init(None);
             if let Some(ms) = args.get(3) {
                 let ms: u64 = ms.parse().expect("latency ms");
                 fake.latency_ms
                     .store(ms, std::sync::atomic::Ordering::SeqCst);
-                eprintln!("fake-gcs latency {ms}ms");
+                tracing::info!(latency_ms = ms, "fake GCS latency configured");
             }
-            eprintln!("fake-gcs serving on {endpoint}");
+            tracing::info!(%endpoint, "fake GCS serving");
             loop {
                 std::thread::park();
             }
         }
         Some(path) => {
             let cfg = config::DemodConfig::load(path);
+            let _telemetry = observability::init(Some(cfg.host.0));
             let state = Arc::new(vm::Demod::start(cfg));
             api::serve(&state);
         }
         None => {
-            eprintln!("usage: demod <config-file> | demod fake-gcs <addr>");
+            let _telemetry = observability::init(None);
+            tracing::error!("usage: demod <config-file> | demod fake-gcs <addr>");
             std::process::exit(2);
         }
     }

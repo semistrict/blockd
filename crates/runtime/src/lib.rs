@@ -22,6 +22,7 @@ mod gcs;
 mod host;
 #[cfg(target_os = "linux")]
 mod loopstats;
+mod metrics;
 #[cfg(target_os = "linux")]
 mod peer;
 #[cfg(target_os = "linux")]
@@ -29,11 +30,15 @@ mod s3;
 mod store;
 
 pub use blobscan::scan_blob_dir;
-pub use gcs::{GcsConfig, GcsStats, GcsStore};
+pub use gcs::{GcsConfig, GcsLatency, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
-pub use host::{Runtime, RuntimeConfig};
+pub use host::{
+    FaultLatency, GuestPauseLatency, LocalIoLatency, Runtime, RuntimeConfig,
+    RuntimeOperationLatency,
+};
 #[cfg(target_os = "linux")]
 pub use loopstats::LoopStats;
+pub use metrics::{AtomicHistogram, HistogramSnapshot, LATENCY_BUCKETS_NS};
 #[cfg(target_os = "linux")]
 pub use peer::{PeerConfig, PeerNet};
 #[cfg(target_os = "linux")]

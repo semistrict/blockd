@@ -90,6 +90,11 @@ if [ "$(findmnt -n -o FSTYPE --target "$BLOB_MOUNT")" != xfs ]; then
   exit 1
 fi
 systemctl enable --now fstrim.timer
+BLOB_DEVICE_BYTES=$(blockdev --getsize64 "$BLOB_DEVICE")
+# Keep ten percent entirely outside the daemon's budget, then begin reclaim
+# another ten percent before that budget is exhausted.
+BLOB_CAPACITY_BYTES=$((BLOB_DEVICE_BYTES * 9 / 10))
+BLOB_HEADROOM_BYTES=$((BLOB_DEVICE_BYTES / 10))
 
 if [ -f "$READY" ]; then
   systemctl start blockd-demod || true
@@ -185,6 +190,8 @@ blob_dir = /var/opt/blockd/blobs
 scratch = /var/opt/blockd/scratch
 shmem_dir = /dev/shm
 fc_dir = $FC_DIR
+disk_capacity_bytes = $BLOB_CAPACITY_BYTES
+disk_headroom_bytes = $BLOB_HEADROOM_BYTES
 EOF
 
 cat > /etc/systemd/system/blockd-demod.service <<EOF

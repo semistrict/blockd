@@ -23,6 +23,7 @@ use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 
 use crate::loopstats::{LoopStats, effect_kind, event_kind};
+use crate::metrics::{AtomicHistogram, HistogramSnapshot};
 use crate::peer::{PeerConfig, PeerNet};
 use crate::store::ObjectStore;
 
@@ -42,6 +43,7 @@ struct VsetHost {
     view: Arc<GuestView>,
     uffd: Arc<Uffd>,
     ctl: GuestCtl,
+    fault_latency: [AtomicHistogram; FaultSource::COUNT],
 }
 
 #[derive(Default)]
@@ -83,6 +85,7 @@ impl VsetHost {
             view,
             uffd: Arc::new(uffd),
             ctl: GuestCtl::default(),
+            fault_latency: std::array::from_fn(|_| AtomicHistogram::default()),
         })
     }
 
@@ -103,6 +106,84 @@ impl VsetHost {
             page: PageNo(u32::try_from(index % per).expect("fits")),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultSource {
+    Zero,
+    Shared,
+    WriteProtect,
+    Local,
+    Peer,
+    Store,
+    Unservable,
+}
+
+impl FaultSource {
+    const COUNT: usize = 7;
+    const ALL: [FaultSource; Self::COUNT] = [
+        FaultSource::Zero,
+        FaultSource::Shared,
+        FaultSource::WriteProtect,
+        FaultSource::Local,
+        FaultSource::Peer,
+        FaultSource::Store,
+        FaultSource::Unservable,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            FaultSource::Zero => "zero",
+            FaultSource::Shared => "shared",
+            FaultSource::WriteProtect => "write_protect",
+            FaultSource::Local => "local_nvme",
+            FaultSource::Peer => "peer",
+            FaultSource::Store => "object_store",
+            FaultSource::Unservable => "unservable",
+        }
+    }
+}
+
+struct FaultInFlight {
+    started: Instant,
+    span: tracing::Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaultLatency {
+    pub vset: VsetId,
+    pub source: &'static str,
+    pub histogram: HistogramSnapshot,
+}
+
+const OPERATION_NAMES: [&str; 5] = ["create", "checkpoint", "restore", "migration", "sync"];
+const OPERATION_OUTCOMES: [&str; 2] = ["success", "failed"];
+const LOCAL_IO_NAMES: [&str; 4] = ["write", "read", "ranged_read", "delete"];
+const LOCAL_IO_OUTCOMES: [&str; 2] = ["success", "missing"];
+const PAUSE_NAMES: [&str; 2] = ["checkpoint", "migration"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeOperationLatency {
+    pub operation: &'static str,
+    pub outcome: &'static str,
+    pub histogram: HistogramSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalIoLatency {
+    pub operation: &'static str,
+    pub outcome: &'static str,
+    pub histogram: HistogramSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestPauseLatency {
+    pub operation: &'static str,
+    pub histogram: HistogramSnapshot,
 }
 
 pub(crate) enum Msg {
@@ -185,6 +266,11 @@ impl LoopQueue {
             lanes = self.cv.wait(lanes).expect("wait");
         }
     }
+
+    fn depths(&self) -> (usize, usize) {
+        let lanes = self.lanes.lock().expect("lock");
+        (lanes.critical.len(), lanes.background.len())
+    }
 }
 
 struct Shared {
@@ -195,9 +281,19 @@ struct Shared {
     incidents: Mutex<Vec<String>>,
     /// The daemon's counters, copied out after every step (R9.2).
     counters: Mutex<blockd_core::daemon::Counters>,
+    daemon_stats: Mutex<blockd_core::daemon::DaemonStats>,
     /// Loop-thread time attribution (R9.2's perf side): decide vs effect
     /// execution vs idle, by kind.
     stats: LoopStats,
+    fault_in_flight: Mutex<BTreeMap<PageId, VecDeque<FaultInFlight>>>,
+    operation_latency: [[AtomicHistogram; OPERATION_OUTCOMES.len()]; OPERATION_NAMES.len()],
+    local_io_latency: [[AtomicHistogram; LOCAL_IO_OUTCOMES.len()]; LOCAL_IO_NAMES.len()],
+    local_io_in_flight: [AtomicU64; LOCAL_IO_NAMES.len()],
+    pause_expected: Mutex<BTreeMap<VsetId, VecDeque<usize>>>,
+    pause_in_flight: Mutex<BTreeMap<VsetId, (usize, Instant)>>,
+    pause_latency: [AtomicHistogram; PAUSE_NAMES.len()],
+    backup_lag_started: Mutex<BTreeMap<VsetId, Instant>>,
+    operation_started: Mutex<BTreeMap<(VsetId, u8), Instant>>,
     next_req: AtomicU64,
 }
 
@@ -269,6 +365,7 @@ impl Runtime {
         (runtime, verdicts)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn start(
         mut daemon: Daemon,
         boot_effects: Vec<Effect>,
@@ -280,12 +377,27 @@ impl Runtime {
         let tx = LoopQueue::new();
         let rx = tx.clone();
         let (admin_tx, admin_rx) = channel::<AdminReply>();
+        let daemon_stats = daemon.stats();
         let shared = Arc::new(Shared {
             vsets: Mutex::new(hosts),
             sync_waiters: Mutex::new(BTreeMap::new()),
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(blockd_core::daemon::Counters::default()),
+            daemon_stats: Mutex::new(daemon_stats),
             stats: LoopStats::default(),
+            fault_in_flight: Mutex::new(BTreeMap::new()),
+            operation_latency: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicHistogram::default())
+            }),
+            local_io_latency: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicHistogram::default())
+            }),
+            local_io_in_flight: std::array::from_fn(|_| AtomicU64::new(0)),
+            pause_expected: Mutex::new(BTreeMap::new()),
+            pause_in_flight: Mutex::new(BTreeMap::new()),
+            pause_latency: std::array::from_fn(|_| AtomicHistogram::default()),
+            backup_lag_started: Mutex::new(BTreeMap::new()),
+            operation_started: Mutex::new(BTreeMap::new()),
             next_req: AtomicU64::new(1),
         });
 
@@ -301,7 +413,7 @@ impl Runtime {
             blob: blob_tx,
             blob_delete: blob_delete_tx,
             timer: timer_tx,
-        } = spawn_io_workers(&config.blob_dir, store, &tx);
+        } = spawn_io_workers(&config.blob_dir, store, &tx, &shared);
 
         // The event loop: the daemon lives here.
         let loop_thread = {
@@ -310,7 +422,7 @@ impl Runtime {
             let peers = peers.clone();
             let self_id = config.daemon.host;
             thread::spawn(move || {
-                let apply = |effects: Vec<Effect>| {
+                let apply = |effects: Vec<Effect>, source: Option<FaultSource>| {
                     for effect in effects {
                         let kind = effect_kind(&effect);
                         let started = Instant::now();
@@ -325,13 +437,14 @@ impl Runtime {
                             &tx,
                             peers.as_ref(),
                             self_id,
+                            source,
                         );
                         shared
                             .stats
                             .record_effect(kind, elapsed_ns(started.elapsed()));
                     }
                 };
-                apply(boot_effects);
+                apply(boot_effects, None);
                 loop {
                     let blocked = Instant::now();
                     let msg = rx.pop();
@@ -350,16 +463,21 @@ impl Runtime {
                         Msg::Stop => break,
                     };
                     let kind = event_kind(&event);
+                    let source = fault_source_of_event(&event);
                     let started = Instant::now();
                     let effects = {
                         let vsets = shared.vsets.lock().expect("lock");
                         daemon.step(event, &MapView { vsets: &vsets })
                     };
                     *shared.counters.lock().expect("lock") = daemon.counters;
+                    let daemon_stats = daemon.stats();
+                    update_backup_lag(&shared, &daemon_stats);
+                    update_active_operations(&shared, &daemon_stats);
+                    *shared.daemon_stats.lock().expect("lock") = daemon_stats;
                     shared
                         .stats
                         .record_decide(kind, elapsed_ns(started.elapsed()));
-                    apply(effects);
+                    apply(effects, source);
                 }
             })
         };
@@ -380,6 +498,107 @@ impl Runtime {
         &self.shared.stats
     }
 
+    pub fn loop_queue_depths(&self) -> (usize, usize) {
+        self.tx.depths()
+    }
+
+    pub fn daemon_stats(&self) -> blockd_core::daemon::DaemonStats {
+        self.shared.daemon_stats.lock().expect("lock").clone()
+    }
+
+    pub fn backup_lag_age(&self) -> Vec<(VsetId, Duration)> {
+        self.shared
+            .backup_lag_started
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(&vset, started)| (vset, started.elapsed()))
+            .collect()
+    }
+
+    pub fn active_operation_age(&self) -> Vec<(VsetId, &'static str, Duration)> {
+        self.shared
+            .operation_started
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(&(vset, operation), started)| {
+                (vset, operation_name(operation), started.elapsed())
+            })
+            .collect()
+    }
+
+    pub fn fault_latency(&self) -> Vec<FaultLatency> {
+        let active: std::collections::BTreeSet<VsetId> = self
+            .shared
+            .daemon_stats
+            .lock()
+            .expect("lock")
+            .vsets
+            .iter()
+            .map(|stats| stats.vset)
+            .collect();
+        let vsets = self.shared.vsets.lock().expect("lock");
+        let mut snapshots = Vec::new();
+        for (&vset, host) in vsets.iter().filter(|(vset, _)| active.contains(vset)) {
+            for source in FaultSource::ALL {
+                snapshots.push(FaultLatency {
+                    vset,
+                    source: source.name(),
+                    histogram: host.fault_latency[source.index()].snapshot(),
+                });
+            }
+        }
+        snapshots
+    }
+
+    pub fn operation_latency(&self) -> Vec<RuntimeOperationLatency> {
+        let mut snapshots = Vec::new();
+        for (operation, operation_name) in OPERATION_NAMES.iter().enumerate() {
+            for (outcome, outcome_name) in OPERATION_OUTCOMES.iter().enumerate() {
+                snapshots.push(RuntimeOperationLatency {
+                    operation: operation_name,
+                    outcome: outcome_name,
+                    histogram: self.shared.operation_latency[operation][outcome].snapshot(),
+                });
+            }
+        }
+        snapshots
+    }
+
+    pub fn local_io_latency(&self) -> Vec<LocalIoLatency> {
+        let mut snapshots = Vec::new();
+        for (operation, operation_name) in LOCAL_IO_NAMES.iter().enumerate() {
+            for (outcome, outcome_name) in LOCAL_IO_OUTCOMES.iter().enumerate() {
+                snapshots.push(LocalIoLatency {
+                    operation: operation_name,
+                    outcome: outcome_name,
+                    histogram: self.shared.local_io_latency[operation][outcome].snapshot(),
+                });
+            }
+        }
+        snapshots
+    }
+
+    pub fn local_io_in_flight(&self) -> Vec<(&'static str, u64)> {
+        LOCAL_IO_NAMES
+            .iter()
+            .zip(&self.shared.local_io_in_flight)
+            .map(|(operation, value)| (*operation, value.load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    pub fn guest_pause_latency(&self) -> Vec<GuestPauseLatency> {
+        PAUSE_NAMES
+            .iter()
+            .zip(&self.shared.pause_latency)
+            .map(|(operation, histogram)| GuestPauseLatency {
+                operation,
+                histogram: histogram.snapshot(),
+            })
+            .collect()
+    }
+
     /// Peer frames dropped on the floor so far (queue full or peer down)
     /// — the retry timers' workload, visible.
     pub fn peer_dropped_sends(&self) -> u64 {
@@ -388,13 +607,40 @@ impl Runtime {
         })
     }
 
+    pub fn peer_connections(&self) -> Vec<(blockd_core::types::HostId, bool)> {
+        self.peers
+            .as_ref()
+            .map_or_else(Vec::new, |peers| peers.connections())
+    }
+
     fn spawn_fault_reader(&self, vset: VsetId, host: Arc<VsetHost>) {
         let tx = self.tx.clone();
+        let shared = self.shared.clone();
         // Exits when the vset's uffd closes (the vset was dropped).
         thread::spawn(move || {
             while let Ok(events) = host.uffd.read_events() {
                 for event in events {
                     let page = host.page_of_addr(vset, event.address & !(page_size() - 1));
+                    let span = tracing::debug_span!(
+                        "page.fault",
+                        vset_id = vset.0,
+                        volume = page.volume.idx.0,
+                        page = page.page.0,
+                        write = event.write,
+                        source = tracing::field::Empty,
+                        outcome = tracing::field::Empty,
+                        duration_ms = tracing::field::Empty,
+                    );
+                    shared
+                        .fault_in_flight
+                        .lock()
+                        .expect("lock")
+                        .entry(page)
+                        .or_default()
+                        .push_back(FaultInFlight {
+                            started: Instant::now(),
+                            span,
+                        });
                     tx.push(Msg::Ev(Event::GuestFault {
                         page,
                         write: event.write,
@@ -433,7 +679,12 @@ impl Runtime {
 
     // ── admin surface ───────────────────────────────────────────────────
 
+    #[tracing::instrument(
+        skip(self, config),
+        fields(vset_id = vset.0, backed = config.backed_up)
+    )]
     pub fn create_vset(&self, vset: VsetId, config: VsetConfig) {
+        let started = Instant::now();
         let host = VsetHost::new(config);
         self.shared
             .vsets
@@ -448,27 +699,41 @@ impl Runtime {
             config,
             from_base: None,
         })));
-        self.wait_admin(|reply| match reply {
-            AdminReply::VsetCreated { req: r, vset: v } if *r == req && *v == vset => Some(()),
+        let created = self.wait_admin(|reply| match reply {
+            AdminReply::VsetCreated { req: r, vset: v } if *r == req && *v == vset => Some(true),
+            AdminReply::AdminFailed { req: r } if *r == req => Some(false),
             _ => None,
         });
+        self.observe_operation(0, created, started.elapsed());
+        assert!(created, "vset creation failed");
     }
 
+    #[tracing::instrument(skip(self), fields(vset_id = vset.0))]
     pub fn checkpoint(&self, vset: VsetId) -> u64 {
+        let started = Instant::now();
         let req = self.req();
+        self.expect_pause(vset, 0);
         self.tx
             .push(Msg::Ev(Event::Admin(AdminCmd::Checkpoint { req, vset })));
-        self.wait_admin(|reply| match reply {
-            AdminReply::CheckpointDone { req: r, epoch, .. } if *r == req => Some(epoch.0),
-            AdminReply::AdminFailed { req: r } if *r == req => {
-                panic!("checkpoint failed")
-            }
+        let result = self.wait_admin(|reply| match reply {
+            AdminReply::CheckpointDone { req: r, epoch, .. } if *r == req => Some(Some(epoch.0)),
+            AdminReply::AdminFailed { req: r } if *r == req => Some(None),
             _ => None,
-        })
+        });
+        self.observe_operation(1, result.is_some(), started.elapsed());
+        if result.is_none() {
+            self.cancel_expected_pause(vset, 0);
+        }
+        result.expect("checkpoint failed")
     }
 
     /// Restore a backed-up vset from the store onto this host (R6.1).
+    #[tracing::instrument(
+        skip(self, config),
+        fields(vset_id = vset.0, backed = config.backed_up)
+    )]
     pub fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
+        let started = Instant::now();
         let host = VsetHost::new(config);
         self.shared
             .vsets
@@ -479,13 +744,15 @@ impl Runtime {
         let req = self.req();
         self.tx
             .push(Msg::Ev(Event::Admin(AdminCmd::RestoreVset { req, vset })));
-        self.wait_admin(|reply| match reply {
+        let result = self.wait_admin(|reply| match reply {
             AdminReply::VsetRestored {
                 req: r, verdict, ..
-            } if *r == req => Some(*verdict),
-            AdminReply::AdminFailed { req: r } if *r == req => panic!("restore failed"),
+            } if *r == req => Some(Some(*verdict)),
+            AdminReply::AdminFailed { req: r } if *r == req => Some(None),
             _ => None,
-        })
+        });
+        self.observe_operation(2, result.is_some(), started.elapsed());
+        result.expect("restore failed")
     }
 
     /// Wait for a backed vset's post-recovery verdict (head refresh).
@@ -513,18 +780,26 @@ impl Runtime {
     /// Hand a non-backed vset off to `to` (R7.2): pauses, captures, makes
     /// the handoff durable on both sides, then serves the post-copy drain.
     /// Returns once this side's `MigratedOut` lands.
+    #[tracing::instrument(skip(self), fields(vset_id = vset.0, destination_host = to.0))]
     pub fn migrate_out(&self, vset: VsetId, to: blockd_core::types::HostId) {
+        let started = Instant::now();
         let req = self.req();
+        self.expect_pause(vset, 1);
         self.tx.push(Msg::Ev(Event::Admin(AdminCmd::MigrateOut {
             req,
             vset,
             to,
         })));
-        self.wait_admin(|reply| match reply {
-            AdminReply::MigratedOut { req: r, .. } if *r == req => Some(()),
-            AdminReply::AdminFailed { req: r } if *r == req => panic!("migrate out failed"),
+        let migrated = self.wait_admin(|reply| match reply {
+            AdminReply::MigratedOut { req: r, .. } if *r == req => Some(true),
+            AdminReply::AdminFailed { req: r } if *r == req => Some(false),
             _ => None,
         });
+        self.observe_operation(3, migrated, started.elapsed());
+        if !migrated {
+            self.cancel_expected_pause(vset, 1);
+        }
+        assert!(migrated, "migrate out failed");
     }
 
     /// Destination side: wait for the inbound migration's verdict (the
@@ -547,6 +822,17 @@ impl Runtime {
 
     pub fn blob_dir(&self) -> &Path {
         &self.blob_dir
+    }
+
+    /// Capacity and unprivileged-available bytes on the filesystem holding
+    /// local durable blobs. This catches pressure outside the daemon's own
+    /// accounting (logs, stale files, and other users of the mount).
+    pub fn blob_filesystem_space(&self) -> Option<(u64, u64)> {
+        let stats = rustix::fs::statvfs(&self.blob_dir).ok()?;
+        Some((
+            stats.f_blocks.saturating_mul(stats.f_frsize),
+            stats.f_bavail.saturating_mul(stats.f_frsize),
+        ))
     }
 
     // ── the guest boundary (called from workload threads) ───────────────
@@ -592,7 +878,13 @@ impl Runtime {
     }
 
     /// A guest pmem sync barrier (R3.8): blocks until acknowledged.
+    #[tracing::instrument(
+        level = "debug",
+        skip(self),
+        fields(vset_id = vset.0, volume = volume.0)
+    )]
     pub fn guest_sync(&self, vset: VsetId, volume: VolumeIdx) -> bool {
+        let started = Instant::now();
         let host = self.host(vset);
         Runtime::op_start(&host);
         let req = self.req();
@@ -610,6 +902,7 @@ impl Runtime {
             .recv_timeout(Duration::from_secs(30))
             .expect("sync ack within 30s");
         self.op_end(vset, &host);
+        self.observe_operation(4, ok, started.elapsed());
         ok
     }
 
@@ -622,6 +915,29 @@ impl Runtime {
     /// backing memfd's page-cache residency).
     pub fn guest_resident_bytes(&self, vset: VsetId) -> usize {
         self.host(vset).region.resident_bytes().expect("resident")
+    }
+
+    fn observe_operation(&self, operation: usize, success: bool, elapsed: Duration) {
+        self.shared.operation_latency[operation][usize::from(!success)].observe(elapsed);
+    }
+
+    fn expect_pause(&self, vset: VsetId, operation: usize) {
+        self.shared
+            .pause_expected
+            .lock()
+            .expect("lock")
+            .entry(vset)
+            .or_default()
+            .push_back(operation);
+    }
+
+    fn cancel_expected_pause(&self, vset: VsetId, operation: usize) {
+        let mut expected = self.shared.pause_expected.lock().expect("lock");
+        if let Some(queue) = expected.get_mut(&vset)
+            && let Some(position) = queue.iter().position(|candidate| *candidate == operation)
+        {
+            queue.remove(position);
+        }
     }
 }
 
@@ -636,6 +952,127 @@ impl Drop for Runtime {
 
 // ── effect interpretation ───────────────────────────────────────────────
 
+fn fault_source_of_event(event: &Event) -> Option<FaultSource> {
+    match event {
+        Event::BlobReadDone { .. } => Some(FaultSource::Local),
+        Event::StoreGetDone { .. } => Some(FaultSource::Store),
+        Event::PeerDelivered {
+            msg: blockd_core::seam::PeerMsg::Page { .. },
+            ..
+        } => Some(FaultSource::Peer),
+        _ => None,
+    }
+}
+
+fn complete_fault(shared: &Shared, page: PageId, source: FaultSource, outcome: &'static str) {
+    let fault = {
+        let mut pending = shared.fault_in_flight.lock().expect("lock");
+        let fault = pending.get_mut(&page).and_then(VecDeque::pop_front);
+        if pending.get(&page).is_some_and(VecDeque::is_empty) {
+            pending.remove(&page);
+        }
+        fault
+    };
+    let Some(fault) = fault else {
+        return; // unsolicited prefetch/hydration fill
+    };
+    let elapsed = fault.started.elapsed();
+    if let Some(host) = shared
+        .vsets
+        .lock()
+        .expect("lock")
+        .get(&page.volume.vset)
+        .cloned()
+    {
+        host.fault_latency[source.index()].observe(elapsed);
+    }
+    fault.span.record("source", source.name());
+    fault.span.record("outcome", outcome);
+    fault
+        .span
+        .record("duration_ms", elapsed.as_secs_f64() * 1000.0);
+
+    let slow = match source {
+        FaultSource::Zero | FaultSource::Shared | FaultSource::WriteProtect => {
+            elapsed >= Duration::from_millis(10)
+        }
+        FaultSource::Local => elapsed >= Duration::from_millis(5),
+        FaultSource::Peer => elapsed >= Duration::from_millis(25),
+        FaultSource::Store => elapsed >= Duration::from_secs(1),
+        FaultSource::Unservable => true,
+    };
+    if slow {
+        tracing::warn!(
+            parent: &fault.span,
+            vset_id = page.volume.vset.0,
+            volume = page.volume.idx.0,
+            page = page.page.0,
+            source = source.name(),
+            outcome,
+            duration_ms = elapsed.as_secs_f64() * 1000.0,
+            "slow or failed page fault"
+        );
+    }
+}
+
+fn complete_pause(shared: &Shared, vset: VsetId) {
+    let started = shared.pause_in_flight.lock().expect("lock").remove(&vset);
+    if let Some((operation, started)) = started {
+        shared.pause_latency[operation].observe(started.elapsed());
+    }
+}
+
+fn update_backup_lag(shared: &Shared, stats: &blockd_core::daemon::DaemonStats) {
+    let now = Instant::now();
+    let lagging: std::collections::BTreeSet<VsetId> = stats
+        .vsets
+        .iter()
+        .filter(|vset| vset.backup_lag_captures.is_some_and(|lag| lag > 0))
+        .map(|vset| vset.vset)
+        .collect();
+    let mut started = shared.backup_lag_started.lock().expect("lock");
+    started.retain(|vset, _| lagging.contains(vset));
+    for vset in lagging {
+        started.entry(vset).or_insert(now);
+    }
+}
+
+const BACKGROUND_OPERATIONS: [u8; 4] = [
+    blockd_core::daemon::VsetOperations::CAPTURE,
+    blockd_core::daemon::VsetOperations::CHECKPOINT,
+    blockd_core::daemon::VsetOperations::BACKUP,
+    blockd_core::daemon::VsetOperations::HYDRATION,
+];
+
+fn operation_name(operation: u8) -> &'static str {
+    match operation {
+        blockd_core::daemon::VsetOperations::CAPTURE => "capture",
+        blockd_core::daemon::VsetOperations::CHECKPOINT => "checkpoint",
+        blockd_core::daemon::VsetOperations::BACKUP => "backup",
+        blockd_core::daemon::VsetOperations::HYDRATION => "hydration",
+        _ => unreachable!("known background operation"),
+    }
+}
+
+fn update_active_operations(shared: &Shared, stats: &blockd_core::daemon::DaemonStats) {
+    let now = Instant::now();
+    let active: std::collections::BTreeSet<(VsetId, u8)> = stats
+        .vsets
+        .iter()
+        .flat_map(|vset| {
+            BACKGROUND_OPERATIONS
+                .into_iter()
+                .filter(move |operation| vset.operations.active(*operation))
+                .map(move |operation| (vset.vset, operation))
+        })
+        .collect();
+    let mut started = shared.operation_started.lock().expect("lock");
+    started.retain(|operation, _| active.contains(operation));
+    for operation in active {
+        started.entry(operation).or_insert(now);
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn apply_effect(
     effect: Effect,
@@ -648,6 +1085,7 @@ fn apply_effect(
     tx: &Arc<LoopQueue>,
     peers: Option<&Arc<PeerNet>>,
     self_id: blockd_core::types::HostId,
+    source: Option<FaultSource>,
 ) {
     match effect {
         Effect::Fill {
@@ -656,6 +1094,7 @@ fn apply_effect(
             writable,
             share,
         } => {
+            complete_fault(shared, page, source.unwrap_or(FaultSource::Zero), "served");
             assert!(share.is_none(), "base sharing is not wired in e2e v1");
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
             let index = host.page_index(page);
@@ -668,12 +1107,14 @@ fn apply_effect(
         }
         Effect::FillShared { .. } => unreachable!("base sharing is not wired in e2e v1"),
         Effect::FillFailed { page } => {
+            complete_fault(shared, page, FaultSource::Unservable, "failed");
             // Unservable page: in production this SIGBUSes the guest. The
             // e2e scenarios never sanction it — die loudly right here.
-            eprintln!("FATAL: unservable page {page:?}");
+            tracing::error!(?page, "fatal unservable page");
             std::process::abort();
         }
         Effect::Unprotect { page } => {
+            complete_fault(shared, page, FaultSource::WriteProtect, "served");
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
             let index = host.page_index(page);
             host.uffd
@@ -710,6 +1151,19 @@ fn apply_effect(
             host.region.punch_hole(index, 1).expect("punch");
         }
         Effect::PauseGuest { vset } => {
+            let operation = shared
+                .pause_expected
+                .lock()
+                .expect("lock")
+                .get_mut(&vset)
+                .and_then(VecDeque::pop_front);
+            if let Some(operation) = operation {
+                shared
+                    .pause_in_flight
+                    .lock()
+                    .expect("lock")
+                    .insert(vset, (operation, Instant::now()));
+            }
             let host = shared.vsets.lock().expect("lock")[&vset].clone();
             let state = host.ctl.state.lock().expect("lock");
             if state.in_op {
@@ -724,6 +1178,7 @@ fn apply_effect(
             }
         }
         Effect::ResumeGuest { vset } => {
+            complete_pause(shared, vset);
             let host = shared.vsets.lock().expect("lock")[&vset].clone();
             let mut state = host.ctl.state.lock().expect("lock");
             state.pause_requested = false;
@@ -812,6 +1267,7 @@ fn apply_effect(
             let _ = store_tx.send(StoreJob::Delete { key });
         }
         Effect::VsetFenced { vset } => {
+            tracing::warn!(vset_id = vset.0, "vset fenced by a newer assignment");
             shared
                 .incidents
                 .lock()
@@ -819,18 +1275,29 @@ fn apply_effect(
                 .push(format!("fenced: {vset:?}"));
         }
         Effect::Admin(reply) => {
+            if let AdminReply::MigratedOut { vset, .. } = reply {
+                complete_pause(shared, vset);
+            }
             let _ = admin_tx.send(reply);
         }
-        Effect::PeerSend { to, msg } => match peers {
-            Some(net) => net.send(self_id, to, &msg),
-            None => shared
-                .incidents
-                .lock()
-                .expect("lock")
-                .push(format!("peer send to {to:?} with no peer config")),
-        },
+        Effect::PeerSend { to, msg } => {
+            if let Some(net) = peers {
+                net.send(self_id, to, &msg);
+            } else {
+                tracing::warn!(
+                    peer_host = to.0,
+                    ?msg,
+                    "peer send attempted without peer config"
+                );
+                shared
+                    .incidents
+                    .lock()
+                    .expect("lock")
+                    .push(format!("peer send to {to:?} with no peer config"));
+            }
+        }
         Effect::Abort { reason } => {
-            eprintln!("FATAL: daemon abort: {reason}");
+            tracing::error!(%reason, "fatal daemon abort");
             std::process::abort();
         }
     }
@@ -889,13 +1356,20 @@ enum BlobJob {
     },
 }
 
-fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Arc<LoopQueue>) {
+fn blob_worker_loop(
+    rx: &Arc<Mutex<Receiver<BlobJob>>>,
+    root: &Path,
+    tx: &Arc<LoopQueue>,
+    shared: &Shared,
+) {
     loop {
         let Ok(job) = rx.lock().expect("lock").recv() else {
             return;
         };
         let event = match job {
             BlobJob::Write { io, name, bytes } => {
+                let started = Instant::now();
+                shared.local_io_in_flight[0].fetch_add(1, Ordering::Relaxed);
                 let path = root.join(name);
                 let parent = path.parent().expect("has parent");
                 std::fs::create_dir_all(parent).expect("mkdir");
@@ -918,16 +1392,23 @@ fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Arc<Lo
                     }
                     dir = dir.parent().expect("under root");
                 }
-                Event::BlobWriteDone { io }
+                shared.local_io_in_flight[0].fetch_sub(1, Ordering::Relaxed);
+                shared.local_io_latency[0][0].observe(started.elapsed());
+                Some(Event::BlobWriteDone { io })
             }
             BlobJob::Read { io, name } => {
+                let started = Instant::now();
+                shared.local_io_in_flight[1].fetch_add(1, Ordering::Relaxed);
                 let bytes = std::fs::File::open(root.join(name))
                     .ok()
                     .and_then(|mut file| {
                         let mut buf = Vec::new();
                         file.read_to_end(&mut buf).ok().map(|_| buf)
                     });
-                Event::BlobReadDone { io, bytes }
+                shared.local_io_in_flight[1].fetch_sub(1, Ordering::Relaxed);
+                let outcome = usize::from(bytes.is_none());
+                shared.local_io_latency[1][outcome].observe(started.elapsed());
+                Some(Event::BlobReadDone { io, bytes })
             }
             BlobJob::ReadRange {
                 io,
@@ -935,18 +1416,29 @@ fn blob_worker_loop(rx: &Arc<Mutex<Receiver<BlobJob>>>, root: &Path, tx: &Arc<Lo
                 offset,
                 len,
             } => {
+                let started = Instant::now();
+                shared.local_io_in_flight[2].fetch_add(1, Ordering::Relaxed);
                 let bytes = std::fs::File::open(root.join(name)).ok().and_then(|file| {
                     let mut buf = vec![0u8; usize::try_from(len).expect("fits")];
                     file.read_exact_at(&mut buf, offset).ok().map(|()| buf)
                 });
-                Event::BlobReadDone { io, bytes }
+                shared.local_io_in_flight[2].fetch_sub(1, Ordering::Relaxed);
+                let outcome = usize::from(bytes.is_none());
+                shared.local_io_latency[2][outcome].observe(started.elapsed());
+                Some(Event::BlobReadDone { io, bytes })
             }
             BlobJob::Delete { name } => {
+                let started = Instant::now();
+                shared.local_io_in_flight[3].fetch_add(1, Ordering::Relaxed);
                 let _ = std::fs::remove_file(root.join(name));
-                continue;
+                shared.local_io_in_flight[3].fetch_sub(1, Ordering::Relaxed);
+                shared.local_io_latency[3][0].observe(started.elapsed());
+                None
             }
         };
-        tx.push(Msg::Ev(event));
+        if let Some(event) = event {
+            tx.push(Msg::Ev(event));
+        }
     }
 }
 
@@ -1064,7 +1556,12 @@ fn timer_loop(rx: &Receiver<(TimerId, u64)>, tx: &Arc<LoopQueue>) {
 /// - Blob workers: local blob I/O has the same completion-event
 ///   contract — one slow filesystem operation (fsync included) must not
 ///   stall guest faults.
-fn spawn_io_workers(blob_dir: &Path, store: &Arc<dyn ObjectStore>, tx: &Arc<LoopQueue>) -> IoLanes {
+fn spawn_io_workers(
+    blob_dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    tx: &Arc<LoopQueue>,
+    shared: &Arc<Shared>,
+) -> IoLanes {
     let (timer_tx, timer_rx) = channel::<(TimerId, u64)>();
     {
         let tx = tx.clone();
@@ -1089,7 +1586,8 @@ fn spawn_io_workers(blob_dir: &Path, store: &Arc<dyn ObjectStore>, tx: &Arc<Loop
             let blob_dir = blob_dir.to_path_buf();
             let tx = tx.clone();
             let blob_rx = blob_rx.clone();
-            thread::spawn(move || blob_worker_loop(&blob_rx, &blob_dir, &tx));
+            let shared = shared.clone();
+            thread::spawn(move || blob_worker_loop(&blob_rx, &blob_dir, &tx, &shared));
         }
     }
 
@@ -1103,7 +1601,8 @@ fn spawn_io_workers(blob_dir: &Path, store: &Arc<dyn ObjectStore>, tx: &Arc<Loop
         let blob_delete_rx = Arc::new(Mutex::new(blob_delete_rx));
         let blob_dir = blob_dir.to_path_buf();
         let tx = tx.clone();
-        thread::spawn(move || blob_worker_loop(&blob_delete_rx, &blob_dir, &tx));
+        let shared = shared.clone();
+        thread::spawn(move || blob_worker_loop(&blob_delete_rx, &blob_dir, &tx, &shared));
     }
 
     IoLanes {
@@ -1130,6 +1629,31 @@ fn elapsed_ns(elapsed: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    fn test_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            vsets: Mutex::new(BTreeMap::new()),
+            sync_waiters: Mutex::new(BTreeMap::new()),
+            incidents: Mutex::new(Vec::new()),
+            counters: Mutex::new(blockd_core::daemon::Counters::default()),
+            daemon_stats: Mutex::new(blockd_core::daemon::DaemonStats::default()),
+            stats: LoopStats::default(),
+            fault_in_flight: Mutex::new(BTreeMap::new()),
+            operation_latency: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicHistogram::default())
+            }),
+            local_io_latency: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicHistogram::default())
+            }),
+            local_io_in_flight: std::array::from_fn(|_| AtomicU64::new(0)),
+            pause_expected: Mutex::new(BTreeMap::new()),
+            pause_in_flight: Mutex::new(BTreeMap::new()),
+            pause_latency: std::array::from_fn(|_| AtomicHistogram::default()),
+            backup_lag_started: Mutex::new(BTreeMap::new()),
+            operation_started: Mutex::new(BTreeMap::new()),
+            next_req: AtomicU64::new(1),
+        })
+    }
+
     #[test]
     fn contiguous_pages_collapse_to_minimal_ranges() {
         let mut indices = vec![9, 3, 4, 4, 5, 12, 11, 20];
@@ -1143,14 +1667,7 @@ mod tests {
 
     #[test]
     fn queued_blob_io_does_not_block_followup_effects() {
-        let shared = Arc::new(Shared {
-            vsets: Mutex::new(BTreeMap::new()),
-            sync_waiters: Mutex::new(BTreeMap::new()),
-            incidents: Mutex::new(Vec::new()),
-            counters: Mutex::new(blockd_core::daemon::Counters::default()),
-            stats: LoopStats::default(),
-            next_req: AtomicU64::new(1),
-        });
+        let shared = test_shared();
         let (store_tx, _store_rx) = channel();
         // No worker receives from this channel: it models every disk worker
         // being occupied by a slow filesystem operation.
@@ -1175,6 +1692,7 @@ mod tests {
             &tx,
             None,
             blockd_core::types::HostId(0),
+            None,
         );
         apply_effect(
             Effect::SetTimer {
@@ -1190,6 +1708,7 @@ mod tests {
             &tx,
             None,
             blockd_core::types::HostId(0),
+            None,
         );
 
         assert!(matches!(
@@ -1217,10 +1736,12 @@ mod tests {
         let (job_tx, job_rx) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let msg_queue = LoopQueue::new();
+        let shared = test_shared();
         let worker = {
             let root = root.clone();
             let msg_queue = msg_queue.clone();
-            thread::spawn(move || blob_worker_loop(&job_rx, &root, &msg_queue))
+            let shared = shared.clone();
+            thread::spawn(move || blob_worker_loop(&job_rx, &root, &msg_queue, &shared))
         };
 
         job_tx

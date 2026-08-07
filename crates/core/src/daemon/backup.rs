@@ -377,6 +377,7 @@ impl Daemon {
         };
         match result {
             Ok(version) => {
+                self.counters.assignment_claims += 1;
                 state.fence = version;
                 state.head_version = Some(version);
                 if state.fork_from.is_some() {
@@ -388,6 +389,7 @@ impl Daemon {
                 }
             }
             Err(StoreFault::CasConflict { .. }) => {
+                self.counters.assignment_claim_conflicts += 1;
                 // The id is already claimed: creation fails loudly (ids are
                 // never reused, R6.5 — this is a control-plane defect).
                 let req = state.create_req.take();

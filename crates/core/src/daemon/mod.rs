@@ -87,6 +87,9 @@ pub struct Counters {
     pub shared_fills: u64,
     /// First-writes caught by write protection.
     pub wp_faults: u64,
+    /// Guest pages transitioning from clean to dirty. Unlike `wp_faults`,
+    /// this includes write-intent missing faults.
+    pub guest_pages_dirtied: u64,
     /// Faults for pages that exist nowhere intact (R8.1's loud failure).
     pub faults_unservable: u64,
     pub pressure_waits: u64,
@@ -107,6 +110,10 @@ pub struct Counters {
     pub store_retries: u64,
     /// Times this host lost a vset to another holder's claim (R6.4).
     pub fenced: u64,
+    /// Successful object-store assignment claims (create or restore).
+    pub assignment_claims: u64,
+    /// Assignment claims lost because another holder won the CAS.
+    pub assignment_claim_conflicts: u64,
     /// Local segments dropped because backup holds them (R2.7's droppable
     /// class); refaults refetch from the store.
     pub nvme_reclaims: u64,
@@ -145,6 +152,69 @@ pub struct Counters {
     pub segs_compacted: u64,
     /// Live pages rewritten forward by compaction.
     pub pages_compacted: u64,
+}
+
+/// One live vset's current operational state. This is deliberately a
+/// point-in-time view: exporters can remove retired vsets instead of
+/// leaving stale high-cardinality series behind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VsetStats {
+    pub vset: VsetId,
+    pub backed_up: bool,
+    pub role: VsetRole,
+    pub fence: u64,
+    pub dirty_pages: usize,
+    pub unstable_pages: usize,
+    pub parked_faults: usize,
+    pub pending_syncs: usize,
+    pub pending_leaf_spans: usize,
+    pub hydration_remaining_pages: usize,
+    pub backup_lag_captures: Option<u64>,
+    pub backup_lag_bytes: Option<u64>,
+    pub operations: VsetOperations,
+    pub live_segment_bytes: u64,
+    pub local_segment_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VsetRole {
+    Initializing,
+    Serving,
+    Hydrating,
+    Outbound,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VsetOperations(u8);
+
+impl VsetOperations {
+    pub const CAPTURE: u8 = 1;
+    pub const CHECKPOINT: u8 = 2;
+    pub const BACKUP: u8 = 4;
+    pub const HYDRATION: u8 = 8;
+
+    pub fn active(self, operation: u8) -> bool {
+        self.0 & operation != 0
+    }
+}
+
+/// Host-wide gauges needed to operate pressure, writeback and hydration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DaemonStats {
+    pub cache_capacity_pages: usize,
+    pub resident_pages: usize,
+    pub shared_resident_pages: usize,
+    pub reserved_pages: usize,
+    pub dirty_pages: usize,
+    pub unstable_pages: usize,
+    pub pressure_waiting_faults: usize,
+    pub parked_faults: usize,
+    pub local_blob_bytes: u64,
+    pub disk_capacity_bytes: Option<u64>,
+    pub disk_headroom_bytes: u64,
+    pub live_segment_bytes: u64,
+    pub local_segment_bytes: u64,
+    pub vsets: Vec<VsetStats>,
 }
 
 /// The page→location map of one consistency point.
@@ -679,6 +749,136 @@ impl Daemon {
                 disk + s.seg_blobs.iter().map(|&(_, _, b)| b).sum::<u64>(),
             )
         })
+    }
+
+    /// A bounded, current-state view for production telemetry (R9.2).
+    #[allow(clippy::too_many_lines)]
+    pub fn stats(&self) -> DaemonStats {
+        let mut blocked: BTreeMap<VsetId, usize> = BTreeMap::new();
+        for &(page, _) in &self.waiters {
+            *blocked.entry(page.volume.vset).or_default() += 1;
+        }
+        for pending in self.pending.values() {
+            let page = match pending {
+                Pending::Fetch { page, .. }
+                | Pending::StoreFetch { page, .. }
+                | Pending::PeerFetch { page, .. } => Some(*page),
+                _ => None,
+            };
+            if let Some(page) = page {
+                *blocked.entry(page.volume.vset).or_default() += 1;
+            }
+        }
+
+        let vsets = self
+            .vsets
+            .iter()
+            .map(|(&vset, state)| {
+                let dirty_pages = self.cache.dirty_pages_of(vset).len();
+                let unstable_pages = self.cache.unstable_pages_of(vset).len();
+                let outage_parked = state.store_fill_retry.len()
+                    + state.leaf_waiters.values().map(Vec::len).sum::<usize>();
+                let hydration_remaining_pages = if state.peer_source.is_some() {
+                    state
+                        .page_locs
+                        .values()
+                        .filter(|(_, loc)| loc.base == 0 && loc.fence < state.fence)
+                        .count()
+                } else {
+                    0
+                };
+                let live_segment_bytes = state.seg_live.values().sum();
+                let local_segment_bytes = state.seg_blobs.iter().map(|&(_, _, bytes)| bytes).sum();
+                let best = state.best.map_or(0, |(capture, _)| capture);
+                let backed = state.backed.map_or(0, |ptr| ptr.capture_seq);
+                let backup_lag_bytes = state.config.backed_up.then(|| {
+                    let Some(record) = state.best_record.as_ref() else {
+                        return 0;
+                    };
+                    let pending_segments: BTreeSet<(u64, SegId)> = record
+                        .overlay
+                        .values()
+                        .filter(|(_, loc)| loc.base == 0)
+                        .map(|(_, loc)| (loc.fence, loc.seg))
+                        .chain(
+                            record
+                                .leaves
+                                .values()
+                                .filter(|ptr| ptr.base == 0)
+                                .filter_map(|ptr| state.leaf_blobs.get(ptr))
+                                .flat_map(|(_, segments)| segments.iter().copied()),
+                        )
+                        .filter(|segment| !state.backed_segs.contains(segment))
+                        .collect();
+                    state
+                        .seg_blobs
+                        .iter()
+                        .filter(|&&(fence, seg, _)| pending_segments.contains(&(fence, seg)))
+                        .map(|&(_, _, bytes)| bytes)
+                        .sum()
+                });
+                let hydrating = state.peer_source.is_some() || !state.pending_leaves.is_empty();
+                let role = if state.outbound.is_some() {
+                    VsetRole::Outbound
+                } else if hydrating {
+                    VsetRole::Hydrating
+                } else if state.ready {
+                    VsetRole::Serving
+                } else {
+                    VsetRole::Initializing
+                };
+                let mut operations = 0;
+                if state.commit_running || state.drain.is_some() {
+                    operations |= VsetOperations::CAPTURE;
+                }
+                if state.ckpt_running {
+                    operations |= VsetOperations::CHECKPOINT;
+                }
+                if state.publish.is_some() {
+                    operations |= VsetOperations::BACKUP;
+                }
+                if hydrating {
+                    operations |= VsetOperations::HYDRATION;
+                }
+                VsetStats {
+                    vset,
+                    backed_up: state.config.backed_up,
+                    role,
+                    fence: state.fence,
+                    dirty_pages,
+                    unstable_pages,
+                    parked_faults: blocked.get(&vset).copied().unwrap_or(0) + outage_parked,
+                    pending_syncs: state.pending_syncs.len(),
+                    pending_leaf_spans: state.pending_leaves.len(),
+                    hydration_remaining_pages,
+                    backup_lag_captures: state
+                        .config
+                        .backed_up
+                        .then_some(best.saturating_sub(backed)),
+                    backup_lag_bytes,
+                    operations: VsetOperations(operations),
+                    live_segment_bytes,
+                    local_segment_bytes,
+                }
+            })
+            .collect();
+        let (live_segment_bytes, local_segment_bytes) = self.seg_space();
+        DaemonStats {
+            cache_capacity_pages: self.cache.capacity(),
+            resident_pages: self.cache.resident_count(),
+            shared_resident_pages: self.cache.base_resident_count(),
+            reserved_pages: self.cache.reserved_count(),
+            dirty_pages: self.cache.dirty_count(),
+            unstable_pages: self.cache.unstable_count(),
+            pressure_waiting_faults: self.waiters.len(),
+            parked_faults: self.parked_fills(),
+            local_blob_bytes: self.local_bytes,
+            disk_capacity_bytes: self.config.disk_capacity,
+            disk_headroom_bytes: self.config.disk_headroom,
+            live_segment_bytes,
+            local_segment_bytes,
+            vsets,
+        }
     }
 
     pub fn new(config: DaemonConfig) -> (Daemon, Vec<Effect>) {

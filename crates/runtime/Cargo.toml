@@ -22,7 +22,9 @@ missing_panics_doc = "allow"
 [dependencies]
 blockd-core = { path = "../core" }
 blockd-hostmem = { path = "../hostmem" }
+tracing = "0.1.44"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+rustix = { version = "0.38.44", features = ["fs"] }
 
 [dev-dependencies]
 # The differential recovery test replays simulation-produced blob sets

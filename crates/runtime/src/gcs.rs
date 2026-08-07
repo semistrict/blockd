@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use blockd_core::seam::StoreFault;
 
+use crate::metrics::{AtomicHistogram, HistogramSnapshot};
 use crate::store::{GetResult, ObjectStore};
 
 /// R4.6: no object exceeds 64 MiB; anything larger is a protocol
@@ -61,6 +62,54 @@ pub struct GcsStats {
     pub token_refreshes: AtomicU64,
     pub bytes_up: AtomicU64,
     pub bytes_down: AtomicU64,
+    latency: [[AtomicHistogram; GCS_OUTCOMES]; GCS_OPERATIONS],
+}
+
+const GCS_OPERATIONS: usize = 6;
+const GCS_OUTCOMES: usize = 3;
+const GCS_OPERATION_NAMES: [&str; GCS_OPERATIONS] = [
+    "put",
+    "conditional_put",
+    "get",
+    "ranged_get",
+    "delete",
+    "token_refresh",
+];
+const GCS_OUTCOME_NAMES: [&str; GCS_OUTCOMES] = ["success", "unavailable", "conflict"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GcsLatency {
+    pub operation: &'static str,
+    pub outcome: &'static str,
+    pub histogram: HistogramSnapshot,
+}
+
+impl GcsStats {
+    fn observe(&self, operation: usize, outcome: usize, elapsed: Duration) {
+        self.latency[operation][outcome].observe(elapsed);
+    }
+
+    pub fn latency(&self) -> Vec<GcsLatency> {
+        let mut snapshots = Vec::with_capacity(GCS_OPERATIONS * GCS_OUTCOMES);
+        for (operation, operation_name) in GCS_OPERATION_NAMES.iter().enumerate() {
+            for (outcome, outcome_name) in GCS_OUTCOME_NAMES.iter().enumerate() {
+                snapshots.push(GcsLatency {
+                    operation: operation_name,
+                    outcome: outcome_name,
+                    histogram: self.latency[operation][outcome].snapshot(),
+                });
+            }
+        }
+        snapshots
+    }
+}
+
+fn outcome_of<T>(result: &Result<T, StoreFault>) -> usize {
+    match result {
+        Ok(_) => 0,
+        Err(StoreFault::Unavailable) => 1,
+        Err(StoreFault::CasConflict { .. }) => 2,
+    }
 }
 
 struct CachedToken {
@@ -137,7 +186,7 @@ struct GcsResponse {
 }
 
 fn abort(context: &str, detail: &str) -> ! {
-    eprintln!("FATAL: GCS {context}: {detail}");
+    tracing::error!(gcs_context = context, detail, "fatal GCS error");
     std::process::abort()
 }
 
@@ -181,6 +230,14 @@ impl GcsStore {
     }
 
     fn refresh_token(&self) -> Result<String, StoreFault> {
+        let started = Instant::now();
+        let result = self.refresh_token_inner();
+        self.stats
+            .observe(5, outcome_of(&result), started.elapsed());
+        result
+    }
+
+    fn refresh_token_inner(&self) -> Result<String, StoreFault> {
         let url = format!(
             "{}/computeMetadata/v1/instance/service-accounts/default/token",
             self.cfg.metadata_endpoint
@@ -303,11 +360,55 @@ impl GcsStore {
 
 impl ObjectStore for GcsStore {
     fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, StoreFault> {
+        let started = Instant::now();
+        let result = self.put_inner(key, &bytes);
+        self.stats
+            .observe(0, outcome_of(&result), started.elapsed());
+        result
+    }
+
+    fn put_cas(&self, key: &str, expected: Option<u64>, bytes: Vec<u8>) -> Result<u64, StoreFault> {
+        let started = Instant::now();
+        let result = self.put_cas_inner(key, expected, &bytes);
+        self.stats
+            .observe(1, outcome_of(&result), started.elapsed());
+        result
+    }
+
+    fn get(&self, key: &str) -> GetResult {
+        let started = Instant::now();
+        let result = self.get_inner(key);
+        self.stats
+            .observe(2, outcome_of(&result), started.elapsed());
+        result
+    }
+
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> GetResult {
+        let started = Instant::now();
+        let result = self.get_range_inner(key, offset, len);
+        self.stats
+            .observe(3, outcome_of(&result), started.elapsed());
+        result
+    }
+
+    fn delete(&self, key: &str) {
+        let started = Instant::now();
+        self.stats.deletes.fetch_add(1, Ordering::SeqCst);
+        // Fire-and-forget (R4.5): a failed delete leaks one superseded
+        // object; the daemon never re-drives deletes, so neither do we.
+        let result = self.request("DELETE", key, &[], None).map(|_| ());
+        self.stats
+            .observe(4, outcome_of(&result), started.elapsed());
+    }
+}
+
+impl GcsStore {
+    fn put_inner(&self, key: &str, bytes: &[u8]) -> Result<u64, StoreFault> {
         self.stats.puts.fetch_add(1, Ordering::SeqCst);
         self.stats
             .bytes_up
             .fetch_add(bytes.len() as u64, Ordering::SeqCst);
-        let resp = self.request("PUT", key, &[], Some(&bytes))?;
+        let resp = self.request("PUT", key, &[], Some(bytes))?;
         match resp.status {
             200 => Ok(Self::generation_or_abort("PUT", &resp)),
             status => abort(
@@ -320,14 +421,19 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn put_cas(&self, key: &str, expected: Option<u64>, bytes: Vec<u8>) -> Result<u64, StoreFault> {
+    fn put_cas_inner(
+        &self,
+        key: &str,
+        expected: Option<u64>,
+        bytes: &[u8],
+    ) -> Result<u64, StoreFault> {
         self.stats.cas_puts.fetch_add(1, Ordering::SeqCst);
         self.stats
             .bytes_up
             .fetch_add(bytes.len() as u64, Ordering::SeqCst);
         let precondition = expected.unwrap_or(0).to_string();
         let headers = [("x-goog-if-generation-match", precondition)];
-        let resp = self.request("PUT", key, &headers, Some(&bytes))?;
+        let resp = self.request("PUT", key, &headers, Some(bytes))?;
         match resp.status {
             200 => Ok(Self::generation_or_abort("CAS PUT", &resp)),
             // The condition failed: someone else holds the key. Any
@@ -351,7 +457,7 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn get(&self, key: &str) -> GetResult {
+    fn get_inner(&self, key: &str) -> GetResult {
         self.stats.gets.fetch_add(1, Ordering::SeqCst);
         let resp = self.request("GET", key, &[], None)?;
         match resp.status {
@@ -367,7 +473,7 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn get_range(&self, key: &str, offset: u64, len: u64) -> GetResult {
+    fn get_range_inner(&self, key: &str, offset: u64, len: u64) -> GetResult {
         assert!(len > 0, "zero-length range read");
         self.stats.ranged_gets.fetch_add(1, Ordering::SeqCst);
         let range = format!("bytes={offset}-{}", offset + len - 1);
@@ -396,13 +502,6 @@ impl ObjectStore for GcsStore {
             404 | 416 => Ok(None),
             status => abort("ranged GET", &format!("status {status} for {key}")),
         }
-    }
-
-    fn delete(&self, key: &str) {
-        self.stats.deletes.fetch_add(1, Ordering::SeqCst);
-        // Fire-and-forget (R4.5): a failed delete leaks one superseded
-        // object; the daemon never re-drives deletes, so neither do we.
-        let _ = self.request("DELETE", key, &[], None);
     }
 }
 

@@ -387,8 +387,8 @@ pub struct ShmemServer {
     parts: Arc<PartTable>,
     /// Faults answered (fills + wakes of already-populated pages).
     pub faults: Arc<AtomicU64>,
-    /// Per-fault service time in microseconds (the fault-latency profile).
-    pub fault_micros: Arc<Mutex<Vec<u64>>>,
+    /// Cumulative end-to-end shmem fault latency, bounded in memory.
+    fault_latency: Arc<crate::metrics::AtomicHistogram>,
 }
 
 impl ShmemServer {
@@ -435,12 +435,12 @@ impl ShmemServer {
         let server = ShmemServer {
             parts,
             faults: Arc::new(AtomicU64::new(0)),
-            fault_micros: Arc::new(Mutex::new(Vec::new())),
+            fault_latency: Arc::new(crate::metrics::AtomicHistogram::default()),
         };
         let (parts, fault_count, latencies) = (
             server.parts.clone(),
             server.faults.clone(),
-            server.fault_micros.clone(),
+            server.fault_latency.clone(),
         );
         thread::spawn(move || {
             loop {
@@ -460,6 +460,17 @@ impl ShmemServer {
     /// Pages filled from the source (unique work — the R5.3 measure).
     pub fn filled(&self) -> u64 {
         self.parts.filled.load(Ordering::SeqCst)
+    }
+
+    pub fn fault_latency(&self) -> crate::metrics::HistogramSnapshot {
+        self.fault_latency.snapshot()
+    }
+
+    pub fn source(&self) -> &'static str {
+        match &self.parts.filler {
+            Filler::File(_) => "local_snapshot",
+            Filler::Store { .. } => "object_store_snapshot",
+        }
     }
 
     /// Physical bytes the shared base holds right now.
@@ -714,7 +725,7 @@ fn serve_one_shmem(
     stream: &UnixStream,
     parts: &Arc<PartTable>,
     fault_count: &AtomicU64,
-    latencies: &Arc<Mutex<Vec<u64>>>,
+    latencies: &Arc<crate::metrics::AtomicHistogram>,
 ) {
     let mut buf = vec![0u8; 65536];
     let (n, fd) = recv_with_fd(stream, &mut buf).expect("recv uffd");
@@ -736,10 +747,7 @@ fn serve_one_shmem(
             parts.fault(offset, move || {
                 uffd.wake(usize::try_from(addr).expect("fits"), page_size())
                     .expect("wake");
-                latencies
-                    .lock()
-                    .expect("lock")
-                    .push(u64::try_from(started.elapsed().as_micros()).expect("fits"));
+                latencies.observe(started.elapsed());
             });
         }
     }

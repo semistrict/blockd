@@ -68,6 +68,33 @@ fn created_daemon() -> Daemon {
 }
 
 #[test]
+fn operational_snapshot_tracks_dirty_and_parked_state() {
+    let mut daemon = created_daemon();
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(0),
+    };
+    let effects = daemon.step(Event::GuestFault { page, write: true }, &NoMem);
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Fill { writable: true, .. }]
+    ));
+
+    let stats = daemon.stats();
+    assert_eq!(stats.cache_capacity_pages, 8);
+    assert_eq!((stats.resident_pages, stats.dirty_pages), (1, 1));
+    assert_eq!(stats.vsets.len(), 1);
+    let vset = &stats.vsets[0];
+    assert_eq!(vset.role, VsetRole::Serving);
+    assert_eq!((vset.dirty_pages, vset.unstable_pages), (1, 1));
+    assert_eq!(vset.backup_lag_bytes, None);
+    assert_eq!(daemon.counters.guest_pages_dirtied, 1);
+}
+
+#[test]
 fn checkpoint_retries_replay_their_outcome() {
     // R3.5: a retried request replays its outcome — same epoch, no new
     // pause, no new capture.

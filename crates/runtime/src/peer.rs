@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
 use std::time::Duration;
@@ -44,7 +44,8 @@ pub struct PeerNet {
     senders: BTreeMap<HostId, SyncSender<Vec<u8>>>,
     /// Frames dropped on the floor (queue full or peer down) — the demo's
     /// visibility into how hard the retry timers are working.
-    pub dropped_sends: AtomicU64,
+    pub dropped_sends: Arc<AtomicU64>,
+    connected: BTreeMap<HostId, Arc<AtomicBool>>,
 }
 
 impl PeerNet {
@@ -56,14 +57,20 @@ impl PeerNet {
         self_id: HostId,
         deliver: impl Fn(HostId, PeerMsg) + Send + Sync + 'static,
     ) -> Arc<PeerNet> {
+        let dropped_sends = Arc::new(AtomicU64::new(0));
         let mut senders = BTreeMap::new();
+        let mut connected = BTreeMap::new();
         for (&peer, &addr) in &config.peers {
             if peer == self_id {
                 continue;
             }
             let (tx, rx) = sync_channel::<Vec<u8>>(SEND_QUEUE);
-            thread::spawn(move || sender_loop(&rx, addr));
+            let peer_connected = Arc::new(AtomicBool::new(false));
+            let status = peer_connected.clone();
+            let dropped = dropped_sends.clone();
+            thread::spawn(move || sender_loop(&rx, addr, peer, &status, &dropped));
             senders.insert(peer, tx);
+            connected.insert(peer, peer_connected);
         }
         let listener = TcpListener::bind(config.listen).expect("peer listen");
         {
@@ -78,7 +85,8 @@ impl PeerNet {
         }
         Arc::new(PeerNet {
             senders,
-            dropped_sends: AtomicU64::new(0),
+            dropped_sends,
+            connected,
         })
     }
 
@@ -94,12 +102,25 @@ impl PeerNet {
             self.dropped_sends.fetch_add(1, Ordering::SeqCst);
         }
     }
+
+    pub fn connections(&self) -> Vec<(HostId, bool)> {
+        self.connected
+            .iter()
+            .map(|(&peer, connected)| (peer, connected.load(Ordering::Relaxed)))
+            .collect()
+    }
 }
 
 /// One outbound connection, made lazily and remade on any error. A frame
 /// that hits a connect or write failure is dropped with its connection —
 /// the protocol's retry timers own recovery, not this loop.
-fn sender_loop(rx: &Receiver<Vec<u8>>, addr: SocketAddr) {
+fn sender_loop(
+    rx: &Receiver<Vec<u8>>,
+    addr: SocketAddr,
+    peer: HostId,
+    connected: &AtomicBool,
+    dropped_sends: &AtomicU64,
+) {
     let mut conn: Option<TcpStream> = None;
     while let Ok(frame) = rx.recv() {
         if conn.is_none() {
@@ -112,14 +133,20 @@ fn sender_loop(rx: &Receiver<Vec<u8>>, addr: SocketAddr) {
                         .ok()?;
                     Some(stream)
                 });
+            connected.store(conn.is_some(), Ordering::Relaxed);
         }
         let Some(stream) = conn.as_mut() else {
+            dropped_sends.fetch_add(1, Ordering::SeqCst);
             continue; // peer unreachable: drop the frame
         };
         if stream.write_all(&frame).is_err() {
+            dropped_sends.fetch_add(1, Ordering::SeqCst);
+            connected.store(false, Ordering::Relaxed);
+            tracing::warn!(peer_host = peer.0, %addr, "peer connection lost");
             conn = None;
         }
     }
+    connected.store(false, Ordering::Relaxed);
 }
 
 /// One inbound connection: length-delimited by the frame header itself,

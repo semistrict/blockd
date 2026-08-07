@@ -78,24 +78,26 @@ fn worked_snapshot(art: &Artifacts) -> (PathBuf, PathBuf, String) {
     (snap, mem, sum)
 }
 
-fn percentile(sorted: &[u64], pct: usize) -> u64 {
-    let index = (sorted.len() - 1) * pct / 100;
-    sorted[index]
+fn fault_percentile(histogram: &blockd_runtime::HistogramSnapshot, pct: u64) -> u64 {
+    let rank = histogram.count.saturating_mul(pct).div_ceil(100);
+    blockd_runtime::LATENCY_BUCKETS_NS
+        .iter()
+        .zip(&histogram.buckets)
+        .find(|(_, count)| **count >= rank)
+        .map_or(u64::MAX, |(upper, _)| upper / 1_000)
 }
 
-fn fault_profile(micros: &Arc<std::sync::Mutex<Vec<u64>>>) -> String {
-    let mut sorted = micros.lock().expect("lock").clone();
-    if sorted.is_empty() {
+fn fault_profile(histogram: &blockd_runtime::HistogramSnapshot) -> String {
+    if histogram.count == 0 {
         return "no faults".to_owned();
     }
-    sorted.sort_unstable();
     format!(
-        "{} faults: p50 {}µs  p90 {}µs  p99 {}µs  max {}µs",
-        sorted.len(),
-        percentile(&sorted, 50),
-        percentile(&sorted, 90),
-        percentile(&sorted, 99),
-        percentile(&sorted, 100),
+        "{} faults: p50 <= {}µs  p90 <= {}µs  p99 <= {}µs  max <= {}µs",
+        histogram.count,
+        fault_percentile(histogram, 50),
+        fault_percentile(histogram, 90),
+        fault_percentile(histogram, 99),
+        fault_percentile(histogram, 100),
     )
 }
 
@@ -156,7 +158,7 @@ fn profile_restore_file_vs_uffdshmem() {
     );
     eprintln!(
         "  UffdShmem faults  {}  (pages filled {})",
-        fault_profile(&server.fault_micros),
+        fault_profile(&server.fault_latency()),
         server.filled(),
     );
     // Shape assertions: both restored correctly (checked above) and within
@@ -234,7 +236,7 @@ fn profile_cold_restore_from_simulated_s3() {
          {gets_at_first_response} GetObject calls to get there)"
     );
     eprintln!("  16 MiB working-set drain {drain:.1?} ({gets_total} GetObject calls total)");
-    eprintln!("  faults: {}", fault_profile(&server.fault_micros));
+    eprintln!("  faults: {}", fault_profile(&server.fault_latency()));
     eprintln!("  S3 bill: {}", store.s3.stats.report());
 
     // The request bill's SHAPE is deterministic: one PutObject per part on

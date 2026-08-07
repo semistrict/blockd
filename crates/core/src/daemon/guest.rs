@@ -36,6 +36,7 @@ impl Daemon {
                 let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                 vset.mutation_seq += 1;
                 self.counters.wp_faults += 1;
+                self.counters.guest_pages_dirtied += 1;
             }
             out.push(Effect::Unprotect { page });
             return;
@@ -96,6 +97,7 @@ impl Daemon {
                             self.cache.fill_slot(page, true);
                             let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                             vset.mutation_seq += 1;
+                            self.counters.guest_pages_dirtied += 1;
                             vset.wedge.fills += 1;
                             self.counters.shared_fills += 1;
                             out.push(Effect::FillShared {
@@ -134,6 +136,7 @@ impl Daemon {
                         let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                         if write {
                             vset.mutation_seq += 1;
+                            self.counters.guest_pages_dirtied += 1;
                         }
                         vset.wedge.fills += 1;
                         self.counters.zero_fills += 1;
@@ -283,6 +286,7 @@ impl Daemon {
         if let Some(vset) = self.vsets.get_mut(&page.volume.vset) {
             if write {
                 vset.mutation_seq += 1;
+                self.counters.guest_pages_dirtied += 1;
             }
             vset.wedge.fills += 1;
         }

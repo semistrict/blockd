@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -89,6 +90,7 @@ fn every_variant_crosses_the_wire_with_its_sender() {
             .expect("delivered");
         assert_eq!((from, got), (HostId(0), msg));
     }
+    assert_eq!(a.connections(), vec![(HostId(1), true)]);
 }
 
 /// Sends into the void drop silently; once the listener exists, later
@@ -106,6 +108,8 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
     // No listener at addr_b yet: this frame is dropped on the floor.
     a.send(HostId(0), HostId(1), &PeerMsg::Released { vset: VsetId(1) });
     std::thread::sleep(Duration::from_millis(50));
+    assert!(a.dropped_sends.load(Ordering::SeqCst) >= 1);
+    assert_eq!(a.connections(), vec![(HostId(1), false)]);
 
     let (_b, rx_b) = net(addr_b, roster);
     // The sender's dead connection is discovered on the next write; the
@@ -123,6 +127,7 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
         .expect("reconnected and delivered");
     assert_eq!(from, HostId(0));
     assert_eq!(got, PeerMsg::ReleasedAck { vset: VsetId(2) });
+    assert_eq!(a.connections(), vec![(HostId(1), true)]);
 }
 
 /// A stream that turns to garbage is closed at the first bad frame and

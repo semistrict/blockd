@@ -139,6 +139,7 @@ impl Daemon {
     ) {
         match result {
             Ok(fence) => {
+                self.counters.assignment_claims += 1;
                 let io = self.io();
                 self.pending.insert(
                     io,
@@ -162,6 +163,7 @@ impl Daemon {
             // A lost race (some other host claimed first): this host
             // simply is not the runner (R6.3).
             Err(StoreFault::CasConflict { .. }) => {
+                self.counters.assignment_claim_conflicts += 1;
                 out.push(Effect::Admin(AdminReply::AdminFailed { req }));
             }
         }

@@ -18,6 +18,7 @@ use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts};
 use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, PeerConfig, Runtime, RuntimeConfig};
 
 use crate::config::DemodConfig;
+use crate::observability::Metrics;
 
 pub const MEM_MIB: u32 = 128;
 pub const PART_BYTES: u64 = 8 * 1024 * 1024;
@@ -72,6 +73,7 @@ pub struct Demod {
     pub rt: Runtime,
     pub store: Arc<GcsStore>,
     pub vms: Mutex<BTreeMap<u64, Vm>>,
+    pub metrics: Arc<Metrics>,
     next_vm: AtomicU64,
     next_fork: AtomicU64,
     next_server: AtomicU64,
@@ -79,6 +81,17 @@ pub struct Demod {
 }
 
 impl Demod {
+    pub fn firecracker_fault_latency(
+        &self,
+    ) -> Vec<(&'static str, blockd_runtime::HistogramSnapshot)> {
+        self.servers
+            .lock()
+            .expect("lock")
+            .values()
+            .map(|fill| (fill.server.source(), fill.server.fault_latency()))
+            .collect()
+    }
+
     pub fn start(cfg: DemodConfig) -> Demod {
         std::fs::create_dir_all(&cfg.scratch).expect("scratch dir");
         let store = Arc::new(GcsStore::new(GcsConfig {
@@ -90,12 +103,12 @@ impl Demod {
         let runtime_config = RuntimeConfig {
             daemon: DaemonConfig {
                 host: cfg.host,
-                cache_pages: 4096,
-                writeback_interval: millis(10),
-                backup_retry: millis(100),
-                disk_capacity: None,
-                disk_headroom: 0,
-                wedge_ticks: 500,
+                cache_pages: cfg.cache_pages,
+                writeback_interval: millis(cfg.writeback_interval_ms),
+                backup_retry: millis(cfg.backup_retry_ms),
+                disk_capacity: cfg.disk_capacity_bytes,
+                disk_headroom: cfg.disk_headroom_bytes,
+                wedge_ticks: cfg.wedge_ticks,
             },
             blob_dir: cfg.blob_dir.clone(),
             peer: Some(PeerConfig {
@@ -110,6 +123,7 @@ impl Demod {
             rt,
             store,
             vms: Mutex::new(BTreeMap::new()),
+            metrics: Arc::new(Metrics::new()),
             next_fork: AtomicU64::new(1),
             next_server: AtomicU64::new(0),
             servers: Mutex::new(BTreeMap::new()),
@@ -123,6 +137,7 @@ impl Demod {
     /// Bake the base image: boot a template guest, give it a worked
     /// state, snapshot, and publish the snapshot to the store. Returns
     /// the guest's own checksum of the baked state.
+    #[tracing::instrument(skip(self), name = "vm.bake_base")]
     pub fn bake_base(&self) -> String {
         let scratch = &self.cfg.scratch;
         let mut vm = FcVm::spawn(&self.fc_bin(), &scratch.join("bake.sock"));
@@ -153,6 +168,7 @@ impl Demod {
     }
 
     /// Upload a snapshot (vmstate + memory parts) under `prefix`.
+    #[tracing::instrument(skip(self, vmstate, mem), fields(snapshot_prefix = prefix))]
     fn publish_snapshot(&self, prefix: &str, vmstate: &Path, mem: &Path) {
         let parts = upload_mem_parts(
             self.store.as_ref(),
@@ -203,6 +219,7 @@ impl Demod {
     }
 
     /// Restore one FC microVM from a store-held snapshot prefix.
+    #[tracing::instrument(skip(self), fields(vm_id = id, snapshot_prefix = prefix))]
     fn boot_from(&self, id: u64, prefix: &str) -> FcVm {
         let fill = self.ensure_server(prefix);
         let vmstate = self.cfg.scratch.join(format!("vm{id}.vmstate"));
@@ -221,8 +238,10 @@ impl Demod {
     }
 
     /// Start a fresh VM from the base snapshot with its paired vset.
+    #[tracing::instrument(skip(self), fields(vm_id = tracing::field::Empty))]
     pub fn start_vm(&self, backed: bool) -> u64 {
         let id = self.next_vm.fetch_add(1, Ordering::SeqCst);
+        tracing::Span::current().record("vm_id", id);
         let mut fc = self.boot_from(id, "base");
         fc.cmd("ping", "PONG");
         self.rt.create_vset(VsetId(id), vset_config(backed));
@@ -235,6 +254,7 @@ impl Demod {
                 fc: Some(Arc::new(Mutex::new(fc))),
             },
         );
+        tracing::info!(vm_id = id, backed, "VM started");
         id
     }
 
@@ -248,6 +268,7 @@ impl Demod {
     /// One work burst: the guest computes over fresh memory, and the
     /// burst is mirrored into the vset — counter plus data pages — with a
     /// sync making it a durable consistency point.
+    #[tracing::instrument(skip(self), fields(vm_id = id, burst_count = bursts))]
     pub fn work(&self, id: u64, bursts: u64) -> (u64, String) {
         let vset = VsetId(id);
         let fc = self.fc_of(id);
@@ -275,6 +296,7 @@ impl Demod {
     /// Verify the vset against the self-describing model: page 0 names
     /// the burst, every data page must match it. Returns (burst,
     /// mismatches).
+    #[tracing::instrument(skip(self), fields(vm_id = id))]
     pub fn verify(&self, id: u64) -> (u64, u32) {
         let vset = VsetId(id);
         let counter = self.rt.guest_read(vset, disk_page(vset, 0));
@@ -292,6 +314,9 @@ impl Demod {
                 mismatches += 1;
             }
         }
+        if mismatches > 0 {
+            tracing::warn!(vm_id = id, burst, mismatches, "VM verification failed");
+        }
         (burst, mismatches)
     }
 
@@ -299,6 +324,7 @@ impl Demod {
     /// microVMs off that one snapshot — they share one memory copy on
     /// this host (the fill server's file), diverging copy-on-write.
     /// Returns (fork ids, sum of Rss, sum of Pss, fill-server resident).
+    #[tracing::instrument(skip(self), fields(vm_id = id, fork_count = n))]
     pub fn fork(&self, id: u64, n: u32) -> (Vec<u64>, usize, usize, usize) {
         let prefix = format!("vm{id}/f{}", self.next_fork.fetch_add(1, Ordering::SeqCst));
         let vmstate = self.cfg.scratch.join(format!("fork-{id}.vmstate"));
@@ -341,12 +367,21 @@ impl Demod {
             .expect("lock")
             .get(&prefix)
             .map_or(0, |s| s.server.resident_bytes());
+        tracing::info!(
+            vm_id = id,
+            fork_count = n,
+            rss_bytes = rss_sum,
+            pss_bytes = pss_sum,
+            base_resident_bytes = resident,
+            "VM forks started"
+        );
         (ids, rss_sum, pss_sum, resident)
     }
 
     /// Destination side of a migration: accept the vset (guest memory
     /// pre-created), then — once the handoff lands — restore the microVM
     /// from the snapshot the source published.
+    #[tracing::instrument(skip(self), fields(vm_id = id))]
     pub fn expect(self: &Arc<Demod>, id: u64) {
         self.rt.expect_migration(VsetId(id), vset_config(false));
         self.vms.lock().expect("lock").insert(
@@ -359,24 +394,32 @@ impl Demod {
             },
         );
         let this = self.clone();
+        let parent = tracing::Span::current();
         std::thread::spawn(move || {
-            let verdict = this.rt.wait_migrated_in(VsetId(id));
-            assert!(
-                matches!(verdict, Verdict::Resume { .. }),
-                "migration verdict {verdict:?}"
-            );
-            let mut fc = this.boot_from(id, &format!("vm{id}/mig"));
-            fc.cmd("ping", "PONG");
-            let mut vms = this.vms.lock().expect("lock");
-            let vm = vms.get_mut(&id).expect("expected vm");
-            vm.fc = Some(Arc::new(Mutex::new(fc)));
-            "running".clone_into(&mut vm.state);
+            parent.in_scope(|| {
+                let span = tracing::info_span!("migration.receive", vm_id = id);
+                span.in_scope(|| {
+                    let verdict = this.rt.wait_migrated_in(VsetId(id));
+                    assert!(
+                        matches!(verdict, Verdict::Resume { .. }),
+                        "migration verdict {verdict:?}"
+                    );
+                    let mut fc = this.boot_from(id, &format!("vm{id}/mig"));
+                    fc.cmd("ping", "PONG");
+                    let mut vms = this.vms.lock().expect("lock");
+                    let vm = vms.get_mut(&id).expect("expected vm");
+                    vm.fc = Some(Arc::new(Mutex::new(fc)));
+                    "running".clone_into(&mut vm.state);
+                    tracing::info!(vm_id = id, "inbound migration resumed");
+                });
+            });
         });
     }
 
     /// Source side: pause + snapshot the microVM, publish it, kill it,
     /// and live-migrate the vset over TCP. Returns milliseconds spent
     /// (snapshot+publish, migrate handoff).
+    #[tracing::instrument(skip(self), fields(vm_id = id, destination_host = to))]
     pub fn migrate(&self, id: u64, to: u16) -> (u128, u128) {
         let vmstate = self.cfg.scratch.join(format!("mig-{id}.vmstate"));
         let mem = self.cfg.scratch.join(format!("mig-{id}.mem"));
@@ -403,11 +446,19 @@ impl Demod {
             fc.into_inner().expect("lock").kill();
         }
         "migrated-out".clone_into(&mut vm.state);
+        tracing::info!(
+            vm_id = id,
+            destination_host = to,
+            snapshot_ms = snap_ms,
+            handoff_ms,
+            "outbound migration completed"
+        );
         (snap_ms, handoff_ms)
     }
 
     /// After the owning host died: restore a backed vset from the store
     /// alone (R6.1) and give it a fresh microVM from the base image.
+    #[tracing::instrument(skip(self), fields(vm_id = id))]
     pub fn restore(&self, id: u64) -> String {
         let verdict = self.rt.restore_vset(VsetId(id), vset_config(true));
         let mut fc = self.boot_from(id, "base");
@@ -421,6 +472,7 @@ impl Demod {
                 fc: Some(Arc::new(Mutex::new(fc))),
             },
         );
+        tracing::info!(vm_id = id, ?verdict, "VM restored");
         format!("{verdict:?}")
     }
 }
