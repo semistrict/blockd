@@ -34,6 +34,7 @@ mod s3;
 mod store;
 #[cfg(target_os = "linux")]
 pub mod vsetfs;
+pub mod world;
 
 pub use blobscan::scan_blob_dir;
 pub use capacity::{

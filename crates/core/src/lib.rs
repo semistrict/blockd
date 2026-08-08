@@ -23,3 +23,4 @@ pub mod seam;
 pub mod segment;
 pub mod types;
 pub mod vsetfs;
+pub mod world;

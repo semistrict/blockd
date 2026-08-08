@@ -471,7 +471,14 @@ impl Executor {
             if let Some(value) = output.borrow_mut().take() {
                 return value;
             }
-            assert!(self.run_one(), "root actor stalled with no possible wake");
+            if !self.run_one() {
+                assert_eq!(
+                    self.mode,
+                    Mode::Production,
+                    "root actor stalled with no possible wake"
+                );
+                self.wait_for_wake();
+            }
         }
     }
 

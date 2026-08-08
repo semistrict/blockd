@@ -194,6 +194,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 name = "blockd-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blockd-platform",
  "crc-fast",
  "lz4_flex",
@@ -261,6 +262,7 @@ dependencies = [
  "axum",
  "base64",
  "blockd-core",
+ "blockd-exec",
  "blockd-hostmem",
  "blockd-sim",
  "blockd-vsetfs",
@@ -283,7 +285,9 @@ dependencies = [
 name = "blockd-sim"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blockd-core",
+ "blockd-exec",
  "blockd-workload",
  "serde",
  "serde_json",
