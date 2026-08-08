@@ -8,12 +8,14 @@
 //! sequence, which is what lets the oracle validate every byte the daemon
 //! ever fills (R8.1) and reconstruct recovered states after crashes (R3.8).
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blockd_core::journal::VsetConfig;
 use blockd_core::seam::ReqId;
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
 
+use crate::oracle::Oracle;
 use crate::rng::{Pcg64, Ppm};
 
 /// Deterministic content of a page after its volume's write number
@@ -91,6 +93,183 @@ pub enum GuestState {
     },
     /// Failed loudly (R8.1) — dead until the next daemon incarnation.
     Dead,
+}
+
+/// One vset's guest memory: the shared mapping. Bytes are the real page
+/// contents; `protected` pages trap writes (uffd write-protect).
+#[derive(Debug, Default)]
+pub(crate) struct VsetMem {
+    pub(crate) pages: BTreeMap<PageId, Vec<u8>>,
+    pub(crate) protected: BTreeSet<PageId>,
+    /// Pages the guest touched since the last accessed-bit harvest — the
+    /// simulation's ground truth behind MGLRU aging (R2.6).
+    pub(crate) accessed: RefCell<BTreeSet<PageId>>,
+}
+
+pub(crate) enum AttemptResult {
+    Fault { page: PageId, write: bool },
+    Complete,
+}
+
+pub(crate) fn attempt_op(mem: &mut VsetMem, guest: &mut Guest, op: PendingOp) -> AttemptResult {
+    let (page, write) = match op {
+        PendingOp::Write { page, .. } => (page, true),
+        PendingOp::Read { page } | PendingOp::Fsck { page } => (page, false),
+    };
+    let resident = mem.pages.contains_key(&page);
+    let trapped = !resident || (write && mem.protected.contains(&page));
+    if trapped {
+        guest.state = GuestState::Faulted { op };
+        return AttemptResult::Fault { page, write };
+    }
+    AttemptResult::Complete
+}
+
+/// Apply an operation that has reached plain guest memory. Returns whether
+/// recovery verification still has pages queued.
+pub(crate) fn complete_op(
+    mem: Option<&mut VsetMem>,
+    guest: &mut Guest,
+    oracle: &mut Oracle,
+    vset: VsetId,
+    op: PendingOp,
+    after_access: impl FnOnce(PendingOp),
+) -> bool {
+    // Every retired op sets the page's accessed bit — the ground truth
+    // MGLRU aging harvests (R2.6).
+    let (PendingOp::Write { page, .. } | PendingOp::Read { page } | PendingOp::Fsck { page }) = op;
+    if let Some(mem) = mem.as_ref() {
+        mem.accessed.borrow_mut().insert(page);
+    }
+    after_access(op);
+    match op {
+        PendingOp::Write { page, vol_seq } => {
+            let mem = mem.expect("mapped");
+            assert!(!mem.protected.contains(&page), "write to protected page");
+            mem.pages.insert(page, page_pattern(page, vol_seq));
+            guest.applied += 1;
+            let op_index = guest.applied;
+            oracle.on_write_ok(page, vol_seq, op_index);
+        }
+        PendingOp::Read { .. } => {
+            // Resident content is either the guest's own writes or a
+            // validated fill: nothing to check, nothing to tell.
+            guest.applied += 1;
+        }
+        PendingOp::Fsck { .. } => {
+            guest.applied += 1;
+            let done = guest.fsck.is_empty();
+            let cold = guest.cold_booting;
+            if done && cold {
+                guest.cold_booting = false;
+                oracle.finish_cold_boot(vset);
+            }
+        }
+    }
+    guest.state = GuestState::Idle;
+    guest.completed += 1;
+    !guest.fsck.is_empty()
+}
+
+pub(crate) enum FillResult {
+    Installed,
+    Refault,
+    Complete(PendingOp),
+}
+
+/// Install bytes delivered by a fill and advance the waiting guest state.
+/// Routing a refault and retiring an operation remain harness concerns.
+pub(crate) fn fill(
+    mem: &mut VsetMem,
+    guest: &mut Guest,
+    oracle: &mut Oracle,
+    page: PageId,
+    bytes: Vec<u8>,
+    writable: bool,
+) -> FillResult {
+    let waited = match guest.state {
+        GuestState::Faulted { op } => {
+            let (PendingOp::Write { page: p, .. }
+            | PendingOp::Read { page: p }
+            | PendingOp::Fsck { page: p }) = op;
+            (p == page).then_some(op)
+        }
+        _ => None,
+    };
+    let Some(op) = waited else {
+        // Unsolicited fill: prefetch pre-population (R6.2) — the
+        // daemon wrote the bytes into the shmem backing and mapped
+        // them with UFFDIO_CONTINUE ahead of the fault (COPY would
+        // make a private page and break R5.3 sharing). Validate and
+        // install; nothing retires.
+        // During cold-boot inference the bytes are the restored disk
+        // state, exactly like an fsck fill.
+        oracle.check_fill(page, &bytes, guest.cold_booting);
+        mem.pages.insert(page, bytes);
+        mem.protected.insert(page);
+        return FillResult::Installed;
+    };
+    let cold_fsck = matches!(op, PendingOp::Fsck { .. }) && guest.cold_booting;
+    oracle.check_fill(page, &bytes, cold_fsck);
+    mem.pages.insert(page, bytes);
+    if writable {
+        mem.protected.remove(&page);
+    } else {
+        mem.protected.insert(page);
+    }
+    if guest.paused {
+        // Memory is resolved, but a paused vCPU retires nothing: the
+        // op completes on resume (captures see one instant).
+        guest.state = GuestState::Parked { op };
+        return FillResult::Installed;
+    }
+    if !writable && matches!(op, PendingOp::Write { .. }) {
+        // An unsolicited fill (prefetch or hydration) landed
+        // write-protected under this waiting writer. Real uffd resolves
+        // the missing fault, the write retries, and traps again as a WP
+        // fault — model exactly that; the op retires via `Unprotect`.
+        return FillResult::Refault;
+    }
+    guest.state = GuestState::Idle;
+    FillResult::Complete(op)
+}
+
+pub(crate) fn resolve_write(guest: Option<&mut Guest>) -> Option<PendingOp> {
+    let guest = guest?;
+    let GuestState::Faulted { op } = guest.state else {
+        // A capture may unprotect-resolve spuriously; nothing waits.
+        return None;
+    };
+    guest.state = GuestState::Idle;
+    Some(op)
+}
+
+pub(crate) enum UnparkResult {
+    Attempt(PendingOp),
+    SyncComplete,
+    Schedule,
+}
+
+/// Retire whatever completed while the vCPU was paused. Scheduling and
+/// memory routing stay with the harness adapter so RNG draw order is fixed.
+pub(crate) fn unpark(guest: &mut Guest, oracle: &mut Oracle) -> UnparkResult {
+    match guest.state {
+        GuestState::Parked { op } => {
+            // The resumed vCPU retries the instruction: re-attempt, so
+            // a write whose page re-protected meanwhile traps again
+            // instead of completing into a protected page.
+            guest.state = GuestState::Idle;
+            UnparkResult::Attempt(op)
+        }
+        GuestState::SyncParked { volume } => {
+            guest.applied += 1;
+            guest.state = GuestState::Idle;
+            guest.completed += 1;
+            oracle.on_sync_ok(volume);
+            UnparkResult::SyncComplete
+        }
+        _ => UnparkResult::Schedule,
+    }
 }
 
 pub struct Guest {

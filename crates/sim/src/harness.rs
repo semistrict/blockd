@@ -14,7 +14,9 @@ use blockd_core::layout::{self, BlobName};
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, Verdict};
 use blockd_core::types::{PageId, SimTime, VsetId, micros, millis};
 
-use crate::guest::{Guest, GuestState, PendingOp, page_pattern};
+use crate::guest::{
+    AttemptResult, FillResult, Guest, GuestState, PendingOp, UnparkResult, VsetMem,
+};
 use crate::kernel::Kernel;
 use crate::oracle::Oracle;
 use crate::world::blobdev::{BdevIo, BlobDev, BlobDevConfig};
@@ -187,17 +189,6 @@ enum AdminKind {
     Create(VsetId),
     Checkpoint(VsetId),
     Restore(VsetId),
-}
-
-/// One vset's guest memory: the shared mapping. Bytes are the real page
-/// contents; `protected` pages trap writes (uffd write-protect).
-#[derive(Debug, Default)]
-struct VsetMem {
-    pages: BTreeMap<PageId, Vec<u8>>,
-    protected: BTreeSet<PageId>,
-    /// Pages the guest touched since the last accessed-bit harvest — the
-    /// simulation's ground truth behind MGLRU aging (R2.6).
-    accessed: std::cell::RefCell<BTreeSet<PageId>>,
 }
 
 /// The daemon's synchronous window onto the mappings.
@@ -902,67 +893,37 @@ impl Harness {
 
     /// Try a memory operation against the mapping; fault if it traps.
     fn attempt_op(&mut self, vset: VsetId, op: PendingOp) {
-        let mem = self.mems.entry(vset).or_default();
-        let (page, write) = match op {
-            PendingOp::Write { page, .. } => (page, true),
-            PendingOp::Read { page } | PendingOp::Fsck { page } => (page, false),
-        };
-        let resident = mem.pages.contains_key(&page);
-        let trapped = !resident || (write && mem.protected.contains(&page));
-        if trapped {
-            self.guests.get_mut(&vset).expect("guest exists").state = GuestState::Faulted { op };
-            self.step_daemon(Event::GuestFault { page, write });
-            return;
+        let result = crate::guest::attempt_op(
+            self.mems.entry(vset).or_default(),
+            self.guests.get_mut(&vset).expect("guest exists"),
+            op,
+        );
+        match result {
+            AttemptResult::Fault { page, write } => {
+                self.step_daemon(Event::GuestFault { page, write });
+            }
+            AttemptResult::Complete => self.complete_op(vset, op),
         }
-        self.complete_op(vset, op);
     }
 
     /// The access proceeds in plain memory: apply it and finish the op.
     fn complete_op(&mut self, vset: VsetId, op: PendingOp) {
-        // Every retired op sets the page's accessed bit — the ground truth
-        // MGLRU aging harvests (R2.6).
-        let (PendingOp::Write { page, .. } | PendingOp::Read { page } | PendingOp::Fsck { page }) =
-            op;
-        if let Some(mem) = self.mems.get(&vset) {
-            mem.accessed.borrow_mut().insert(page);
-        }
-        if let Some(filter) = std::env::var_os("BLOCKD_SIM_TRACE_PAGE") {
-            let text = format!("{op:?}");
-            if text.contains(filter.to_string_lossy().as_ref()) {
-                eprintln!("[t={:?}] complete {text}", self.kernel.now());
-            }
-        }
-        match op {
-            PendingOp::Write { page, vol_seq } => {
-                let mem = self.mems.get_mut(&vset).expect("mapped");
-                assert!(!mem.protected.contains(&page), "write to protected page");
-                mem.pages.insert(page, page_pattern(page, vol_seq));
-                let guest = self.guests.get_mut(&vset).expect("guest exists");
-                guest.applied += 1;
-                let op_index = guest.applied;
-                self.oracle.on_write_ok(page, vol_seq, op_index);
-            }
-            PendingOp::Read { .. } => {
-                // Resident content is either the guest's own writes or a
-                // validated fill: nothing to check, nothing to tell.
-                self.guests.get_mut(&vset).expect("guest exists").applied += 1;
-            }
-            PendingOp::Fsck { page } => {
-                let guest = self.guests.get_mut(&vset).expect("guest exists");
-                guest.applied += 1;
-                let done = guest.fsck.is_empty();
-                let cold = guest.cold_booting;
-                let _ = page;
-                if done && cold {
-                    guest.cold_booting = false;
-                    self.oracle.finish_cold_boot(vset);
+        let now = self.kernel.now();
+        let fsck_pending = crate::guest::complete_op(
+            self.mems.get_mut(&vset),
+            self.guests.get_mut(&vset).expect("guest exists"),
+            &mut self.oracle,
+            vset,
+            op,
+            |op| {
+                if let Some(filter) = std::env::var_os("BLOCKD_SIM_TRACE_PAGE") {
+                    let text = format!("{op:?}");
+                    if text.contains(filter.to_string_lossy().as_ref()) {
+                        eprintln!("[t={now:?}] complete {text}");
+                    }
                 }
-            }
-        }
-        let guest = self.guests.get_mut(&vset).expect("guest exists");
-        guest.state = GuestState::Idle;
-        guest.completed += 1;
-        let fsck_pending = !guest.fsck.is_empty();
+            },
+        );
         if self.within_horizon() || fsck_pending {
             self.schedule_guest(vset);
         }
@@ -973,70 +934,27 @@ impl Harness {
     /// let the blocked operation proceed.
     fn fill(&mut self, page: PageId, bytes: Vec<u8>, writable: bool) {
         let vset = page.volume.vset;
-        let guest = self.guests.get_mut(&vset).expect("guest exists");
-        let waited = match guest.state {
-            GuestState::Faulted { op } => {
-                let (PendingOp::Write { page: p, .. }
-                | PendingOp::Read { page: p }
-                | PendingOp::Fsck { page: p }) = op;
-                (p == page).then_some(op)
-            }
-            _ => None,
-        };
-        let Some(op) = waited else {
-            // Unsolicited fill: prefetch pre-population (R6.2) — the
-            // daemon wrote the bytes into the shmem backing and mapped
-            // them with UFFDIO_CONTINUE ahead of the fault (COPY would
-            // make a private page and break R5.3 sharing). Validate and
-            // install; nothing retires.
-            // During cold-boot inference the bytes are the restored disk
-            // state, exactly like an fsck fill.
-            self.oracle.check_fill(page, &bytes, guest.cold_booting);
-            let mem = self.mems.get_mut(&vset).expect("mapped");
-            mem.pages.insert(page, bytes);
-            mem.protected.insert(page);
-            return;
-        };
-        let cold_fsck = matches!(op, PendingOp::Fsck { .. }) && guest.cold_booting;
-        self.oracle.check_fill(page, &bytes, cold_fsck);
-        let mem = self.mems.get_mut(&vset).expect("mapped");
-        mem.pages.insert(page, bytes);
-        if writable {
-            mem.protected.remove(&page);
-        } else {
-            mem.protected.insert(page);
+        let result = crate::guest::fill(
+            self.mems.get_mut(&vset).expect("mapped"),
+            self.guests.get_mut(&vset).expect("guest exists"),
+            &mut self.oracle,
+            page,
+            bytes,
+            writable,
+        );
+        match result {
+            FillResult::Installed => {}
+            FillResult::Refault => self.refaults.push(page),
+            FillResult::Complete(op) => self.complete_op(vset, op),
         }
-        let guest = self.guests.get_mut(&vset).expect("guest exists");
-        if guest.paused {
-            // Memory is resolved, but a paused vCPU retires nothing: the
-            // op completes on resume (captures see one instant).
-            guest.state = GuestState::Parked { op };
-            return;
-        }
-        if !writable && matches!(op, PendingOp::Write { .. }) {
-            // An unsolicited fill (prefetch pre-population) landed
-            // write-protected under this waiting writer. Real uffd resolves
-            // the missing fault, the write retries, and traps again as a WP
-            // fault — model exactly that; the op retires via `Unprotect`.
-            self.refaults.push(page);
-            return;
-        }
-        guest.state = GuestState::Idle;
-        self.complete_op(vset, op);
     }
 
     /// The write-protect fault resolved: the blocked write proceeds.
     fn resolve_write(&mut self, page: PageId) {
         let vset = page.volume.vset;
-        let Some(guest) = self.guests.get_mut(&vset) else {
-            return;
-        };
-        let GuestState::Faulted { op } = guest.state else {
-            // A capture may unprotect-resolve spuriously; nothing waits.
-            return;
-        };
-        guest.state = GuestState::Idle;
-        self.complete_op(vset, op);
+        if let Some(op) = crate::guest::resolve_write(self.guests.get_mut(&vset)) {
+            self.complete_op(vset, op);
+        }
     }
 
     fn fill_failed(&mut self, page: PageId) {
@@ -1099,25 +1017,18 @@ impl Harness {
 
     /// Retire whatever completed while the vCPU was paused.
     fn unpark(&mut self, vset: VsetId) {
-        let guest = self.guests.get_mut(&vset).expect("guest exists");
-        match guest.state {
-            GuestState::Parked { op } => {
-                // The resumed vCPU retries the instruction: re-attempt, so
-                // a write whose page re-protected meanwhile traps again
-                // instead of completing into a protected page.
-                guest.state = GuestState::Idle;
-                self.attempt_op(vset, op);
-            }
-            GuestState::SyncParked { volume } => {
-                guest.applied += 1;
-                guest.state = GuestState::Idle;
-                guest.completed += 1;
-                self.oracle.on_sync_ok(volume);
+        let result = crate::guest::unpark(
+            self.guests.get_mut(&vset).expect("guest exists"),
+            &mut self.oracle,
+        );
+        match result {
+            UnparkResult::Attempt(op) => self.attempt_op(vset, op),
+            UnparkResult::SyncComplete => {
                 if self.within_horizon() {
                     self.schedule_guest(vset);
                 }
             }
-            _ => self.schedule_guest(vset),
+            UnparkResult::Schedule => self.schedule_guest(vset),
         }
     }
 

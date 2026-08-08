@@ -176,12 +176,9 @@ verified closure. A stash never gains permission to run the guest.
 
 Peer traffic is mutually authenticated TLS. The exact verified leaf
 certificate maps to a roster host ID, and a frame whose claimed sender differs
-from that identity closes the connection. Rollout is a separate fail-closed
-control-plane policy: disabled by default, then one failure domain, then a
-salted deterministic percentage of vsets. Expansion aborts on any false ACK,
-recovery mismatch, non-active-peer byte, cleanup rewrite, or 80% spool-capacity
-alert. A production gate separately records completion of transport,
-capacity-alert, recovery-drill, and downgrade checks.
+from that identity closes the connection. Peer-stashed durability is selected
+explicitly per vset; rollout orchestration and production-readiness policy are
+control-plane responsibilities outside this daemon.
 
 The recovery drill inventories only peers named by the fenced head, verifies a
 complete closure in quarantine, claims ownership by head CAS, refences and
