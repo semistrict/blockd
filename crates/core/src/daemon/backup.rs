@@ -24,7 +24,10 @@ impl Daemon {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
         };
-        if state.config.durability != DurabilityMode::Backup || state.publish.is_some() {
+        if state.config.durability != DurabilityMode::Backup
+            || state.publish.is_some()
+            || (state.migrated_verdict.is_some() && !state.migration_head_claimed)
+        {
             return;
         }
         let Some(head_version) = state.head_version else {
@@ -305,6 +308,7 @@ impl Daemon {
                     self.drain_sync_acks(vset, out);
                     self.store_cleanup(vset, out);
                     self.maybe_publish(vset, out);
+                    self.maybe_finish_backed_migration(vset, out);
                 }
                 Err(StoreFault::CasConflict { .. }) => {
                     // Another holder claimed the head: structurally fenced

@@ -4,7 +4,7 @@
 //! runs are deterministic.
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::types::{HostId, VsetId, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
@@ -27,11 +27,8 @@ fn base_config() -> HarnessConfig {
         store: StoreConfig::s3(),
         vset_count: 2,
         backed_vsets: 1,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 16,
-            durability: DurabilityMode::Local, // overridden per vset by `backed_vsets`
-        },
+        // Durability is overridden per vset by `backed_vsets`.
+        vset_config: VsetConfig::compute(2, 16, false),
         horizon: secs(2),
         think: (millis(1), millis(5)),
         checkpoint_interval: None,

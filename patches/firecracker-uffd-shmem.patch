@@ -121,6 +121,18 @@ index 5e39a32..10665da 100644
  fn create_guest_memory(
      mem_state: &GuestMemoryState,
      track_dirty_pages: bool,
+diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
+index aea1869..85fea91 100644
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -1327,6 +1327,7 @@ mod tests {
+                 mem_backend: MemBackendConfig {
+                     backend_type: MemBackendType::File,
+                     backend_path: PathBuf::new(),
++                    shmem_path: None,
+                 },
+                 track_dirty_pages: false,
+                 resume_vm: false,
 diff --git a/src/vmm/src/vmm_config/snapshot.rs b/src/vmm/src/vmm_config/snapshot.rs
 index 4f312f8..317360c 100644
 --- a/src/vmm/src/vmm_config/snapshot.rs
@@ -151,3 +163,23 @@ index 4f312f8..317360c 100644
  }
  
  /// The microVM state options.
+diff --git a/src/vmm/tests/integration_tests.rs b/src/vmm/tests/integration_tests.rs
+index 7936a0a..dcba2d2 100644
+--- a/src/vmm/tests/integration_tests.rs
++++ b/src/vmm/tests/integration_tests.rs
+@@ -304,6 +304,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
+             mem_backend: MemBackendConfig {
+                 backend_path: memory_file.as_path().to_path_buf(),
+                 backend_type: MemBackendType::File,
++                shmem_path: None,
+             },
+             track_dirty_pages: false,
+             resume_vm: true,
+@@ -390,6 +391,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
+         mem_backend: MemBackendConfig {
+             backend_path: memory_file.as_path().to_path_buf(),
+             backend_type: MemBackendType::File,
++            shmem_path: None,
+         },
+         track_dirty_pages: false,
+         resume_vm: false,

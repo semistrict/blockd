@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Capture, Daemon, PageMap, Pending, Vset};
-use crate::journal::{JournalRecord, RecordKind};
+use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_of};
 use crate::seam::{AdminCmd, AdminReply, Effect, HostMap, IoId, ReqId, TimerId};
@@ -58,6 +58,8 @@ const DRAIN_PAGES_PER_STEP: usize = 64;
 pub(super) struct Drain {
     seq: JournalSeq,
     capture_seq: u64,
+    database: crate::journal::DatabaseMeta,
+    database_prune_spans: BTreeSet<u32>,
     builder: SegmentBatchBuilder,
     /// Armed pages not yet read: drained in key order, or immediately on
     /// a write-protect fault (copy-on-fault, the crux — see `drain_cow`).
@@ -79,6 +81,8 @@ pub(super) struct Drain {
 struct Built {
     seq: JournalSeq,
     capture_seq: u64,
+    database: crate::journal::DatabaseMeta,
+    database_prune_spans: BTreeSet<u32>,
     checkpoint: Option<(Epoch, u64, ReqId)>,
     new_locs: Vec<NewLoc>,
     seg_blobs: Vec<SegmentBlob>,
@@ -90,7 +94,7 @@ struct Built {
 impl Daemon {
     // ── admin ───────────────────────────────────────────────────────────
 
-    pub(super) fn admin(&mut self, cmd: AdminCmd, out: &mut Vec<Effect>) {
+    pub(super) fn admin(&mut self, cmd: AdminCmd, mem: &dyn HostMap, out: &mut Vec<Effect>) {
         match cmd {
             AdminCmd::CreateVset {
                 req,
@@ -132,7 +136,7 @@ impl Daemon {
                     out.push(Effect::Admin(AdminReply::AdminFailed { req }));
                     return;
                 };
-                if !state.ready {
+                if !state.ready || state.config.kind != VsetKind::Compute {
                     out.push(Effect::Admin(AdminReply::AdminFailed { req }));
                     return;
                 }
@@ -151,6 +155,20 @@ impl Daemon {
             AdminCmd::RestoreVset { req, vset } => self.restore_vset(req, vset, out),
             AdminCmd::MigrateOut { req, vset, to } => self.migrate_out(req, vset, to, out),
             AdminCmd::DeleteBase { req, base } => Self::delete_base(req, base, out),
+            AdminCmd::AttachDatabase { req, vset, vm } => {
+                self.attach_database(req, vset, vm, out);
+            }
+            AdminCmd::BeginDetachDatabase {
+                req,
+                vset,
+                attachment,
+                mode,
+            } => self.begin_detach_database(req, vset, attachment, mode, mem, out),
+            AdminCmd::FinishDetachDatabase {
+                req,
+                vset,
+                attachment,
+            } => self.finish_detach_database(req, vset, attachment, mem, out),
         }
     }
 
@@ -216,10 +234,21 @@ impl Daemon {
         let has_uncovered_sync = state
             .pending_syncs
             .iter()
+            .chain(state.pending_database_syncs.iter())
             .any(|&(_, barrier)| barrier > state.local_covered_through);
+        let detach_needs_commit = state
+            .database_runtime
+            .detach_barrier()
+            .is_some_and(|barrier| barrier > state.local_covered_through);
         // Any pending sync needs a record whose watermark covers it; a
+        // graceful detach needs its final barrier represented too. A
         // compaction rescue needs a capture to carry it home.
-        if has_dirty || has_uncovered_sync || !state.compact_stash.is_empty() {
+        if has_dirty
+            || state.database != state.database_durable
+            || has_uncovered_sync
+            || detach_needs_commit
+            || !state.compact_stash.is_empty()
+        {
             self.start_capture(vset, None, mem, out);
         }
     }
@@ -391,13 +420,15 @@ impl Daemon {
         let seq = JournalSeq(state.next_seq);
         state.next_seq += 1;
         state.commit_running = true;
-        let capture_seq = state.mutation_seq;
+        let capture_seq = state.database_runtime.capture_seq(state.mutation_seq);
+        let database = state.database;
         let overlay = state.overlay.clone();
         let leaf_table = state.leaf_table.clone();
         state.captures.insert(
             seq,
             Capture {
                 capture_seq,
+                database,
                 checkpoint: None,
                 overlay,
                 leaf_table,
@@ -456,9 +487,18 @@ impl Daemon {
             })
             .map(|(&span, _)| span)
             .collect();
+        to_roll.extend(
+            force_rolls
+                .iter()
+                .copied()
+                .filter(|span| !state.pending_leaves.contains_key(span)),
+        );
         // Overlay-cap pressure: roll the fattest spans until back under.
-        let mut remaining =
-            overlay.len() - to_roll.iter().map(|span| span_counts[span]).sum::<usize>();
+        let mut remaining = overlay.len()
+            - to_roll
+                .iter()
+                .map(|span| span_counts.get(span).copied().unwrap_or(0))
+                .sum::<usize>();
         while remaining > OVERLAY_MAX {
             let fattest = span_counts
                 .iter()
@@ -476,6 +516,9 @@ impl Daemon {
         let mut rolled_gens = BTreeMap::new();
         let mut writes = Vec::new();
         for span in to_roll {
+            // A truncate/delete may remove every entry in the span, so clear
+            // the old inline half independently of the rebuilt content.
+            overlay.retain(|page, _| span_of(*page) != span);
             // Full span content: the serving map ⊕ this capture's locs.
             let lo_key = u64::from(span) * LEAF_SPAN;
             let idx = VolumeIdx(u8::try_from(lo_key >> 32).expect("volume index"));
@@ -543,7 +586,13 @@ impl Daemon {
         let state = self.vsets.get_mut(&vset_id).expect("capture of known vset");
         let seq = JournalSeq(state.next_seq);
         state.next_seq += 1;
-        let capture_seq = state.mutation_seq;
+        let capture_seq = state.database_runtime.capture_seq(state.mutation_seq);
+        let database = state.database;
+        let database_prune_spans: BTreeSet<u32> = state
+            .database_prune_spans
+            .iter()
+            .filter_map(|(&span, &op)| (op <= capture_seq).then_some(span))
+            .collect();
         let checkpoint = ckpt.map(|(req, vmstate)| (Epoch(state.epoch.0 + 1), vmstate, req));
         if checkpoint.is_none() {
             state.commit_running = true;
@@ -588,6 +637,8 @@ impl Daemon {
                 vset_id,
                 seq,
                 capture_seq,
+                database,
+                database_prune_spans,
                 &to_flush,
                 to_protect,
                 compact_victims,
@@ -645,6 +696,8 @@ impl Daemon {
             Built {
                 seq,
                 capture_seq,
+                database,
+                database_prune_spans,
                 checkpoint,
                 new_locs,
                 seg_blobs,
@@ -676,6 +729,8 @@ impl Daemon {
         let Built {
             seq,
             capture_seq,
+            database,
+            database_prune_spans,
             checkpoint,
             new_locs,
             seg_blobs,
@@ -687,7 +742,7 @@ impl Daemon {
         // Every leaf still referencing a victim segment — via live
         // entries (all in the rescue) or stale ones — must rotate, or the
         // leaf keeps the dying segment pinned.
-        let force_rolls: BTreeSet<u32> = if compact_victims.is_empty() {
+        let mut force_rolls: BTreeSet<u32> = if compact_victims.is_empty() {
             BTreeSet::new()
         } else {
             state
@@ -701,6 +756,7 @@ impl Daemon {
                 .map(|(&span, _)| span)
                 .collect()
         };
+        force_rolls.extend(database_prune_spans.iter().copied());
         let leaves_before = state.next_leaf;
         let (overlay, leaf_table, rolled_gens, leaf_writes) =
             Self::shard_map(state, vset_id, &new_locs, &force_rolls);
@@ -743,6 +799,7 @@ impl Daemon {
             seq,
             Capture {
                 capture_seq,
+                database,
                 checkpoint,
                 overlay,
                 leaf_table,
@@ -836,6 +893,8 @@ impl Daemon {
         vset_id: VsetId,
         seq: JournalSeq,
         capture_seq: u64,
+        database: crate::journal::DatabaseMeta,
+        database_prune_spans: BTreeSet<u32>,
         to_flush: &[PageId],
         to_protect: Vec<PageId>,
         compact_victims: BTreeSet<(u64, SegId)>,
@@ -864,6 +923,8 @@ impl Daemon {
         state.drain = Some(Drain {
             seq,
             capture_seq,
+            database,
+            database_prune_spans,
             builder: SegmentBatchBuilder::new(vset_id, fence, seg),
             unread,
             armed: to_flush.to_vec(),
@@ -962,6 +1023,8 @@ impl Daemon {
             Built {
                 seq: drain.seq,
                 capture_seq: drain.capture_seq,
+                database: drain.database,
+                database_prune_spans: drain.database_prune_spans,
                 checkpoint: None,
                 new_locs,
                 seg_blobs,
@@ -1000,25 +1063,55 @@ impl Daemon {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
         };
+        let capture_seq = state.captures[&seq].capture_seq;
+        let inherited_checkpoint = state
+            .captures
+            .iter()
+            .filter(|(other_seq, _)| **other_seq != seq)
+            .find_map(|(_, other)| {
+                (other.capture_seq == capture_seq)
+                    .then_some(other.checkpoint)
+                    .flatten()
+                    .map(|(epoch, vmstate, _)| RecordKind::Checkpoint { epoch, vmstate })
+            })
+            .or_else(|| {
+                state
+                    .pinned
+                    .as_ref()
+                    .filter(|checkpoint| checkpoint.capture_seq == capture_seq)
+                    .map(|checkpoint| checkpoint.kind)
+            });
         let capture = state.captures.get_mut(&seq).expect("capture exists");
         // The watermark is monotone: everything already durable-acked plus
         // every pending barrier this capture covers (R3.8).
         capture.sync_covered_through = state
             .pending_syncs
             .iter()
+            .chain(state.pending_database_syncs.iter())
             .filter(|&&(_, barrier)| barrier <= capture.capture_seq)
             .map(|&(_, barrier)| barrier)
+            .chain(
+                state
+                    .database_runtime
+                    .detach_barrier()
+                    .filter(|barrier| *barrier <= capture.capture_seq),
+            )
             .fold(state.local_covered_through, u64::max);
         let record = JournalRecord {
             config: state.config,
             seq,
             fence: state.fence,
+            // A metadata-only recapture (for example compaction) of an
+            // active or pinned checkpoint is still that exact recovery
+            // point. Keep its epoch/vmstate so physical relocation cannot
+            // silently downgrade a resumable backup to a cold boot.
             kind: match capture.checkpoint {
-                None => RecordKind::Commit,
+                None => inherited_checkpoint.unwrap_or(RecordKind::Commit),
                 Some((epoch, vmstate, _)) => RecordKind::Checkpoint { epoch, vmstate },
             },
             capture_seq: capture.capture_seq,
             sync_covered_through: capture.sync_covered_through,
+            database: capture.database,
             overlay: capture.overlay.clone(),
             leaves: capture.leaf_table.clone(),
             migrated_from: state.peer_source,
@@ -1089,6 +1182,7 @@ impl Daemon {
                     self.write_record(vset, seq, out);
                 }
                 self.drain_waiters(out);
+                self.drive_database_waiters(mem, out);
             }
             Some(Pending::LeafWrite { vset, seq }) => {
                 let Some(state) = self.vsets.get_mut(&vset) else {
@@ -1125,6 +1219,7 @@ impl Daemon {
     }
 
     /// A record is durable: this is the moment its consistency point exists.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn finalize_record(
         &mut self,
         vset_id: VsetId,
@@ -1143,6 +1238,10 @@ impl Daemon {
         {
             state.best = Some((capture.capture_seq, seq));
             state.best_record.clone_from(&capture.record);
+            state.database_durable = capture.database;
+            state
+                .database_prune_spans
+                .retain(|_, op| *op > capture.capture_seq);
             // Adopt the record's map shape: the leaf table advances, and
             // the overlay shrinks to entries genuinely newer than the
             // rolled leaves' content.
@@ -1156,9 +1255,19 @@ impl Daemon {
         }
         self.counters.records_written += 1;
 
+        let mut claim_migration_head = false;
         if !state.ready {
             state.ready = true;
-            if let Some(verdict) = state.migrated_verdict.take() {
+            if state.migrated_verdict.is_some()
+                && state.config.durability.uses_store()
+                && !state.migration_head_claimed
+            {
+                // The first local record is the backed destination's
+                // provisional side. Claim the assignment head next, then
+                // write once more in the returned fence before accepting.
+                state.ready = false;
+                claim_migration_head = true;
+            } else if let Some(verdict) = state.migrated_verdict.take() {
                 // Inbound migration durable: accept + serve (R7.2 dest side),
                 // and start draining the tail off the source (R7.1).
                 let source = state.peer_source.expect("offer sender recorded");
@@ -1191,6 +1300,11 @@ impl Daemon {
         }
 
         match capture.checkpoint {
+            None if state.config.kind == VsetKind::Database && state.migrate.is_some() => {
+                state.commit_running = false;
+                let record = capture.record.clone().expect("record kept");
+                self.migrate_capture_done(vset_id, record, out);
+            }
             None => state.commit_running = false,
             Some((_, _, req)) if state.migrate.is_some() && req == ReqId(u64::MAX) => {
                 // The migration's final capture is durable: hand off.
@@ -1215,6 +1329,9 @@ impl Daemon {
                 }));
             }
         }
+        if claim_migration_head {
+            self.start_migrate_head_claim(vset_id, out);
+        }
 
         let state = self.vsets.get_mut(&vset_id).expect("known vset");
         state.local_covered_through = state
@@ -1225,6 +1342,10 @@ impl Daemon {
 
         self.maybe_replicate(vset_id, out);
         self.cleanup(vset_id, out);
+        // A database mutation parked for cache pressure or a tail-page fetch
+        // cannot resume until this record makes the preceding consistency
+        // point durable. Re-drive it now that `commit_running` is clear.
+        self.drive_database(vset_id, mem, out);
         // Chain a commit immediately only for waiting syncs (R3.8 wants
         // their record now); plain dirtiness waits for the writeback tick —
         // its interval IS the capture cadence (R2.4), and chaining on it
@@ -1233,7 +1354,11 @@ impl Daemon {
         if self.vsets.get(&vset_id).is_some_and(|s| {
             s.pending_syncs
                 .iter()
+                .chain(s.pending_database_syncs.iter())
                 .any(|&(_, barrier)| barrier > s.local_covered_through)
+                || s.database_runtime
+                    .detach_barrier()
+                    .is_some_and(|barrier| barrier > s.local_covered_through)
         }) {
             self.maybe_start_commit(vset_id, mem, out);
         }
@@ -1262,6 +1387,18 @@ impl Daemon {
         for (req, _) in acked {
             self.counters.syncs_acked += 1;
             out.push(Effect::SyncOk { req });
+        }
+        let (database_acked, database_kept): (Vec<_>, Vec<_>) = state
+            .pending_database_syncs
+            .drain(..)
+            .partition(|&(_, barrier)| barrier <= watermark);
+        state.pending_database_syncs = database_kept;
+        for (req, barrier) in database_acked {
+            self.counters.syncs_acked += 1;
+            out.push(Effect::Database(crate::database::DatabaseReply::Synced {
+                req,
+                sequence: barrier,
+            }));
         }
     }
 

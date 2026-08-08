@@ -1,14 +1,16 @@
 use super::*;
+use crate::database::{AttachmentId, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest};
 use crate::head::HeadRecord;
 use crate::journal::{DurabilityMode, VsetConfig};
 use crate::layout;
+use crate::mapleaf::{LeafPtr, span_of};
 use crate::placement::{PeerCandidate, rank_stash_candidates};
 use crate::seam::{
-    AdminCmd, AdminReply, Effect, Event, HostMap, PeerMsg, ReplicaArtifact, ReplicaCommitInfo,
-    ReqId,
+    AdminCmd, AdminReply, DetachMode, Effect, Event, HostMap, PeerMsg, ReplicaArtifact,
+    ReplicaCommitInfo, ReqId, Verdict,
 };
 use crate::segment::SegmentBuilder;
-use crate::types::{PageNo, VolumeId, VolumeIdx, page_size};
+use crate::types::{HostId, PageNo, VmId, VolumeId, VolumeIdx, page_size};
 
 /// Record-only flows never touch the mapping.
 struct NoMem;
@@ -21,20 +23,20 @@ impl HostMap for NoMem {
 const VSET: VsetId = VsetId(7);
 
 fn config() -> VsetConfig {
-    VsetConfig {
-        disk_volumes: 1,
-        pages_per_volume: 4,
-        durability: DurabilityMode::Local,
-    }
+    VsetConfig::compute(1, 4, false)
 }
 
 /// Drive one event and complete every blob write it (transitively)
 /// issues — the storage layer always succeeds, instantly.
 fn step_settled(daemon: &mut Daemon, event: Event) -> Vec<Effect> {
+    step_settled_with_mem(daemon, event, &NoMem)
+}
+
+fn step_settled_with_mem(daemon: &mut Daemon, event: Event, mem: &dyn HostMap) -> Vec<Effect> {
     let mut settled = Vec::new();
     let mut queue = vec![event];
     while let Some(event) = queue.pop() {
-        for effect in daemon.step(event, &NoMem) {
+        for effect in daemon.step(event, mem) {
             match effect {
                 Effect::BlobWrite { io, .. } => queue.push(Event::BlobWriteDone { io }),
                 other => settled.push(other),
@@ -152,6 +154,106 @@ fn checkpoint_retries_replay_their_outcome() {
     );
     assert_eq!(retried, [done]);
     assert_eq!(daemon.counters.checkpoints_done, 1, "no second capture");
+}
+
+#[test]
+fn overlapping_recapture_preserves_running_checkpoint_recovery_kind() {
+    let mut daemon = created_daemon();
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(0),
+    };
+    let _ = daemon.step(Event::GuestFault { page, write: true }, &ZeroMem);
+    assert_eq!(
+        daemon.step(
+            Event::Admin(AdminCmd::Checkpoint {
+                req: ReqId(2),
+                vset: VSET,
+            }),
+            &ZeroMem,
+        ),
+        [Effect::PauseGuest { vset: VSET }]
+    );
+    let checkpoint_effects = daemon.step(
+        Event::GuestPaused {
+            vset: VSET,
+            vmstate: 17,
+        },
+        &ZeroMem,
+    );
+    assert!(
+        checkpoint_effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::BlobWrite { .. }))
+    );
+
+    // A compaction recapture can finish before the checkpoint's own writes.
+    // With no intervening mutation it represents the same exact snapshot and
+    // must carry the in-flight checkpoint's resume metadata.
+    let mut recapture_effects = Vec::new();
+    daemon.start_capture(VSET, None, &ZeroMem, &mut recapture_effects);
+    while let Some(effect) = recapture_effects.pop() {
+        if let Effect::BlobWrite { io, .. } = effect {
+            recapture_effects.extend(daemon.step(Event::BlobWriteDone { io }, &ZeroMem));
+        }
+    }
+    assert!(matches!(
+        daemon.vsets[&VSET].best_record.as_ref().map(|r| r.kind),
+        Some(crate::journal::RecordKind::Checkpoint {
+            epoch: Epoch(1),
+            vmstate: 17
+        })
+    ));
+}
+
+#[test]
+fn same_state_recapture_preserves_checkpoint_recovery_kind() {
+    let mut daemon = created_daemon();
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(0),
+    };
+    let _ = daemon.step(Event::GuestFault { page, write: true }, &ZeroMem);
+    let _ = step_settled_with_mem(
+        &mut daemon,
+        Event::Admin(AdminCmd::Checkpoint {
+            req: ReqId(3),
+            vset: VSET,
+        }),
+        &ZeroMem,
+    );
+    let _ = step_settled_with_mem(
+        &mut daemon,
+        Event::GuestPaused {
+            vset: VSET,
+            vmstate: 23,
+        },
+        &ZeroMem,
+    );
+    assert!(matches!(
+        daemon.vsets[&VSET].best_record.as_ref().map(|r| r.kind),
+        Some(crate::journal::RecordKind::Checkpoint { .. })
+    ));
+
+    // Compaction can durably recapture the same logical state under a newer
+    // sequence number. It must retain the checkpoint's resume metadata.
+    let mut effects = Vec::new();
+    daemon.start_capture(VSET, None, &ZeroMem, &mut effects);
+    while let Some(effect) = effects.pop() {
+        if let Effect::BlobWrite { io, .. } = effect {
+            effects.extend(daemon.step(Event::BlobWriteDone { io }, &ZeroMem));
+        }
+    }
+    assert!(matches!(
+        daemon.vsets[&VSET].best_record.as_ref().map(|r| r.kind),
+        Some(crate::journal::RecordKind::Checkpoint { .. })
+    ));
 }
 
 #[test]
@@ -488,6 +590,7 @@ fn peer_stashed_sync_acks_only_after_exact_peer_commit_and_retries() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn completing_older_head_cas_preserves_newer_upload_notice() {
     let mut daemon = created_daemon();
     let assignment = crate::head::StashAssignment {
@@ -507,6 +610,7 @@ fn completing_older_head_cas_preserves_newer_upload_notice() {
         kind: crate::journal::RecordKind::Commit,
         capture_seq,
         sync_covered_through: capture_seq,
+        database: crate::journal::DatabaseMeta::default(),
         overlay: BTreeMap::new(),
         leaves: BTreeMap::new(),
         migrated_from: None,
@@ -620,6 +724,7 @@ fn head_mutations_are_serialized_per_vset() {
         kind: crate::journal::RecordKind::Commit,
         capture_seq: 2,
         sync_covered_through: 2,
+        database: crate::journal::DatabaseMeta::default(),
         overlay: BTreeMap::new(),
         leaves: BTreeMap::new(),
         migrated_from: None,
@@ -898,6 +1003,7 @@ fn failed_active_peer_rebinds_through_a_fenced_transition_before_sync_ack() {
         kind: crate::journal::RecordKind::Commit,
         capture_seq: 10,
         sync_covered_through: 10,
+        database: crate::journal::DatabaseMeta::default(),
         overlay: BTreeMap::new(),
         leaves: BTreeMap::new(),
         migrated_from: None,
@@ -1213,6 +1319,7 @@ fn claimed_recovery_head_releases_the_store_covered_active_residue() {
         kind: crate::journal::RecordKind::Commit,
         capture_seq: 4,
         sync_covered_through: 5,
+        database: crate::journal::DatabaseMeta::default(),
         overlay: BTreeMap::new(),
         leaves: BTreeMap::new(),
         migrated_from: None,
@@ -1476,6 +1583,7 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
         kind: crate::journal::RecordKind::Commit,
         capture_seq: 12,
         sync_covered_through: info.sync_covered_through,
+        database: crate::journal::DatabaseMeta::default(),
         overlay: BTreeMap::from([(page, (Gen(2), locs[0].2))]),
         leaves: BTreeMap::new(),
         migrated_from: None,
@@ -1899,11 +2007,7 @@ fn checkpoint_cost_scales_with_the_delta_not_the_volume() {
         wedge_ticks: 25,
         replica_placement: None,
     });
-    let config = VsetConfig {
-        disk_volumes: 1,
-        pages_per_volume: 64,
-        durability: DurabilityMode::Local,
-    };
+    let config = VsetConfig::compute(1, 64, false);
     let effects = step_settled(
         &mut daemon,
         Event::Admin(AdminCmd::CreateVset {
@@ -1986,4 +2090,1463 @@ fn checkpoint_cost_scales_with_the_delta_not_the_volume() {
     checkpoint(&mut daemon, 3);
     assert_eq!(daemon.counters.checkpoints_done, 3);
     assert_eq!(daemon.counters.pages_flushed, 67);
+}
+
+#[derive(Default)]
+struct DatabaseMem(std::cell::RefCell<BTreeMap<PageId, Vec<u8>>>);
+
+impl HostMap for DatabaseMem {
+    fn read_page(&self, page: PageId) -> Vec<u8> {
+        self.0.borrow()[&page].clone()
+    }
+}
+
+fn database_step(daemon: &mut Daemon, mem: &DatabaseMem, event: Event) -> Vec<Effect> {
+    let mut settled = Vec::new();
+    let mut queue = VecDeque::from([event]);
+    while let Some(event) = queue.pop_front() {
+        for effect in daemon.step(event, mem) {
+            match effect {
+                Effect::DatabaseInstall { page, bytes } => {
+                    mem.0.borrow_mut().insert(page, bytes);
+                }
+                Effect::BlobWrite { io, .. } => queue.push_back(Event::BlobWriteDone { io }),
+                other => settled.push(other),
+            }
+        }
+    }
+    settled
+}
+
+fn database_daemon_with_capacity(
+    cache_pages: usize,
+    database_pages: u32,
+) -> (Daemon, DatabaseMem, AttachmentId) {
+    let (mut daemon, _) = Daemon::new(DaemonConfig {
+        host: crate::types::HostId(0),
+        cache_pages,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: None,
+    });
+    let mem = DatabaseMem::default();
+    let effects = database_step(
+        &mut daemon,
+        &mem,
+        Event::Admin(AdminCmd::CreateVset {
+            req: ReqId(100),
+            vset: VSET,
+            config: VsetConfig::database(database_pages, false),
+            from_base: None,
+        }),
+    );
+    assert_eq!(
+        effects,
+        [Effect::Admin(AdminReply::VsetCreated {
+            req: ReqId(100),
+            vset: VSET,
+        })]
+    );
+    let effects = database_step(
+        &mut daemon,
+        &mem,
+        Event::Admin(AdminCmd::AttachDatabase {
+            req: ReqId(101),
+            vset: VSET,
+            vm: VmId(9),
+        }),
+    );
+    let [Effect::Admin(AdminReply::DatabaseAttached { attachment, .. })] = effects.as_slice()
+    else {
+        panic!("expected attachment, got {effects:?}");
+    };
+    (daemon, mem, *attachment)
+}
+
+fn database_daemon() -> (Daemon, DatabaseMem, AttachmentId) {
+    database_daemon_with_capacity(8, 8)
+}
+
+fn database_request(
+    daemon: &mut Daemon,
+    mem: &DatabaseMem,
+    attachment: AttachmentId,
+    req: u64,
+    op: DatabaseOp,
+) -> Vec<Effect> {
+    database_step(
+        daemon,
+        mem,
+        Event::Database(DatabaseRequest {
+            req: ReqId(req),
+            vset: VSET,
+            attachment,
+            op,
+        }),
+    )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn database_byte_io_sync_truncate_and_recreate_are_exact() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            102,
+            DatabaseOp::Open {
+                handle: 1,
+                file: DatabaseFile::Main,
+                create: true,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Opened { req: ReqId(102) })]
+    );
+
+    let bytes: Vec<u8> = (0u32..5000)
+        .map(|i| u8::try_from(i % 251).expect("below 251"))
+        .collect();
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            103,
+            DatabaseOp::Write {
+                handle: 1,
+                offset: 100,
+                bytes: bytes.clone(),
+            },
+        ),
+        [Effect::Database(DatabaseReply::Written {
+            req: ReqId(103),
+            sequence: 2,
+        })]
+    );
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            104,
+            DatabaseOp::Read {
+                handle: 1,
+                offset: 100,
+                len: 5000,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Read {
+            req: ReqId(104),
+            bytes: bytes.clone(),
+            eof: false,
+        })]
+    );
+
+    let sync = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        105,
+        DatabaseOp::Sync { handle: 1 },
+    );
+    assert!(sync.iter().any(|effect| matches!(
+        effect,
+        Effect::Database(DatabaseReply::Synced {
+            req: ReqId(105),
+            sequence: 2,
+        })
+    )));
+
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            106,
+            DatabaseOp::Truncate {
+                handle: 1,
+                size: 200,
+            },
+        ),
+        [
+            Effect::Evict {
+                page: DatabaseFile::Main.page(VSET, 1),
+            },
+            Effect::Database(DatabaseReply::Truncated {
+                req: ReqId(106),
+                sequence: 3,
+            }),
+        ]
+    );
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            107,
+            DatabaseOp::Truncate {
+                handle: 1,
+                size: 1000,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Truncated {
+            req: ReqId(107),
+            sequence: 4,
+        })]
+    );
+    let expected = bytes[..100]
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(0, 800))
+        .collect();
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            108,
+            DatabaseOp::Read {
+                handle: 1,
+                offset: 100,
+                len: 900,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Read {
+            req: ReqId(108),
+            bytes: expected,
+            eof: false,
+        })]
+    );
+
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            109,
+            DatabaseOp::Delete {
+                file: DatabaseFile::Main,
+            },
+        ),
+        [
+            Effect::Evict {
+                page: DatabaseFile::Main.page(VSET, 0),
+            },
+            Effect::Database(DatabaseReply::Deleted {
+                req: ReqId(109),
+                sequence: 5,
+            }),
+        ]
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        110,
+        DatabaseOp::Close { handle: 1 },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        111,
+        DatabaseOp::Open {
+            handle: 2,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            112,
+            DatabaseOp::Read {
+                handle: 2,
+                offset: 0,
+                len: 16,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Read {
+            req: ReqId(112),
+            bytes: Vec::new(),
+            eof: true,
+        })]
+    );
+}
+
+#[test]
+fn rejected_database_truncate_does_not_mutate_file() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            200,
+            DatabaseOp::Open {
+                handle: 1,
+                file: DatabaseFile::Main,
+                create: true,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Opened { req: ReqId(200) })]
+    );
+    let original = vec![0xa5; 512];
+    assert!(matches!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            201,
+            DatabaseOp::Write {
+                handle: 1,
+                offset: 0,
+                bytes: original.clone(),
+            },
+        )
+        .as_slice(),
+        [Effect::Database(DatabaseReply::Written { .. })]
+    ));
+
+    // Lazy hydration of an unrelated database-file span makes a truncate
+    // temporarily unavailable, but must not permit a partial tail-page write.
+    let unrelated = span_of(DatabaseFile::Wal.page(VSET, 0));
+    daemon
+        .vsets
+        .get_mut(&VSET)
+        .expect("database vset")
+        .pending_leaves
+        .insert(
+            unrelated,
+            LeafPtr {
+                base: 0,
+                fence: 1,
+                id: 99,
+            },
+        );
+    let sequence_before = daemon.vsets[&VSET].mutation_seq;
+    let page_before = mem.0.borrow()[&DatabaseFile::Main.page(VSET, 0)].clone();
+
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            202,
+            DatabaseOp::Truncate {
+                handle: 1,
+                size: 100,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Failed {
+            req: ReqId(202),
+            error: crate::database::DatabaseError::Busy,
+        })]
+    );
+    assert_eq!(daemon.vsets[&VSET].mutation_seq, sequence_before);
+    assert_eq!(
+        mem.0.borrow()[&DatabaseFile::Main.page(VSET, 0)],
+        page_before
+    );
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            203,
+            DatabaseOp::Read {
+                handle: 1,
+                offset: 0,
+                len: u32::try_from(original.len()).expect("small fixture"),
+            },
+        ),
+        [Effect::Database(DatabaseReply::Read {
+            req: ReqId(203),
+            bytes: original,
+            eof: false,
+        })]
+    );
+}
+
+#[test]
+fn database_transient_file_can_be_deleted_before_its_first_capture() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        113,
+        DatabaseOp::Open {
+            handle: 3,
+            file: DatabaseFile::Journal,
+            create: true,
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        114,
+        DatabaseOp::Write {
+            handle: 3,
+            offset: 0,
+            bytes: vec![0x5a; 512],
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        115,
+        DatabaseOp::Delete {
+            file: DatabaseFile::Journal,
+        },
+    );
+
+    let effects = database_step(&mut daemon, &mem, Event::Timer(TimerId::Writeback));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SetTimer {
+            timer: TimerId::Writeback,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn database_write_makes_progress_when_dirty_pages_fill_the_cache() {
+    let (mut daemon, mem, attachment) = database_daemon_with_capacity(2, 8);
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        710,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+
+    let started = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        711,
+        DatabaseOp::Write {
+            handle: 1,
+            offset: 0,
+            bytes: vec![0x5a; page_size() * 3],
+        },
+    );
+    assert!(
+        !started.iter().any(|effect| matches!(
+            effect,
+            Effect::Database(DatabaseReply::Written {
+                req: ReqId(711),
+                ..
+            })
+        )),
+        "the write must initially park behind cache pressure"
+    );
+
+    let capture_started = daemon.step(Event::Timer(TimerId::Writeback), &mem);
+    assert_eq!(
+        daemon.vsets[&VSET]
+            .captures
+            .values()
+            .next()
+            .expect("pressure capture")
+            .capture_seq,
+        1,
+        "a parked write is not part of the capture consistency point"
+    );
+    let segment_io = capture_started
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::BlobWrite { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("pressure capture segment");
+    let segment_done = daemon.step(Event::BlobWriteDone { io: segment_io }, &mem);
+    assert!(!segment_done.iter().any(|effect| matches!(
+        effect,
+        Effect::Database(DatabaseReply::Written {
+            req: ReqId(711),
+            ..
+        })
+    )));
+    assert!(
+        !segment_done
+            .iter()
+            .any(|effect| matches!(effect, Effect::DatabaseInstall { .. })),
+        "the parked write cannot resume before the capture record is durable"
+    );
+
+    let record_ios: Vec<_> = segment_done
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::BlobWrite { io, .. } => Some(*io),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(record_ios.len(), 2);
+    let mut finalized = Vec::new();
+    for io in record_ios {
+        for effect in daemon.step(Event::BlobWriteDone { io }, &mem) {
+            if let Effect::DatabaseInstall { page, bytes } = &effect {
+                mem.0.borrow_mut().insert(*page, bytes.clone());
+            }
+            finalized.push(effect);
+        }
+    }
+    assert!(finalized.iter().any(|effect| matches!(
+        effect,
+        Effect::Database(DatabaseReply::Written {
+            req: ReqId(711),
+            ..
+        })
+    )));
+}
+
+#[test]
+fn parked_truncate_does_not_resume_until_the_capture_record_is_durable() {
+    let (mut daemon, mem, attachment) = database_daemon_with_capacity(2, 8);
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        730,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        731,
+        DatabaseOp::Write {
+            handle: 1,
+            offset: 0,
+            bytes: vec![0x41; page_size()],
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        732,
+        DatabaseOp::Sync { handle: 1 },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        733,
+        DatabaseOp::Write {
+            handle: 1,
+            offset: page_size() as u64,
+            bytes: vec![0x52; page_size() * 2],
+        },
+    );
+    let parked = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        734,
+        DatabaseOp::Truncate { handle: 1, size: 1 },
+    );
+    assert!(
+        !parked
+            .iter()
+            .any(|effect| matches!(effect, Effect::BlobReadRange { .. })),
+        "truncate must initially park behind dirty-cache pressure"
+    );
+
+    let capture_started = daemon.step(Event::Timer(TimerId::Writeback), &mem);
+    assert_eq!(
+        daemon.vsets[&VSET]
+            .captures
+            .values()
+            .next()
+            .expect("truncate pressure capture")
+            .capture_seq,
+        3
+    );
+    let segment_io = capture_started
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::BlobWrite { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("truncate pressure segment");
+    let segment_done = daemon.step(Event::BlobWriteDone { io: segment_io }, &mem);
+    assert!(
+        !segment_done
+            .iter()
+            .any(|effect| matches!(effect, Effect::BlobReadRange { .. })),
+        "truncate cannot resume while the capture record is still pending"
+    );
+
+    let record_ios: Vec<_> = segment_done
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::BlobWrite { io, .. } => Some(*io),
+            _ => None,
+        })
+        .collect();
+    let mut finalized = Vec::new();
+    for io in record_ios {
+        finalized.extend(daemon.step(Event::BlobWriteDone { io }, &mem));
+    }
+    assert!(
+        finalized
+            .iter()
+            .any(|effect| matches!(effect, Effect::BlobReadRange { .. })),
+        "truncate resumes once the capture consistency point is durable"
+    );
+}
+
+#[test]
+fn database_prune_is_rejected_while_an_incremental_capture_is_armed() {
+    let (mut daemon, mem, attachment) = database_daemon_with_capacity(80, 80);
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        720,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    let written = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        721,
+        DatabaseOp::Write {
+            handle: 1,
+            offset: 0,
+            bytes: vec![0x33; page_size() * 65],
+        },
+    );
+    assert!(written.iter().any(|effect| matches!(
+        effect,
+        Effect::Database(DatabaseReply::Written {
+            req: ReqId(721),
+            ..
+        })
+    )));
+
+    let armed = daemon.step(Event::Timer(TimerId::Writeback), &mem);
+    assert!(armed.iter().any(|effect| matches!(
+        effect,
+        Effect::SetTimer {
+            timer: TimerId::CaptureStep(VSET),
+            ..
+        }
+    )));
+    assert!(daemon.vsets[&VSET].drain.is_some());
+
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            722,
+            DatabaseOp::Delete {
+                file: DatabaseFile::Main,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Failed {
+            req: ReqId(722),
+            error: crate::database::DatabaseError::Busy,
+        })]
+    );
+    assert!(daemon.vsets[&VSET].drain.is_some());
+}
+
+#[test]
+fn database_attachment_generation_fences_old_requests() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        120,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    let effects = database_step(
+        &mut daemon,
+        &mem,
+        Event::Admin(AdminCmd::BeginDetachDatabase {
+            req: ReqId(121),
+            vset: VSET,
+            attachment,
+            mode: DetachMode::Forced,
+        }),
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Admin(AdminReply::DatabaseDetachStarted {
+            forced: true,
+            ..
+        })]
+    ));
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            122,
+            DatabaseOp::Access {
+                file: DatabaseFile::Main,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Failed {
+            req: ReqId(122),
+            error: crate::database::DatabaseError::StaleAttachment,
+        })]
+    );
+
+    assert!(matches!(
+        database_step(
+            &mut daemon,
+            &mem,
+            Event::Admin(AdminCmd::FinishDetachDatabase {
+                req: ReqId(123),
+                vset: VSET,
+                attachment,
+            }),
+        )
+        .as_slice(),
+        [Effect::Admin(AdminReply::DatabaseDetached { .. })]
+    ));
+
+    let effects = database_step(
+        &mut daemon,
+        &mem,
+        Event::Admin(AdminCmd::AttachDatabase {
+            req: ReqId(124),
+            vset: VSET,
+            vm: VmId(10),
+        }),
+    );
+    let [
+        Effect::Admin(AdminReply::DatabaseAttached {
+            attachment: replacement,
+            ..
+        }),
+    ] = effects.as_slice()
+    else {
+        panic!("expected replacement attachment, got {effects:?}");
+    };
+    assert!(replacement.generation > attachment.generation);
+    assert_ne!(replacement.vm, attachment.vm);
+    assert_eq!(
+        database_request(
+            &mut daemon,
+            &mem,
+            *replacement,
+            125,
+            DatabaseOp::Access {
+                file: DatabaseFile::Main,
+            },
+        ),
+        [Effect::Database(DatabaseReply::Access {
+            req: ReqId(125),
+            exists: true,
+        })]
+    );
+}
+
+#[test]
+fn forced_database_detach_finishes_after_an_interleaved_record_finalize() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        126,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        127,
+        DatabaseOp::Write {
+            handle: 1,
+            offset: 0,
+            bytes: b"dirty before forced detach".to_vec(),
+        },
+    );
+    assert!(matches!(
+        database_step(
+            &mut daemon,
+            &mem,
+            Event::Admin(AdminCmd::BeginDetachDatabase {
+                req: ReqId(128),
+                vset: VSET,
+                attachment,
+                mode: DetachMode::Forced,
+            }),
+        )
+        .as_slice(),
+        [Effect::Admin(AdminReply::DatabaseDetachStarted {
+            req: ReqId(128),
+            forced: true,
+            ..
+        })]
+    ));
+
+    let _ = database_step(&mut daemon, &mem, Event::Timer(TimerId::Writeback));
+
+    assert!(matches!(
+        database_step(
+            &mut daemon,
+            &mem,
+            Event::Admin(AdminCmd::FinishDetachDatabase {
+                req: ReqId(129),
+                vset: VSET,
+                attachment,
+            }),
+        )
+        .as_slice(),
+        [Effect::Admin(AdminReply::DatabaseDetached {
+            req: ReqId(129),
+            ..
+        })]
+    ));
+}
+
+#[test]
+fn graceful_database_detach_makes_the_final_mutation_durable() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        130,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        131,
+        DatabaseOp::Write {
+            handle: 1,
+            offset: 0,
+            bytes: b"durable on detach".to_vec(),
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        132,
+        DatabaseOp::Close { handle: 1 },
+    );
+    let started = database_step(
+        &mut daemon,
+        &mem,
+        Event::Admin(AdminCmd::BeginDetachDatabase {
+            req: ReqId(133),
+            vset: VSET,
+            attachment,
+            mode: DetachMode::Graceful,
+        }),
+    );
+    assert!(started.iter().any(|effect| matches!(
+        effect,
+        Effect::Admin(AdminReply::DatabaseDetachStarted {
+            req: ReqId(133),
+            forced: false,
+            ..
+        })
+    )));
+    assert_eq!(
+        database_step(
+            &mut daemon,
+            &mem,
+            Event::Admin(AdminCmd::FinishDetachDatabase {
+                req: ReqId(134),
+                vset: VSET,
+                attachment,
+            }),
+        ),
+        [Effect::Admin(AdminReply::DatabaseDetached {
+            req: ReqId(134),
+            vset: VSET,
+            attachment,
+        })]
+    );
+}
+
+#[test]
+fn graceful_database_detach_begin_is_idempotent_while_draining() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    for req in [135, 136] {
+        let effects = database_step(
+            &mut daemon,
+            &mem,
+            Event::Admin(AdminCmd::BeginDetachDatabase {
+                req: ReqId(req),
+                vset: VSET,
+                attachment,
+                mode: DetachMode::Graceful,
+            }),
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Admin(AdminReply::DatabaseDetachStarted {
+                req: reply,
+                forced: false,
+                ..
+            }) if *reply == ReqId(req)
+        )));
+    }
+}
+
+#[test]
+fn graceful_database_detach_chains_after_an_inflight_record() {
+    let (mut daemon, mem, attachment) = database_daemon();
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        140,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        141,
+        DatabaseOp::Write {
+            handle: 1,
+            offset: 0,
+            bytes: b"detach races a record".to_vec(),
+        },
+    );
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        142,
+        DatabaseOp::Close { handle: 1 },
+    );
+
+    let capture = daemon.step(Event::Timer(TimerId::Writeback), &mem);
+    let segment_io = capture
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::BlobWrite { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("dirty capture writes a segment");
+    let record_writes = daemon.step(Event::BlobWriteDone { io: segment_io }, &mem);
+    let record_ios: Vec<_> = record_writes
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::BlobWrite { io, .. } => Some(*io),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(record_ios.len(), 2, "primary and mirrored record writes");
+
+    let started = database_step(
+        &mut daemon,
+        &mem,
+        Event::Admin(AdminCmd::BeginDetachDatabase {
+            req: ReqId(143),
+            vset: VSET,
+            attachment,
+            mode: DetachMode::Graceful,
+        }),
+    );
+    assert!(started.iter().any(|effect| matches!(
+        effect,
+        Effect::Admin(AdminReply::DatabaseDetachStarted {
+            req: ReqId(143),
+            ..
+        })
+    )));
+
+    for io in record_ios {
+        let _ = database_step(&mut daemon, &mem, Event::BlobWriteDone { io });
+    }
+    assert_eq!(
+        database_step(
+            &mut daemon,
+            &mem,
+            Event::Admin(AdminCmd::FinishDetachDatabase {
+                req: ReqId(144),
+                vset: VSET,
+                attachment,
+            }),
+        ),
+        [Effect::Admin(AdminReply::DatabaseDetached {
+            req: ReqId(144),
+            vset: VSET,
+            attachment,
+        })]
+    );
+}
+
+#[test]
+fn five_hundred_idle_database_vsets_share_one_vm_without_page_residency() {
+    let (mut daemon, _) = Daemon::new(DaemonConfig {
+        host: crate::types::HostId(0),
+        cache_pages: 8,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: None,
+    });
+    let mem = DatabaseMem::default();
+    for id in 1..=500 {
+        let vset = VsetId(10_000 + id);
+        assert!(
+            database_step(
+                &mut daemon,
+                &mem,
+                Event::Admin(AdminCmd::CreateVset {
+                    req: ReqId(id),
+                    vset,
+                    config: VsetConfig::database(8, false),
+                    from_base: None,
+                }),
+            )
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                Effect::Admin(AdminReply::VsetCreated { vset: created, .. }) if *created == vset
+            ))
+        );
+        assert!(matches!(
+            database_step(
+                &mut daemon,
+                &mem,
+                Event::Admin(AdminCmd::AttachDatabase {
+                    req: ReqId(1_000 + id),
+                    vset,
+                    vm: VmId(42),
+                }),
+            )
+            .as_slice(),
+            [Effect::Admin(AdminReply::DatabaseAttached { vset: attached, .. })]
+                if *attached == vset
+        ));
+    }
+    assert!(mem.0.borrow().is_empty());
+}
+
+#[allow(clippy::too_many_lines)]
+fn database_cluster_step(
+    daemons: &mut [Daemon; 2],
+    mems: &[DatabaseMem; 2],
+    blobs: &mut [BTreeMap<String, Vec<u8>>; 2],
+    store: &mut DatabaseTestStore,
+    initial: (usize, Event),
+) -> Vec<(usize, Effect)> {
+    let mut queue = VecDeque::from([initial]);
+    let mut settled = Vec::new();
+    let mut steps = 0;
+    let mut hydration_ticks = BTreeSet::new();
+    while let Some((host, event)) = queue.pop_front() {
+        steps += 1;
+        assert!(steps < 10_000, "database cluster did not settle");
+        for effect in daemons[host].step(event, &mems[host]) {
+            match effect {
+                Effect::DatabaseInstall { page, bytes } => {
+                    mems[host].0.borrow_mut().insert(page, bytes);
+                }
+                Effect::Evict { page } => {
+                    mems[host].0.borrow_mut().remove(&page);
+                }
+                Effect::BlobWrite { io, name, bytes } => {
+                    blobs[host].insert(name, bytes);
+                    queue.push_back((host, Event::BlobWriteDone { io }));
+                }
+                Effect::BlobRead { io, name } => {
+                    let bytes = blobs[host].get(&name).cloned();
+                    queue.push_back((host, Event::BlobReadDone { io, bytes }));
+                }
+                Effect::BlobReadRange {
+                    io,
+                    name,
+                    offset,
+                    len,
+                } => {
+                    let bytes = blobs[host].get(&name).and_then(|blob| {
+                        let start = usize::try_from(offset).ok()?;
+                        let amount = usize::try_from(len).ok()?;
+                        let end = start.checked_add(amount)?.min(blob.len());
+                        (start <= blob.len()).then(|| blob[start..end].to_vec())
+                    });
+                    queue.push_back((host, Event::BlobReadDone { io, bytes }));
+                }
+                Effect::BlobDelete { name } => {
+                    blobs[host].remove(&name);
+                }
+                Effect::PeerSend { to, msg } => queue.push_back((
+                    usize::from(to.0),
+                    Event::PeerDelivered {
+                        from: HostId(u16::try_from(host).expect("two hosts")),
+                        msg,
+                    },
+                )),
+                Effect::SetTimer { timer, .. }
+                    if matches!(timer, TimerId::DatabaseMigrate(_) | TimerId::CaptureStep(_)) =>
+                {
+                    queue.push_back((host, Event::Timer(timer)));
+                }
+                Effect::SetTimer {
+                    timer: TimerId::Hydrate(vset),
+                    ..
+                } if hydration_ticks.insert((host, vset)) => {
+                    queue.push_back((host, Event::Timer(TimerId::Hydrate(vset))));
+                }
+                Effect::SetTimer { .. } => {}
+                Effect::Fill { page, .. } => {
+                    panic!("database hydration used the compute fill path for {page:?}")
+                }
+                Effect::StorePut { io, key, bytes } => {
+                    let version = store.put(key, bytes);
+                    queue.push_back((
+                        host,
+                        Event::StorePutDone {
+                            io,
+                            result: Ok(version),
+                        },
+                    ));
+                }
+                Effect::StoreCas {
+                    io,
+                    key,
+                    expected,
+                    bytes,
+                } => {
+                    let result = store.cas(key, expected, bytes);
+                    queue.push_back((host, Event::StorePutDone { io, result }));
+                }
+                Effect::StoreGet { io, key } => {
+                    let result = Ok(store.objects.get(&key).cloned());
+                    queue.push_back((host, Event::StoreGetDone { io, result }));
+                }
+                Effect::StoreGetRange {
+                    io,
+                    key,
+                    offset,
+                    len,
+                } => {
+                    let result = Ok(store.objects.get(&key).and_then(|(version, bytes)| {
+                        let start = usize::try_from(offset).ok()?;
+                        let amount = usize::try_from(len).ok()?;
+                        let end = start.checked_add(amount)?.min(bytes.len());
+                        (start <= bytes.len()).then(|| (*version, bytes[start..end].to_vec()))
+                    }));
+                    queue.push_back((host, Event::StoreGetDone { io, result }));
+                }
+                Effect::StoreDelete { key } => {
+                    store.objects.remove(&key);
+                }
+                Effect::Abort { reason } => panic!("daemon aborted: {reason}"),
+                other => settled.push((host, other)),
+            }
+        }
+    }
+    settled
+}
+
+#[derive(Default)]
+struct DatabaseTestStore {
+    objects: BTreeMap<String, (u64, Vec<u8>)>,
+    next_version: u64,
+}
+
+impl DatabaseTestStore {
+    fn put(&mut self, key: String, bytes: Vec<u8>) -> u64 {
+        self.next_version += 1;
+        let version = self.next_version;
+        self.objects.insert(key, (version, bytes));
+        version
+    }
+
+    fn cas(
+        &mut self,
+        key: String,
+        expected: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<u64, crate::seam::StoreFault> {
+        let actual = self.objects.get(&key).map(|(version, _)| *version);
+        if actual != expected {
+            return Err(crate::seam::StoreFault::CasConflict { actual });
+        }
+        Ok(self.put(key, bytes))
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn detached_database_migrates_without_vm_pause_and_reads_tail_from_peer() {
+    let config = |host| DaemonConfig {
+        host: HostId(host),
+        cache_pages: 8,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: None,
+    };
+    let (source, _) = Daemon::new(config(0));
+    let (destination, _) = Daemon::new(config(1));
+    let mut daemons = [source, destination];
+    let mems = [DatabaseMem::default(), DatabaseMem::default()];
+    let mut blobs = [BTreeMap::new(), BTreeMap::new()];
+    let mut store = DatabaseTestStore::default();
+    let mut run =
+        |daemons: &mut [Daemon; 2], blobs: &mut [BTreeMap<String, Vec<u8>>; 2], initial| {
+            database_cluster_step(daemons, &mems, blobs, &mut store, initial)
+        };
+
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            0,
+            Event::Admin(AdminCmd::CreateVset {
+                req: ReqId(200),
+                vset: VSET,
+                config: VsetConfig::database(8, false),
+                from_base: None,
+            }),
+        ),
+    );
+    let attached = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            0,
+            Event::Admin(AdminCmd::AttachDatabase {
+                req: ReqId(201),
+                vset: VSET,
+                vm: VmId(7),
+            }),
+        ),
+    );
+    let attachment = attached
+        .iter()
+        .find_map(|(_, effect)| match effect {
+            Effect::Admin(AdminReply::DatabaseAttached { attachment, .. }) => Some(*attachment),
+            _ => None,
+        })
+        .expect("source attachment");
+    let request = |req, op| {
+        Event::Database(DatabaseRequest {
+            req: ReqId(req),
+            vset: VSET,
+            attachment,
+            op,
+        })
+    };
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            0,
+            request(
+                202,
+                DatabaseOp::Open {
+                    handle: 9,
+                    file: DatabaseFile::Main,
+                    create: true,
+                },
+            ),
+        ),
+    );
+    let expected = b"peer-backed sqlite page bytes".to_vec();
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            0,
+            request(
+                203,
+                DatabaseOp::Write {
+                    handle: 9,
+                    offset: 211,
+                    bytes: expected.clone(),
+                },
+            ),
+        ),
+    );
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (0, request(204, DatabaseOp::Sync { handle: 9 })),
+    );
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (0, request(205, DatabaseOp::Close { handle: 9 })),
+    );
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            0,
+            Event::Admin(AdminCmd::BeginDetachDatabase {
+                req: ReqId(206),
+                vset: VSET,
+                attachment,
+                mode: DetachMode::Graceful,
+            }),
+        ),
+    );
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            0,
+            Event::Admin(AdminCmd::FinishDetachDatabase {
+                req: ReqId(207),
+                vset: VSET,
+                attachment,
+            }),
+        ),
+    );
+
+    let moved = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            0,
+            Event::Admin(AdminCmd::MigrateOut {
+                req: ReqId(208),
+                vset: VSET,
+                to: HostId(1),
+            }),
+        ),
+    );
+    assert!(
+        !moved
+            .iter()
+            .any(|(_, effect)| matches!(effect, Effect::PauseGuest { .. })),
+        "database movement must not pause a VM"
+    );
+    assert!(moved.iter().any(|(host, effect)| matches!(
+        (host, effect),
+        (
+            1,
+            Effect::Admin(AdminReply::VsetMigratedIn {
+                verdict: Verdict::DatabaseReady { .. },
+                ..
+            })
+        )
+    )));
+    let hydrated = DatabaseFile::Main.page(VSET, 0);
+    assert_eq!(
+        &mems[1].0.borrow()[&hydrated][211..211 + expected.len()],
+        expected.as_slice()
+    );
+    assert_eq!(daemons[1].counters.hydrate_fills, 1);
+
+    let destination_attachment = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            1,
+            Event::Admin(AdminCmd::AttachDatabase {
+                req: ReqId(209),
+                vset: VSET,
+                vm: VmId(8),
+            }),
+        ),
+    )
+    .iter()
+    .find_map(|(_, effect)| match effect {
+        Effect::Admin(AdminReply::DatabaseAttached { attachment, .. }) => Some(*attachment),
+        _ => None,
+    })
+    .expect("destination attachment");
+    let destination_request = |req, op| {
+        Event::Database(DatabaseRequest {
+            req: ReqId(req),
+            vset: VSET,
+            attachment: destination_attachment,
+            op,
+        })
+    };
+    let _ = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            1,
+            destination_request(
+                210,
+                DatabaseOp::Open {
+                    handle: 10,
+                    file: DatabaseFile::Main,
+                    create: false,
+                },
+            ),
+        ),
+    );
+    let read = run(
+        &mut daemons,
+        &mut blobs,
+        (
+            1,
+            destination_request(
+                211,
+                DatabaseOp::Read {
+                    handle: 10,
+                    offset: 211,
+                    len: u32::try_from(expected.len()).expect("small"),
+                },
+            ),
+        ),
+    );
+    assert!(read.iter().any(|(_, effect)| matches!(
+        effect,
+        Effect::Database(DatabaseReply::Read { req: ReqId(211), bytes, .. }) if *bytes == expected
+    )));
+    assert!(
+        store.objects.is_empty(),
+        "non-backed movement used the store"
+    );
 }

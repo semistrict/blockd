@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use blockd_core::seam::{Effect, Event};
 
-pub(crate) const EVENT_KINDS: [&str; 10] = [
+pub(crate) const EVENT_KINDS: [&str; 11] = [
     "GuestFault",
     "GuestSync",
     "GuestPaused",
@@ -25,6 +25,7 @@ pub(crate) const EVENT_KINDS: [&str; 10] = [
     "StorePutDone",
     "StoreGetDone",
     "Timer",
+    "Database",
 ];
 
 pub(crate) fn event_kind(event: &Event) -> usize {
@@ -39,10 +40,11 @@ pub(crate) fn event_kind(event: &Event) -> usize {
         Event::StorePutDone { .. } => 7,
         Event::StoreGetDone { .. } => 8,
         Event::Timer(_) => 9,
+        Event::Database(_) => 10,
     }
 }
 
-pub(crate) const EFFECT_KINDS: [&str; 27] = [
+pub(crate) const EFFECT_KINDS: [&str; 29] = [
     "Fill",
     "FillShared",
     "FillFailed",
@@ -70,6 +72,8 @@ pub(crate) const EFFECT_KINDS: [&str; 27] = [
     "Admin",
     "PeerSend",
     "Abort",
+    "DatabaseInstall",
+    "Database",
 ];
 
 pub(crate) fn effect_kind(effect: &Effect) -> usize {
@@ -101,6 +105,8 @@ pub(crate) fn effect_kind(effect: &Effect) -> usize {
         Effect::Admin(_) => 24,
         Effect::PeerSend { .. } => 25,
         Effect::Abort { .. } => 26,
+        Effect::DatabaseInstall { .. } => 27,
+        Effect::Database(_) => 28,
     }
 }
 

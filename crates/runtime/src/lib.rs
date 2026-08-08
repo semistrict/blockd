@@ -14,6 +14,8 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod blobscan;
+#[cfg(target_os = "linux")]
+pub mod database;
 pub mod fakegcs;
 #[cfg(target_os = "linux")]
 pub mod fc;
@@ -28,6 +30,8 @@ mod replica_recovery;
 #[cfg(target_os = "linux")]
 mod s3;
 mod store;
+#[cfg(target_os = "linux")]
+pub mod vsetfs;
 
 pub use blobscan::scan_blob_dir;
 pub use gcs::{GcsConfig, GcsLatency, GcsStats, GcsStore};

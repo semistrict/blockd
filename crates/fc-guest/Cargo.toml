@@ -21,3 +21,6 @@ missing_panics_doc = "allow"
 [dependencies]
 blockd-platform = { path = "../platform" }
 libc = "0.2.189"
+blockd-core = { path = "../core" }
+blockd-sqlite-vfs = { path = "../sqlite-vfs" }
+rusqlite = "0.40.1"

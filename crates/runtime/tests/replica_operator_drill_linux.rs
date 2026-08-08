@@ -105,6 +105,7 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
         let b = Runtime::new(&configs[1], store(&endpoint, &prefix));
         let c = Runtime::new(&configs[2], store(&endpoint, &prefix));
         let vset_config = VsetConfig {
+            kind: blockd_core::journal::VsetKind::Compute,
             disk_volumes: 1,
             pages_per_volume: 8,
             durability: DurabilityMode::PeerStashed,

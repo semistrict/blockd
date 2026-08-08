@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{Runtime, RuntimeConfig, S3Store};
 
@@ -50,11 +50,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 fn vset_config() -> VsetConfig {
-    VsetConfig {
-        disk_volumes: 1,
-        pages_per_volume: PAGES_PER_VOLUME,
-        durability: DurabilityMode::Local,
-    }
+    VsetConfig::compute(1, PAGES_PER_VOLUME, false)
 }
 
 struct Lcg(u64);

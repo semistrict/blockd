@@ -6,6 +6,8 @@
 
 pub mod cache;
 pub mod daemon;
+pub mod database;
+pub mod dbproto;
 pub mod format;
 pub mod gc;
 pub mod head;
@@ -20,3 +22,4 @@ pub mod rollout;
 pub mod seam;
 pub mod segment;
 pub mod types;
+pub mod vsetfs;

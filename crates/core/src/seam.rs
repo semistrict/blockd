@@ -68,8 +68,9 @@
 //! every peer handler is idempotent and, since R11.1, authorizes its
 //! counterparty in the protocol, not the transport.
 
+use crate::database::{AttachmentId, DatabaseReply, DatabaseRequest};
 use crate::journal::VsetConfig;
-use crate::types::{Epoch, HostId, PageId, SegId, VolumeId, VsetId};
+use crate::types::{Epoch, HostId, PageId, SegId, VmId, VolumeId, VsetId};
 use std::fmt;
 
 /// Daemon-issued I/O id, unique per daemon incarnation.
@@ -289,6 +290,28 @@ pub enum AdminCmd {
         vset: VsetId,
         to: HostId,
     },
+    /// Grant one VM volatile authority over a locally ready database vset.
+    AttachDatabase { req: ReqId, vset: VsetId, vm: VmId },
+    /// Start a graceful drain, or immediately retire this generation.
+    BeginDetachDatabase {
+        req: ReqId,
+        vset: VsetId,
+        attachment: AttachmentId,
+        mode: DetachMode,
+    },
+    /// Complete a graceful detach once handles are closed and its accepted
+    /// mutation prefix is durable.
+    FinishDetachDatabase {
+        req: ReqId,
+        vset: VsetId,
+        attachment: AttachmentId,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DetachMode {
+    Graceful,
+    Forced,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -346,6 +369,22 @@ pub enum AdminReply {
         vset: VsetId,
         verdict: Verdict,
     },
+    DatabaseAttached {
+        req: ReqId,
+        vset: VsetId,
+        attachment: AttachmentId,
+    },
+    DatabaseDetachStarted {
+        req: ReqId,
+        vset: VsetId,
+        attachment: AttachmentId,
+        forced: bool,
+    },
+    DatabaseDetached {
+        req: ReqId,
+        vset: VsetId,
+        attachment: AttachmentId,
+    },
 }
 
 /// Timer identity; the daemon owns the meaning.
@@ -395,6 +434,12 @@ pub enum TimerId {
     /// Re-issue store fetches for map leaves still pending after a fault
     /// (lazy hydration never gives up on a transient outage).
     LeafRetry(VsetId),
+    /// Retry an async database page fetch parked by a store outage.
+    DatabaseRetry(VsetId),
+    /// Start a detached database vset's final migration capture.
+    DatabaseMigrate(VsetId),
+    /// Retry assignment-head transfer for an inbound backed database move.
+    DatabaseMigrateHead(VsetId),
 }
 
 /// Everything that can happen to the daemon.
@@ -413,6 +458,8 @@ pub enum Event {
         req: ReqId,
         volume: VolumeId,
     },
+    /// One operation decoded from a VM-authenticated database transport.
+    Database(DatabaseRequest),
     /// The VMM paused the vset's vCPUs (response to `PauseGuest`); `vmstate`
     /// is the serialized device/vCPU state captured at the pause instant.
     GuestPaused {
@@ -498,6 +545,15 @@ pub enum Effect {
     Evict {
         page: PageId,
     },
+    /// Install or replace one database cache page. Interpreters apply this
+    /// before a later reply in the same batch.
+    DatabaseInstall {
+        page: PageId,
+        bytes: Vec<u8>,
+    },
+    /// Complete a database request. Request ids permit out-of-order transport
+    /// delivery even though each database accepts mutations in event order.
+    Database(DatabaseReply),
     /// Pause the vset's vCPUs for a checkpoint capture (R3.1); the VMM
     /// answers with `GuestPaused`.
     PauseGuest {
@@ -627,6 +683,9 @@ pub enum Verdict {
     /// Newest usable recovery point is disk-only: boot fresh from disks at
     /// sync consistency; memory is invalid (R3.7).
     ColdBoot,
+    /// A storage-only `SQLite` vset recovered at a durable file/page point.
+    /// It is ready for a separate attachment and carries no VM state.
+    DatabaseReady { synced_through: u64 },
     /// Durable state exists but no intact record: nothing restorable.
     Unrestorable,
 }

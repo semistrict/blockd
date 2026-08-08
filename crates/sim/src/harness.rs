@@ -427,7 +427,7 @@ impl Harness {
     }
 
     // One arm per effect kind; splitting would only scatter the seam.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::match_same_arms, clippy::too_many_lines)]
     fn apply_effects(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             self.kernel.observe(&effect);
@@ -747,6 +747,12 @@ impl Harness {
                         self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
                     }
                 }
+                Effect::DatabaseInstall { page, bytes } => {
+                    let mem = self.mems.entry(page.volume.vset).or_default();
+                    mem.pages.insert(page, bytes);
+                    mem.protected.insert(page);
+                }
+                Effect::Database(_) => {}
                 Effect::Admin(reply) => self.admin_reply(reply),
                 Effect::PeerSend { .. } => {
                     self.report
@@ -1149,7 +1155,10 @@ impl Harness {
             | AdminReply::BaseDeleted { .. }
             | AdminReply::VsetForked { .. }
             | AdminReply::MigratedOut { .. }
-            | AdminReply::VsetMigratedIn { .. } => {}
+            | AdminReply::VsetMigratedIn { .. }
+            | AdminReply::DatabaseAttached { .. }
+            | AdminReply::DatabaseDetachStarted { .. }
+            | AdminReply::DatabaseDetached { .. } => {}
             AdminReply::VsetRecovered { vset, verdict } => {
                 self.mems.insert(vset, VsetMem::default());
                 match verdict {
@@ -1165,6 +1174,9 @@ impl Harness {
                         self.oracle.start_cold_boot(vset);
                         let guest = self.guests.get_mut(&vset).expect("guest exists");
                         guest.reborn(0, true);
+                    }
+                    Verdict::DatabaseReady { .. } => {
+                        unreachable!("compute harness recovered a database vset")
                     }
                 }
                 self.schedule_guest(vset);
@@ -1187,6 +1199,9 @@ impl Harness {
                         self.oracle.start_cold_boot(vset);
                         let guest = self.guests.get_mut(&vset).expect("guest exists");
                         guest.reborn(0, true);
+                    }
+                    Verdict::DatabaseReady { .. } => {
+                        unreachable!("compute harness restored a database vset")
                     }
                 }
                 self.schedule_guest(vset);
@@ -1265,6 +1280,9 @@ impl Harness {
                     let guest = self.guests.get_mut(&vset).expect("listed");
                     guest.reborn(0, true);
                     self.schedule_guest(vset);
+                }
+                Some(Verdict::DatabaseReady { .. }) => {
+                    unreachable!("compute harness found a database vset")
                 }
                 None if self.vset_config_for(vset).durability.uses_store() => {
                     // Recovery defers the verdict until the head confirms

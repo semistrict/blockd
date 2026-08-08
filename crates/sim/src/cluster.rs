@@ -651,6 +651,13 @@ impl Cluster {
                         mem.protected.remove(&page);
                     }
                 }
+                Effect::DatabaseInstall { page, bytes } => {
+                    let mems = &mut self.hosts[usize::from(host)].mems;
+                    let mem = mems.entry(page.volume.vset).or_default();
+                    mem.pages.insert(page, bytes);
+                    mem.protected.insert(page);
+                }
+                Effect::Database(_) => {}
                 Effect::PauseGuest { vset } => {
                     self.paused_at.insert(vset, self.kernel.now());
                     let guest = self.guests.get_mut(&vset).expect("guest exists");
@@ -1587,6 +1594,9 @@ impl Cluster {
                 guest.reborn(0, true);
                 self.schedule_guest(vset);
             }
+            Verdict::DatabaseReady { .. } => {
+                unreachable!("compute cluster recovered a database vset")
+            }
             Verdict::Unrestorable => {
                 // No storage damage is injected in cluster runs: local
                 // recovery must always reach a verdict.
@@ -1895,6 +1905,9 @@ impl Cluster {
                 let guest = self.guests.get_mut(&vset).expect("guest exists");
                 guest.reborn(0, true);
             }
+            Verdict::DatabaseReady { .. } => {
+                unreachable!("compute cluster restored a database vset")
+            }
         }
         self.schedule_guest(vset);
     }
@@ -2001,7 +2014,10 @@ impl Cluster {
             }
             AdminReply::BaseKept { .. }
             | AdminReply::BaseDeleted { .. }
-            | AdminReply::VsetForked { .. } => {}
+            | AdminReply::VsetForked { .. }
+            | AdminReply::DatabaseAttached { .. }
+            | AdminReply::DatabaseDetachStarted { .. }
+            | AdminReply::DatabaseDetached { .. } => {}
         }
     }
 }

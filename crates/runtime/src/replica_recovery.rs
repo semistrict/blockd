@@ -270,6 +270,7 @@ mod tests {
             .expect("initial head");
         let record = JournalRecord {
             config: VsetConfig {
+                kind: blockd_core::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
                 durability: DurabilityMode::PeerStashed,
@@ -279,6 +280,7 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 4,
             sync_covered_through: 5,
+            database: blockd_core::journal::DatabaseMeta::default(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -353,6 +355,7 @@ mod tests {
             .expect("initial head");
         let record = JournalRecord {
             config: VsetConfig {
+                kind: blockd_core::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
                 durability: DurabilityMode::PeerStashed,
@@ -362,6 +365,7 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 4,
             sync_covered_through: 5,
+            database: blockd_core::journal::DatabaseMeta::default(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,

@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, StoreFault, TimerId};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
 
@@ -157,6 +157,9 @@ impl World {
             Effect::Evict { page } => {
                 self.resident.remove(&page);
             }
+            Effect::DatabaseInstall { page, .. } => {
+                self.resident.insert(page, false);
+            }
             Effect::PauseGuest { vset } => {
                 self.applied += 1;
                 local.push_back(Event::GuestPaused {
@@ -164,7 +167,10 @@ impl World {
                     vmstate: self.applied,
                 });
             }
-            Effect::ResumeGuest { .. } | Effect::SyncOk { .. } | Effect::SyncFailed { .. } => {}
+            Effect::ResumeGuest { .. }
+            | Effect::SyncOk { .. }
+            | Effect::SyncFailed { .. }
+            | Effect::Database(_) => {}
             Effect::BlobWrite { io, name, bytes } => {
                 self.blobs.insert(name, bytes);
                 local.push_back(Event::BlobWriteDone { io });
@@ -343,11 +349,7 @@ impl Lcg {
 }
 
 fn drive(vsets: u64) -> World {
-    let config = VsetConfig {
-        disk_volumes: 1,
-        pages_per_volume: PAGES_PER_VOLUME,
-        durability: DurabilityMode::Local,
-    };
+    let config = VsetConfig::compute(1, PAGES_PER_VOLUME, false);
     let mut world = World::new(DaemonConfig {
         host: HostId(0),
         cache_pages: 1 << 22, // never under pressure: measure decide, not eviction storms
@@ -422,11 +424,7 @@ fn profile_huge_vset_capture_stall() {
         Event::Admin(AdminCmd::CreateVset {
             req: ReqId(1),
             vset: VsetId(1),
-            config: VsetConfig {
-                disk_volumes: 1,
-                pages_per_volume: HUGE_PAGES,
-                durability: DurabilityMode::Local,
-            },
+            config: VsetConfig::compute(1, HUGE_PAGES, false),
             from_base: None,
         }),
         Bucket::Admin,

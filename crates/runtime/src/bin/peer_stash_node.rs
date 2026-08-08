@@ -31,6 +31,7 @@ mod linux {
 
     const VSET: VsetId = VsetId(1);
     const VSET_CONFIG: VsetConfig = VsetConfig {
+        kind: blockd_core::journal::VsetKind::Compute,
         disk_volumes: 1,
         pages_per_volume: 64,
         durability: DurabilityMode::PeerStashed,

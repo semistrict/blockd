@@ -474,6 +474,7 @@ mod tests {
         };
         let record = JournalRecord {
             config: VsetConfig {
+                kind: crate::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
                 durability: DurabilityMode::PeerStashed,
@@ -483,6 +484,7 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 11,
             sync_covered_through: info.sync_covered_through,
+            database: crate::journal::DatabaseMeta::default(),
             overlay: locs
                 .into_iter()
                 .map(|(page, generation, loc)| (page, (generation, loc)))
@@ -605,6 +607,7 @@ mod tests {
         let peer = HostId(1);
         let vset = VsetId(8);
         let config = VsetConfig {
+            kind: crate::journal::VsetKind::Compute,
             disk_volumes: 1,
             pages_per_volume: 8,
             durability: DurabilityMode::PeerStashed,
@@ -621,6 +624,7 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 11,
             sync_covered_through: peer_info.sync_covered_through,
+            database: crate::journal::DatabaseMeta::default(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -636,6 +640,7 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 13,
             sync_covered_through: 13,
+            database: crate::journal::DatabaseMeta::default(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,

@@ -348,11 +348,7 @@ mod tests {
     const VSET: VsetId = VsetId(9);
 
     fn config() -> VsetConfig {
-        VsetConfig {
-            disk_volumes: 1,
-            pages_per_volume: 2,
-            durability: blockd_core::journal::DurabilityMode::Local,
-        }
+        VsetConfig::compute(1, 2, false)
     }
 
     fn page(volume: u8, n: u32) -> PageId {

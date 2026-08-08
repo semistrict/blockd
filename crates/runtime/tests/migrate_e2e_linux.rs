@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig, S3Store};
@@ -170,11 +170,7 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
 
     // A non-backed vset (the mode that must migrate, R7.2) does real work
     // on A — enough distinct pages that the post-copy tail is nontrivial.
-    let vc = VsetConfig {
-        disk_volumes: 2,
-        pages_per_volume: 64,
-        durability: DurabilityMode::Local,
-    };
+    let vc = VsetConfig::compute(2, 64, false);
     a.create_vset(VSET, vc);
     let mut workload = Workload::new(0xB10C_D001, vc);
     for op in 0..600 {

@@ -46,6 +46,7 @@ fn fixture() -> (Vec<u8>, Vec<u8>) {
     };
     let record = JournalRecord {
         config: VsetConfig {
+            kind: blockd_core::journal::VsetKind::Compute,
             disk_volumes: 1,
             pages_per_volume: 8,
             durability: DurabilityMode::PeerStashed,
@@ -55,6 +56,7 @@ fn fixture() -> (Vec<u8>, Vec<u8>) {
         kind: RecordKind::Commit,
         capture_seq: 12,
         sync_covered_through: info.sync_covered_through,
+        database: blockd_core::journal::DatabaseMeta::default(),
         overlay: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
         leaves: BTreeMap::new(),
         migrated_from: None,

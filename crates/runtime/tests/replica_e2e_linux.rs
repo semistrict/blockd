@@ -135,6 +135,7 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         store.clone(),
     );
     let config = VsetConfig {
+        kind: blockd_core::journal::VsetKind::Compute,
         disk_volumes: 1,
         pages_per_volume: 8,
         durability: DurabilityMode::PeerStashed,
@@ -214,8 +215,20 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         0x1122_3344_5566_7788
     );
 
+    // File removal precedes the completion event that records the unlink.
+    // Wait for both observable sides of the asynchronous release.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !spool_files(active_root, HostId(0), VSET).is_empty() {
+    loop {
+        let active_counters = if active == HostId(1) {
+            b.counters()
+        } else {
+            c.counters()
+        };
+        if spool_files(active_root, HostId(0), VSET).is_empty()
+            && active_counters.replica_unlinks > 0
+        {
+            break;
+        }
         assert!(Instant::now() < deadline, "peer spool was not released");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -265,6 +278,7 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
         })
         .collect();
     let config = VsetConfig {
+        kind: blockd_core::journal::VsetKind::Compute,
         disk_volumes: 1,
         pages_per_volume: 8,
         durability: DurabilityMode::PeerStashed,
@@ -363,8 +377,19 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
     let bytes = recovered.guest_read(VSET, page);
     assert_eq!(u64::from_ne_bytes(bytes[..8].try_into().expect("word")), 4);
 
+    // File removal precedes the completion event that records the unlink.
+    // Wait for both observable sides of the asynchronous release.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !spool_files(replacement_root, HostId(0), VSET).is_empty() {
+    loop {
+        let replacement_counters = runtimes[usize::from(replacement.0)]
+            .as_ref()
+            .expect("replacement runtime")
+            .counters();
+        if spool_files(replacement_root, HostId(0), VSET).is_empty()
+            && replacement_counters.replica_unlinks > 0
+        {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
             "replacement spool was not released"

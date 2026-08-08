@@ -55,7 +55,7 @@ fn api_request(sock: &Path, method: &str, path: &str, body: &str) -> (u16, Strin
     let mut buf = [0u8; 4096];
     let (headers_end, header_text) = loop {
         let n = stream.read(&mut buf).expect("api read");
-        assert!(n > 0, "api connection closed mid-response");
+        assert!(n > 0, "{method} {path}: api connection closed mid-response");
         raw.extend_from_slice(&buf[..n]);
         if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
             break (pos + 4, String::from_utf8_lossy(&raw[..pos]).into_owned());
@@ -106,12 +106,21 @@ impl FcVm {
             .expect("spawn firecracker");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
         let (line_tx, lines) = channel();
         thread::spawn(move || {
             use std::io::BufRead;
             for line in std::io::BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if line_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stderr).lines() {
+                if line.is_err() {
                     break;
                 }
             }
@@ -134,6 +143,34 @@ impl FcVm {
         assert!(
             (200..300).contains(&status),
             "{method} {path} failed: {status} {reply}"
+        );
+    }
+
+    /// Add Firecracker's single virtio-vsock device before boot. Guest
+    /// connections to host CID 2 and port P are forwarded to
+    /// `<uds_path>_P` on the host.
+    pub fn configure_vsock(&self, guest_cid: u32, uds_path: &Path) {
+        self.api(
+            "PUT",
+            "/vsock",
+            &format!(
+                "{{\"guest_cid\": {guest_cid}, \"uds_path\": \"{}\"}}",
+                uds_path.display()
+            ),
+        );
+    }
+
+    /// Add the VM-wide vhost-user virtio-fs device. The patched frontend
+    /// reserves drive id `vsetfs`; all database vsets share this one device.
+    pub fn configure_vsetfs(&self, uds_path: &Path) {
+        self.api(
+            "PUT",
+            "/drives/vsetfs",
+            &format!(
+                "{{\"drive_id\": \"vsetfs\", \"is_root_device\": false, \
+                 \"cache_type\": \"Unsafe\", \"socket\": \"{}\"}}",
+                uds_path.display()
+            ),
         );
     }
 
@@ -228,12 +265,50 @@ impl FcVm {
         );
     }
 
+    /// Restore from an immutable memory snapshot through a per-VM shared
+    /// working copy. Vhost-user backends need shared visibility of virtqueue
+    /// writes, while the source snapshot must remain unchanged.
+    pub fn load_snapshot_shared(&self, snapshot_path: &Path, mem_path: &Path) {
+        self.api(
+            "PUT",
+            "/snapshot/load",
+            &format!(
+                "{{\"snapshot_path\": \"{}\", \"mem_backend\": \
+                 {{\"backend_type\": \"FileShared\", \"backend_path\": \"{}\"}}, \
+                 \"resume_vm\": true}}",
+                snapshot_path.display(),
+                mem_path.display()
+            ),
+        );
+    }
+
     /// Send one workload command and wait for its reply line (replies are
     /// uppercase; the tty echo of commands can never match).
     pub fn cmd(&mut self, command: &str, reply_prefix: &str) -> String {
         writeln!(self.stdin, "{command}").expect("serial write");
         self.stdin.flush().expect("serial flush");
         self.wait_line(reply_prefix)
+    }
+
+    pub fn try_cmd(
+        &mut self,
+        command: &str,
+        reply_prefix: &str,
+        timeout: Duration,
+    ) -> Option<String> {
+        writeln!(self.stdin, "{command}").ok()?;
+        self.stdin.flush().ok()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining == Duration::ZERO {
+                return None;
+            }
+            let line = self.lines.recv_timeout(remaining).ok()?;
+            if let Some(rest) = line.trim_start().strip_prefix(reply_prefix) {
+                return Some(rest.trim().to_owned());
+            }
+        }
     }
 
     /// Wait for a serial line starting with `prefix`.

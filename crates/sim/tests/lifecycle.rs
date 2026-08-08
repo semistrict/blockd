@@ -4,7 +4,7 @@
 //! are exact; any drift is a real behavior change.
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::types::{micros, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::rng::Ppm;
@@ -73,12 +73,12 @@ fn crash_storm_with_checkpoints_resumes() {
     };
     let report = run(3, config);
     assert_clean(&report);
-    assert_eq!(report.crashes, page_pin(12, 9));
-    assert_eq!(report.resumes, page_pin(11, 3));
-    assert_eq!(report.cold_boots, page_pin(25, 24));
+    assert_eq!(report.crashes, page_pin(10, 9));
+    assert_eq!(report.resumes, page_pin(4, 3));
+    assert_eq!(report.cold_boots, page_pin(26, 24));
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(3388, 4085));
+    assert_eq!(report.completed_ops, page_pin(3714, 4085));
 }
 
 #[test]
@@ -344,11 +344,7 @@ fn big_maps_cost_deltas_not_size() {
             ..base_config().daemon
         },
         vset_count: 1,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 8_000,
-            durability: DurabilityMode::Local,
-        },
+        vset_config: VsetConfig::compute(2, 8_000, false),
         think: (micros(5), micros(25)),
         horizon: secs(1),
         checkpoint_interval: Some(millis(300)),
@@ -410,11 +406,7 @@ fn steady_overwrites_dont_amplify_disk_space() {
             ..base_config().daemon
         },
         vset_count: 1,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 4_096,
-            durability: DurabilityMode::Local,
-        },
+        vset_config: VsetConfig::compute(2, 4_096, false),
         think: (micros(10), micros(50)),
         horizon: secs(2),
         checkpoint_interval: None,

@@ -60,6 +60,11 @@ id_type!(
     VsetId(u64)
 );
 id_type!(
+    /// A VM identity assigned by the host control plane, never trusted from
+    /// guest-provided protocol bytes.
+    VmId(u64)
+);
+id_type!(
     /// Volume index within a vset. Index 0 is the memory volume.
     VolumeIdx(u8)
 );

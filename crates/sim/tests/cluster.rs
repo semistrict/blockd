@@ -30,11 +30,7 @@ impl HostMap for PatternMem {
 }
 
 fn config() -> VsetConfig {
-    VsetConfig {
-        disk_volumes: 1,
-        pages_per_volume: 4,
-        durability: DurabilityMode::Backup,
-    }
+    VsetConfig::compute(1, 4, true)
 }
 
 fn daemon(host: u16) -> Daemon {

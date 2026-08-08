@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use super::{Daemon, Pending, Vset};
-use crate::journal::{JournalRecord, RecordKind};
+use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
 use crate::seam::{AdminReply, Effect, ReqId, StoreFault, Verdict};
@@ -339,7 +339,7 @@ impl Daemon {
         let mut overlay: BTreeMap<PageId, _> = BTreeMap::new();
         let whole = matches!(record.kind, RecordKind::Checkpoint { .. });
         for (page, entry) in &record.overlay {
-            if !whole && page.volume.idx.is_memory() {
+            if !whole && record.config.is_memory(page.volume.idx) {
                 continue;
             }
             let rekeyed = PageId {
@@ -367,11 +367,14 @@ impl Daemon {
                 )
             })
             .collect();
-        if !whole {
+        if !whole && record.config.kind == VsetKind::Compute {
             leaves.retain(|span, _| !span_is_memory(*span));
         }
-        let verdict = match record.kind {
-            RecordKind::Checkpoint { epoch: _, vmstate } => {
+        let verdict = match (record.config.kind, record.kind) {
+            (VsetKind::Database, RecordKind::Commit) => Verdict::DatabaseReady {
+                synced_through: record.sync_covered_through,
+            },
+            (VsetKind::Compute, RecordKind::Checkpoint { epoch: _, vmstate }) => {
                 // Forks of a whole base resume (R5.2) — at their own epoch 0.
                 state.fork_vmstate = Some(vmstate);
                 Verdict::Resume {
@@ -379,8 +382,13 @@ impl Daemon {
                     vmstate,
                 }
             }
-            RecordKind::Commit => Verdict::ColdBoot,
+            (VsetKind::Compute, RecordKind::Commit) => Verdict::ColdBoot,
+            (VsetKind::Database, RecordKind::Checkpoint { .. }) => {
+                unreachable!("database records cannot carry vmstate")
+            }
         };
+        state.database = record.database;
+        state.database_durable = record.database;
         state.fork_verdict = Some(verdict);
         state.mutation_seq = record.capture_seq;
         state.local_covered_through = 0;

@@ -1,8 +1,9 @@
 # blockd
 
 blockd is a page-granular storage backend for Firecracker sandbox fleets.
-One daemon per host owns guest RAM and pmem disk state, commits it locally,
-and optionally publishes it asynchronously to an object store. See
+One daemon per host owns guest RAM, pmem disk state, and independently
+attachable SQLite database vsets, commits them locally, and optionally
+publishes them asynchronously to an object store. See
 `REQUIREMENTS.md` for the system contract and `DESIGN.md` for the standing
 design decisions.
 

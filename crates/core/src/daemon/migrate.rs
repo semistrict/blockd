@@ -17,7 +17,8 @@
 //! R7.3) — loudly, at the destination's first unservable fetch.
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::journal::JournalRecord;
+use crate::head::HeadRecord;
+use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::seam::{AdminReply, Effect, PeerMsg, ReqId, TimerId, Verdict};
 use crate::segment::PageLoc;
@@ -98,11 +99,13 @@ impl Daemon {
         // tail off a source may not chain-migrate — its record would point
         // the new destination at segments the middle host never had.
         if !state.ready
-            || state.config.durability.uses_store()
+            || (state.config.durability.uses_store() && state.config.kind != VsetKind::Database)
             || state.outbound.is_some()
             || state.migrate.is_some()
             || state.peer_source.is_some()
             || state.ckpt_pausing.is_some()
+            || state.commit_running
+            || (state.config.kind == VsetKind::Database && !state.database_runtime.is_detached())
         {
             out.push(Effect::Admin(AdminReply::AdminFailed { req }));
             return;
@@ -112,9 +115,38 @@ impl Daemon {
             to,
             record: None,
         });
-        // Cut over: pause, capture, hand off (R7.1's guest-observed pause
-        // is this pause plus one network hop).
-        out.push(Effect::PauseGuest { vset });
+        if state.config.kind == VsetKind::Database {
+            // Storage-only migration has no VM state and never pauses an
+            // unrelated VM. The zero-delay continuation starts its final
+            // commit with access to the host mapping.
+            out.push(Effect::SetTimer {
+                timer: TimerId::DatabaseMigrate(vset),
+                after: 0,
+            });
+        } else {
+            // Cut over: pause, capture, hand off (R7.1's guest-observed pause
+            // is this pause plus one network hop).
+            out.push(Effect::PauseGuest { vset });
+        }
+    }
+
+    pub(super) fn database_migrate_capture(
+        &mut self,
+        vset: VsetId,
+        mem: &dyn crate::seam::HostMap,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(state) = self.vsets.get(&vset) else {
+            return;
+        };
+        if state.config.kind != VsetKind::Database
+            || state.migrate.is_none()
+            || !state.database_runtime.is_detached()
+        {
+            return;
+        }
+        self.abandon_drain(vset);
+        self.start_capture(vset, None, mem, out);
     }
 
     /// The final capture's record is durable: persist the handoff marker —
@@ -132,6 +164,20 @@ impl Daemon {
             return;
         };
         migrate.record = Some(record);
+        if state.config.durability.uses_store() {
+            self.maybe_finish_backed_migration(vset, out);
+            return;
+        }
+        self.write_migration_handoff(vset, out);
+    }
+
+    fn write_migration_handoff(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get(&vset) else {
+            return;
+        };
+        let Some(migrate) = &state.migrate else {
+            return;
+        };
         let handoff = Handoff {
             vset,
             to: migrate.to,
@@ -143,6 +189,29 @@ impl Daemon {
             name: layout::handoff_blob(vset),
             bytes: handoff.encode(),
         });
+    }
+
+    /// A backed database transfers only after its final record is the store
+    /// head. This prevents a late source publish from racing the destination's
+    /// assignment claim and fencing the peer that still serves the tail.
+    pub(super) fn maybe_finish_backed_migration(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let ready = self.vsets.get(&vset).is_some_and(|state| {
+            let Some(migrate) = &state.migrate else {
+                return false;
+            };
+            let Some(record) = &migrate.record else {
+                return false;
+            };
+            state.config.durability.uses_store()
+                && state.publish.is_none()
+                && state.outbound.is_none()
+                && state.backed.is_some_and(|ptr| {
+                    (ptr.capture_seq, ptr.seq) == (record.capture_seq, record.seq)
+                })
+        });
+        if ready {
+            self.write_migration_handoff(vset, out);
+        }
     }
 
     pub(super) fn handoff_written(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
@@ -294,7 +363,7 @@ impl Daemon {
                     len: u64::from(len),
                 });
             }
-            PeerMsg::Page { io, bytes } => self.peer_fill_done(io, bytes, out),
+            PeerMsg::Page { io, bytes } => self.peer_fill_done(io, bytes, mem, out),
             PeerMsg::FetchLeaf {
                 io,
                 vset,
@@ -454,8 +523,14 @@ impl Daemon {
             self.counters.peer_rejected += 1;
             return;
         }
-        let crate::journal::RecordKind::Checkpoint { epoch, vmstate } = record.kind else {
-            return; // migration always offers a whole point
+        let verdict = match (record.config.kind, record.kind) {
+            (VsetKind::Compute, RecordKind::Checkpoint { epoch, vmstate }) => {
+                Verdict::Resume { epoch, vmstate }
+            }
+            (VsetKind::Database, RecordKind::Commit) => Verdict::DatabaseReady {
+                synced_through: record.sync_covered_through,
+            },
+            _ => return,
         };
         let mut state = Vset::new(record.config);
         // Strictly above BOTH the offer's fence and this host's fence
@@ -466,10 +541,14 @@ impl Daemon {
         let floor = self.fence_floors.get(&vset).copied().unwrap_or(0);
         state.fence = record.fence.max(floor) + 1;
         self.fence_floors.insert(vset, state.fence);
-        state.epoch = Epoch(epoch.0);
+        if let Verdict::Resume { epoch, .. } = verdict {
+            state.epoch = Epoch(epoch.0);
+        }
         state.mutation_seq = record.capture_seq;
         state.local_covered_through = record.sync_covered_through;
         state.adopt_local_ack_if_allowed();
+        state.database = record.database;
+        state.database_durable = record.database;
         state.next_seq = record.seq.0 + 1;
         state.next_gen = record
             .overlay
@@ -488,11 +567,145 @@ impl Daemon {
         state.best = Some((record.capture_seq, record.seq));
         state.best_record = Some(record);
         state.peer_source = Some(from);
-        state.migrated_verdict = Some(Verdict::Resume { epoch, vmstate });
+        state.migrated_verdict = Some(verdict);
         self.vsets.insert(vset, state);
         self.request_pending_leaves(vset, out);
         // The first local record IS the acceptance; `finalize_record`
         // replies and sends the accept once it is durable.
+        self.start_record_only_capture(vset, out);
+    }
+
+    /// The provisional inbound record is durable before a backed database
+    /// attempts to take assignment. The source is detached and remains the
+    /// head holder/peer tier until this CAS succeeds.
+    pub(super) fn start_migrate_head_claim(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get(&vset) else {
+            return;
+        };
+        if !state.config.durability.uses_store()
+            || state.migrated_verdict.is_none()
+            || state.migration_head_claimed
+        {
+            return;
+        }
+        let Some(source) = state.peer_source else {
+            return;
+        };
+        if self.pending.values().any(
+            |pending| matches!(pending, Pending::MigrateHeadGet { vset: owner, .. } | Pending::MigrateHeadClaim { vset: owner, .. } if *owner == vset),
+        ) {
+            return;
+        }
+        let io = self.io();
+        self.pending
+            .insert(io, Pending::MigrateHeadGet { vset, source });
+        out.push(Effect::StoreGet {
+            io,
+            key: layout::head_key(vset),
+        });
+    }
+
+    pub(super) fn migrate_head_done(
+        &mut self,
+        vset: VsetId,
+        source: HostId,
+        result: Result<Option<(u64, Vec<u8>)>, crate::seam::StoreFault>,
+        out: &mut Vec<Effect>,
+    ) {
+        let (version, bytes) = match result {
+            Ok(Some(found)) => found,
+            Err(crate::seam::StoreFault::Unavailable) => {
+                self.retry_migrate_head(vset, out);
+                return;
+            }
+            Ok(None) | Err(crate::seam::StoreFault::CasConflict { .. }) => {
+                self.fence_vset(vset, out);
+                return;
+            }
+        };
+        let Ok(head) = HeadRecord::decode(vset, &bytes) else {
+            self.fence_vset(vset, out);
+            return;
+        };
+        if head.holder == self.config.host {
+            // A prior CAS returned an ambiguous outage but did land.
+            self.adopt_migration_head(vset, version, head.manifest, out);
+            return;
+        }
+        if head.holder != source {
+            self.fence_vset(vset, out);
+            return;
+        }
+        let claim = HeadRecord {
+            vset,
+            holder: self.config.host,
+            fence: 0,
+            manifest: head.manifest,
+            stash: head.stash,
+            retired_stashes: head.retired_stashes,
+        };
+        let io = self.io();
+        self.pending.insert(
+            io,
+            Pending::MigrateHeadClaim {
+                vset,
+                manifest: head.manifest,
+            },
+        );
+        out.push(Effect::StoreCas {
+            io,
+            key: layout::head_key(vset),
+            expected: Some(version),
+            bytes: claim.encode(),
+        });
+    }
+
+    pub(super) fn migrate_head_claim_done(
+        &mut self,
+        vset: VsetId,
+        manifest: Option<crate::head::ManifestPtr>,
+        result: Result<u64, crate::seam::StoreFault>,
+        out: &mut Vec<Effect>,
+    ) {
+        match result {
+            Ok(fence) => self.adopt_migration_head(vset, fence, manifest, out),
+            Err(
+                crate::seam::StoreFault::Unavailable | crate::seam::StoreFault::CasConflict { .. },
+            ) => self.retry_migrate_head(vset, out),
+        }
+    }
+
+    fn retry_migrate_head(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        self.counters.store_retries += 1;
+        out.push(Effect::SetTimer {
+            timer: TimerId::DatabaseMigrateHead(vset),
+            after: self.config.backup_retry,
+        });
+    }
+
+    fn adopt_migration_head(
+        &mut self,
+        vset: VsetId,
+        fence: u64,
+        manifest: Option<crate::head::ManifestPtr>,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(state) = self.vsets.get_mut(&vset) else {
+            return;
+        };
+        if state.migrated_verdict.is_none() || state.migration_head_claimed {
+            return;
+        }
+        state.fence = fence;
+        state.head_version = Some(fence);
+        state.backed = manifest;
+        if let Some(ptr) = manifest {
+            state.store_manifests.insert((ptr.fence, ptr.seq));
+        }
+        state.migration_head_claimed = true;
+        state.ready = false;
+        // Persist under the claimed fence before telling the source or node
+        // manager that assignment has moved.
         self.start_record_only_capture(vset, out);
     }
 
@@ -501,6 +714,7 @@ impl Daemon {
         &mut self,
         io: crate::seam::IoId,
         bytes: Option<Vec<u8>>,
+        mem: &dyn crate::seam::HostMap,
         out: &mut Vec<Effect>,
     ) {
         match self.pending.remove(&io) {
@@ -513,6 +727,12 @@ impl Daemon {
             Some(Pending::HydrateFetch { page, generation }) => {
                 self.hydrate_fetch_done(page, generation, bytes, out);
             }
+            Some(Pending::DatabasePeerFetch {
+                vset,
+                page,
+                generation,
+                loc,
+            }) => self.database_peer_fetch_done(vset, page, generation, loc, bytes, mem, out),
             Some(other) => {
                 // Io ids are never reused, so a `Page` can only name a peer
                 // fetch — but keep foreign entries untouched regardless.
@@ -526,19 +746,36 @@ impl Daemon {
     /// A peer fetch went unanswered (lost message or source downtime):
     /// re-run the fill ladder for the page, which re-issues the fetch with
     /// a fresh io — stale replies to the old io fall into the ignore path.
-    pub(super) fn peer_retry(&mut self, io: crate::seam::IoId, out: &mut Vec<Effect>) {
-        let Some(&Pending::PeerFetch {
-            page,
-            write,
-            generation,
-            loc,
-        }) = self.pending.get(&io)
-        else {
-            return; // answered in time
-        };
-        self.pending.remove(&io);
-        self.counters.peer_retries += 1;
-        self.fill_read_done(page, write, generation, loc, None, out);
+    pub(super) fn peer_retry(
+        &mut self,
+        io: crate::seam::IoId,
+        mem: &dyn crate::seam::HostMap,
+        out: &mut Vec<Effect>,
+    ) {
+        match self.pending.remove(&io) {
+            Some(Pending::PeerFetch {
+                page,
+                write,
+                generation,
+                loc,
+            }) => {
+                self.counters.peer_retries += 1;
+                self.fill_read_done(page, write, generation, loc, None, out);
+            }
+            Some(Pending::DatabasePeerFetch {
+                vset,
+                page,
+                generation,
+                loc,
+            }) => {
+                self.counters.peer_retries += 1;
+                self.database_peer_retry(vset, page, generation, loc, mem, out);
+            }
+            Some(other) => {
+                self.pending.insert(io, other);
+            }
+            None => {}
+        }
     }
 
     // ── hydration: the post-copy tail drain (R7.1) ──────────────────────
@@ -620,6 +857,7 @@ impl Daemon {
                     Pending::Fetch { page: q, .. }
                     | Pending::StoreFetch { page: q, .. }
                     | Pending::PeerFetch { page: q, .. }
+                    | Pending::DatabasePeerFetch { page: q, .. }
                     | Pending::HydrateFetch { page: q, .. } if *q == page
                 )
             });
@@ -674,7 +912,8 @@ impl Daemon {
                 p,
                 Pending::Fetch { page: q, .. }
                 | Pending::StoreFetch { page: q, .. }
-                | Pending::PeerFetch { page: q, .. } if *q == page
+                | Pending::PeerFetch { page: q, .. }
+                | Pending::DatabasePeerFetch { page: q, .. } if *q == page
             )
         });
         if self.cache.is_resident(page) || in_flight {
@@ -683,18 +922,26 @@ impl Daemon {
         if !self.cache.reserve_if_free() {
             return; // pressure: hydration never evicts anyone
         }
-        self.cache.fill_slot_cold(page);
+        let memory = self.vsets[&page.volume.vset]
+            .config
+            .is_memory(page.volume.idx);
+        let database = self.vsets[&page.volume.vset].config.kind == VsetKind::Database;
+        self.cache.fill_slot_cold(page, memory);
         self.cache.mark_dirty(page);
         if let Some(state) = self.vsets.get_mut(&page.volume.vset) {
             state.wedge.hydration += 1;
         }
         self.counters.hydrate_fills += 1;
-        out.push(Effect::Fill {
-            page,
-            bytes: raw,
-            writable: false,
-            share: None,
-        });
+        if database {
+            out.push(Effect::DatabaseInstall { page, bytes: raw });
+        } else {
+            out.push(Effect::Fill {
+                page,
+                bytes: raw,
+                writable: false,
+                share: None,
+            });
+        }
     }
 
     /// A peer read completed locally: answer the requester.

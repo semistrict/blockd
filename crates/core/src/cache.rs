@@ -40,6 +40,9 @@ pub const MAX_NR_GENS: u64 = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
+    /// 0 = storage, 1 = compute memory. Stored at admission because volume
+    /// index zero is a database file for database vsets (R2.4/R12.1).
+    class: u8,
     /// Write-unprotected: the guest is mutating it invisibly.
     dirty: bool,
     /// Number of in-flight flushes of this page.
@@ -54,11 +57,6 @@ impl Entry {
     fn evictable(&self) -> bool {
         !self.dirty && self.flushing == 0
     }
-}
-
-/// Eviction class: clean disk pages go before clean memory pages (R2.4).
-fn class(page: PageId) -> u8 {
-    u8::from(page.volume.idx.is_memory())
 }
 
 /// Identity of a shared base page: its immutable location.
@@ -151,6 +149,20 @@ impl Cache {
         self.entries.get(&page).is_some_and(|e| e.dirty)
     }
 
+    /// Remove one resident page regardless of dirty state. Database
+    /// truncate/delete uses this only after the logical mapping has been
+    /// pruned, so the old bytes cannot be observed by a later extension.
+    pub fn remove_page(&mut self, page: PageId) -> bool {
+        let Some(entry) = self.entries.remove(&page) else {
+            return false;
+        };
+        self.unlink(page, &entry);
+        self.count_remove(entry.class, entry.generation);
+        self.dirty.remove(&page);
+        self.unstable.remove(&page);
+        true
+    }
+
     pub fn resident_count(&self) -> usize {
         self.entries.len()
     }
@@ -175,33 +187,37 @@ impl Cache {
         self.unstable.len()
     }
 
+    pub fn resident_pages_of(&self, vset: VsetId) -> Vec<PageId> {
+        self.entries
+            .range(vset_range(vset))
+            .map(|(&page, _)| page)
+            .collect()
+    }
+
     fn unlink(&mut self, page: PageId, entry: &Entry) {
         self.victims
-            .remove(&(class(page), entry.generation, entry.touched, page));
+            .remove(&(entry.class, entry.generation, entry.touched, page));
     }
 
     fn link(&mut self, page: PageId, entry: &Entry) {
         if entry.evictable() {
             self.victims
-                .insert((class(page), entry.generation, entry.touched, page));
+                .insert((entry.class, entry.generation, entry.touched, page));
         }
     }
 
-    fn count_add(&mut self, page: PageId, generation: u64) {
-        *self
-            .gen_counts
-            .entry((class(page), generation))
-            .or_insert(0) += 1;
+    fn count_add(&mut self, class: u8, generation: u64) {
+        *self.gen_counts.entry((class, generation)).or_insert(0) += 1;
     }
 
-    fn count_remove(&mut self, page: PageId, generation: u64) {
-        let key = (class(page), generation);
+    fn count_remove(&mut self, class: u8, generation: u64) {
+        let key = (class, generation);
         let count = self.gen_counts.get_mut(&key).expect("counted");
         *count -= 1;
         if *count == 0 {
             self.gen_counts.remove(&key);
         }
-        self.advance_min_seq(usize::from(class(page)));
+        self.advance_min_seq(usize::from(class));
     }
 
     /// `min_seq` advances past emptied generations (the kernel's rule).
@@ -248,14 +264,14 @@ impl Cache {
                 continue;
             };
             self.unlink(page, &entry);
-            self.count_remove(page, entry.generation);
+            self.count_remove(entry.class, entry.generation);
             self.clock += 1;
             let entry = Entry {
                 generation: self.max_seq,
                 touched: self.clock,
                 ..entry
             };
-            self.count_add(page, self.max_seq);
+            self.count_add(entry.class, self.max_seq);
             self.link(page, &entry);
             self.entries.insert(page, entry);
         }
@@ -284,7 +300,7 @@ impl Cache {
         let &(_, _, _, victim) = self.victims.iter().next()?;
         let entry = self.entries.remove(&victim).expect("victim resident");
         self.unlink(victim, &entry);
-        self.count_remove(victim, entry.generation);
+        self.count_remove(entry.class, entry.generation);
         self.reserved += 1;
         Some(Some(victim))
     }
@@ -292,22 +308,24 @@ impl Cache {
     /// A fill resolved into a slot obtained from [`Cache::reserve_slot`]:
     /// the page is resident — protected-clean, or dirty if the faulting
     /// access was a write.
-    pub fn fill_slot(&mut self, page: PageId, dirty: bool) {
-        self.fill_slot_in(page, dirty, self.max_seq);
+    pub fn fill_slot(&mut self, page: PageId, dirty: bool, memory: bool) {
+        self.fill_slot_in(page, dirty, self.max_seq, memory);
     }
 
     /// Install a readahead page (resume-set prefetch, R6.2): it joins the
     /// OLDEST generation, exactly where the kernel puts speculative
     /// page-cache reads — a guess that is never used ages out first.
-    pub fn fill_slot_cold(&mut self, page: PageId) {
-        self.fill_slot_in(page, false, self.min_seq[usize::from(class(page))]);
+    pub fn fill_slot_cold(&mut self, page: PageId, memory: bool) {
+        let class = u8::from(memory);
+        self.fill_slot_in(page, false, self.min_seq[usize::from(class)], memory);
     }
 
-    fn fill_slot_in(&mut self, page: PageId, dirty: bool, generation: u64) {
+    fn fill_slot_in(&mut self, page: PageId, dirty: bool, generation: u64, memory: bool) {
         assert!(self.reserved > 0, "fill without reserve");
         self.reserved -= 1;
         self.clock += 1;
         let entry = Entry {
+            class: u8::from(memory),
             dirty,
             flushing: 0,
             generation,
@@ -317,7 +335,7 @@ impl Cache {
             self.dirty.insert(page);
             self.unstable.insert(page);
         }
-        self.count_add(page, generation);
+        self.count_add(entry.class, generation);
         self.link(page, &entry);
         let previous = self.entries.insert(page, entry);
         assert!(previous.is_none(), "page already resident");
@@ -339,8 +357,8 @@ impl Cache {
         // A write-protect fault is an OBSERVED access: promote to the
         // youngest generation inline (the aging harvest would only learn
         // of it later).
-        self.count_remove(page, entry.generation);
-        self.count_add(page, self.max_seq);
+        self.count_remove(entry.class, entry.generation);
+        self.count_add(entry.class, self.max_seq);
         let entry = self.entries.get_mut(&page).expect("just observed");
         entry.dirty = true;
         entry.generation = self.max_seq;
@@ -408,7 +426,7 @@ impl Cache {
         for page in &pages {
             let entry = self.entries.remove(page).expect("listed");
             self.unlink(*page, &entry);
-            self.count_remove(*page, entry.generation);
+            self.count_remove(entry.class, entry.generation);
             self.dirty.remove(page);
             self.unstable.remove(page);
         }
@@ -438,15 +456,15 @@ mod tests {
     fn eviction_prefers_disk_pages_over_memory_pages() {
         let mut cache = Cache::new(2);
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(0, 0), false); // memory page, touched FIRST
+        cache.fill_slot(page(0, 0), false, true); // memory page, touched FIRST
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 0), false); // disk page, touched LAST
+        cache.fill_slot(page(1, 0), false, false); // disk page, touched LAST
         // Full: the victim must be the DISK page despite its recency.
         assert_eq!(cache.reserve_slot(), Some(Some(page(1, 0))));
-        cache.fill_slot(page(1, 1), false);
+        cache.fill_slot(page(1, 1), false, false);
         // Both remaining are (memory, disk): disk goes first again…
         assert_eq!(cache.reserve_slot(), Some(Some(page(1, 1))));
-        cache.fill_slot(page(0, 1), false);
+        cache.fill_slot(page(0, 1), false, true);
         // …and only with no disk pages left do memory pages evict, in
         // least-recently-touched order.
         assert_eq!(cache.reserve_slot(), Some(Some(page(0, 0))));
@@ -457,7 +475,7 @@ mod tests {
     fn dirty_pages_are_not_victims() {
         let mut cache = Cache::new(1);
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 0), true); // dirty
+        cache.fill_slot(page(1, 0), true, false); // dirty
         assert_eq!(cache.reserve_slot(), None, "a dirty page was offered");
     }
 
@@ -468,9 +486,9 @@ mod tests {
     fn aging_evicts_the_unaccessed_before_the_accessed() {
         let mut cache = Cache::new(2);
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 0), false); // A, arrived first
+        cache.fill_slot(page(1, 0), false, false); // A, arrived first
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 1), false); // B, arrived last
+        cache.fill_slot(page(1, 1), false, false); // B, arrived last
         // The harvest saw A touched, B idle.
         cache.age(|| vec![page(1, 0)]);
         // B is in the older generation now: it goes first, recency be
@@ -485,18 +503,18 @@ mod tests {
     fn readahead_ages_out_before_demand_fills() {
         let mut cache = Cache::new(3);
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 0), false); // A: demand, gen 0
+        cache.fill_slot(page(1, 0), false, false); // A: demand, gen 0
         cache.age(Vec::new); // opens gen 1; A stays old
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 1), false); // B: demand, gen 1
+        cache.fill_slot(page(1, 1), false, false); // B: demand, gen 1
         assert!(cache.reserve_if_free());
-        cache.fill_slot_cold(page(1, 2)); // C: readahead → gen 0
+        cache.fill_slot_cold(page(1, 2), false); // C: readahead → gen 0
         // Oldest generation drains first: A then C — the prefetched C dies
         // before B even though C arrived last.
         assert_eq!(cache.reserve_slot(), Some(Some(page(1, 0))));
-        cache.fill_slot(page(1, 3), false);
+        cache.fill_slot(page(1, 3), false, false);
         assert_eq!(cache.reserve_slot(), Some(Some(page(1, 2))));
-        cache.fill_slot(page(1, 4), false);
+        cache.fill_slot(page(1, 4), false, false);
         assert_eq!(cache.reserve_slot(), Some(Some(page(1, 1))));
     }
 
@@ -506,7 +524,7 @@ mod tests {
     fn generation_span_stays_bounded() {
         let mut cache = Cache::new(2);
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 0), false);
+        cache.fill_slot(page(1, 0), false, false);
         for _ in 0..10 {
             cache.age(Vec::new);
         }
@@ -535,10 +553,10 @@ mod tests {
             vpage(2, u8::MAX, 7),  // dirty, extreme volume index
         ] {
             assert_eq!(cache.reserve_slot(), Some(None));
-            cache.fill_slot(page, true);
+            cache.fill_slot(page, true, page.volume.idx.is_memory());
         }
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(vpage(2, 1, 3), false); // clean
+        cache.fill_slot(vpage(2, 1, 3), false, false); // clean
         assert_eq!(cache.dirty_pages_of(VsetId(1)), vec![vpage(1, 0, u32::MAX)]);
         assert_eq!(
             cache.dirty_pages_of(VsetId(2)),
@@ -581,9 +599,9 @@ mod tests {
     fn write_faults_promote_inline() {
         let mut cache = Cache::new(2);
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 0), false); // A
+        cache.fill_slot(page(1, 0), false, false); // A
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 1), false); // B
+        cache.fill_slot(page(1, 1), false, false); // B
         cache.age(Vec::new); // both old now, gen 1 open
         cache.mark_dirty(page(1, 0)); // guest wrote A → promoted + dirty
         cache.begin_flush(page(1, 0)); // captured…

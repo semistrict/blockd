@@ -370,6 +370,7 @@ mod tests {
         };
         let record = JournalRecord {
             config: VsetConfig {
+                kind: crate::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 16,
                 durability: DurabilityMode::PeerStashed,
@@ -379,6 +380,7 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 12,
             sync_covered_through: info.sync_covered_through,
+            database: crate::journal::DatabaseMeta::default(),
             overlay: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
             leaves: BTreeMap::new(),
             migrated_from: None,

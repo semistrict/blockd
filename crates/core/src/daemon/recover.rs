@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::{Daemon, DaemonConfig, PassiveReplica, ReplicaKey, Vset};
 use crate::format::crc32c;
-use crate::journal::{JournalRecord, RecordKind};
+use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout::{self, BlobName};
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
 use crate::replica_spool::scan_replica_spool;
@@ -286,7 +286,14 @@ impl Daemon {
             state.local_covered_through = watermark;
             state.adopt_local_ack_if_allowed();
 
-            let (verdict, chosen) = if let Some(c) = resume {
+            let (verdict, chosen) = if cold.config.kind == VsetKind::Database {
+                (
+                    Verdict::DatabaseReady {
+                        synced_through: cold.sync_covered_through,
+                    },
+                    cold,
+                )
+            } else if let Some(c) = resume {
                 let RecordKind::Checkpoint { epoch, vmstate } = c.kind else {
                     unreachable!("filtered to checkpoints");
                 };
@@ -297,10 +304,13 @@ impl Daemon {
                 // Disk-only recovery point: memory is invalid (R3.7) — its
                 // entries are dropped and reclaimed, leaf spans included.
                 let mut c = cold;
-                c.overlay.retain(|page, _| !page.volume.idx.is_memory());
+                c.overlay
+                    .retain(|page, _| !c.config.is_memory(page.volume.idx));
                 c.leaves.retain(|span, _| !span_is_memory(*span));
                 (Verdict::ColdBoot, c)
             };
+            state.database = chosen.database;
+            state.database_durable = chosen.database;
             state.fence = chosen.fence;
             state.mutation_seq = chosen.capture_seq;
             // Materialize the serving map: leaves first, overlay wins. A

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::head::{HeadRecord, ManifestPtr};
-use crate::journal::{JournalRecord, RecordKind};
+use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf};
 use crate::seam::{AdminReply, Effect, HostMap, ReqId, StoreFault, TimerId, Verdict};
@@ -229,7 +229,11 @@ impl Daemon {
         let resume = matches!(record.kind, RecordKind::Checkpoint { .. })
             && record.capture_seq >= record.sync_covered_through;
         let mut chosen = record;
-        let verdict = if resume {
+        let verdict = if chosen.config.kind == VsetKind::Database {
+            Verdict::DatabaseReady {
+                synced_through: chosen.sync_covered_through,
+            }
+        } else if resume {
             let RecordKind::Checkpoint { epoch, vmstate } = chosen.kind else {
                 unreachable!("checked above");
             };
@@ -239,14 +243,17 @@ impl Daemon {
             // drop, and its spans' leaves are never even fetched.
             chosen
                 .overlay
-                .retain(|page, _| !page.volume.idx.is_memory());
+                .retain(|page, _| !chosen.config.is_memory(page.volume.idx));
             chosen
                 .leaves
                 .retain(|span, _| !crate::mapleaf::span_is_memory(*span));
             Verdict::ColdBoot
         };
 
+        let database_vset = chosen.config.kind == VsetKind::Database;
         let mut state = Vset::new(chosen.config);
+        state.database = chosen.database;
+        state.database_durable = chosen.database;
         state.fence = fence;
         state.ready = true;
         if let RecordKind::Checkpoint { epoch, .. } = chosen.kind {
@@ -300,13 +307,15 @@ impl Daemon {
         // the recorded resume set concurrently, and record a fresh one from
         // what this start actually touches. Cold boots carry no latency
         // target, but warming their boot set is the same one-object bet.
-        self.start_resume_recording(vset, out);
-        let io = self.io();
-        self.pending.insert(io, Pending::RestoreRsGet { vset });
-        out.push(Effect::StoreGet {
-            io,
-            key: layout::resume_set_key(vset),
-        });
+        if !database_vset {
+            self.start_resume_recording(vset, out);
+            let io = self.io();
+            self.pending.insert(io, Pending::RestoreRsGet { vset });
+            out.push(Effect::StoreGet {
+                io,
+                key: layout::resume_set_key(vset),
+            });
+        }
     }
 
     // ── lazy leaf hydration (restore, migration, forks) ─────────────────
@@ -436,6 +445,7 @@ impl Daemon {
                 self.counters.faults_unservable += 1;
                 out.push(Effect::FillFailed { page });
             }
+            self.drive_database(vset_id, mem, out);
             return;
         };
         let blob = bytes.expect("decoded from bytes");
@@ -485,6 +495,7 @@ impl Daemon {
         for (page, write) in waiters {
             self.fault(page, write, mem, out);
         }
+        self.drive_database(vset_id, mem, out);
     }
 
     // ── resume sets (R6.2) ──────────────────────────────────────────────
@@ -619,7 +630,10 @@ impl Daemon {
             }
             // Readahead placement (R2.6): prefetched pages join the oldest
             // generation — an unused guess ages out first.
-            self.cache.fill_slot_cold(page);
+            let memory = self.vsets[&page.volume.vset]
+                .config
+                .is_memory(page.volume.idx);
+            self.cache.fill_slot_cold(page, memory);
         }
         self.counters.prefetch_fills += 1;
         out.push(Effect::Fill {

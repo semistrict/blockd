@@ -2,6 +2,7 @@
 //! reject loudly, and never let one guest's behavior touch another vset.
 
 use super::{Daemon, Pending};
+use crate::journal::VsetKind;
 use crate::layout;
 use crate::seam::{Effect, HostMap, ReqId, StoreFault};
 use crate::segment::{PageLoc, open_entry};
@@ -20,7 +21,11 @@ impl Daemon {
             out.push(Effect::FillFailed { page });
             return;
         };
-        if !vset.ready || vset.outbound.is_some() || !vset.config.contains(page) {
+        if !vset.ready
+            || vset.config.kind != VsetKind::Compute
+            || vset.outbound.is_some()
+            || !vset.config.contains(page)
+        {
             self.counters.guest_rejected += 1;
             out.push(Effect::FillFailed { page });
             return;
@@ -49,6 +54,7 @@ impl Daemon {
     #[allow(clippy::too_many_lines)]
     pub(super) fn missing_fault(&mut self, page: PageId, write: bool, out: &mut Vec<Effect>) {
         let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
+        let memory = vset.config.is_memory(page.volume.idx);
         // Lazy hydration: a page whose span's leaf is not local yet has an
         // UNKNOWN location — absent-from-map means zero-fill only once the
         // span is materialized. Park until the leaf arrives; a span dead
@@ -94,7 +100,7 @@ impl Daemon {
                             if let Some(victim) = victim {
                                 out.push(Effect::Evict { page: victim });
                             }
-                            self.cache.fill_slot(page, true);
+                            self.cache.fill_slot(page, true, memory);
                             let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                             vset.mutation_seq += 1;
                             self.counters.guest_pages_dirtied += 1;
@@ -132,7 +138,7 @@ impl Daemon {
                 match loc {
                     None => {
                         // Never written: the zero page.
-                        self.cache.fill_slot(page, write);
+                        self.cache.fill_slot(page, write, memory);
                         let vset = self.vsets.get_mut(&page.volume.vset).expect("validated");
                         if write {
                             vset.mutation_seq += 1;
@@ -227,7 +233,11 @@ impl Daemon {
             out.push(Effect::SyncFailed { req });
             return;
         };
-        if !vset.ready || volume.idx.is_memory() || volume.idx.0 > vset.config.disk_volumes {
+        if !vset.ready
+            || vset.config.kind != VsetKind::Compute
+            || volume.idx.is_memory()
+            || volume.idx.0 > vset.config.disk_volumes
+        {
             self.counters.guest_rejected += 1;
             out.push(Effect::SyncFailed { req });
             return;
@@ -281,7 +291,10 @@ impl Daemon {
         if let Some(key) = share {
             self.cache.base_insert(key);
         } else {
-            self.cache.fill_slot(page, write);
+            let memory = self.vsets[&page.volume.vset]
+                .config
+                .is_memory(page.volume.idx);
+            self.cache.fill_slot(page, write, memory);
         }
         if let Some(vset) = self.vsets.get_mut(&page.volume.vset) {
             if write {

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::head::HeadRecord;
-use blockd_core::journal::{DurabilityMode, JournalRecord, RecordKind, VsetConfig};
+use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
 use blockd_core::layout;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
@@ -58,15 +58,7 @@ fn runtime_config(tag: &str, cache_pages: usize) -> RuntimeConfig {
 }
 
 fn vset_config(disk_volumes: u8, pages_per_volume: u32, backed_up: bool) -> VsetConfig {
-    VsetConfig {
-        disk_volumes,
-        pages_per_volume,
-        durability: if backed_up {
-            DurabilityMode::Backup
-        } else {
-            DurabilityMode::Local
-        },
-    }
+    VsetConfig::compute(disk_volumes, pages_per_volume, backed_up)
 }
 
 /// The simulated VM workload: seeded ops with a full model; every read is
@@ -317,25 +309,38 @@ fn backup_restore_moves_the_vset_between_hosts_via_s3() {
     // manifest pointer resolves to a Checkpoint-kind record.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let backed = store
+        let observed = store
             .get(&layout::head_key(VSET))
             .expect("store up")
             .and_then(|(_, bytes)| HeadRecord::decode(VSET, &bytes).ok())
-            .and_then(|head| head.manifest)
+            .and_then(|head| head.manifest.map(|manifest| (head, manifest)))
             .and_then(|ptr| {
                 store
-                    .get(&layout::manifest_key(VSET, ptr.fence, ptr.seq))
+                    .get(&layout::manifest_key(VSET, ptr.1.fence, ptr.1.seq))
                     .expect("store up")
+                    .map(|(_, bytes)| (ptr.0, bytes))
             })
-            .and_then(|(_, bytes)| JournalRecord::decode(VSET, &bytes).ok())
-            .is_some_and(|record| matches!(record.kind, RecordKind::Checkpoint { .. }));
-        if backed {
+            .and_then(|(head, bytes)| {
+                JournalRecord::decode(VSET, &bytes)
+                    .ok()
+                    .map(|record| (head, record))
+            });
+        if observed
+            .as_ref()
+            .is_some_and(|(_, record)| matches!(record.kind, RecordKind::Checkpoint { .. }))
+        {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "backup never published the checkpoint"
-        );
+        if Instant::now() >= deadline {
+            let listing = store.s3.list_objects_v2("v/", None, 1_000);
+            panic!(
+                "backup never published the checkpoint; observed={observed:?}; counters={:?}; s3={}; keys={:?}; incidents={:?}",
+                host_a.counters(),
+                store.s3.stats.report(),
+                listing.contents,
+                host_a.incidents(),
+            );
+        }
         std::thread::park_timeout(Duration::from_millis(20));
     }
     assert_eq!(host_a.incidents(), Vec::<String>::new());

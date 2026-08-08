@@ -4,6 +4,7 @@
 //! on caller threads and touch mapped memory directly — their faults reach
 //! the daemon exactly as production faults do.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -16,12 +17,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
+use blockd_core::database::{AttachmentId, DatabaseError, DatabaseReply, DatabaseRequest};
+use blockd_core::journal::VsetKind;
 use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout;
 use blockd_core::seam::{
     AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, TimerId, Verdict,
 };
-use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -52,7 +55,7 @@ struct VsetHost {
     config: VsetConfig,
     region: Arc<HostRegion>,
     view: Arc<GuestView>,
-    uffd: Arc<Uffd>,
+    uffd: Option<Arc<Uffd>>,
     ctl: GuestCtl,
     fault_latency: [AtomicHistogram; FaultSource::COUNT],
 }
@@ -86,23 +89,26 @@ impl VsetHost {
             * usize::try_from(config.pages_per_volume).expect("fits");
         let region = Arc::new(HostRegion::new(pages).expect("region"));
         let view = Arc::new(GuestView::map(&region, 0, pages).expect("view"));
-        let (uffd, features) = Uffd::new(
-            UffdFeatures::PAGEFAULT_FLAG_WP
-                | UffdFeatures::MINOR_SHMEM
-                | UffdFeatures::WP_HUGETLBFS_SHMEM,
-        )
-        .expect("userfaultfd");
-        assert!(
-            features.has(UffdFeatures::MINOR_SHMEM)
-                && features.has(UffdFeatures::WP_HUGETLBFS_SHMEM),
-            "kernel lacks required uffd features: {features:?}"
-        );
-        uffd.register_all(&view).expect("register");
+        let uffd = (config.kind == VsetKind::Compute).then(|| {
+            let (uffd, features) = Uffd::new(
+                UffdFeatures::PAGEFAULT_FLAG_WP
+                    | UffdFeatures::MINOR_SHMEM
+                    | UffdFeatures::WP_HUGETLBFS_SHMEM,
+            )
+            .expect("userfaultfd");
+            assert!(
+                features.has(UffdFeatures::MINOR_SHMEM)
+                    && features.has(UffdFeatures::WP_HUGETLBFS_SHMEM),
+                "kernel lacks required uffd features: {features:?}"
+            );
+            uffd.register_all(&view).expect("register");
+            Arc::new(uffd)
+        });
         Arc::new(VsetHost {
             config,
             region,
             view,
-            uffd: Arc::new(uffd),
+            uffd,
             ctl: GuestCtl::default(),
             fault_latency: std::array::from_fn(|_| AtomicHistogram::default()),
         })
@@ -295,6 +301,7 @@ impl LoopQueue {
 struct Shared {
     vsets: Mutex<BTreeMap<VsetId, Arc<VsetHost>>>,
     sync_waiters: Mutex<BTreeMap<ReqId, Sender<bool>>>,
+    database_waiters: Mutex<BTreeMap<ReqId, Sender<DatabaseReply>>>,
     /// `VsetFenced` / `FillFailed` and friends: anything the tests must know
     /// went wrong (asserted empty in healthy scenarios).
     incidents: Mutex<Vec<String>>,
@@ -330,9 +337,13 @@ impl HostMap for MapView<'_> {
     fn read_page(&self, page: PageId) -> Vec<u8> {
         let host = &self.vsets[&page.volume.vset];
         let index = host.page_index(page);
-        host.uffd
-            .writeprotect(host.view.addr_of(index), page_size(), true)
-            .expect("capture write-protect");
+        if host.config.kind == VsetKind::Compute {
+            host.uffd
+                .as_ref()
+                .expect("compute vset has userfaultfd")
+                .writeprotect(host.view.addr_of(index), page_size(), true)
+                .expect("capture write-protect");
+        }
         host.region.read_page(index)
     }
 }
@@ -346,6 +357,8 @@ pub struct Runtime {
     peers: Option<Arc<PeerNet>>,
     fault_io: FaultIo,
     authenticated_peers: bool,
+    #[cfg(test)]
+    fault_reader_count: Arc<std::sync::atomic::AtomicUsize>,
     loop_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -391,6 +404,16 @@ fn spawn_fault_io_runtime() -> FaultIo {
     }
 }
 
+#[cfg(test)]
+struct ActiveFaultReader(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl Drop for ActiveFaultReader {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Runtime {
     /// A fresh daemon on an empty (or to-be-ignored) blob directory.
     // Ownership transfer: the async store executor clones from it.
@@ -429,7 +452,9 @@ impl Runtime {
         }
         let runtime = Runtime::start(daemon, effects, hosts, config, &store);
         for (&vset, host) in runtime.shared.vsets.lock().expect("lock").iter() {
-            runtime.spawn_fault_reader(vset, host.clone());
+            if host.config.kind == VsetKind::Compute {
+                runtime.spawn_fault_reader(vset, host.clone());
+            }
         }
         (runtime, verdicts)
     }
@@ -450,6 +475,7 @@ impl Runtime {
         let shared = Arc::new(Shared {
             vsets: Mutex::new(hosts),
             sync_waiters: Mutex::new(BTreeMap::new()),
+            database_waiters: Mutex::new(BTreeMap::new()),
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(blockd_core::daemon::Counters::default()),
             daemon_stats: Mutex::new(daemon_stats),
@@ -568,6 +594,8 @@ impl Runtime {
             peers,
             fault_io,
             authenticated_peers: config.peer.as_ref().is_some_and(|peer| peer.tls.is_some()),
+            #[cfg(test)]
+            fault_reader_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             loop_thread: Some(loop_thread),
         }
     }
@@ -695,12 +723,21 @@ impl Runtime {
     fn spawn_fault_reader(&self, vset: VsetId, host: Arc<VsetHost>) {
         let tx = self.tx.clone();
         let shared = self.shared.clone();
-        host.uffd
-            .set_nonblocking(true)
-            .expect("nonblocking userfaultfd");
+        let uffd = host
+            .uffd
+            .as_ref()
+            .expect("compute vset has userfaultfd")
+            .clone();
+        uffd.set_nonblocking(true).expect("nonblocking userfaultfd");
+        #[cfg(test)]
+        let fault_reader_count = self.fault_reader_count.clone();
         self.fault_io.handle.spawn(async move {
-            let uffd =
-                AsyncFd::new(SharedUffd(host.uffd.clone())).expect("register runtime userfaultfd");
+            #[cfg(test)]
+            let _active = {
+                fault_reader_count.fetch_add(1, Ordering::SeqCst);
+                ActiveFaultReader(fault_reader_count)
+            };
+            let uffd = AsyncFd::new(SharedUffd(uffd)).expect("register runtime userfaultfd");
             loop {
                 let Ok(mut ready) = uffd.readable().await else {
                     return;
@@ -783,7 +820,9 @@ impl Runtime {
             .lock()
             .expect("lock")
             .insert(vset, host.clone());
-        self.spawn_fault_reader(vset, host);
+        if config.kind == VsetKind::Compute {
+            self.spawn_fault_reader(vset, host);
+        }
         let req = self.req();
         self.tx.push(Msg::Ev(Event::Admin(AdminCmd::CreateVset {
             req,
@@ -819,6 +858,104 @@ impl Runtime {
         result.expect("checkpoint failed")
     }
 
+    pub fn attach_database(&self, vset: VsetId, vm: VmId) -> AttachmentId {
+        self.try_attach_database(vset, vm)
+            .expect("database attach failed")
+    }
+
+    pub fn try_attach_database(&self, vset: VsetId, vm: VmId) -> Option<AttachmentId> {
+        let req = self.req();
+        self.tx.push(Msg::Ev(Event::Admin(AdminCmd::AttachDatabase {
+            req,
+            vset,
+            vm,
+        })));
+        self.wait_admin(|reply| match reply {
+            AdminReply::DatabaseAttached {
+                req: r,
+                vset: got,
+                attachment,
+            } if *r == req && *got == vset => Some(Some(*attachment)),
+            AdminReply::AdminFailed { req: r } if *r == req => Some(None),
+            _ => None,
+        })
+    }
+
+    pub fn begin_detach_database(
+        &self,
+        vset: VsetId,
+        attachment: AttachmentId,
+        mode: blockd_core::seam::DetachMode,
+    ) {
+        let req = self.req();
+        self.tx
+            .push(Msg::Ev(Event::Admin(AdminCmd::BeginDetachDatabase {
+                req,
+                vset,
+                attachment,
+                mode,
+            })));
+        self.wait_admin(|reply| match reply {
+            AdminReply::DatabaseDetachStarted { req: r, .. } if *r == req => Some(()),
+            AdminReply::AdminFailed { req: r } if *r == req => {
+                panic!("database detach failed")
+            }
+            _ => None,
+        });
+    }
+
+    pub fn finish_detach_database(&self, vset: VsetId, attachment: AttachmentId) -> bool {
+        let req = self.req();
+        self.tx
+            .push(Msg::Ev(Event::Admin(AdminCmd::FinishDetachDatabase {
+                req,
+                vset,
+                attachment,
+            })));
+        self.wait_admin(|reply| match reply {
+            AdminReply::DatabaseDetached { req: r, .. } if *r == req => Some(true),
+            AdminReply::AdminFailed { req: r } if *r == req => Some(false),
+            _ => None,
+        })
+    }
+
+    /// Submit a decoded request whose VM identity was bound by the listener.
+    /// The daemon still performs the authoritative attachment check.
+    pub fn database_request(&self, mut request: DatabaseRequest) -> DatabaseReply {
+        let caller_req = request.req;
+        let req = self.req();
+        request.req = req;
+        let (done_tx, done_rx) = channel();
+        {
+            let mut waiters = self.shared.database_waiters.lock().expect("lock");
+            match waiters.entry(req) {
+                Entry::Occupied(_) => {
+                    return DatabaseReply::Failed {
+                        req: caller_req,
+                        error: DatabaseError::Busy,
+                    };
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(done_tx);
+                }
+            }
+        }
+        self.tx.push(Msg::Ev(Event::Database(request)));
+        if let Ok(reply) = done_rx.recv_timeout(Duration::from_secs(30)) {
+            reply.with_req(caller_req)
+        } else {
+            self.shared
+                .database_waiters
+                .lock()
+                .expect("lock")
+                .remove(&req);
+            DatabaseReply::Failed {
+                req: caller_req,
+                error: DatabaseError::Io,
+            }
+        }
+    }
+
     /// Restore a backed-up vset from the store onto this host (R6.1).
     #[tracing::instrument(
         skip(self, config),
@@ -833,7 +970,9 @@ impl Runtime {
             .lock()
             .expect("lock")
             .insert(vset, host.clone());
-        self.spawn_fault_reader(vset, host);
+        if config.kind == VsetKind::Compute {
+            self.spawn_fault_reader(vset, host);
+        }
         let req = self.req();
         self.tx
             .push(Msg::Ev(Event::Admin(AdminCmd::RestoreVset { req, vset })));
@@ -868,7 +1007,9 @@ impl Runtime {
             .lock()
             .expect("lock")
             .insert(vset, host.clone());
-        self.spawn_fault_reader(vset, host);
+        if config.kind == VsetKind::Compute {
+            self.spawn_fault_reader(vset, host);
+        }
     }
 
     /// Hand a non-backed vset off to `to` (R7.2): pauses, captures, makes
@@ -939,6 +1080,28 @@ impl Runtime {
             stats.f_blocks.saturating_mul(stats.f_frsize),
             stats.f_bavail.saturating_mul(stats.f_frsize),
         ))
+    }
+
+    pub fn database_dax_file(
+        &self,
+        vset: VsetId,
+        file: blockd_core::database::DatabaseFile,
+    ) -> std::io::Result<(std::fs::File, u64)> {
+        let host = self
+            .shared
+            .vsets
+            .lock()
+            .expect("lock")
+            .get(&vset)
+            .cloned()
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        if host.config.kind != VsetKind::Database {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let file_offset = u64::from(file.volume_index().0)
+            * u64::from(host.config.pages_per_volume)
+            * page_size() as u64;
+        Ok((host.region.try_clone_file()?, file_offset))
     }
 
     // ── the guest boundary (called from workload threads) ───────────────
@@ -1210,6 +1373,8 @@ fn apply_effect(
             // Non-writable fills install write-protected: the next guest
             // store traps, keeping dirty tracking exact (R2.4).
             host.uffd
+                .as_ref()
+                .expect("compute fill")
                 .continue_range(host.view.addr_of(index), page_size(), !writable)
                 .expect("continue");
         }
@@ -1226,6 +1391,8 @@ fn apply_effect(
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
             let index = host.page_index(page);
             host.uffd
+                .as_ref()
+                .expect("compute unprotect")
                 .writeprotect(host.view.addr_of(index), page_size(), false)
                 .expect("unprotect");
         }
@@ -1241,9 +1408,16 @@ fn apply_effect(
             }
             for (vset, mut indices) in by_vset {
                 let host = &vsets[&vset];
+                // Database vsets are storage-only. Their writes enter through
+                // DatabaseOp and the daemon tracks dirty generations itself;
+                // there is no guest mapping whose stores need trapping.
+                if host.config.kind == VsetKind::Database {
+                    debug_assert!(host.uffd.is_none());
+                    continue;
+                }
+                let uffd = host.uffd.as_ref().expect("compute write-protect");
                 for_each_contiguous_run(&mut indices, |start, len| {
-                    host.uffd
-                        .writeprotect(host.view.addr_of(start), len * page_size(), true)
+                    uffd.writeprotect(host.view.addr_of(start), len * page_size(), true)
                         .expect("write-protect");
                 });
             }
@@ -1257,6 +1431,20 @@ fn apply_effect(
             let index = host.page_index(page);
             host.view.evict(index, 1).expect("evict");
             host.region.punch_hole(index, 1).expect("punch");
+        }
+        Effect::DatabaseInstall { page, bytes } => {
+            let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
+            host.region.write_page(host.page_index(page), &bytes);
+        }
+        Effect::Database(reply) => {
+            if let Some(waiter) = shared
+                .database_waiters
+                .lock()
+                .expect("lock")
+                .remove(&reply.req())
+            {
+                let _ = waiter.send(reply);
+            }
         }
         Effect::PauseGuest { vset } => {
             let operation = shared
@@ -1919,6 +2107,7 @@ mod tests {
         Arc::new(Shared {
             vsets: Mutex::new(BTreeMap::new()),
             sync_waiters: Mutex::new(BTreeMap::new()),
+            database_waiters: Mutex::new(BTreeMap::new()),
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(blockd_core::daemon::Counters::default()),
             daemon_stats: Mutex::new(blockd_core::daemon::DaemonStats::default()),
@@ -1940,6 +2129,45 @@ mod tests {
             operation_started: Mutex::new(BTreeMap::new()),
             next_req: AtomicU64::new(1),
         })
+    }
+
+    #[test]
+    fn dropping_runtime_stops_its_fault_reader() {
+        let root =
+            std::env::temp_dir().join(format!("blockd-fault-reader-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = Runtime::new(
+            &RuntimeConfig {
+                daemon: DaemonConfig {
+                    host: blockd_core::types::HostId(0),
+                    cache_pages: 8,
+                    writeback_interval: blockd_core::types::millis(5),
+                    backup_retry: blockd_core::types::millis(20),
+                    disk_capacity: None,
+                    disk_headroom: 0,
+                    wedge_ticks: 25,
+                    replica_placement: None,
+                },
+                blob_dir: root.clone(),
+                peer: None,
+            },
+            Arc::new(crate::s3::S3Store::new()),
+        );
+        let fault_reader_count = runtime.fault_reader_count.clone();
+        runtime.create_vset(VsetId(99), VsetConfig::compute(1, 1, false));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while fault_reader_count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(fault_reader_count.load(Ordering::SeqCst), 1);
+
+        drop(runtime);
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while fault_reader_count.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(fault_reader_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).expect("cleanup test blobs");
     }
 
     #[test]

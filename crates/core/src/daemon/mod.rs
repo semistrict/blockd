@@ -29,6 +29,7 @@
 
 mod backup;
 mod capture;
+mod database;
 mod guest;
 mod lineage;
 mod migrate;
@@ -43,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::cache::Cache;
 use crate::head::ManifestPtr;
-use crate::journal::{DurabilityMode, JournalRecord, VsetConfig};
+use crate::journal::{DatabaseMeta, DurabilityMode, JournalRecord, VsetConfig};
 use crate::layout;
 use crate::mapleaf::LeafPtr;
 use crate::placement::{PeerCandidate, rank_stash_candidates};
@@ -294,6 +295,8 @@ type Rescue = (PageId, Gen, Vec<u8>);
 #[derive(Debug)]
 struct Capture {
     capture_seq: u64,
+    /// Database file metadata at the same acceptance cut as this map.
+    database: DatabaseMeta,
     /// `Some` for checkpoints: (new epoch, vmstate, requester).
     checkpoint: Option<(Epoch, u64, ReqId)>,
     /// The map at the capture instant: bounded overlay + one leaf per
@@ -426,6 +429,27 @@ enum Pending {
         /// Pins the segment against cleanup while the read is in flight.
         loc: PageLoc,
     },
+    /// Database byte I/O fetching a durable page from local storage.
+    DatabaseFetch {
+        vset: VsetId,
+        page: PageId,
+        generation: Gen,
+        loc: PageLoc,
+    },
+    /// Database byte I/O fallback fetch from object storage.
+    DatabaseStoreFetch {
+        vset: VsetId,
+        page: PageId,
+        generation: Gen,
+        loc: PageLoc,
+    },
+    /// Database byte I/O fallback fetch from a migration source.
+    DatabasePeerFetch {
+        vset: VsetId,
+        page: PageId,
+        generation: Gen,
+        loc: PageLoc,
+    },
     /// Store-tier fill (R2.3: local first, then the store).
     StoreFetch {
         page: PageId,
@@ -484,6 +508,18 @@ enum Pending {
     RestoreHeadGet {
         req: ReqId,
         vset: VsetId,
+    },
+    /// Backed database migration: read the assignment head after the
+    /// provisional inbound record is durable.
+    MigrateHeadGet {
+        vset: VsetId,
+        source: HostId,
+    },
+    /// Backed database migration: claim the head while preserving its newest
+    /// backup manifest.
+    MigrateHeadClaim {
+        vset: VsetId,
+        manifest: Option<ManifestPtr>,
     },
     /// Restore: claim CAS.
     RestoreClaim {
@@ -595,6 +631,14 @@ struct Wedge {
 #[derive(Debug)]
 struct Vset {
     config: VsetConfig,
+    /// Durable `SQLite` file namespace metadata; empty for compute vsets.
+    database: DatabaseMeta,
+    /// Newest database metadata known to be represented by a durable record.
+    database_durable: DatabaseMeta,
+    /// Volatile attachment, handles, and serialized database request queue.
+    database_runtime: database::DatabaseRuntime,
+    /// Spans whose next record must rebuild a leaf after truncate/delete.
+    database_prune_spans: BTreeMap<u32, u64>,
     /// This holder incarnation's fence: the head record's CAS version at
     /// claim (R6.3). Everything this incarnation writes is namespaced by it.
     fence: u64,
@@ -661,6 +705,9 @@ struct Vset {
     ckpt_done: BTreeMap<ReqId, Epoch>,
     ckpt_done_order: VecDeque<ReqId>,
     pending_syncs: Vec<(ReqId, u64)>,
+    /// Database sync waiters use database replies rather than virtio-pmem
+    /// acknowledgements, but share the same durable watermark.
+    pending_database_syncs: Vec<(ReqId, u64)>,
     /// Demand fills parked by a store outage (R8.3), re-issued by the
     /// `FillRetry` timer: each entry's guest is blocked on it.
     store_fill_retry: Vec<(PageId, bool, Gen, crate::segment::PageLoc)>,
@@ -740,6 +787,9 @@ struct Vset {
     migrated_verdict: Option<crate::seam::Verdict>,
     /// Liveness watch state (R9.2), advanced once per writeback tick.
     wedge: Wedge,
+    /// The destination won the backed-vset head and is writing its first
+    /// record in the returned fence namespace.
+    migration_head_claimed: bool,
 }
 
 /// One in-flight backup publish (R4.2): segments verbatim, then the
@@ -770,6 +820,10 @@ impl Vset {
     fn new(config: VsetConfig) -> Vset {
         Vset {
             config,
+            database: DatabaseMeta::default(),
+            database_durable: DatabaseMeta::default(),
+            database_runtime: database::DatabaseRuntime::default(),
+            database_prune_spans: BTreeMap::new(),
             fence: 1,
             ready: false,
             create_req: None,
@@ -798,6 +852,7 @@ impl Vset {
             ckpt_done: BTreeMap::new(),
             ckpt_done_order: VecDeque::new(),
             pending_syncs: Vec::new(),
+            pending_database_syncs: Vec::new(),
             store_fill_retry: Vec::new(),
             local_covered_through: 0,
             sync_ack_through: 0,
@@ -839,6 +894,7 @@ impl Vset {
             peer_source: None,
             migrated_verdict: None,
             wedge: Wedge::default(),
+            migration_head_claimed: false,
         }
     }
 
@@ -925,6 +981,7 @@ pub struct Daemon {
     vsets: BTreeMap<VsetId, Vset>,
     cache: Cache,
     next_io: u64,
+    next_attachment_generation: u64,
     pending: BTreeMap<IoId, Pending>,
     /// Faults waiting for a cache slot (pressure, R2.5): FIFO, never
     /// dropped, never killed. `(page, write)`.
@@ -1106,6 +1163,7 @@ impl Daemon {
             vsets: BTreeMap::new(),
             cache,
             next_io: 0,
+            next_attachment_generation: 1,
             pending: BTreeMap::new(),
             waiters: VecDeque::new(),
             restore_retries: BTreeMap::new(),
@@ -1214,12 +1272,13 @@ impl Daemon {
         match event {
             Event::GuestFault { page, write } => self.fault(page, write, mem, &mut out),
             Event::GuestSync { req, volume } => self.sync(req, volume, mem, &mut out),
+            Event::Database(request) => self.database_request(request, mem, &mut out),
             Event::GuestPaused { vset, vmstate } => self.paused(vset, vmstate, mem, &mut out),
             Event::PeerDelivered { from, msg } => self.peer(from, msg, mem, &mut out),
-            Event::Admin(cmd) => self.admin(cmd, &mut out),
+            Event::Admin(cmd) => self.admin(cmd, mem, &mut out),
             Event::BlobWriteDone { io } => self.blob_write_done(io, mem, &mut out),
             Event::ReplicaDeleteFailed { io } => self.replica_delete_failed(io, &mut out),
-            Event::BlobReadDone { io, bytes } => self.blob_read_routed(io, bytes, &mut out),
+            Event::BlobReadDone { io, bytes } => self.blob_read_routed(io, bytes, mem, &mut out),
             Event::StorePutDone { io, result } => self.store_put_done(io, result, &mut out),
             Event::StoreGetDone { io, result } => self.store_get_done(io, result, mem, &mut out),
             Event::Timer(TimerId::Backup(vset)) => self.backup_tick(vset, mem, &mut out),
@@ -1236,12 +1295,19 @@ impl Daemon {
             }) => self.replica_upload_retry(source, vset, assignment_epoch, &mut out),
             Event::Timer(TimerId::ResumeSet(vset)) => self.resume_set_flush(vset, &mut out),
             Event::Timer(TimerId::MigrateOffer(vset)) => self.migrate_offer_tick(vset, &mut out),
-            Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, &mut out),
+            Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, mem, &mut out),
             Event::Timer(TimerId::FillRetry(vset)) => self.fill_retry_tick(vset, &mut out),
             Event::Timer(TimerId::CaptureStep(vset)) => self.capture_step(vset, mem, &mut out),
             Event::Timer(TimerId::Hydrate(vset)) => self.hydrate_tick(vset, &mut out),
             Event::Timer(TimerId::RestoreRetry(vset)) => self.restore_retry(vset, &mut out),
             Event::Timer(TimerId::LeafRetry(vset)) => self.leaf_retry(vset, &mut out),
+            Event::Timer(TimerId::DatabaseRetry(vset)) => self.database_retry(vset, &mut out),
+            Event::Timer(TimerId::DatabaseMigrate(vset)) => {
+                self.database_migrate_capture(vset, mem, &mut out);
+            }
+            Event::Timer(TimerId::DatabaseMigrateHead(vset)) => {
+                self.start_migrate_head_claim(vset, &mut out);
+            }
             Event::Timer(TimerId::Writeback) => {
                 // MGLRU-mirrored aging (R2.6) rides the writeback cadence,
                 // as reclaim-driven aging rides kswapd in the kernel.
@@ -1289,6 +1355,9 @@ impl Daemon {
             Some(Pending::RestoreClaim { req, vset, ptr }) => {
                 self.restore_claim_done(req, vset, ptr, result, out);
             }
+            Some(Pending::MigrateHeadClaim { vset, manifest }) => {
+                self.migrate_head_claim_done(vset, manifest, result, out);
+            }
             // Best effort (R6.2): a lost resume set only costs demand faults.
             Some(Pending::ResumeSetPut) => {}
             _ => out.push(Effect::Abort {
@@ -1310,6 +1379,9 @@ impl Daemon {
             Some(Pending::RestoreHeadGet { req, vset }) => {
                 self.restore_head_done(req, vset, result, out);
             }
+            Some(Pending::MigrateHeadGet { vset, source }) => {
+                self.migrate_head_done(vset, source, result, out);
+            }
             Some(Pending::RestoreManifestGet {
                 req,
                 vset,
@@ -1322,6 +1394,12 @@ impl Daemon {
                 generation,
                 loc,
             }) => self.store_fill_done(page, write, generation, loc, result, out),
+            Some(Pending::DatabaseStoreFetch {
+                vset,
+                page,
+                generation,
+                loc,
+            }) => self.database_store_fetch_done(vset, page, generation, loc, result, mem, out),
             Some(Pending::LeafGet { vset, span, ptr }) => {
                 self.leaf_get_done(vset, span, ptr, result, mem, out);
             }
@@ -1340,7 +1418,13 @@ impl Daemon {
         }
     }
 
-    fn blob_read_routed(&mut self, io: IoId, bytes: Option<Vec<u8>>, out: &mut Vec<Effect>) {
+    fn blob_read_routed(
+        &mut self,
+        io: IoId,
+        bytes: Option<Vec<u8>>,
+        mem: &dyn HostMap,
+        out: &mut Vec<Effect>,
+    ) {
         match self.pending.remove(&io) {
             Some(Pending::Fetch {
                 page,
@@ -1348,6 +1432,12 @@ impl Daemon {
                 generation,
                 loc,
             }) => self.fill_read_done(page, write, generation, loc, bytes, out),
+            Some(Pending::DatabaseFetch {
+                vset,
+                page,
+                generation,
+                loc,
+            }) => self.database_fetch_done(vset, page, generation, loc, bytes, mem, out),
             Some(Pending::CompactRead { vset, fence, seg }) => {
                 self.compact_read_done(vset, fence, seg, bytes);
             }

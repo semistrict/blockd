@@ -8,6 +8,8 @@ members = [
     "crates/platform",
     "crates/runtime",
     "crates/sim",
+    "crates/sqlite-vfs",
+    "crates/vsetfs",
 ]
 
 [workspace.package]

@@ -4,7 +4,7 @@
 //! cluster runs.
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::types::{VsetId, micros, millis, page_size, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, PeerKind, run};
 use blockd_sim::harness::Sabotage;
@@ -362,11 +362,7 @@ fn migrate_config() -> ClusterConfig {
     ClusterConfig {
         hosts: 2,
         vset_count: 1,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 16,
-            durability: DurabilityMode::Local,
-        },
+        vset_config: VsetConfig::compute(2, 16, false),
         kill_hosts_at: vec![],
         drop_peer: None,
         race_restore: false,
@@ -426,11 +422,7 @@ fn restores_meet_the_200ms_budget_and_prefetch_the_resume_set() {
     for pages_per_volume in [16, 64] {
         let config = ClusterConfig {
             vset_count: 1,
-            vset_config: VsetConfig {
-                disk_volumes: 2,
-                pages_per_volume,
-                durability: DurabilityMode::Backup,
-            },
+            vset_config: VsetConfig::compute(2, pages_per_volume, true),
             drop_peer: None,
             race_restore: false,
             // Host 0 dies; the vset restores onto host 1, resumes, records
@@ -661,11 +653,7 @@ fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
 #[test]
 fn store_outage_during_cold_serving_parks_fills_until_heal() {
     let config = ClusterConfig {
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 64,
-            durability: DurabilityMode::Backup,
-        },
+        vset_config: VsetConfig::compute(2, 64, true),
         // base_config kills host 0 at 1500ms; the raced restore completes
         // shortly after and serves cold from the store. The outage then
         // lands on the remaining cold demand fills.
@@ -724,11 +712,7 @@ fn a_released_blackout_wedges_both_sides_loudly_then_converges() {
 fn a_leaf_blackout_parks_faults_loudly_and_the_heal_serves_them_all() {
     let config = ClusterConfig {
         hosts: 2,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 5_000,
-            durability: DurabilityMode::Local,
-        },
+        vset_config: VsetConfig::compute(2, 5_000, false),
         migrate_at: Some((millis(1200), VsetId(1), 1)),
         drop_peer: Some((PeerKind::Leaf, millis(1150), millis(2400))),
         ..multi_leaf_config()
@@ -889,11 +873,7 @@ fn restore_waits_out_a_store_outage() {
 fn a_rotten_resume_set_is_ignored_not_fatal() {
     let config = ClusterConfig {
         vset_count: 1,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 16,
-            durability: DurabilityMode::Backup,
-        },
+        vset_config: VsetConfig::compute(2, 16, true),
         drop_peer: None,
         race_restore: false,
         kill_hosts_at: vec![(millis(1500), 0), (millis(2800), 1)],
@@ -926,11 +906,7 @@ fn multi_leaf_config() -> ClusterConfig {
         vset_count: 1,
         // Just past the span size, so each disk volume shards into two
         // leaves — the smallest genuinely multi-leaf shape.
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 5_000,
-            durability: DurabilityMode::Backup,
-        },
+        vset_config: VsetConfig::compute(2, 5_000, true),
         think: (micros(20), micros(100)),
         guest_sync_share: Some(Ppm(1_000)),
         drop_peer: None,
@@ -973,11 +949,7 @@ fn restores_hydrate_multi_leaf_maps_lazily() {
 fn migration_hydrates_multi_leaf_maps_from_the_source() {
     let config = ClusterConfig {
         hosts: 2,
-        vset_config: VsetConfig {
-            disk_volumes: 2,
-            pages_per_volume: 5_000,
-            durability: DurabilityMode::Local,
-        },
+        vset_config: VsetConfig::compute(2, 5_000, false),
         migrate_at: Some((millis(1200), VsetId(1), 1)),
         ..multi_leaf_config()
     };

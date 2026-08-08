@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts_async};
@@ -30,15 +30,7 @@ pub const VSET_PAGES: u32 = 256;
 pub const MIRROR_PAGES: u32 = 63;
 
 fn vset_config(backed: bool) -> VsetConfig {
-    VsetConfig {
-        disk_volumes: 1,
-        pages_per_volume: VSET_PAGES,
-        durability: if backed {
-            DurabilityMode::Backup
-        } else {
-            DurabilityMode::Local
-        },
-    }
+    VsetConfig::compute(1, VSET_PAGES, backed)
 }
 
 fn disk_page(vset: VsetId, page: u32) -> PageId {

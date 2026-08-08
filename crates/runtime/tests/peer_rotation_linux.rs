@@ -179,12 +179,9 @@ fn rolling_certificate_rotation_requires_overlap_then_removes_old_identity() {
     while b_rx.try_recv().is_ok() {}
     old_a.send(HostId(0), HostId(1), &PeerMsg::Released { vset: VsetId(9) });
     let deadline = std::time::Instant::now() + Duration::from_millis(200);
-    loop {
-        let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) else {
-            break;
-        };
+    while let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) {
         match b_rx.recv_timeout(wait) {
-            Ok((_, PeerMsg::Released { vset })) if vset == VsetId(9) => {
+            Ok((_, PeerMsg::Released { vset: VsetId(9) })) => {
                 panic!("old leaf identity must be rejected after overlap removal");
             }
             Ok(_) => {} // a straggling duplicate of an earlier legitimate send
