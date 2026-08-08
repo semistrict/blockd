@@ -367,7 +367,8 @@ mod tests {
     use crate::seam::{AdminCmd, AdminReply, HostMap, PeerMsg, ReqId};
     use crate::types::{HostId, PageId, VsetId};
     use crate::world::{
-        AdminIo, BlobError, Blobs, GuestFault, GuestMem, GuestSync, Peers, Store, StoreError,
+        AdminIo, BlobEntry, BlobError, Blobs, GuestFault, GuestMem, GuestSync, Peers, Store,
+        StoreError,
     };
 
     struct ModelWorld {
@@ -384,6 +385,19 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Blobs for ModelWorld {
+        async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
+            Ok(self
+                .blobs
+                .borrow()
+                .iter()
+                .map(|(name, bytes)| BlobEntry {
+                    name: name.clone(),
+                    bytes: bytes.clone(),
+                    len: bytes.len() as u64,
+                })
+                .collect())
+        }
+
         async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
             assert!(self.blobs.borrow_mut().insert(name, bytes).is_none());
             Ok(())

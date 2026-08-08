@@ -4,9 +4,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use async_trait::async_trait;
+use blockd_core::layout::BlobName;
 use blockd_core::protocol::StoreFault;
 use blockd_core::types::SimTime;
-use blockd_core::world::{BlobError, Blobs, Store, StoreError};
+use blockd_core::world::{BlobEntry, BlobError, Blobs, Store, StoreError};
 use blockd_exec::{delay, now};
 
 use super::blobdev::{BlobDev, BlobDevConfig};
@@ -33,6 +34,27 @@ impl SimBlobs {
 
 #[async_trait(?Send)]
 impl Blobs for SimBlobs {
+    async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
+        Ok(self
+            .device
+            .borrow()
+            .scan()
+            .filter_map(|(name, bytes)| {
+                let parsed = blockd_core::layout::parse_blob(name)?;
+                let payload = if matches!(parsed, BlobName::Segment { .. }) {
+                    Vec::new()
+                } else {
+                    bytes.clone()
+                };
+                Some(BlobEntry {
+                    name: name.clone(),
+                    bytes: payload,
+                    len: bytes.len() as u64,
+                })
+            })
+            .collect())
+    }
+
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
         let (io, done) = self.device.borrow_mut().submit_write(
             SimTime(now()),

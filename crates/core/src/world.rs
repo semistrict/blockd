@@ -36,6 +36,16 @@ pub enum BlobError {
     Io,
 }
 
+/// One durable local artifact discovered during recovery. Immutable segment
+/// payloads may leave `bytes` empty while still reporting their exact length;
+/// metadata-bearing artifacts provide their complete bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobEntry {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub len: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreError {
     Fault(StoreFault),
@@ -62,6 +72,10 @@ pub struct GuestSync {
 
 #[async_trait(?Send)]
 pub trait Blobs {
+    /// Return a canonicalizable snapshot of durable local artifacts. Unknown
+    /// files may be omitted. Actors sort by name before interpreting it, so
+    /// directory enumeration order cannot affect recovery.
+    async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError>;
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError>;
     async fn append(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError>;
     async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError>;

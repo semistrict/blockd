@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use blockd_core::protocol::{MAX_OBJECT_BYTES, StoreFault};
-use blockd_core::world::{BlobError, Blobs, Store, StoreError};
+use blockd_core::world::{BlobEntry, BlobError, Blobs, Store, StoreError};
 use blockd_exec::inject::{Injected, Injector, Lane, injector};
 
 use crate::ObjectStore;
@@ -19,6 +19,9 @@ const FILE_WORKERS: usize = 8;
 const FILE_QUEUE_CAPACITY: usize = 1024;
 
 enum FileJob {
+    Scan {
+        reply: Injector<Result<Vec<BlobEntry>, BlobError>>,
+    },
     Write {
         name: String,
         bytes: Vec<u8>,
@@ -147,6 +150,17 @@ fn file_worker(root: &Path, receiver: &Arc<Mutex<Receiver<FileJob>>>) {
             return;
         };
         match job {
+            FileJob::Scan { reply } => {
+                let blobs = crate::blobscan::scan_blob_dir_for_recovery(root)
+                    .into_iter()
+                    .map(|blob| BlobEntry {
+                        name: blob.name,
+                        bytes: blob.bytes,
+                        len: blob.len,
+                    })
+                    .collect();
+                send(&reply, Ok(blobs));
+            }
             FileJob::Write { name, bytes, reply } => {
                 send(
                     &reply,
@@ -224,6 +238,14 @@ fn file_worker(root: &Path, receiver: &Arc<Mutex<Receiver<FileJob>>>) {
 
 #[async_trait(?Send)]
 impl Blobs for FileBlobs {
+    async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
+        let (reply, response) = injector();
+        self.normal
+            .send(FileJob::Scan { reply })
+            .map_err(|_| BlobError::Io)?;
+        Self::response(response).await
+    }
+
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
         let (reply, response) = injector();
         self.normal
