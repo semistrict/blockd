@@ -5,13 +5,10 @@
 //! timers, and I/O completion ordering already flow through the shared
 //! executor and async world contracts.
 
-use std::cell::Cell;
-use std::collections::BTreeMap;
-use std::future::Future;
 use std::rc::Rc;
 
-use blockd_exec::channel::{Receiver, TryRecvError, UnboundedSender, unbounded};
-use blockd_exec::{TaskHandle, TaskId, delay, spawn};
+use blockd_exec::channel::{UnboundedSender, unbounded};
+use blockd_exec::{TaskSet, delay};
 
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::layout;
@@ -24,51 +21,9 @@ pub trait ActorWorld: Blobs + Store + Peers + GuestMem + AdminIo + HostMap + 'st
 
 impl<T> ActorWorld for T where T: Blobs + Store + Peers + GuestMem + AdminIo + HostMap + 'static {}
 
-struct ActorGroup {
-    actors: BTreeMap<TaskId, TaskHandle<()>>,
-    completed_tx: UnboundedSender<TaskId>,
-    completed_rx: Receiver<TaskId>,
-}
-
-impl ActorGroup {
-    fn new() -> Self {
-        let (completed_tx, completed_rx) = unbounded();
-        Self {
-            actors: BTreeMap::new(),
-            completed_tx,
-            completed_rx,
-        }
-    }
-
-    fn spawn(&mut self, future: impl Future<Output = ()> + 'static) {
-        let completed = self.completed_tx.clone();
-        let task_id = Rc::new(Cell::new(u64::MAX));
-        let child_id = Rc::clone(&task_id);
-        let handle = spawn(async move {
-            future.await;
-            let _ = completed.send(child_id.get());
-        });
-        task_id.set(handle.id());
-        self.actors.insert(handle.id(), handle);
-    }
-
-    fn reap(&mut self) {
-        loop {
-            match self.completed_rx.try_recv() {
-                Ok(task) => {
-                    if let Some(handle) = self.actors.remove(&task) {
-                        handle.detach();
-                    }
-                }
-                Err(TryRecvError::Empty | TryRecvError::Closed) => return,
-            }
-        }
-    }
-}
-
 pub async fn host_actor<W: ActorWorld>(config: DaemonConfig, world: Rc<W>) {
     let (events, mut inbox) = unbounded();
-    let mut actors = ActorGroup::new();
+    let mut actors = TaskSet::new();
     let writeback_interval = config.writeback_interval;
 
     actors.spawn(admin_source(Rc::clone(&world), events.clone()));
@@ -89,7 +44,7 @@ pub async fn host_actor<W: ActorWorld>(config: DaemonConfig, world: Rc<W>) {
 }
 
 fn spawn_effects<W: ActorWorld>(
-    actors: &mut ActorGroup,
+    actors: &mut TaskSet,
     world: &Rc<W>,
     events: &UnboundedSender<Event>,
     effects: Vec<Effect>,
