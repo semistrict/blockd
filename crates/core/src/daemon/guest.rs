@@ -155,33 +155,7 @@ impl Daemon {
                     }
                     Some((generation, loc)) => {
                         let io = self.io();
-                        self.pending.insert(
-                            io,
-                            Pending::Fetch {
-                                page,
-                                write,
-                                generation,
-                                loc,
-                            },
-                        );
                         if loc.base != 0 {
-                            // Base pages live only in the store (their local
-                            // caching tier arrives with the shared cache).
-                            out.push(Effect::StoreGetRange {
-                                io,
-                                key: layout::base_segment_key(loc.base, loc.fence, loc.seg),
-                                offset: u64::from(loc.offset),
-                                len: u64::from(loc.len),
-                            });
-                            let Some(Pending::Fetch {
-                                page,
-                                write,
-                                generation,
-                                loc,
-                            }) = self.pending.remove(&io)
-                            else {
-                                unreachable!("just inserted");
-                            };
                             self.pending.insert(
                                 io,
                                 Pending::StoreFetch {
@@ -191,7 +165,24 @@ impl Daemon {
                                     loc,
                                 },
                             );
+                            // Base pages live only in the store (their local
+                            // caching tier arrives with the shared cache).
+                            out.push(Effect::StoreGetRange {
+                                io,
+                                key: layout::base_segment_key(loc.base, loc.fence, loc.seg),
+                                offset: u64::from(loc.offset),
+                                len: u64::from(loc.len),
+                            });
                         } else {
+                            self.pending.insert(
+                                io,
+                                Pending::Fetch {
+                                    page,
+                                    write,
+                                    generation,
+                                    loc,
+                                },
+                            );
                             out.push(Effect::BlobReadRange {
                                 io,
                                 name: layout::segment_blob(page.volume.vset, loc.fence, loc.seg),

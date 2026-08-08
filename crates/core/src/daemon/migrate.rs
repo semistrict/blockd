@@ -545,28 +545,11 @@ impl Daemon {
         if let Verdict::Resume { epoch, .. } = verdict {
             state.epoch = Epoch(epoch.0);
         }
-        state.mutation_seq = record.capture_seq;
-        state.local_covered_through = record.sync_covered_through;
-        state.adopt_local_ack_if_allowed();
-        state.database = record.database;
-        state.database_durable = record.database;
-        state.next_seq = record.seq.0 + 1;
-        state.next_gen = record
-            .overlay
-            .values()
-            .map(|(g, _)| g.0 + 1)
-            .max()
-            .unwrap_or(0);
         // The map hydrates lazily from the source: overlay serves now,
         // every leaf span parks its faults until fetched (post-copy is
         // already the contract — a parked fault is just a further page).
-        state.page_locs = record.overlay.clone();
-        state.rebuild_seg_live();
-        state.overlay = record.overlay.clone();
-        state.leaf_table = record.leaves.clone();
-        state.pending_leaves = record.leaves.clone();
-        state.best = Some((record.capture_seq, record.seq));
-        state.best_record = Some(record);
+        state.adopt_record(record);
+        state.adopt_local_ack_if_allowed();
         state.peer_source = Some(from);
         state.hydration_remaining_pages = state
             .page_locs

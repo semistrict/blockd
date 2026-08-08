@@ -55,31 +55,19 @@ impl Daemon {
         if !newer {
             return;
         }
-        // Segments the record references: its overlay's, plus those of
-        // every local leaf it points at (a pending leaf came FROM the
-        // store, so its segments are already backed).
-        let mut segs_todo: Vec<(u64, SegId)> = record
-            .overlay
-            .values()
-            .filter(|(_, loc)| loc.base == 0) // base segments are shared, kept by their base
-            .map(|(_, loc)| (loc.fence, loc.seg))
-            .chain(
-                record
-                    .leaves
-                    .values()
-                    .filter(|ptr| ptr.base == 0)
-                    .filter_map(|ptr| state.leaf_blobs.get(ptr))
-                    .flat_map(|(_, segs)| segs.iter().copied()),
-            )
+        // A pending leaf came from the store, so its segments are already
+        // backed and absent from the locally known closure.
+        let closure = state.own_namespace_closure(&record);
+        let mut segs_todo: Vec<(u64, SegId)> = closure
+            .segments
+            .into_iter()
             .filter(|key| !state.backed_segs.contains(key))
             .collect();
         segs_todo.sort_unstable();
         segs_todo.dedup();
-        let leaves_todo: Vec<(u64, u64)> = record
+        let leaves_todo: Vec<(u64, u64)> = closure
             .leaves
-            .values()
-            .filter(|ptr| ptr.base == 0)
-            .map(|ptr| (ptr.fence, ptr.id))
+            .into_iter()
             .filter(|key| !state.backed_leaves.contains(key))
             .collect();
         state.publish = Some(Publish {

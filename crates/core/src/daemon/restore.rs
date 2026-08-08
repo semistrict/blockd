@@ -253,8 +253,6 @@ impl Daemon {
 
         let database_vset = chosen.config.kind == VsetKind::Database;
         let mut state = Vset::new(chosen.config);
-        state.database = chosen.database;
-        state.database_durable = chosen.database;
         state.fence = fence;
         state.ready = true;
         if let RecordKind::Checkpoint { epoch, .. } = chosen.kind {
@@ -265,28 +263,10 @@ impl Daemon {
         } else {
             state.epoch = Epoch(0);
         }
-        state.mutation_seq = chosen.capture_seq;
-        state.local_covered_through = chosen.sync_covered_through;
         // The chosen record was fetched through the published manifest, so
         // it satisfies the stronger mode without consulting a peer.
         state.sync_ack_through = chosen.sync_covered_through;
-        state.next_seq = chosen.seq.0 + 1;
         state.next_seg = 0; // fresh fence namespace: no collisions possible
-        state.next_gen = chosen
-            .overlay
-            .values()
-            .map(|(g, _)| g.0 + 1)
-            .max()
-            .unwrap_or(0);
-        // The map hydrates lazily: the overlay serves immediately, every
-        // span with a leaf is pending until its object lands (faults into
-        // it park), and next_gen advances as leaves reveal their gens.
-        state.page_locs = chosen.overlay.clone();
-        state.rebuild_seg_live();
-        state.overlay = chosen.overlay.clone();
-        state.leaf_table = chosen.leaves.clone();
-        state.pending_leaves = chosen.leaves.clone();
-        state.best = Some((chosen.capture_seq, chosen.seq));
         state.backed = Some(ptr);
         state.backed_segs = chosen
             .overlay
@@ -296,7 +276,7 @@ impl Daemon {
             .collect();
         state.store_manifests.insert((ptr.fence, ptr.seq));
         state.head_version = Some(fence);
-        state.best_record = Some(chosen);
+        state.adopt_record(chosen);
         self.vsets.insert(vset, state);
         out.push(Effect::Admin(AdminReply::VsetRestored {
             req,

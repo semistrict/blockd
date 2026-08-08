@@ -219,18 +219,8 @@ impl Daemon {
             return;
         }
         let frame_len = frame.len() as u64;
-        let rotated = replica.current_file_bytes != 0
-            && replica.current_file_bytes.saturating_add(frame_len)
-                > MAX_REPLICA_SPOOL_GENERATION_BYTES;
-        if rotated {
-            replica.current_generation = replica.current_generation.saturating_add(1);
-            replica.current_file_bytes = 0;
-        }
-        let generation = replica.current_generation;
-        replica.append_inflight = true;
-        let io = self.io();
-        self.pending.insert(
-            io,
+        self.start_replica_append(
+            key,
             Pending::ReplicaArtifactAppend {
                 source,
                 vset,
@@ -240,17 +230,9 @@ impl Daemon {
                 bytes,
                 frame_len,
             },
+            frame,
+            out,
         );
-        self.counters.replica_bytes += frame_len;
-        self.counters.replica_rotations += u64::from(rotated);
-        out.push(Effect::ReplicaAppend {
-            io,
-            source,
-            vset,
-            assignment_epoch,
-            generation,
-            bytes: frame,
-        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -318,6 +300,35 @@ impl Daemon {
             return;
         }
         let frame_len = frame.len() as u64;
+        replica.pending_commit = Some(super::ReplicaPendingCommit {
+            info,
+            required: required.to_vec(),
+            record: record.to_vec(),
+        });
+        self.start_replica_append(
+            key,
+            Pending::ReplicaCommitAppend {
+                source,
+                vset,
+                assignment_epoch,
+                info,
+                record_checksum,
+                frame_len,
+            },
+            frame,
+            out,
+        );
+    }
+
+    fn start_replica_append(
+        &mut self,
+        key: ReplicaKey,
+        pending: Pending,
+        frame: Vec<u8>,
+        out: &mut Vec<Effect>,
+    ) {
+        let frame_len = frame.len() as u64;
+        let replica = self.replicas.get_mut(&key).expect("validated replica");
         let rotated = replica.current_file_bytes != 0
             && replica.current_file_bytes.saturating_add(frame_len)
                 > MAX_REPLICA_SPOOL_GENERATION_BYTES;
@@ -327,30 +338,15 @@ impl Daemon {
         }
         let generation = replica.current_generation;
         replica.append_inflight = true;
-        replica.pending_commit = Some(super::ReplicaPendingCommit {
-            info,
-            required: required.to_vec(),
-            record: record.to_vec(),
-        });
         let io = self.io();
-        self.pending.insert(
-            io,
-            Pending::ReplicaCommitAppend {
-                source,
-                vset,
-                assignment_epoch,
-                info,
-                record_checksum,
-                frame_len,
-            },
-        );
+        self.pending.insert(io, pending);
         self.counters.replica_bytes += frame_len;
         self.counters.replica_rotations += u64::from(rotated);
         out.push(Effect::ReplicaAppend {
             io,
-            source,
-            vset,
-            assignment_epoch,
+            source: key.source,
+            vset: key.vset,
+            assignment_epoch: key.assignment_epoch,
             generation,
             bytes: frame,
         });
@@ -882,23 +878,11 @@ impl Daemon {
         state: &Vset,
         record: &crate::journal::JournalRecord,
     ) -> Vec<ReplicaArtifact> {
-        let mut artifacts: Vec<ReplicaArtifact> = record
-            .overlay
-            .values()
-            .filter(|(_, loc)| loc.base == 0)
-            .map(|(_, loc)| ReplicaArtifact::Segment {
-                fence: loc.fence,
-                seg: loc.seg,
-            })
-            .chain(
-                record
-                    .leaves
-                    .values()
-                    .filter(|ptr| ptr.base == 0)
-                    .filter_map(|ptr| state.leaf_blobs.get(ptr))
-                    .flat_map(|(_, segs)| segs.iter().copied())
-                    .map(|(fence, seg)| ReplicaArtifact::Segment { fence, seg }),
-            )
+        let closure = state.own_namespace_closure(record);
+        let mut artifacts: Vec<ReplicaArtifact> = closure
+            .segments
+            .into_iter()
+            .map(|(fence, seg)| ReplicaArtifact::Segment { fence, seg })
             .filter(|artifact| match artifact {
                 ReplicaArtifact::Segment { fence, seg } => {
                     !state.backed_segs.contains(&(*fence, *seg))
@@ -906,14 +890,10 @@ impl Daemon {
                 ReplicaArtifact::Leaf { .. } => unreachable!(),
             })
             .chain(
-                record
+                closure
                     .leaves
-                    .values()
-                    .filter(|ptr| ptr.base == 0)
-                    .map(|ptr| ReplicaArtifact::Leaf {
-                        fence: ptr.fence,
-                        id: ptr.id,
-                    })
+                    .into_iter()
+                    .map(|(fence, id)| ReplicaArtifact::Leaf { fence, id })
                     .filter(|artifact| match artifact {
                         ReplicaArtifact::Leaf { fence, id } => {
                             !state.backed_leaves.contains(&(*fence, *id))
@@ -1122,22 +1102,7 @@ impl Daemon {
             return;
         }
         let committed_record = send.record.clone();
-        let transitioning = self.vsets[&vset]
-            .stash_assignment
-            .is_some_and(|assignment| assignment.transition_peer.is_some());
-        let state = self.vsets.get_mut(&vset).expect("known");
-        state.peer_committed = Some(info);
-        state.peer_committed_record = Some(committed_record);
-        state.replica_send = None;
-        if transitioning {
-            self.start_replica_activation(vset, info, out);
-        } else {
-            let state = self.vsets.get_mut(&vset).expect("known");
-            state.sync_ack_through = state.sync_ack_through.max(info.sync_covered_through);
-            self.drain_sync_acks(vset, out);
-            self.cleanup(vset, out);
-            self.maybe_replicate(vset, out);
-        }
+        self.accept_replica_commit(vset, info, Some(committed_record), out);
     }
 
     fn replica_status_reply(
@@ -1169,12 +1134,8 @@ impl Daemon {
         });
         if covered {
             let known = committed.expect("covered is some");
-            let transitioning = self.vsets[&vset]
-                .stash_assignment
-                .is_some_and(|assignment| assignment.transition_peer.is_some());
-            let state = self.vsets.get_mut(&vset).expect("known");
-            state.peer_committed = Some(known);
-            state.peer_committed_record = (known == wanted)
+            let state = &self.vsets[&vset];
+            let committed_record = (known == wanted)
                 .then(|| state.replica_send.as_ref().expect("sending").record.clone())
                 .or_else(|| {
                     state
@@ -1183,16 +1144,7 @@ impl Daemon {
                         .filter(|record| Self::commit_info(record) == known)
                         .cloned()
                 });
-            state.replica_send = None;
-            if transitioning {
-                self.start_replica_activation(vset, known, out);
-            } else {
-                let state = self.vsets.get_mut(&vset).expect("known");
-                state.sync_ack_through = state.sync_ack_through.max(known.sync_covered_through);
-                self.drain_sync_acks(vset, out);
-                self.cleanup(vset, out);
-                self.maybe_replicate(vset, out);
-            }
+            self.accept_replica_commit(vset, known, committed_record, out);
         } else {
             self.vsets
                 .get_mut(&vset)
@@ -1210,6 +1162,31 @@ impl Daemon {
                 .retries = 0;
             self.replica_send_step(vset, out);
         }
+    }
+
+    fn accept_replica_commit(
+        &mut self,
+        vset: VsetId,
+        info: ReplicaCommitInfo,
+        record: Option<crate::journal::JournalRecord>,
+        out: &mut Vec<Effect>,
+    ) {
+        let transitioning = self.vsets[&vset]
+            .stash_assignment
+            .is_some_and(|assignment| assignment.transition_peer.is_some());
+        let state = self.vsets.get_mut(&vset).expect("known");
+        state.peer_committed = Some(info);
+        state.peer_committed_record = record;
+        state.replica_send = None;
+        if transitioning {
+            self.start_replica_activation(vset, info, out);
+            return;
+        }
+        let state = self.vsets.get_mut(&vset).expect("known");
+        state.sync_ack_through = state.sync_ack_through.max(info.sync_covered_through);
+        self.drain_sync_acks(vset, out);
+        self.cleanup(vset, out);
+        self.maybe_replicate(vset, out);
     }
 
     pub(super) fn replica_retry(&mut self, vset: VsetId, generation: u64, out: &mut Vec<Effect>) {

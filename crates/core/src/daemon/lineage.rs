@@ -66,28 +66,11 @@ impl Daemon {
         // Own-namespace references to copy: the overlay's segments plus
         // everything the record's own leaves hold (a keep on a vset whose
         // leaves are still hydrating fails cleanly at the local read).
-        let mut segs_todo: Vec<(u64, SegId)> = record
-            .overlay
-            .values()
-            .filter(|(_, loc)| loc.base == 0)
-            .map(|(_, loc)| (loc.fence, loc.seg))
-            .chain(
-                record
-                    .leaves
-                    .values()
-                    .filter(|ptr| ptr.base == 0)
-                    .filter_map(|ptr| state.leaf_blobs.get(ptr))
-                    .flat_map(|(_, segs)| segs.iter().copied()),
-            )
-            .collect();
+        let closure = state.own_namespace_closure(&record);
+        let mut segs_todo = closure.segments;
         segs_todo.sort_unstable();
         segs_todo.dedup();
-        let leaves_todo: Vec<(u64, u64)> = record
-            .leaves
-            .values()
-            .filter(|ptr| ptr.base == 0)
-            .map(|ptr| (ptr.fence, ptr.id))
-            .collect();
+        let leaves_todo = closure.leaves;
         state.keep = Some(BaseKeep {
             req,
             base,

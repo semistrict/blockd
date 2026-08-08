@@ -823,6 +823,11 @@ struct ReplicaSend {
     timer_generation: u64,
 }
 
+struct OwnNamespaceClosure {
+    segments: Vec<(u64, SegId)>,
+    leaves: Vec<(u64, u64)>,
+}
+
 impl Vset {
     fn new(config: VsetConfig) -> Vset {
         Vset {
@@ -912,6 +917,56 @@ impl Vset {
         if !self.config.durability.requires_peer_sync() {
             self.sync_ack_through = self.sync_ack_through.max(self.local_covered_through);
         }
+    }
+
+    /// Install the recovery map and record metadata shared by store restore
+    /// and migration-in. Fork creation intentionally builds its lineage in
+    /// stages and must not pre-populate `best_record` through this path.
+    fn adopt_record(&mut self, record: JournalRecord) {
+        self.database = record.database;
+        self.database_durable = record.database;
+        self.mutation_seq = record.capture_seq;
+        self.local_covered_through = record.sync_covered_through;
+        self.next_seq = record.seq.0 + 1;
+        self.next_gen = record
+            .overlay
+            .values()
+            .map(|(generation, _)| generation.0 + 1)
+            .max()
+            .unwrap_or(0);
+        self.page_locs = record.overlay.clone();
+        self.rebuild_seg_live();
+        self.overlay = record.overlay.clone();
+        self.leaf_table = record.leaves.clone();
+        self.pending_leaves = record.leaves.clone();
+        self.best = Some((record.capture_seq, record.seq));
+        self.best_record = Some(record);
+    }
+
+    /// Own-namespace segments and leaves reachable from one record. Shared
+    /// base-origin objects remain owned by their base and are excluded.
+    fn own_namespace_closure(&self, record: &JournalRecord) -> OwnNamespaceClosure {
+        let segments = record
+            .overlay
+            .values()
+            .filter(|(_, loc)| loc.base == 0)
+            .map(|(_, loc)| (loc.fence, loc.seg))
+            .chain(
+                record
+                    .leaves
+                    .values()
+                    .filter(|ptr| ptr.base == 0)
+                    .filter_map(|ptr| self.leaf_blobs.get(ptr))
+                    .flat_map(|(_, segments)| segments.iter().copied()),
+            )
+            .collect();
+        let leaves = record
+            .leaves
+            .values()
+            .filter(|ptr| ptr.base == 0)
+            .map(|ptr| (ptr.fence, ptr.id))
+            .collect();
+        OwnNamespaceClosure { segments, leaves }
     }
 
     /// The one door for serving-map adoption (newest generation wins).
@@ -1103,19 +1158,10 @@ impl Daemon {
                     let Some(record) = state.best_record.as_ref() else {
                         return 0;
                     };
-                    let pending_segments: BTreeSet<(u64, SegId)> = record
-                        .overlay
-                        .values()
-                        .filter(|(_, loc)| loc.base == 0)
-                        .map(|(_, loc)| (loc.fence, loc.seg))
-                        .chain(
-                            record
-                                .leaves
-                                .values()
-                                .filter(|ptr| ptr.base == 0)
-                                .filter_map(|ptr| state.leaf_blobs.get(ptr))
-                                .flat_map(|(_, segments)| segments.iter().copied()),
-                        )
+                    let closure = state.own_namespace_closure(record);
+                    let pending_segments: BTreeSet<(u64, SegId)> = closure
+                        .segments
+                        .into_iter()
                         .filter(|segment| !state.backed_segs.contains(segment))
                         .collect();
                     state

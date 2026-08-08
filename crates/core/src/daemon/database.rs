@@ -68,6 +68,13 @@ enum Active {
     },
 }
 
+enum PageResolution {
+    Ready(Vec<u8>),
+    Fetch,
+    Park,
+    Dead,
+}
+
 impl DatabaseRuntime {
     pub(super) fn capture_seq(&self, mutation_seq: u64) -> u64 {
         match self.active {
@@ -658,33 +665,18 @@ impl Daemon {
                 let in_page = usize::try_from(absolute % page_size() as u64).expect("page offset");
                 let take = (*len - *cursor).min(page_size() - in_page);
                 let page = file.page(vset, page_no);
-                let span = span_of(page);
-                if self.vsets[&vset].pending_leaves.contains_key(&span) {
-                    self.vsets
-                        .get_mut(&vset)
-                        .expect("known")
-                        .database_runtime
-                        .active = Some(active);
-                    return false;
-                }
-                if self.vsets[&vset].dead_spans.contains(&span) {
-                    Self::database_fail(*req, DatabaseError::Io, out);
-                    return true;
-                }
-                let bytes = if let Some((got, bytes)) = fetched.take() {
-                    debug_assert_eq!(got, page);
-                    bytes
-                } else if self.cache.is_resident(page) {
-                    mem.read_page(page)
-                } else if self.vsets[&vset].page_locs.contains_key(&page) {
-                    self.vsets
-                        .get_mut(&vset)
-                        .expect("known")
-                        .database_runtime
-                        .active = Some(active);
-                    return self.start_database_fetch(vset, page, out);
-                } else {
-                    vec![0; page_size()]
+                let bytes = match self.resolve_database_page(vset, page, fetched, mem, false) {
+                    PageResolution::Ready(bytes) => bytes,
+                    PageResolution::Fetch => {
+                        return self.park_database_active(vset, active, Some(page), out);
+                    }
+                    PageResolution::Park => {
+                        return self.park_database_active(vset, active, None, out);
+                    }
+                    PageResolution::Dead => {
+                        Self::database_fail(*req, DatabaseError::Io, out);
+                        return true;
+                    }
                 };
                 output.extend_from_slice(&bytes[in_page..in_page + take]);
                 *cursor += take;
@@ -723,47 +715,26 @@ impl Daemon {
                 let in_page = usize::try_from(absolute % page_size() as u64).expect("page offset");
                 let take = (bytes.len() - *cursor).min(page_size() - in_page);
                 let page = file.page(vset, page_no);
-                let span = span_of(page);
-                if self.vsets[&vset].pending_leaves.contains_key(&span) {
-                    self.vsets
-                        .get_mut(&vset)
-                        .expect("known")
-                        .database_runtime
-                        .active = Some(active);
-                    return false;
-                }
-                if self.vsets[&vset].dead_spans.contains(&span) {
-                    Self::database_fail(*req, DatabaseError::Io, out);
-                    return true;
-                }
                 let full = in_page == 0 && take == page_size();
-                let mut page_bytes = if full {
-                    vec![0; page_size()]
-                } else if let Some((got, bytes)) = fetched.take() {
-                    debug_assert_eq!(got, page);
-                    bytes
-                } else if self.cache.is_resident(page) {
-                    mem.read_page(page)
-                } else if self.vsets[&vset].page_locs.contains_key(&page) {
-                    self.vsets
-                        .get_mut(&vset)
-                        .expect("known")
-                        .database_runtime
-                        .active = Some(active);
-                    return self.start_database_fetch(vset, page, out);
-                } else {
-                    vec![0; page_size()]
-                };
+                let mut page_bytes =
+                    match self.resolve_database_page(vset, page, fetched, mem, full) {
+                        PageResolution::Ready(bytes) => bytes,
+                        PageResolution::Fetch => {
+                            return self.park_database_active(vset, active, Some(page), out);
+                        }
+                        PageResolution::Park => {
+                            return self.park_database_active(vset, active, None, out);
+                        }
+                        PageResolution::Dead => {
+                            Self::database_fail(*req, DatabaseError::Io, out);
+                            return true;
+                        }
+                    };
                 if self.cache.is_resident(page) {
                     self.cache.mark_dirty(page);
                 } else {
                     let Some(victim) = self.cache.reserve_slot() else {
-                        self.vsets
-                            .get_mut(&vset)
-                            .expect("known")
-                            .database_runtime
-                            .active = Some(active);
-                        return false;
+                        return self.park_database_active(vset, active, None, out);
                     };
                     if let Some(victim) = victim {
                         out.push(Effect::Evict { page: victim });
@@ -795,46 +766,27 @@ impl Daemon {
                 if *size < *old_size && *size % page_size() as u64 != 0 {
                     let page_no = u32::try_from(*size / page_size() as u64).expect("bounded");
                     let page = file.page(vset, page_no);
-                    let span = span_of(page);
-                    if self.vsets[&vset].pending_leaves.contains_key(&span) {
-                        self.vsets
-                            .get_mut(&vset)
-                            .expect("known")
-                            .database_runtime
-                            .active = Some(active);
-                        return false;
-                    }
-                    if self.vsets[&vset].dead_spans.contains(&span) {
-                        Self::database_fail(*req, DatabaseError::Io, out);
-                        return true;
-                    }
-                    let mut page_bytes = if let Some((got, bytes)) = fetched.take() {
-                        debug_assert_eq!(got, page);
-                        bytes
-                    } else if self.cache.is_resident(page) {
-                        mem.read_page(page)
-                    } else if self.vsets[&vset].page_locs.contains_key(&page) {
-                        self.vsets
-                            .get_mut(&vset)
-                            .expect("known")
-                            .database_runtime
-                            .active = Some(active);
-                        return self.start_database_fetch(vset, page, out);
-                    } else {
-                        vec![0; page_size()]
-                    };
+                    let mut page_bytes =
+                        match self.resolve_database_page(vset, page, fetched, mem, false) {
+                            PageResolution::Ready(bytes) => bytes,
+                            PageResolution::Fetch => {
+                                return self.park_database_active(vset, active, Some(page), out);
+                            }
+                            PageResolution::Park => {
+                                return self.park_database_active(vset, active, None, out);
+                            }
+                            PageResolution::Dead => {
+                                Self::database_fail(*req, DatabaseError::Io, out);
+                                return true;
+                            }
+                        };
                     let tail = usize::try_from(*size % page_size() as u64).expect("offset");
                     page_bytes[tail..].fill(0);
                     if self.cache.is_resident(page) {
                         self.cache.mark_dirty(page);
                     } else {
                         let Some(victim) = self.cache.reserve_slot() else {
-                            self.vsets
-                                .get_mut(&vset)
-                                .expect("known")
-                                .database_runtime
-                                .active = Some(active);
-                            return false;
+                            return self.park_database_active(vset, active, None, out);
                         };
                         if let Some(victim) = victim {
                             out.push(Effect::Evict { page: victim });
@@ -866,6 +818,56 @@ impl Daemon {
                 true
             }
         }
+    }
+
+    fn resolve_database_page(
+        &self,
+        vset: VsetId,
+        page: PageId,
+        fetched: &mut Option<(PageId, Vec<u8>)>,
+        mem: &dyn HostMap,
+        overwrite_full_page: bool,
+    ) -> PageResolution {
+        let state = &self.vsets[&vset];
+        let span = span_of(page);
+        if state.pending_leaves.contains_key(&span) {
+            return PageResolution::Park;
+        }
+        if state.dead_spans.contains(&span) {
+            return PageResolution::Dead;
+        }
+        if overwrite_full_page {
+            return PageResolution::Ready(vec![0; page_size()]);
+        }
+        if let Some((got, bytes)) = fetched.take() {
+            debug_assert_eq!(got, page);
+            return PageResolution::Ready(bytes);
+        }
+        if self.cache.is_resident(page) {
+            return PageResolution::Ready(mem.read_page(page));
+        }
+        if state.page_locs.contains_key(&page) {
+            return PageResolution::Fetch;
+        }
+        PageResolution::Ready(vec![0; page_size()])
+    }
+
+    fn park_database_active(
+        &mut self,
+        vset: VsetId,
+        active: Active,
+        fetch: Option<PageId>,
+        out: &mut Vec<Effect>,
+    ) -> bool {
+        self.vsets
+            .get_mut(&vset)
+            .expect("known")
+            .database_runtime
+            .active = Some(active);
+        if let Some(page) = fetch {
+            self.start_database_fetch(vset, page, out);
+        }
+        false
     }
 
     fn start_database_fetch(&mut self, vset: VsetId, page: PageId, out: &mut Vec<Effect>) -> bool {
