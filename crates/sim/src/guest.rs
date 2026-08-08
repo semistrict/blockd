@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::ReqId;
+use blockd_core::protocol::ReqId;
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
 
 use crate::oracle::Oracle;

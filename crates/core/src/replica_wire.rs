@@ -1,5 +1,5 @@
 use crate::format::{Dec, DecodeError, Enc};
-use crate::seam::{ReplicaArtifact, ReplicaCommitInfo};
+use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::types::{JournalSeq, SegId};
 
 pub(crate) fn encode_artifact(e: &mut Enc, artifact: ReplicaArtifact) {

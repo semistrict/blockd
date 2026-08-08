@@ -15,8 +15,9 @@ use blockd_core::daemon::{Daemon, DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
 use blockd_core::layout;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
+use blockd_core::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use blockd_core::replica_spool::{seal_replica_artifact, seal_replica_commit};
-use blockd_core::seam::{Effect, ReplicaArtifact, ReplicaCommitInfo};
+use blockd_core::seam::Effect;
 use blockd_core::segment::SegmentBuilder;
 use blockd_core::types::{
     Gen, HostId, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,

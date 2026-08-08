@@ -4,7 +4,8 @@
 use super::{Daemon, Pending};
 use crate::journal::VsetKind;
 use crate::layout;
-use crate::seam::{Effect, HostMap, ReqId, StoreFault};
+use crate::protocol::{ReqId, StoreFault};
+use crate::seam::{Effect, HostMap};
 use crate::segment::{PageLoc, open_entry};
 use crate::types::{Gen, PageId, VolumeId, VsetId, page_size};
 
@@ -344,7 +345,7 @@ impl Daemon {
             );
             out.push(Effect::PeerSend {
                 to: source,
-                msg: crate::seam::PeerMsg::FetchRange {
+                msg: crate::protocol::PeerMsg::FetchRange {
                     io,
                     vset: page.volume.vset,
                     fence: loc.fence,

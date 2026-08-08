@@ -15,7 +15,7 @@ use base64::Engine;
 use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
-use blockd_core::seam::Verdict;
+use blockd_core::protocol::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts_async};
 use blockd_runtime::{

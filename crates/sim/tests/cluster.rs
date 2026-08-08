@@ -10,9 +10,8 @@ use blockd_core::daemon::{ArchivePolicy, Daemon, DaemonConfig, ReplicaPlacementC
 use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::placement::PeerCandidate;
-use blockd_core::seam::{
-    AdminCmd, AdminReply, Effect, Event, HostMap, PeerMsg, ReplicaArtifact, ReqId, TimerId, Verdict,
-};
+use blockd_core::protocol::{AdminCmd, AdminReply, PeerMsg, ReplicaArtifact, ReqId, Verdict};
+use blockd_core::seam::{Effect, Event, HostMap, TimerId};
 use blockd_core::types::{
     HostId, PageId, PageNo, SegId, SimTime, VolumeId, VolumeIdx, VsetId, page_size,
 };
@@ -132,7 +131,7 @@ fn settle(
                     let result = result.map(|found| found.map(|(v, b)| (v.0, b)));
                     queue.push_back(Event::StoreGetDone {
                         io,
-                        result: result.map_err(|_| blockd_core::seam::StoreFault::Unavailable),
+                        result: result.map_err(|_| blockd_core::protocol::StoreFault::Unavailable),
                     });
                 }
                 Effect::StoreGetRange {
@@ -145,7 +144,7 @@ fn settle(
                     let result = result.map(|found| found.map(|(v, b)| (v.0, b)));
                     queue.push_back(Event::StoreGetDone {
                         io,
-                        result: result.map_err(|_| blockd_core::seam::StoreFault::Unavailable),
+                        result: result.map_err(|_| blockd_core::protocol::StoreFault::Unavailable),
                     });
                 }
                 Effect::StoreDelete { key } => {
@@ -247,15 +246,15 @@ fn settle(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn map_put(result: Result<Version, StoreError>) -> Result<u64, blockd_core::seam::StoreFault> {
+fn map_put(result: Result<Version, StoreError>) -> Result<u64, blockd_core::protocol::StoreFault> {
     match result {
         Ok(v) => Ok(v.0),
         Err(StoreError::CasConflict { actual }) => {
-            Err(blockd_core::seam::StoreFault::CasConflict {
+            Err(blockd_core::protocol::StoreFault::CasConflict {
                 actual: actual.map(|v| v.0),
             })
         }
-        Err(_) => Err(blockd_core::seam::StoreFault::Unavailable),
+        Err(_) => Err(blockd_core::protocol::StoreFault::Unavailable),
     }
 }
 
@@ -333,6 +332,150 @@ fn seeded_host_a(local: &mut BTreeMap<String, Vec<u8>>, store: &mut ObjectStore)
     assert!(a.counters.manifests_published >= 1, "checkpoint published");
     assert_eq!(a.archive_lag(VSET), Some(0));
     a
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn racing_restores_resolve_to_exactly_one_runner_and_fence_the_old_holder() {
+    let mut store = ObjectStore::new(StoreConfig::s3());
+    let mut local_a = BTreeMap::new();
+    let mut local_b = BTreeMap::new();
+    let mut local_c = BTreeMap::new();
+    let mut a = seeded_host_a(&mut local_a, &mut store);
+
+    // Hosts B and C race to restore (a wrong liveness guess about A —
+    // safe to attempt at any moment, R6.4). C reads the head first; B's
+    // claim lands while C's is still in flight — a genuine race.
+    let mut b = daemon(1);
+    let mut c = daemon(2);
+    let mut rng = Pcg64::new(3, 3);
+    let now = SimTime::ZERO;
+    let c_read = c.step(
+        Event::Admin(AdminCmd::RestoreVset {
+            req: ReqId(11),
+            vset: VSET,
+        }),
+        &PatternMem,
+    );
+    let [Effect::StoreGet { io: c_io, key }] = c_read.as_slice() else {
+        panic!("restore starts with a head read: {c_read:?}");
+    };
+    let (_, stale) = store.get(now, &mut rng, key);
+    let stale = stale
+        .map(|found| found.map(|(v, b)| (v.0, b)))
+        .map_err(|_| blockd_core::protocol::StoreFault::Unavailable);
+
+    let b_effects = settle(
+        &mut b,
+        &mut local_b,
+        &mut store,
+        Event::Admin(AdminCmd::RestoreVset {
+            req: ReqId(10),
+            vset: VSET,
+        }),
+    );
+    let c_effects = settle(
+        &mut c,
+        &mut local_c,
+        &mut store,
+        Event::StoreGetDone {
+            io: *c_io,
+            result: stale,
+        },
+    );
+    // B claimed the head; C's claim carried the stale expectation and
+    // CAS-failed: exactly one runner (R6.3).
+    assert_eq!(
+        b_effects,
+        [
+            Effect::Admin(AdminReply::VsetRestored {
+                req: ReqId(10),
+                vset: VSET,
+                verdict: Verdict::Resume {
+                    epoch: blockd_core::types::Epoch(1),
+                    vmstate: 7
+                }
+            }),
+            // The resume opens its R6.2 recording window (the resume-set
+            // fetch itself was settled against the store).
+            Effect::SetTimer {
+                timer: blockd_core::seam::TimerId::ResumeSet(VSET),
+                after: blockd_core::types::millis(1000),
+            },
+        ]
+    );
+    assert_eq!(
+        c_effects,
+        [Effect::Admin(AdminReply::AdminFailed { req: ReqId(11) })]
+    );
+
+    // A still runs its zombie guest (bounded double-run window). Its next
+    // publish attempt CAS-fails and it is structurally fenced (R6.4).
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(1),
+    };
+    let _ = settle(
+        &mut a,
+        &mut local_a,
+        &mut store,
+        Event::GuestFault { page, write: true },
+    );
+    let effects = settle(
+        &mut a,
+        &mut local_a,
+        &mut store,
+        Event::Timer(blockd_core::seam::TimerId::Writeback),
+    );
+    assert!(
+        effects.contains(&Effect::VsetFenced { vset: VSET }),
+        "old holder must fence itself on the lost CAS: {effects:?}"
+    );
+    assert_eq!(a.counters.fenced, 1);
+    assert_eq!(a.backup_lag(VSET), None, "the vset is gone from A");
+
+    // B serves the restored page: fill comes from the store (A's segment,
+    // verbatim bytes — R8.4/R2.3) after the local miss.
+    let restored = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(0),
+    };
+    let effects = settle(
+        &mut b,
+        &mut local_b,
+        &mut store,
+        Event::GuestFault {
+            page: restored,
+            write: false,
+        },
+    );
+    let mut expected = vec![0u8; page_size()];
+    expected[0] = 0xA0 ^ 1;
+    expected[1] = 0;
+    assert_eq!(
+        effects,
+        [Effect::Fill {
+            page: restored,
+            bytes: expected,
+            writable: false,
+            share: None
+        }]
+    );
+    assert_eq!(b.counters.fills, 1);
+
+    // The head belongs to B; nothing A writes is reachable (R6.4).
+    let now = SimTime::ZERO;
+    let mut rng = Pcg64::new(1, 1);
+    let (_, head) = store.get(now, &mut rng, &layout::head_key(VSET));
+    let (_, bytes) = head.expect("store up").expect("head exists");
+    let head = blockd_core::head::HeadRecord::decode(VSET, &bytes).expect("intact");
+    assert_eq!(head.holder, HostId(1));
 }
 
 #[test]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{DetachMode, StoreFault};
+use blockd_core::protocol::{DetachMode, StoreFault};
 use blockd_core::types::{HostId, VmId, VsetId, millis};
 use blockd_runtime::fc::FcVm;
 use blockd_runtime::vsetfs::VsetFsEndpoint;
@@ -178,7 +178,7 @@ fn stock_sqlite_wal_survives_hot_unplug_restart_and_replug() {
     let (restarted, verdicts) = Runtime::recover(&config, store, &configs);
     assert!(matches!(
         verdicts.get(&vset),
-        Some(blockd_core::seam::Verdict::DatabaseReady { .. })
+        Some(blockd_core::protocol::Verdict::DatabaseReady { .. })
     ));
     let restarted = Arc::new(restarted);
     let (mut second, second_fs, _second_attachment) =
@@ -334,7 +334,7 @@ fn open_sqlite_connection_survives_firecracker_memory_snapshot() {
     let (recovered, verdicts) = Runtime::recover(&config, store, &configs);
     assert!(matches!(
         verdicts.get(&vset),
-        Some(blockd_core::seam::Verdict::DatabaseReady { .. })
+        Some(blockd_core::protocol::Verdict::DatabaseReady { .. })
     ));
     let runtime = Arc::new(recovered);
 

@@ -8,8 +8,9 @@ use crate::format::crc32c;
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout::{self, BlobName};
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
+use crate::protocol::Verdict;
 use crate::replica_spool::scan_replica_spool;
-use crate::seam::{Effect, Verdict};
+use crate::seam::Effect;
 use crate::types::{HostId, JournalSeq, PageId, SegId, VolumeId, VsetId};
 
 /// One local recovery entry. Segment contents are verified lazily on first

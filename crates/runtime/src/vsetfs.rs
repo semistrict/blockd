@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use blockd_core::database::{AttachmentId, DatabaseReply, DatabaseRequest};
-use blockd_core::seam::DetachMode;
+use blockd_core::protocol::DetachMode;
 use blockd_core::types::{VmId, VsetId};
 use blockd_core::vsetfs::{AttachedExport, DaxMapping, VsetFsState};
 use blockd_vsetfs::{
@@ -41,7 +41,7 @@ impl DatabaseIo for RuntimeDatabaseIo {
         saved: AttachmentId,
     ) -> io::Result<RestoredAttachment> {
         let probe = self.runtime.database_request(DatabaseRequest {
-            req: blockd_core::seam::ReqId(0),
+            req: blockd_core::protocol::ReqId(0),
             vset,
             attachment: saved,
             op: blockd_core::database::DatabaseOp::Access {

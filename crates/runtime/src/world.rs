@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use blockd_core::seam::{MAX_OBJECT_BYTES, StoreFault};
+use blockd_core::protocol::{MAX_OBJECT_BYTES, StoreFault};
 use blockd_core::world::{BlobError, Blobs, Store, StoreError};
 use blockd_exec::inject::{Injected, Injector, Lane, injector};
 
@@ -397,7 +397,7 @@ impl Store for RuntimeStore {
 mod tests {
     use std::sync::Arc;
 
-    use blockd_core::seam::StoreFault;
+    use blockd_core::protocol::StoreFault;
     use blockd_core::world::{Blobs, Store, StoreError};
     use blockd_exec::Executor;
 

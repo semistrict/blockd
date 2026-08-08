@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use async_trait::async_trait;
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 use blockd_core::types::SimTime;
 use blockd_core::world::{BlobError, Blobs, Store, StoreError};
 use blockd_exec::{delay, now};
@@ -207,7 +207,7 @@ impl Store for SimStore {
 
 #[cfg(test)]
 mod tests {
-    use blockd_core::seam::StoreFault;
+    use blockd_core::protocol::StoreFault;
     use blockd_core::world::{Blobs, Store, StoreError};
     use blockd_exec::Executor;
 

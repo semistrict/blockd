@@ -15,7 +15,7 @@ use std::time::Duration;
 use blockd_core::database::{DatabaseError, DatabaseReply, DatabaseRequest};
 use blockd_core::dbproto::{MAX_DATABASE_FRAME, decode_request, encode_reply};
 use blockd_core::format::FRAME_HEADER;
-use blockd_core::seam::ReqId;
+use blockd_core::protocol::ReqId;
 use blockd_core::types::VmId;
 
 use crate::Runtime;

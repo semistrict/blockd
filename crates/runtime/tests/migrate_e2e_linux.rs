@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
-use blockd_core::seam::Verdict;
+use blockd_core::protocol::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig, S3Store};
 use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};

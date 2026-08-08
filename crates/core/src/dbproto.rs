@@ -8,7 +8,7 @@ use crate::database::{
     MAX_DATABASE_IO,
 };
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, open_frame, seal_frame};
-use crate::seam::ReqId;
+use crate::protocol::ReqId;
 use crate::types::{VmId, VsetId};
 
 pub const MAGIC_DATABASE_REQUEST: u32 = u32::from_le_bytes(*b"BDQ1");

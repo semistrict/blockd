@@ -15,8 +15,9 @@ use blockd_exec::{TaskHandle, TaskId, delay, spawn};
 
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::layout;
+use crate::protocol::PeerMsg;
 use crate::replica_spool::seal_verified_replica_artifact;
-use crate::seam::{Effect, Event, HostMap, PeerMsg, TimerId};
+use crate::seam::{Effect, Event, HostMap, TimerId};
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
 
 pub trait ActorWorld: Blobs + Store + Peers + GuestMem + AdminIo + HostMap + 'static {}
@@ -200,7 +201,7 @@ async fn sync_source<W: ActorWorld>(world: Rc<W>, events: UnboundedSender<Event>
 async fn blob_done<W: ActorWorld>(
     world: &W,
     events: &UnboundedSender<Event>,
-    io: crate::seam::IoId,
+    io: crate::protocol::IoId,
     result: Result<(), crate::world::BlobError>,
 ) {
     if result.is_ok() {
@@ -213,7 +214,7 @@ async fn blob_done<W: ActorWorld>(
 async fn store_put_done<W: ActorWorld>(
     world: &W,
     events: &UnboundedSender<Event>,
-    io: crate::seam::IoId,
+    io: crate::protocol::IoId,
     result: Result<u64, StoreError>,
 ) {
     let result = match result {
@@ -230,7 +231,7 @@ async fn store_put_done<W: ActorWorld>(
 async fn store_get_done<W: ActorWorld>(
     world: &W,
     events: &UnboundedSender<Event>,
-    io: crate::seam::IoId,
+    io: crate::protocol::IoId,
     result: Result<Option<(u64, Vec<u8>)>, StoreError>,
 ) {
     let result = match result {

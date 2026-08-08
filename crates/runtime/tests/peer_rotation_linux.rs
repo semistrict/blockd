@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use blockd_core::seam::PeerMsg;
+use blockd_core::protocol::PeerMsg;
 use blockd_core::types::{HostId, VsetId};
 use blockd_runtime::{PeerConfig, PeerNet, PeerTlsConfig};
 

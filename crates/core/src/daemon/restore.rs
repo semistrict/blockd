@@ -12,7 +12,8 @@ use crate::head::{HeadRecord, ManifestPtr};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf};
-use crate::seam::{AdminReply, Effect, HostMap, ReqId, StoreFault, TimerId, Verdict};
+use crate::protocol::{AdminReply, ReqId, StoreFault, Verdict};
+use crate::seam::{Effect, HostMap, TimerId};
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 
@@ -342,7 +343,7 @@ impl Daemon {
                     .insert(io, Pending::PeerLeafFetch { vset, span, ptr });
                 out.push(Effect::PeerSend {
                     to: source,
-                    msg: crate::seam::PeerMsg::FetchLeaf {
+                    msg: crate::protocol::PeerMsg::FetchLeaf {
                         io,
                         vset,
                         base: ptr.base,

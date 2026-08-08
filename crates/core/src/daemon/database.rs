@@ -9,7 +9,8 @@ use crate::database::{
 };
 use crate::journal::{DatabaseFileMeta, VsetKind};
 use crate::mapleaf::span_of;
-use crate::seam::{AdminReply, DetachMode, Effect, HostMap, PeerMsg, ReqId, StoreFault, TimerId};
+use crate::protocol::{AdminReply, DetachMode, PeerMsg, ReqId, StoreFault};
+use crate::seam::{Effect, HostMap, TimerId};
 use crate::segment::PageLoc;
 use crate::types::{Gen, PageId, VsetId, page_size};
 

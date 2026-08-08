@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use blockd_core::seam::{MAX_OBJECT_BYTES, StoreFault};
+use blockd_core::protocol::{MAX_OBJECT_BYTES, StoreFault};
 use bytes::Bytes;
 use tokio::sync::Mutex;
 

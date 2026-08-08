@@ -16,7 +16,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
-use blockd_core::seam::MAX_OBJECT_BYTES;
+use blockd_core::protocol::MAX_OBJECT_BYTES;
 use futures_util::stream;
 
 /// One parsed request, recorded for assertions.

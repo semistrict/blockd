@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use blockd_core::format::{Dec, FRAME_HEADER};
 use blockd_core::peer::{MAGIC_PEER, MAX_PEER_PAYLOAD, decode_peer, encode_peer_version};
-use blockd_core::seam::PeerMsg;
+use blockd_core::protocol::PeerMsg;
 use blockd_core::types::HostId;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;

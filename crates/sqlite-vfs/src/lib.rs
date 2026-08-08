@@ -841,7 +841,7 @@ mod tests {
 
     impl Model {
         #[allow(clippy::too_many_lines)]
-        fn execute(&mut self, req: blockd_core::seam::ReqId, op: DatabaseOp) -> DatabaseReply {
+        fn execute(&mut self, req: blockd_core::protocol::ReqId, op: DatabaseOp) -> DatabaseReply {
             match op {
                 DatabaseOp::Open {
                     handle,

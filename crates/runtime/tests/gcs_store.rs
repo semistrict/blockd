@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 use blockd_runtime::fakegcs::{FakeGcs, Fault, Seen};
 use blockd_runtime::{GcsConfig, GcsStore};
 

@@ -19,10 +19,10 @@ use std::time::Instant;
 use blockd_core::daemon::{ArchivePolicy, Daemon, DaemonConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
-use blockd_core::seam::{
-    AdminCmd, AdminReply, Effect, Event, HostMap, PeerMsg, ReplicaCommitInfo, ReqId, StoreFault,
-    TimerId,
+use blockd_core::protocol::{
+    AdminCmd, AdminReply, PeerMsg, ReplicaCommitInfo, ReqId, StoreFault,
 };
+use blockd_core::seam::{Effect, Event, HostMap, TimerId};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
 use blockd_workload::{
     Backend, Capability, LogicalPage, Operation, WorkloadModel, WorkloadOutcome,

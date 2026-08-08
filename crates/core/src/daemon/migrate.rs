@@ -20,7 +20,8 @@ use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::head::HeadRecord;
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
-use crate::seam::{AdminReply, Effect, PeerMsg, ReqId, TimerId, Verdict};
+use crate::protocol::{AdminReply, PeerMsg, ReqId, Verdict};
+use crate::seam::{Effect, TimerId};
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, HostId, PageId, VsetId, millis};
 
@@ -452,8 +453,8 @@ impl Daemon {
         vset: VsetId,
         from: HostId,
         leaf: bool,
-        peer_io: crate::seam::IoId,
-    ) -> Option<crate::seam::IoId> {
+        peer_io: crate::protocol::IoId,
+    ) -> Option<crate::protocol::IoId> {
         if self.rejects_counterparty(vset, from) {
             return None;
         }
@@ -610,16 +611,16 @@ impl Daemon {
         &mut self,
         vset: VsetId,
         source: HostId,
-        result: Result<Option<(u64, Vec<u8>)>, crate::seam::StoreFault>,
+        result: Result<Option<(u64, Vec<u8>)>, crate::protocol::StoreFault>,
         out: &mut Vec<Effect>,
     ) {
         let (version, bytes) = match result {
             Ok(Some(found)) => found,
-            Err(crate::seam::StoreFault::Unavailable) => {
+            Err(crate::protocol::StoreFault::Unavailable) => {
                 self.retry_migrate_head(vset, out);
                 return;
             }
-            Ok(None) | Err(crate::seam::StoreFault::CasConflict { .. }) => {
+            Ok(None) | Err(crate::protocol::StoreFault::CasConflict { .. }) => {
                 self.fence_vset(vset, out);
                 return;
             }
@@ -665,13 +666,14 @@ impl Daemon {
         &mut self,
         vset: VsetId,
         manifest: Option<crate::head::ManifestPtr>,
-        result: Result<u64, crate::seam::StoreFault>,
+        result: Result<u64, crate::protocol::StoreFault>,
         out: &mut Vec<Effect>,
     ) {
         match result {
             Ok(fence) => self.adopt_migration_head(vset, fence, manifest, out),
             Err(
-                crate::seam::StoreFault::Unavailable | crate::seam::StoreFault::CasConflict { .. },
+                crate::protocol::StoreFault::Unavailable
+                | crate::protocol::StoreFault::CasConflict { .. },
             ) => self.retry_migrate_head(vset, out),
         }
     }
@@ -713,7 +715,7 @@ impl Daemon {
     /// Destination fill from the source (the peer tier, R2.3).
     pub(super) fn peer_fill_done(
         &mut self,
-        io: crate::seam::IoId,
+        io: crate::protocol::IoId,
         bytes: Option<Vec<u8>>,
         mem: &dyn crate::seam::HostMap,
         out: &mut Vec<Effect>,
@@ -748,7 +750,7 @@ impl Daemon {
     /// resend the same request id so a slow original reply remains useful.
     pub(super) fn peer_retry(
         &mut self,
-        io: crate::seam::IoId,
+        io: crate::protocol::IoId,
         mem: &dyn crate::seam::HostMap,
         out: &mut Vec<Effect>,
     ) {
@@ -819,7 +821,7 @@ impl Daemon {
 
     fn resend_peer_range(
         &mut self,
-        io: crate::seam::IoId,
+        io: crate::protocol::IoId,
         vset: VsetId,
         loc: PageLoc,
         out: &mut Vec<Effect>,
@@ -1048,7 +1050,7 @@ impl Daemon {
     /// A peer read completed locally: answer the requester.
     pub(super) fn peer_read_done(
         requester: HostId,
-        peer_io: crate::seam::IoId,
+        peer_io: crate::protocol::IoId,
         bytes: Option<Vec<u8>>,
         out: &mut Vec<Effect>,
     ) {

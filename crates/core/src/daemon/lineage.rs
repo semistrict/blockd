@@ -21,7 +21,8 @@ use super::{Daemon, Pending, StoreCopyArtifact, Vset};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
-use crate::seam::{AdminReply, Effect, ReqId, StoreFault, Verdict};
+use crate::protocol::{AdminReply, ReqId, StoreFault, Verdict};
+use crate::seam::Effect;
 use crate::segment::scan_segment;
 use crate::types::{PageId, SegId, VolumeId, VsetId};
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{DetachMode, StoreFault, Verdict};
+use blockd_core::protocol::{DetachMode, StoreFault, Verdict};
 use blockd_core::types::{HostId, VmId, VsetId, millis};
 use blockd_runtime::database::DatabaseEndpoint;
 use blockd_runtime::{GetResult, ObjectStore, Runtime, RuntimeConfig};

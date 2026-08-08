@@ -10,7 +10,7 @@ use std::time::Duration;
 use blockd_core::database::{
     DatabaseError, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest,
 };
-use blockd_core::seam::ReqId;
+use blockd_core::protocol::ReqId;
 use blockd_core::types::{VsetId, page_size};
 use blockd_core::vsetfs::{
     AttachedExport, ByteRangeLock, DaxMapping, Node, NodeKind, ROOT_INODE, VSETS_INODE,

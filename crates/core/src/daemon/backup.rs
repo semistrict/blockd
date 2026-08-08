@@ -6,7 +6,8 @@
 use super::{Daemon, Pending};
 use crate::head::HeadRecord;
 use crate::layout;
-use crate::seam::{Effect, HostMap, StoreFault, TimerId};
+use crate::protocol::StoreFault;
+use crate::seam::{Effect, HostMap, TimerId};
 use crate::types::{SegId, VsetId};
 
 impl Daemon {
@@ -114,7 +115,9 @@ impl Daemon {
                 self.vsets.remove(&vset_id);
                 self.purge_vset_pages(vset_id, out);
                 if let Some(req) = req {
-                    out.push(Effect::Admin(crate::seam::AdminReply::AdminFailed { req }));
+                    out.push(Effect::Admin(crate::protocol::AdminReply::AdminFailed {
+                        req,
+                    }));
                 }
             }
             Err(StoreFault::Unavailable) => self.backup_backoff(vset_id, out),

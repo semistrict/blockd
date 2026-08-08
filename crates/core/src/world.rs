@@ -28,7 +28,7 @@
 use async_trait::async_trait;
 
 use crate::database::{DatabaseReply, DatabaseRequest};
-use crate::seam::{AdminCmd, AdminReply, PeerMsg, ReqId, StoreFault};
+use crate::protocol::{AdminCmd, AdminReply, PeerMsg, ReqId, StoreFault};
 use crate::types::{HostId, PageId, VolumeId, VsetId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

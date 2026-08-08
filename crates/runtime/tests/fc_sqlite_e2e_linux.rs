@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{DetachMode, StoreFault, Verdict};
+use blockd_core::protocol::{DetachMode, StoreFault, Verdict};
 use blockd_core::types::{HostId, VmId, VsetId, millis};
 use blockd_runtime::database::{DEFAULT_DATABASE_VSOCK_PORT, DatabaseEndpoint};
 use blockd_runtime::fc::FcVm;

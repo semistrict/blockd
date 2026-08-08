@@ -5,7 +5,7 @@
 //! serialized with warm VM snapshots. This module covers only the durable
 //! main, WAL, and rollback-journal namespaces.
 
-use crate::seam::ReqId;
+use crate::protocol::ReqId;
 use crate::types::{PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
 
 /// Largest byte payload accepted in one request or returned in one reply.

@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
 use crate::journal::JournalRecord;
 use crate::mapleaf::MapLeaf;
+use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
 };
-use crate::seam::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::segment::scan_segment;
 use crate::types::{HostId, VsetId};
 

@@ -15,7 +15,8 @@ use super::{Capture, Daemon, PageMap, Pending, Rescue, Vset};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_of};
-use crate::seam::{AdminCmd, AdminReply, Effect, HostMap, IoId, ReqId, TimerId};
+use crate::protocol::{AdminCmd, AdminReply, IoId, ReqId};
+use crate::seam::{Effect, HostMap, TimerId};
 use crate::segment::{PageLoc, SegmentBatchBuilder};
 use crate::types::{Epoch, Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
 
@@ -1325,7 +1326,7 @@ impl Daemon {
                 let source = state.peer_source.expect("offer sender recorded");
                 out.push(Effect::PeerSend {
                     to: source,
-                    msg: crate::seam::PeerMsg::MigrateAccept { vset: vset_id },
+                    msg: crate::protocol::PeerMsg::MigrateAccept { vset: vset_id },
                 });
                 out.push(Effect::Admin(AdminReply::VsetMigratedIn {
                     vset: vset_id,

@@ -14,10 +14,11 @@ use blockd_core::journal::{JournalRecord, VsetConfig};
 use blockd_core::layout::{self, BlobName};
 use blockd_core::mapleaf::MapLeaf;
 use blockd_core::placement::PeerCandidate;
-use blockd_core::seam::{
-    AdminCmd, AdminReply, Effect, Event, HostMap, IoId, PeerMsg, ReplicaArtifact,
-    ReplicaCommitInfo, ReqId, Verdict,
+use blockd_core::protocol::{
+    AdminCmd, AdminReply, IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, ReqId, StoreFault,
+    Verdict,
 };
+use blockd_core::seam::{Effect, Event, HostMap};
 use blockd_core::segment::scan_segment;
 use blockd_core::types::{
     HostId, PageId, PageNo, SimTime, VolumeId, VolumeIdx, VsetId, micros, millis,
@@ -33,7 +34,6 @@ use crate::kernel::Kernel;
 use crate::oracle::Oracle;
 use crate::world::blobdev::{BdevIo, BlobDev, BlobDevConfig};
 use crate::world::store::{ObjectStore, StoreConfig, StoreCounters, StoreError, Version};
-use blockd_core::seam::StoreFault;
 
 #[derive(Clone, Debug)]
 pub struct FaultPlan {

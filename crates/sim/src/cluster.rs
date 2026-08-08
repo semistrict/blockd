@@ -16,7 +16,8 @@ use blockd_core::placement::PeerCandidate;
 use blockd_core::replica_recovery::{
     ReplicaResidue, export_replica_recovery, refence_replica_export,
 };
-use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, Verdict};
+use blockd_core::protocol::{AdminCmd, AdminReply, IoId, ReqId, Verdict};
+use blockd_core::seam::{Effect, Event, HostMap};
 use blockd_core::types::{HostId, PageId, SimTime, VsetId, micros, millis};
 
 use crate::guest::{
@@ -54,8 +55,8 @@ pub enum PeerKind {
 }
 
 impl PeerKind {
-    fn of(msg: &blockd_core::seam::PeerMsg) -> PeerKind {
-        use blockd_core::seam::PeerMsg;
+    fn of(msg: &blockd_core::protocol::PeerMsg) -> PeerKind {
+        use blockd_core::protocol::PeerMsg;
         match msg {
             PeerMsg::MigrateOffer { .. } => PeerKind::Offer,
             PeerMsg::MigrateAccept { .. } => PeerKind::Accept,
@@ -326,7 +327,7 @@ enum Ev {
     PeerDeliver {
         from: u16,
         to: u16,
-        msg: blockd_core::seam::PeerMsg,
+        msg: blockd_core::protocol::PeerMsg,
     },
 }
 
@@ -978,7 +979,7 @@ impl Cluster {
                         && result.is_ok();
                     let result = if inject_unknown {
                         self.hit_fault(FaultPoint::StoreUnknownResult);
-                        Err(blockd_core::seam::StoreFault::Unavailable)
+                        Err(blockd_core::protocol::StoreFault::Unavailable)
                     } else {
                         result.map(|v| v.0).map_err(store_fault)
                     };
@@ -1141,15 +1142,15 @@ impl Cluster {
                     }
                     let transfer_crash = if self
                         .fault_pending(FaultPoint::CrashPrimaryAfterClosureCapture)
-                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaStatus { .. })
+                        && matches!(msg, blockd_core::protocol::PeerMsg::ReplicaStatus { .. })
                     {
                         Some(FaultPoint::CrashPrimaryAfterClosureCapture)
                     } else if self.fault_pending(FaultPoint::CrashPrimaryDuringArtifactTransfer)
-                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaPut { .. })
+                        && matches!(msg, blockd_core::protocol::PeerMsg::ReplicaPut { .. })
                     {
                         Some(FaultPoint::CrashPrimaryDuringArtifactTransfer)
                     } else if self.fault_pending(FaultPoint::CrashPeerAfterDataFlushBeforeCommit)
-                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaPutAck { .. })
+                        && matches!(msg, blockd_core::protocol::PeerMsg::ReplicaPutAck { .. })
                     {
                         Some(FaultPoint::CrashPeerAfterDataFlushBeforeCommit)
                     } else {
@@ -1161,7 +1162,7 @@ impl Cluster {
                         break;
                     }
                     if self.fault_pending(FaultPoint::CrashPeerAfterCommitBeforeAck)
-                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaCommitAck { .. })
+                        && matches!(msg, blockd_core::protocol::PeerMsg::ReplicaCommitAck { .. })
                     {
                         self.hit_fault(FaultPoint::CrashPeerAfterCommitBeforeAck);
                         self.crash_host(host);
@@ -1199,21 +1200,24 @@ impl Cluster {
                         },
                     );
                     if self.fault_pending(FaultPoint::CrashPeerAfterUploadBeforeHead)
-                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaUploadDone { .. })
+                        && matches!(
+                            msg,
+                            blockd_core::protocol::PeerMsg::ReplicaUploadDone { .. }
+                        )
                     {
                         self.hit_fault(FaultPoint::CrashPeerAfterUploadBeforeHead);
                         self.crash_host(host);
                         break;
                     }
                     if self.fault_pending(FaultPoint::CrashPrimaryAfterHeadBeforeRelease)
-                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaRelease { .. })
+                        && matches!(msg, blockd_core::protocol::PeerMsg::ReplicaRelease { .. })
                     {
                         self.hit_fault(FaultPoint::CrashPrimaryAfterHeadBeforeRelease);
                         self.crash_host(host);
                         break;
                     }
                     if self.fault_pending(FaultPoint::CrashPrimaryAfterActiveCasBeforeCommit)
-                        && matches!(msg, blockd_core::seam::PeerMsg::ReplicaStatus { .. })
+                        && matches!(msg, blockd_core::protocol::PeerMsg::ReplicaStatus { .. })
                         && self
                             .store
                             .peek(&layout::head_key(VsetId(1)))
@@ -1229,16 +1233,19 @@ impl Cluster {
                         self.crash_host(host);
                         break;
                     }
-                    if matches!(msg, blockd_core::seam::PeerMsg::ReplicaStatusReply { .. }) {
+                    if matches!(
+                        msg,
+                        blockd_core::protocol::PeerMsg::ReplicaStatusReply { .. }
+                    ) {
                         self.hit_fault(FaultPoint::StatusReconciliation);
                     }
                     let forced_duplicate = match msg {
-                        blockd_core::seam::PeerMsg::ReplicaPutAck { .. }
-                        | blockd_core::seam::PeerMsg::ReplicaCommitAck { .. }
-                        | blockd_core::seam::PeerMsg::ReplicaReleaseAck { .. } => {
+                        blockd_core::protocol::PeerMsg::ReplicaPutAck { .. }
+                        | blockd_core::protocol::PeerMsg::ReplicaCommitAck { .. }
+                        | blockd_core::protocol::PeerMsg::ReplicaReleaseAck { .. } => {
                             Some(FaultPoint::DuplicateAck)
                         }
-                        blockd_core::seam::PeerMsg::ReplicaRelease { .. } => {
+                        blockd_core::protocol::PeerMsg::ReplicaRelease { .. } => {
                             Some(FaultPoint::ReleaseOverlap)
                         }
                         _ => None,
@@ -1374,7 +1381,7 @@ impl Cluster {
         }
     }
 
-    fn peer_deliver(&mut self, from: u16, to: u16, msg: blockd_core::seam::PeerMsg) {
+    fn peer_deliver(&mut self, from: u16, to: u16, msg: blockd_core::protocol::PeerMsg) {
         if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
             let mut text = format!("{msg:?}");
             text.truncate(110);
@@ -1383,11 +1390,11 @@ impl Cluster {
                 self.kernel.now().nanos()
             );
         }
-        if let blockd_core::seam::PeerMsg::MigrateOffer { vset, .. } = &msg {
+        if let blockd_core::protocol::PeerMsg::MigrateOffer { vset, .. } = &msg {
             self.pending_offers.insert(*vset, (from, to));
         }
         if self.hosts[usize::from(to)].daemon.is_some() {
-            if let blockd_core::seam::PeerMsg::Released { vset } = msg
+            if let blockd_core::protocol::PeerMsg::Released { vset } = msg
                 && self.migrated_from.remove(&vset).is_some()
             {
                 // The tail is drained: the vset no longer depends on its
@@ -1402,7 +1409,7 @@ impl Cluster {
                 },
             );
         } else if self.dead.contains(&to)
-            && let blockd_core::seam::PeerMsg::FetchRange { io, .. } = msg
+            && let blockd_core::protocol::PeerMsg::FetchRange { io, .. } = msg
         {
             // A dead source answers nothing; the harness surfaces the
             // silence as an explicit miss so the R7.3 failure is loud, not
@@ -1414,7 +1421,7 @@ impl Cluster {
                 Ev::PeerDeliver {
                     from: to,
                     to: from,
-                    msg: blockd_core::seam::PeerMsg::Page { io, bytes: None },
+                    msg: blockd_core::protocol::PeerMsg::Page { io, bytes: None },
                 },
             );
         }
@@ -2211,7 +2218,7 @@ impl Cluster {
                         Ev::PeerDeliver {
                             from: rogue,
                             to: source,
-                            msg: blockd_core::seam::PeerMsg::Released { vset },
+                            msg: blockd_core::protocol::PeerMsg::Released { vset },
                         },
                     );
                 }
@@ -2247,13 +2254,13 @@ impl Cluster {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn store_fault(err: crate::world::store::StoreError) -> blockd_core::seam::StoreFault {
+fn store_fault(err: crate::world::store::StoreError) -> blockd_core::protocol::StoreFault {
     use crate::world::store::StoreError;
     match err {
         StoreError::Unavailable | StoreError::TooLarge => {
-            blockd_core::seam::StoreFault::Unavailable
+            blockd_core::protocol::StoreFault::Unavailable
         }
-        StoreError::CasConflict { actual } => blockd_core::seam::StoreFault::CasConflict {
+        StoreError::CasConflict { actual } => blockd_core::protocol::StoreFault::CasConflict {
             actual: actual.map(|v| v.0),
         },
     }

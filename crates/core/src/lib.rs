@@ -17,6 +17,7 @@ pub mod layout;
 pub mod mapleaf;
 pub mod peer;
 pub mod placement;
+pub mod protocol;
 pub mod replica_recovery;
 pub mod replica_spool;
 mod replica_wire;

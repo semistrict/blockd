@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 
 use crate::{GetResult, ObjectStore};
 

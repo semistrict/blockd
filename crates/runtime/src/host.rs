@@ -22,11 +22,9 @@ use blockd_core::format::crc32c;
 use blockd_core::journal::VsetConfig;
 use blockd_core::journal::VsetKind;
 use blockd_core::layout;
+use blockd_core::protocol::{AdminCmd, AdminReply, IoId, PeerMsg, ReplicaArtifact, ReqId, Verdict};
 use blockd_core::replica_spool::seal_verified_replica_artifact;
-use blockd_core::seam::{
-    AdminCmd, AdminReply, Effect, Event, HostMap, IoId, PeerMsg, ReplicaArtifact, ReqId, TimerId,
-    Verdict,
-};
+use blockd_core::seam::{Effect, Event, HostMap, TimerId};
 use blockd_core::types::{HostId, PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 use tokio::io::unix::AsyncFd;
@@ -240,10 +238,10 @@ impl LoopQueue {
             | Msg::Stop => true,
             Msg::Ev(Event::PeerDelivered { msg, .. }) => matches!(
                 msg,
-                blockd_core::seam::PeerMsg::Page { .. }
-                    | blockd_core::seam::PeerMsg::Leaf { .. }
-                    | blockd_core::seam::PeerMsg::FetchRange { .. }
-                    | blockd_core::seam::PeerMsg::FetchLeaf { .. }
+                blockd_core::protocol::PeerMsg::Page { .. }
+                    | blockd_core::protocol::PeerMsg::Leaf { .. }
+                    | blockd_core::protocol::PeerMsg::FetchRange { .. }
+                    | blockd_core::protocol::PeerMsg::FetchLeaf { .. }
             ),
             Msg::Ev(_) => false,
         };
@@ -1111,7 +1109,7 @@ impl Runtime {
         &self,
         vset: VsetId,
         attachment: AttachmentId,
-        mode: blockd_core::seam::DetachMode,
+        mode: blockd_core::protocol::DetachMode,
     ) {
         let req = self.req();
         self.tx
@@ -1448,7 +1446,7 @@ fn fault_source_of_event(event: &Event) -> Option<FaultSource> {
         Event::BlobReadDone { .. } => Some(FaultSource::Local),
         Event::StoreGetDone { .. } => Some(FaultSource::Store),
         Event::PeerDelivered {
-            msg: blockd_core::seam::PeerMsg::Page { .. },
+            msg: blockd_core::protocol::PeerMsg::Page { .. },
             ..
         } => Some(FaultSource::Peer),
         _ => None,
@@ -2438,7 +2436,7 @@ mod tests {
             self: Arc<Self>,
             _key: String,
             _bytes: Vec<u8>,
-        ) -> Result<u64, blockd_core::seam::StoreFault> {
+        ) -> Result<u64, blockd_core::protocol::StoreFault> {
             self.uploads_started.fetch_add(1, Ordering::SeqCst);
             self.release_uploads
                 .acquire()
@@ -2453,7 +2451,7 @@ mod tests {
             _key: String,
             _expected: Option<u64>,
             _bytes: Vec<u8>,
-        ) -> Result<u64, blockd_core::seam::StoreFault> {
+        ) -> Result<u64, blockd_core::protocol::StoreFault> {
             unreachable!("profile only submits unconditional uploads")
         }
 

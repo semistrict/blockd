@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use blockd_core::seam::{IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo};
+use blockd_core::protocol::{IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo};
 use blockd_core::types::{HostId, JournalSeq, SegId, VsetId};
 use blockd_runtime::{PeerConfig, PeerNet};
 

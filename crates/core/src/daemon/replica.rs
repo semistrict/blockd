@@ -11,10 +11,11 @@ use crate::head::{HeadRecord, ManifestPtr, RetiredStash};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf};
 use crate::placement::rank_stash_candidates;
+use crate::protocol::{IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, StoreFault};
 use crate::replica_spool::{
     seal_replica_commit, seal_verified_replica_artifact, verify_replica_artifact,
 };
-use crate::seam::{Effect, IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, StoreFault, TimerId};
+use crate::seam::{Effect, TimerId};
 use crate::segment::{SegmentBatchBuilder, open_entry};
 use crate::types::{HostId, PageId, SegId, VsetId};
 

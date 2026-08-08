@@ -12,10 +12,10 @@
 //! verbatim, damage included (R8.1: the reader decides).
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
+use crate::protocol::{IoId, MAX_OBJECT_BYTES, PeerMsg};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
 };
-use crate::seam::{IoId, MAX_OBJECT_BYTES, PeerMsg};
 use crate::types::{HostId, SegId, VsetId};
 
 pub const MAGIC_PEER: u32 = u32::from_le_bytes(*b"BPM1");

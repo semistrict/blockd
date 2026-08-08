@@ -49,7 +49,8 @@ use crate::journal::{DatabaseMeta, JournalRecord, VsetConfig};
 use crate::layout;
 use crate::mapleaf::LeafPtr;
 use crate::placement::{PeerCandidate, rank_stash_candidates};
-use crate::seam::{Effect, Event, HostMap, IoId, ReqId, TimerId};
+use crate::protocol::{IoId, ReqId};
+use crate::seam::{Effect, Event, HostMap, TimerId};
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
 
@@ -387,7 +388,7 @@ enum Pending {
         source: HostId,
         vset: VsetId,
         assignment_epoch: u64,
-        artifact: crate::seam::ReplicaArtifact,
+        artifact: crate::protocol::ReplicaArtifact,
         checksum: u32,
         bytes: Vec<u8>,
         frame_len: u64,
@@ -396,7 +397,7 @@ enum Pending {
         source: HostId,
         vset: VsetId,
         assignment_epoch: u64,
-        info: crate::seam::ReplicaCommitInfo,
+        info: crate::protocol::ReplicaCommitInfo,
         record_checksum: u32,
         frame_len: u64,
     },
@@ -416,15 +417,15 @@ enum Pending {
     },
     ReplicaUploadArtifact {
         key: ReplicaKey,
-        artifact: crate::seam::ReplicaArtifact,
+        artifact: crate::protocol::ReplicaArtifact,
     },
     ReplicaUploadManifest {
         key: ReplicaKey,
-        info: crate::seam::ReplicaCommitInfo,
+        info: crate::protocol::ReplicaCommitInfo,
     },
     ReplicaHeadCas {
         vset: VsetId,
-        info: crate::seam::ReplicaCommitInfo,
+        info: crate::protocol::ReplicaCommitInfo,
         ptr: ManifestPtr,
         record: JournalRecord,
     },
@@ -436,7 +437,7 @@ enum Pending {
         vset: VsetId,
         assignment: crate::head::StashAssignment,
         retired: crate::head::RetiredStash,
-        info: crate::seam::ReplicaCommitInfo,
+        info: crate::protocol::ReplicaCommitInfo,
     },
     ReplicaHistoryCas {
         vset: VsetId,
@@ -446,7 +447,7 @@ enum Pending {
         source: HostId,
         vset: VsetId,
         assignment_epoch: u64,
-        through: crate::seam::ReplicaCommitInfo,
+        through: crate::protocol::ReplicaCommitInfo,
     },
     ReplicaTailTruncate {
         key: ReplicaKey,
@@ -515,7 +516,7 @@ enum Pending {
     /// Passive-replica sender: local immutable artifact read.
     ReplicaSourceRead {
         vset: VsetId,
-        artifact: crate::seam::ReplicaArtifact,
+        artifact: crate::protocol::ReplicaArtifact,
     },
     /// Head creation CAS at vset creation (backed-up vsets).
     HeadCreate {
@@ -763,21 +764,21 @@ struct Vset {
     store_manifests: BTreeSet<(u64, JournalSeq)>,
     /// Artifacts already acknowledged by the current passive peer. Volatile:
     /// after restart, identical puts are safely re-acknowledged by the peer.
-    peer_artifacts: BTreeSet<crate::seam::ReplicaArtifact>,
-    peer_committed: Option<crate::seam::ReplicaCommitInfo>,
+    peer_artifacts: BTreeSet<crate::protocol::ReplicaArtifact>,
+    peer_committed: Option<crate::protocol::ReplicaCommitInfo>,
     peer_committed_record: Option<JournalRecord>,
     store_published_through: u64,
-    peer_upload_done: Option<(u64, crate::seam::ReplicaCommitInfo, JournalRecord)>,
+    peer_upload_done: Option<(u64, crate::protocol::ReplicaCommitInfo, JournalRecord)>,
     replica_head_inflight: bool,
     replica_assignment_inflight: bool,
     replica_assignment_proposal: Option<ReplicaAssignmentProposal>,
     replica_send: Option<ReplicaSend>,
-    replica_release: Option<(HostId, u64, crate::seam::ReplicaCommitInfo)>,
-    replica_release_queue: VecDeque<(HostId, u64, crate::seam::ReplicaCommitInfo)>,
+    replica_release: Option<(HostId, u64, crate::protocol::ReplicaCommitInfo)>,
+    replica_release_queue: VecDeque<(HostId, u64, crate::protocol::ReplicaCommitInfo)>,
     replica_history_inflight: bool,
     /// Backed-up recovery holds its verdict until the head confirms this
     /// host still owns the vset and local state is not behind the backup.
-    pending_verdict: Option<crate::seam::Verdict>,
+    pending_verdict: Option<crate::protocol::Verdict>,
     /// In-flight base keep (R5.2).
     keep: Option<lineage::BaseKeep>,
     /// This vset was created as a fork of the given base (R5.1).
@@ -785,7 +786,7 @@ struct Vset {
     /// The base's vmstate, if the fork resumes.
     fork_vmstate: Option<u64>,
     /// Reply verdict for a fork, delivered when its first record lands.
-    fork_verdict: Option<crate::seam::Verdict>,
+    fork_verdict: Option<crate::protocol::Verdict>,
     /// Post-resume fault recording toward the next resume set (R6.2).
     resume_recording: Option<Vec<PageId>>,
     /// An in-flight incremental commit capture (2a-full): the unstable set
@@ -806,7 +807,7 @@ struct Vset {
     hydrate_cursor: Option<PageId>,
     /// Reply verdict for an inbound migration, delivered when its first
     /// record lands.
-    migrated_verdict: Option<crate::seam::Verdict>,
+    migrated_verdict: Option<crate::protocol::Verdict>,
     /// Liveness watch state (R9.2), advanced once per writeback tick.
     wedge: Wedge,
     /// The destination won the backed-vset head and is writing its first
@@ -1082,16 +1083,16 @@ struct ReplicaKey {
 
 #[derive(Debug, Default)]
 struct PassiveReplica {
-    artifacts: BTreeMap<crate::seam::ReplicaArtifact, (u32, Vec<u8>)>,
-    uncommitted_artifacts: BTreeSet<crate::seam::ReplicaArtifact>,
-    committed: Option<(crate::seam::ReplicaCommitInfo, u32)>,
-    committed_required: Vec<crate::seam::ReplicaArtifact>,
+    artifacts: BTreeMap<crate::protocol::ReplicaArtifact, (u32, Vec<u8>)>,
+    uncommitted_artifacts: BTreeSet<crate::protocol::ReplicaArtifact>,
+    committed: Option<(crate::protocol::ReplicaCommitInfo, u32)>,
+    committed_required: Vec<crate::protocol::ReplicaArtifact>,
     committed_record: Vec<u8>,
     pending_commit: Option<ReplicaPendingCommit>,
     upload: Option<ReplicaUpload>,
     upload_queue: VecDeque<ReplicaUpload>,
-    uploaded_artifacts: BTreeSet<crate::seam::ReplicaArtifact>,
-    upload_done: Option<crate::seam::ReplicaCommitInfo>,
+    uploaded_artifacts: BTreeSet<crate::protocol::ReplicaArtifact>,
+    upload_done: Option<crate::protocol::ReplicaCommitInfo>,
     upload_done_record: Option<Vec<u8>>,
     archive_timer_armed: bool,
     archive_urgent: bool,
@@ -1114,15 +1115,15 @@ struct ReplicaCompaction {
 
 #[derive(Debug)]
 struct ReplicaPendingCommit {
-    info: crate::seam::ReplicaCommitInfo,
-    required: Vec<crate::seam::ReplicaArtifact>,
+    info: crate::protocol::ReplicaCommitInfo,
+    required: Vec<crate::protocol::ReplicaArtifact>,
     record: Vec<u8>,
 }
 
 #[derive(Debug)]
 struct ReplicaUpload {
-    info: crate::seam::ReplicaCommitInfo,
-    todo: Vec<crate::seam::ReplicaArtifact>,
+    info: crate::protocol::ReplicaCommitInfo,
+    todo: Vec<crate::protocol::ReplicaArtifact>,
     record: Vec<u8>,
     /// Archive-only objects derived from the exact durable spool cut. These
     /// need not be appended back into the recovery spool: a restart derives
@@ -1486,7 +1487,7 @@ impl Daemon {
     fn store_put_done(
         &mut self,
         io: IoId,
-        result: Result<u64, crate::seam::StoreFault>,
+        result: Result<u64, crate::protocol::StoreFault>,
         out: &mut Vec<Effect>,
     ) {
         match self.pending.remove(&io) {
@@ -1524,7 +1525,7 @@ impl Daemon {
     fn store_get_done(
         &mut self,
         io: IoId,
-        result: Result<Option<(u64, Vec<u8>)>, crate::seam::StoreFault>,
+        result: Result<Option<(u64, Vec<u8>)>, crate::protocol::StoreFault>,
         mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
@@ -1610,7 +1611,7 @@ impl Daemon {
             Some(Pending::PeerLeafRead { requester, peer_io }) => {
                 out.push(Effect::PeerSend {
                     to: requester,
-                    msg: crate::seam::PeerMsg::Leaf { io: peer_io, bytes },
+                    msg: crate::protocol::PeerMsg::Leaf { io: peer_io, bytes },
                 });
             }
             _ => out.push(Effect::Abort {

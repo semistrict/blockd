@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 
 /// One get's outcome: `Ok(None)` means the key does not exist — a normal
 /// answer, not a fault.

@@ -7,10 +7,11 @@ use crate::journal::VsetConfig;
 use crate::layout;
 use crate::mapleaf::{LeafPtr, span_of};
 use crate::placement::{PeerCandidate, rank_stash_candidates};
-use crate::seam::{
-    AdminCmd, AdminReply, DetachMode, Effect, Event, HostMap, PeerMsg, ReplicaArtifact,
-    ReplicaCommitInfo, ReqId, StoreFault, Verdict,
+use crate::protocol::{
+    AdminCmd, AdminReply, DetachMode, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, ReqId,
+    StoreFault, Verdict,
 };
+use crate::seam::{Effect, Event, HostMap};
 use crate::segment::SegmentBuilder;
 use crate::types::{HostId, PageNo, VmId, VolumeId, VolumeIdx, page_size};
 
@@ -2145,7 +2146,7 @@ fn assignment_cas_conflict_rereads_authority_without_seeding_a_peer() {
             vset: VSET,
             assignment,
         },
-        Err(crate::seam::StoreFault::CasConflict { actual: Some(9) }),
+        Err(crate::protocol::StoreFault::CasConflict { actual: Some(9) }),
         &mut effects,
     );
     assert!(
@@ -5386,10 +5387,10 @@ impl DatabaseTestStore {
         key: String,
         expected: Option<u64>,
         bytes: Vec<u8>,
-    ) -> Result<u64, crate::seam::StoreFault> {
+    ) -> Result<u64, crate::protocol::StoreFault> {
         let actual = self.objects.get(&key).map(|(version, _)| *version);
         if actual != expected {
-            return Err(crate::seam::StoreFault::CasConflict { actual });
+            return Err(crate::protocol::StoreFault::CasConflict { actual });
         }
         Ok(self.put(key, bytes))
     }
