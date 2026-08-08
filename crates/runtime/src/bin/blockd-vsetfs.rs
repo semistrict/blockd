@@ -5,19 +5,19 @@ mod linux {
 
     use std::collections::BTreeMap;
     use std::fs::{File, OpenOptions};
-    use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::io::{self, BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::{Component, Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use blockd_core::daemon::DaemonConfig;
     use blockd_core::journal::VsetConfig;
-    use blockd_core::seam::{DetachMode, StoreFault};
+    use blockd_core::seam::DetachMode;
     use blockd_core::types::{HostId, VmId, VsetId, millis};
+    use blockd_runtime::directory_store::DirectoryStore;
     use blockd_runtime::vsetfs::VsetFsEndpoint;
-    use blockd_runtime::{GetResult, ObjectStore, Runtime, RuntimeConfig};
+    use blockd_runtime::{ObjectStore, Runtime, RuntimeConfig};
 
     struct Args {
         host: HostId,
@@ -76,140 +76,6 @@ mod linux {
 
     fn invalid(error: impl std::fmt::Display) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
-    }
-
-    struct DirectoryStore {
-        root: PathBuf,
-        lock: Mutex<()>,
-        next_temp: AtomicU64,
-    }
-
-    impl DirectoryStore {
-        fn new(root: PathBuf) -> io::Result<Self> {
-            std::fs::create_dir_all(&root)?;
-            Ok(Self {
-                root,
-                lock: Mutex::new(()),
-                next_temp: AtomicU64::new(1),
-            })
-        }
-
-        fn path(&self, key: &str) -> io::Result<PathBuf> {
-            let key = Path::new(key);
-            if key.is_absolute()
-                || key
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-            {
-                return Err(invalid("invalid object key"));
-            }
-            Ok(self.root.join(key))
-        }
-
-        fn read(path: &Path) -> io::Result<Option<(u64, Vec<u8>)>> {
-            let mut file = match File::open(path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            let mut version = [0; 8];
-            file.read_exact(&mut version)?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            Ok(Some((u64::from_le_bytes(version), bytes)))
-        }
-
-        fn write(&self, path: &Path, version: u64, bytes: &[u8]) -> io::Result<()> {
-            let parent = path
-                .parent()
-                .ok_or_else(|| invalid("object has no parent"))?;
-            std::fs::create_dir_all(parent)?;
-            let temp = parent.join(format!(
-                ".blockd-store-{}-{}",
-                std::process::id(),
-                self.next_temp.fetch_add(1, Ordering::Relaxed)
-            ));
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            file.write_all(&version.to_le_bytes())?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temp, path)?;
-            File::open(parent)?.sync_all()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for DirectoryStore {
-        async fn put(self: Arc<Self>, key: String, bytes: Vec<u8>) -> Result<u64, StoreFault> {
-            let _guard = self.lock.lock().map_err(|_| StoreFault::Unavailable)?;
-            let path = self.path(&key).map_err(|_| StoreFault::Unavailable)?;
-            let version = Self::read(&path)
-                .map_err(|_| StoreFault::Unavailable)?
-                .map_or(1, |(version, _)| version.saturating_add(1));
-            self.write(&path, version, &bytes)
-                .map_err(|_| StoreFault::Unavailable)?;
-            Ok(version)
-        }
-
-        async fn put_cas(
-            self: Arc<Self>,
-            key: String,
-            expected: Option<u64>,
-            bytes: Vec<u8>,
-        ) -> Result<u64, StoreFault> {
-            let _guard = self.lock.lock().map_err(|_| StoreFault::Unavailable)?;
-            let path = self.path(&key).map_err(|_| StoreFault::Unavailable)?;
-            let actual = Self::read(&path)
-                .map_err(|_| StoreFault::Unavailable)?
-                .map(|(version, _)| version);
-            if actual != expected {
-                return Err(StoreFault::CasConflict { actual });
-            }
-            let version = actual.map_or(1, |version| version.saturating_add(1));
-            self.write(&path, version, &bytes)
-                .map_err(|_| StoreFault::Unavailable)?;
-            Ok(version)
-        }
-
-        async fn get(self: Arc<Self>, key: String) -> GetResult {
-            let _guard = self.lock.lock().map_err(|_| StoreFault::Unavailable)?;
-            let path = self.path(&key).map_err(|_| StoreFault::Unavailable)?;
-            Self::read(&path).map_err(|_| StoreFault::Unavailable)
-        }
-
-        async fn get_range(self: Arc<Self>, key: String, offset: u64, len: u64) -> GetResult {
-            let _guard = self.lock.lock().map_err(|_| StoreFault::Unavailable)?;
-            let path = self.path(&key).map_err(|_| StoreFault::Unavailable)?;
-            let Some((version, bytes)) = Self::read(&path).map_err(|_| StoreFault::Unavailable)?
-            else {
-                return Ok(None);
-            };
-            let start = usize::try_from(offset).map_err(|_| StoreFault::Unavailable)?;
-            if start >= bytes.len() {
-                return Ok(None);
-            }
-            let end = start
-                .saturating_add(usize::try_from(len).unwrap_or(usize::MAX))
-                .min(bytes.len());
-            Ok(Some((version, bytes[start..end].to_vec())))
-        }
-
-        async fn delete(self: Arc<Self>, key: String) {
-            let Ok(_guard) = self.lock.lock() else { return };
-            let Ok(path) = self.path(&key) else { return };
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    if let Some(parent) = path.parent() {
-                        let _ = File::open(parent).and_then(|dir| dir.sync_all());
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => {}
-            }
-        }
     }
 
     fn remove_socket(path: &Path) -> io::Result<()> {

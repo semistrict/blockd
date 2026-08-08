@@ -13,15 +13,91 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blockd_runtime::fc::{FcVm, ShmemServer, upload_mem_parts};
-use blockd_runtime::{S3LatencyModel, S3Store};
+use blockd_core::seam::StoreFault;
+use blockd_runtime::fc::{FcVm, ShmemServer, upload_mem_parts, upload_mem_parts_async};
+use blockd_runtime::{GetResult, ObjectStore, S3LatencyModel, S3Store};
 
 const MEM_MIB: u32 = 128;
 const ARENA_PAGES: u32 = 4096; // 16 MiB guest working set
 const PART_BYTES: u64 = 8 * 1024 * 1024; // segment-object size for S3 parts
+
+#[derive(Default)]
+struct UploadProbe {
+    in_flight: AtomicU64,
+    max_in_flight: AtomicU64,
+    puts: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for UploadProbe {
+    async fn put(self: Arc<Self>, _key: String, bytes: Vec<u8>) -> Result<u64, StoreFault> {
+        let current = self
+            .in_flight
+            .fetch_add(bytes.len() as u64, Ordering::SeqCst)
+            + bytes.len() as u64;
+        self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        self.in_flight
+            .fetch_sub(bytes.len() as u64, Ordering::SeqCst);
+        Ok(self.puts.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    async fn put_cas(
+        self: Arc<Self>,
+        _key: String,
+        _expected: Option<u64>,
+        _bytes: Vec<u8>,
+    ) -> Result<u64, StoreFault> {
+        unreachable!()
+    }
+
+    async fn get(self: Arc<Self>, _key: String) -> GetResult {
+        unreachable!()
+    }
+
+    async fn get_range(self: Arc<Self>, _key: String, _offset: u64, _len: u64) -> GetResult {
+        unreachable!()
+    }
+
+    async fn delete(self: Arc<Self>, _key: String) {
+        unreachable!()
+    }
+}
+
+#[test]
+#[ignore = "performance profile; run explicitly in release mode"]
+fn profile_streaming_snapshot_upload() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let memory = scratch.path().join("memory");
+    std::fs::File::create(&memory)
+        .expect("memory file")
+        .set_len(u64::from(MEM_MIB) * 1024 * 1024)
+        .expect("size memory file");
+    let store = Arc::new(UploadProbe::default());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let started = Instant::now();
+    let parts = runtime.block_on(upload_mem_parts_async(
+        store.clone(),
+        memory,
+        "snapshot/mem".to_owned(),
+        PART_BYTES,
+    ));
+    let elapsed = started.elapsed();
+    let max_in_flight = store.max_in_flight.load(Ordering::SeqCst);
+    assert_eq!(parts, 16);
+    assert!(max_in_flight <= PART_BYTES * 8);
+    eprintln!(
+        "streamed 128 MiB as {parts} parts in {:.1}ms; at most {:.1} MiB in upload futures",
+        elapsed.as_secs_f64() * 1_000.0,
+        max_in_flight as f64 / 1024.0 / 1024.0,
+    );
+}
 
 struct Artifacts {
     fc: PathBuf,

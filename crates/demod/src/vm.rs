@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
@@ -28,6 +28,15 @@ pub const GUEST_FILL_PAGES: u32 = 512;
 pub const VSET_PAGES: u32 = 256;
 /// Data words the mirror writes per burst (page 0 is the burst counter).
 pub const MIRROR_PAGES: u32 = 63;
+
+#[allow(clippy::struct_field_names)]
+pub struct MigrationTimings {
+    pub snapshot_write_ms: u128,
+    pub publish_ms: u128,
+    pub handoff_ms: u128,
+    pub total_ms: u128,
+    pub overlap_ms: u128,
+}
 
 fn vset_config(backed: bool) -> VsetConfig {
     VsetConfig::compute(1, VSET_PAGES, backed)
@@ -191,6 +200,38 @@ impl Demod {
                 bytes,
             ))
             .expect("publish vmstate");
+        tokio::runtime::Handle::current()
+            .block_on(GcsStore::put(
+                self.store.as_ref(),
+                &format!("{prefix}/ready"),
+                Vec::new(),
+            ))
+            .expect("publish snapshot readiness");
+    }
+
+    fn snapshot_generation(&self, prefix: &str) -> Option<u64> {
+        tokio::runtime::Handle::current()
+            .block_on(GcsStore::get(
+                self.store.as_ref(),
+                &format!("{prefix}/ready"),
+            ))
+            .expect("store up")
+            .map(|(generation, _)| generation)
+    }
+
+    fn wait_snapshot_after(&self, prefix: &str, previous: Option<u64>) {
+        let deadline = Instant::now() + Duration::from_mins(5);
+        loop {
+            let current = self.snapshot_generation(prefix);
+            if current.is_some() && current != previous {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "migration snapshot was not published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The fill server for a snapshot prefix — one per host per prefix;
@@ -395,13 +436,15 @@ impl Demod {
     /// from the snapshot the source published.
     #[tracing::instrument(skip(self, ready), fields(vm_id = id))]
     pub fn expect(self: &Arc<Demod>, id: u64, ready: impl FnOnce()) {
+        let prefix = format!("vm{id}/mig");
+        let previous_snapshot = self.snapshot_generation(&prefix);
         self.rt.expect_migration(VsetId(id), vset_config(false));
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
                 state: "expecting".to_owned(),
                 backed: false,
-                prefix: format!("vm{id}/mig"),
+                prefix: prefix.clone(),
                 fc: None,
             },
         );
@@ -413,7 +456,9 @@ impl Demod {
                 matches!(verdict, Verdict::Resume { .. }),
                 "migration verdict {verdict:?}"
             );
-            let mut fc = self.boot_from(id, &format!("vm{id}/mig"));
+            self.wait_snapshot_after(&prefix, previous_snapshot);
+            self.servers.lock().expect("lock").remove(&prefix);
+            let mut fc = self.boot_from(id, &prefix);
             fc.cmd("ping", "PONG");
             let mut vms = self.vms.lock().expect("lock");
             let vm = vms.get_mut(&id).expect("expected vm");
@@ -424,10 +469,10 @@ impl Demod {
     }
 
     /// Source side: pause + snapshot the microVM, publish it, kill it,
-    /// and live-migrate the vset over TCP. Returns milliseconds spent
-    /// (snapshot+publish, migrate handoff).
+    /// and live-migrate the vset over TCP. Snapshot publication and the vset
+    /// handoff overlap; the returned timings expose the saved serial time.
     #[tracing::instrument(skip(self), fields(vm_id = id, destination_host = to))]
-    pub fn migrate(&self, id: u64, to: u16) -> (u128, u128) {
+    pub fn migrate(&self, id: u64, to: u16) -> MigrationTimings {
         let vmstate = self.cfg.scratch.join(format!("mig-{id}.vmstate"));
         let mem = self.cfg.scratch.join(format!("mig-{id}.mem"));
         let _ = std::fs::remove_file(&vmstate);
@@ -439,12 +484,25 @@ impl Demod {
             fc.pause();
             fc.snapshot(&vmstate, &mem);
         }
-        self.publish_snapshot(&format!("vm{id}/mig"), &vmstate, &mem);
-        let snap_ms = snap_started.elapsed().as_millis();
-
-        let handoff_started = Instant::now();
-        self.rt.migrate_out(VsetId(id), HostId(to));
-        let handoff_ms = handoff_started.elapsed().as_millis();
+        let snapshot_write_ms = snap_started.elapsed().as_millis();
+        let prefix = format!("vm{id}/mig");
+        let runtime = tokio::runtime::Handle::current();
+        let (publish_ms, handoff_ms) = std::thread::scope(|scope| {
+            let publisher = scope.spawn(|| {
+                let _runtime = runtime.enter();
+                let publish_started = Instant::now();
+                self.publish_snapshot(&prefix, &vmstate, &mem);
+                publish_started.elapsed().as_millis()
+            });
+            let handoff_started = Instant::now();
+            self.rt.migrate_out(VsetId(id), HostId(to));
+            let handoff_ms = handoff_started.elapsed().as_millis();
+            let publish_ms = publisher.join().expect("snapshot publisher");
+            (publish_ms, handoff_ms)
+        });
+        let total_ms = snap_started.elapsed().as_millis();
+        let serial_ms = snapshot_write_ms + publish_ms + handoff_ms;
+        let overlap_ms = serial_ms.saturating_sub(total_ms);
         let mut vms = self.vms.lock().expect("lock");
         let vm = vms.get_mut(&id).expect("vm");
         if let Some(fc) = vm.fc.take()
@@ -456,11 +514,20 @@ impl Demod {
         tracing::info!(
             vm_id = id,
             destination_host = to,
-            snapshot_ms = snap_ms,
+            snapshot_write_ms,
+            publish_ms,
             handoff_ms,
+            total_ms,
+            overlap_ms,
             "outbound migration completed"
         );
-        (snap_ms, handoff_ms)
+        MigrationTimings {
+            snapshot_write_ms,
+            publish_ms,
+            handoff_ms,
+            total_ms,
+            overlap_ms,
+        }
     }
 
     /// After the owning host died: restore a backed vset from the store

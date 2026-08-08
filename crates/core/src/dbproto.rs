@@ -99,6 +99,10 @@ pub fn encode_request(request: &DatabaseRequest) -> Vec<u8> {
             e.u8(8);
             e.u64(*handle);
         }
+        DatabaseOp::Stat { file } => {
+            e.u8(9);
+            encode_file(&mut e, *file);
+        }
     }
     seal_frame(MAGIC_DATABASE_REQUEST, &e.finish())
 }
@@ -172,6 +176,9 @@ pub fn decode_request(vm: VmId, bytes: &[u8]) -> Result<DatabaseRequest, DecodeE
             file: decode_file(&mut d)?,
         },
         8 => DatabaseOp::Sync { handle: d.u64()? },
+        9 => DatabaseOp::Stat {
+            file: decode_file(&mut d)?,
+        },
         _ => return Err(DecodeError),
     };
     d.finish()?;
@@ -259,6 +266,11 @@ pub fn encode_reply(reply: &DatabaseReply) -> Vec<u8> {
             e.u8(9);
             e.u8(encode_error(*error));
         }
+        DatabaseReply::Stat { exists, size, .. } => {
+            e.u8(10);
+            e.u8(u8::from(*exists));
+            e.u64(*size);
+        }
     }
     seal_frame(MAGIC_DATABASE_REPLY, &e.finish())
 }
@@ -324,6 +336,15 @@ pub fn decode_reply(bytes: &[u8]) -> Result<DatabaseReply, DecodeError> {
             req,
             error: decode_error(d.u8()?)?,
         },
+        10 => DatabaseReply::Stat {
+            req,
+            exists: match d.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError),
+            },
+            size: d.u64()?,
+        },
         _ => return Err(DecodeError),
     };
     d.finish()?;
@@ -372,6 +393,9 @@ mod tests {
                 file: DatabaseFile::Journal,
             },
             DatabaseOp::Sync { handle: 1 },
+            DatabaseOp::Stat {
+                file: DatabaseFile::Main,
+            },
         ];
         ops.into_iter()
             .enumerate()
@@ -421,6 +445,11 @@ mod tests {
                 req: ReqId(9),
                 error: DatabaseError::StaleAttachment,
             },
+            DatabaseReply::Stat {
+                req: ReqId(10),
+                exists: true,
+                size: 1234,
+            },
         ]
     }
 
@@ -442,10 +471,10 @@ mod tests {
     fn layouts_are_byte_pinned() {
         let request_bytes: Vec<u8> = requests().iter().flat_map(encode_request).collect();
         let reply_bytes: Vec<u8> = replies().iter().flat_map(encode_reply).collect();
-        assert_eq!(request_bytes.len(), 480);
-        assert_eq!(crc32c(&request_bytes), 0x6711_7B9D);
-        assert_eq!(reply_bytes.len(), 306);
-        assert_eq!(crc32c(&reply_bytes), 0x56B5_6FEE);
+        assert_eq!(request_bytes.len(), 520);
+        assert_eq!(crc32c(&request_bytes), 0x0523_3CD2);
+        assert_eq!(reply_bytes.len(), 338);
+        assert_eq!(crc32c(&reply_bytes), 0x998A_D168);
     }
 
     #[test]

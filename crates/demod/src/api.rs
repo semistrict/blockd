@@ -380,13 +380,16 @@ async fn migrate(
 ) -> ApiResult<Json<Value>> {
     let id = parse_id(&id)?;
     let to = u16::try_from(arg(&query, "to", 1)).map_err(|_| ApiError::bad_request("bad to"))?;
-    let (snapshot_ms, handoff_ms) =
-        run_blocking(&state, move |daemon| daemon.migrate(id, to)).await?;
+    let timings = run_blocking(&state, move |daemon| daemon.migrate(id, to)).await?;
     Ok(Json(json!({
         "id": id,
         "to": to,
-        "snapshot_ms": snapshot_ms,
-        "handoff_ms": handoff_ms,
+        "snapshot_ms": timings.snapshot_write_ms + timings.publish_ms,
+        "snapshot_write_ms": timings.snapshot_write_ms,
+        "publish_ms": timings.publish_ms,
+        "handoff_ms": timings.handoff_ms,
+        "migration_ms": timings.total_ms,
+        "overlap_ms": timings.overlap_ms,
     })))
 }
 

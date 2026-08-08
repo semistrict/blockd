@@ -1298,8 +1298,8 @@ index 0cd6d46..0c7c6b1 100644
  /// Number of queues for the vhost-user block device.
  pub const NUM_QUEUES: u64 = 1;
  
-+/// The high-priority queue plus one request queue used by virtio-fs.
-+pub const FS_NUM_QUEUES: u64 = 2;
++/// The high-priority queue plus four request queues used by virtio-fs.
++pub const FS_NUM_QUEUES: u64 = 5;
 +
  /// Queue size for the vhost-user block device.
  pub const QUEUE_SIZE: u16 = 256;

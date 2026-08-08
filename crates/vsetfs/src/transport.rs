@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 use fuse_backend_rs::api::server::Server;
@@ -27,10 +27,8 @@ use crate::{DatabaseIo, VsetFilesystem};
 use blockd_core::vsetfs::DaxMapping;
 
 const MAX_TAG_LEN: usize = 36;
-const REQUEST_QUEUES: u32 = 1;
+const REQUEST_QUEUES: u32 = 4;
 const MAX_QUEUE_SIZE: usize = 32_768;
-const HIPRIO_QUEUE_EVENT: u16 = 0;
-const REQUEST_QUEUE_EVENT: u16 = 1;
 const VIRTIO_F_VERSION_1: u64 = 32;
 const VIRTIO_RING_F_INDIRECT_DESC: u64 = 28;
 const MAX_SNAPSHOT_BYTES: u64 = 80 * 1024 * 1024;
@@ -96,7 +94,7 @@ impl FsCacheReqHandler for DaxRequest {
     }
 }
 
-/// The high-priority queue plus one normal request queue.
+/// The high-priority queue plus the configured request queues.
 pub const VHOST_USER_FS_QUEUES: usize = REQUEST_QUEUES as usize + 1;
 
 type GuestMemory = GuestMemoryMmap<()>;
@@ -113,7 +111,9 @@ struct BackendInner<I: DatabaseIo> {
     backend_req: Mutex<Option<Backend>>,
     dax_map_count: Arc<AtomicU64>,
     dax_unmap_count: Arc<AtomicU64>,
-    exit_event: (EventConsumer, EventNotifier),
+    active_requests: Mutex<usize>,
+    requests_idle: Condvar,
+    exit_events: Vec<(EventConsumer, EventNotifier)>,
     config: [u8; MAX_TAG_LEN + size_of::<u32>()],
 }
 
@@ -141,7 +141,9 @@ impl<I: DatabaseIo> VsetFsBackend<I> {
         let mut config = [0_u8; MAX_TAG_LEN + size_of::<u32>()];
         config[..tag.len()].copy_from_slice(tag.as_bytes());
         config[MAX_TAG_LEN..].copy_from_slice(&REQUEST_QUEUES.to_le_bytes());
-        let exit_event = new_event_consumer_and_notifier(EventFlag::NONBLOCK)?;
+        let exit_events = (0..VHOST_USER_FS_QUEUES)
+            .map(|_| new_event_consumer_and_notifier(EventFlag::NONBLOCK))
+            .collect::<io::Result<Vec<_>>>()?;
 
         Ok(Self {
             inner: Arc::new(BackendInner {
@@ -154,7 +156,9 @@ impl<I: DatabaseIo> VsetFsBackend<I> {
                 backend_req: Mutex::new(None),
                 dax_map_count: Arc::new(AtomicU64::new(0)),
                 dax_unmap_count: Arc::new(AtomicU64::new(0)),
-                exit_event,
+                active_requests: Mutex::new(0),
+                requests_idle: Condvar::new(),
+                exit_events,
                 config,
             }),
         })
@@ -213,7 +217,10 @@ impl<I: DatabaseIo> VsetFsBackend<I> {
     /// Wake the worker's epoll loop so an owner can join the backend after
     /// the frontend has disconnected.
     pub fn shutdown(&self) -> io::Result<()> {
-        self.inner.exit_event.1.notify()
+        for (_, notifier) in &self.inner.exit_events {
+            notifier.notify()?;
+        }
+        Ok(())
     }
 
     fn process_queue(&self, vring: &VringRwLock<AtomicGuestMemory>) -> io::Result<()> {
@@ -300,7 +307,16 @@ impl<I: DatabaseIo> VsetFsBackend<I> {
             ));
         }
 
+        let mut active = self.inner.active_requests.lock().map_err(|_| poisoned())?;
         self.inner.frozen.store(true, Ordering::Release);
+        while *active != 0 {
+            active = self
+                .inner
+                .requests_idle
+                .wait(active)
+                .map_err(|_| poisoned())?;
+        }
+        drop(active);
         let filesystem = Arc::clone(&self.inner.filesystem);
         let handle = match direction {
             VhostTransferStateDirection::SAVE => thread::spawn(move || {
@@ -401,21 +417,22 @@ impl<I: DatabaseIo> VhostUserBackend for VsetFsBackend<I> {
         self.inner.event_idx.store(enabled, Ordering::Release);
     }
 
+    fn queues_per_thread(&self) -> Vec<u64> {
+        (0..VHOST_USER_FS_QUEUES)
+            .map(|queue| 1_u64 << queue)
+            .collect()
+    }
+
     fn exit_event(&self, thread_index: usize) -> Option<(EventConsumer, EventNotifier)> {
-        (thread_index == 0).then(|| {
-            (
-                self.inner
-                    .exit_event
-                    .0
-                    .try_clone()
-                    .expect("clone exit-event consumer"),
-                self.inner
-                    .exit_event
-                    .1
-                    .try_clone()
-                    .expect("clone exit-event notifier"),
-            )
-        })
+        self.inner
+            .exit_events
+            .get(thread_index)
+            .map(|(consumer, notifier)| {
+                (
+                    consumer.try_clone().expect("clone exit-event consumer"),
+                    notifier.try_clone().expect("clone exit-event notifier"),
+                )
+            })
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -460,26 +477,26 @@ impl<I: DatabaseIo> VhostUserBackend for VsetFsBackend<I> {
                 "virtqueue event is not readable",
             ));
         }
+        let mut active = self.inner.active_requests.lock().map_err(|_| poisoned())?;
         if self.inner.frozen.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "filesystem is frozen for snapshot",
             ));
         }
-        let index = match device_event {
-            HIPRIO_QUEUE_EVENT => 0,
-            REQUEST_QUEUE_EVENT => 1,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unknown virtqueue event",
-                ));
-            }
-        };
-        let vring = vrings
+        *active += 1;
+        drop(active);
+        let index = usize::from(device_event);
+        let result = vrings
             .get(index)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "virtqueue is missing"))?;
-        self.process_queue(vring)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "virtqueue is missing"))
+            .and_then(|vring| self.process_queue(vring));
+        let mut active = self.inner.active_requests.lock().map_err(|_| poisoned())?;
+        *active = active.checked_sub(1).expect("active request count");
+        if *active == 0 {
+            self.inner.requests_idle.notify_all();
+        }
+        result
     }
 
     fn set_device_state_fd(
@@ -567,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn config_contains_tag_and_one_request_queue() {
+    fn config_contains_tag_and_parallel_request_queues() {
         let backend = backend(VmId(5), false);
         assert_eq!(&backend.get_config(0, 5), b"vsets");
         assert_eq!(
@@ -575,6 +592,7 @@ mod tests {
             REQUEST_QUEUES.to_le_bytes()
         );
         assert_eq!(backend.get_config(100, 3), vec![0, 0, 0]);
+        assert_eq!(backend.queues_per_thread(), [1, 2, 4, 8, 16]);
     }
 
     #[test]

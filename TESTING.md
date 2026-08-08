@@ -30,6 +30,9 @@ cargo test --release -p blockd-runtime --test perf_decider profile_huge_vset_cap
 # Replica artifact preparation: old inline-equivalent time versus bounded
 # peer-I/O queue submission and worker completion.
 cargo test --release -p blockd-core --test perf_replica -- --ignored --nocapture
+
+# Directory-backed store: 8192 bounded 4 KiB reads from one 32 MiB object.
+cargo test --release -p blockd-runtime profile_bounded_directory_range_reads -- --ignored --nocapture
 ```
 
 On Linux, the real-userfaultfd noisy-neighbor profile adds end-to-end probe
@@ -38,7 +41,27 @@ latency, event-loop occupancy, and mean on-loop fill dispatch time:
 ```sh
 cargo test --release -p blockd-runtime --test loop_interference_linux \
   profile_probe_latency_under_noisy_neighbors -- --nocapture
+
+# 128 MiB snapshot upload: elapsed time and maximum bytes held by concurrent
+# upload futures. This profile does not require Firecracker artifacts.
+cargo test --release -p blockd-runtime --test fc_perf_linux \
+  profile_streaming_snapshot_upload -- --ignored --nocapture
+
+# vsetfs metadata request count plus clean and one-page-dirty 8 MiB DAX fsync.
+cargo test --release -p blockd-vsetfs \
+  profile_metadata_and_dax_writeback_shape -- --ignored --nocapture
+
+# Real guest comparison: one active request worker versus four request queues
+# and four independent database vsets. Requires BLOCKD_FC_DIR artifacts.
+cargo test --release -p blockd-runtime --test fc_virtiofs_sqlite_e2e_linux \
+  profile_parallel_virtiofs_request_queues -- --ignored --nocapture
 ```
+
+The demo migration response also reports `snapshot_write_ms`, `publish_ms`,
+`handoff_ms`, total `migration_ms`, and `overlap_ms`. Use those fields to
+compare the same 128 MiB guest and store-latency configuration across builds;
+`overlap_ms` is the serial blackout removed by concurrent publication and
+handoff.
 
 Keep the same machine, build profile, CPU governor, and background load when
 comparing revisions. The printed shape assertions ensure the intended path ran;

@@ -87,6 +87,10 @@ pub enum DatabaseOp {
     Access {
         file: DatabaseFile,
     },
+    /// Read existence and size without creating a temporary open handle.
+    Stat {
+        file: DatabaseFile,
+    },
     Delete {
         file: DatabaseFile,
     },
@@ -141,6 +145,11 @@ pub enum DatabaseReply {
         req: ReqId,
         exists: bool,
     },
+    Stat {
+        req: ReqId,
+        exists: bool,
+        size: u64,
+    },
     Deleted {
         req: ReqId,
         sequence: u64,
@@ -165,6 +174,7 @@ impl DatabaseReply {
             | DatabaseReply::Truncated { req, .. }
             | DatabaseReply::FileSize { req, .. }
             | DatabaseReply::Access { req, .. }
+            | DatabaseReply::Stat { req, .. }
             | DatabaseReply::Deleted { req, .. }
             | DatabaseReply::Synced { req, .. }
             | DatabaseReply::Failed { req, .. } => req,
@@ -184,6 +194,7 @@ impl DatabaseReply {
             | DatabaseReply::Truncated { req, .. }
             | DatabaseReply::FileSize { req, .. }
             | DatabaseReply::Access { req, .. }
+            | DatabaseReply::Stat { req, .. }
             | DatabaseReply::Deleted { req, .. }
             | DatabaseReply::Synced { req, .. }
             | DatabaseReply::Failed { req, .. } => *req = replacement,

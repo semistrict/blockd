@@ -875,6 +875,7 @@ mod tests {
     }
 
     impl Model {
+        #[allow(clippy::too_many_lines)]
         fn execute(&mut self, req: blockd_core::seam::ReqId, op: DatabaseOp) -> DatabaseReply {
             match op {
                 DatabaseOp::Open {
@@ -956,6 +957,14 @@ mod tests {
                     req,
                     exists: self.files.get(&file).is_some_and(|file| file.exists),
                 },
+                DatabaseOp::Stat { file } => {
+                    let model = self.files.get(&file);
+                    DatabaseReply::Stat {
+                        req,
+                        exists: model.is_some_and(|file| file.exists),
+                        size: model.map_or(0, |file| file.bytes.len() as u64),
+                    }
+                }
                 DatabaseOp::Delete { file } => {
                     self.files.insert(file, FileModel::default());
                     self.sequence += 1;

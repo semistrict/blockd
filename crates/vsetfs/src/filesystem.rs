@@ -11,7 +11,7 @@ use blockd_core::database::{
     DatabaseError, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest,
 };
 use blockd_core::seam::ReqId;
-use blockd_core::types::VsetId;
+use blockd_core::types::{VsetId, page_size};
 use blockd_core::vsetfs::{
     AttachedExport, ByteRangeLock, DaxMapping, Node, NodeKind, ROOT_INODE, VSETS_INODE,
     VsetFsError, VsetFsFile, VsetFsState,
@@ -22,6 +22,8 @@ use fuse_backend_rs::api::filesystem::{
     Context, DirEntry, Entry, FileLock, FileSystem, ZeroCopyReader, ZeroCopyWriter,
 };
 use fuse_backend_rs::transport::FsCacheReqHandler;
+
+use crate::transport::DAX_WINDOW_SIZE;
 
 const ATTR_TIMEOUT: Duration = Duration::from_mins(1);
 const ENTRY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -65,6 +67,9 @@ pub struct VsetFilesystem<I> {
     io: I,
     next_request: AtomicU64,
     shm_dax: Mutex<std::collections::BTreeMap<u64, File>>,
+    /// Exact clean-page shadows for the bounded DAX window. Comparing bytes
+    /// avoids both full-range rewrites and hash-collision data loss.
+    dax_clean: Mutex<std::collections::BTreeMap<(u64, u64), Vec<u8>>>,
 }
 
 impl<I: DatabaseIo> VsetFilesystem<I> {
@@ -74,6 +79,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
             io,
             next_request: AtomicU64::new(1),
             shm_dax: Mutex::new(std::collections::BTreeMap::new()),
+            dax_clean: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -340,49 +346,14 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
     }
 
     fn durable_size(&self, node: Node, file: DatabaseFile) -> io::Result<u64> {
-        let handle = {
-            let mut state = self.lock_state()?;
-            state
-                .open(node.inode, libc::O_RDONLY as u32)
-                .map_err(vset_error)?
-        };
-        let opened = self.request(
-            node,
-            DatabaseOp::Open {
-                handle: handle.handle,
-                file,
-                create: false,
-            },
-        );
-        if let Err(error) = opened {
-            self.lock_state()?
-                .close(handle.handle)
-                .map_err(vset_error)?;
-            return Err(error);
-        }
-        let result = self
-            .request(
-                node,
-                DatabaseOp::FileSize {
-                    handle: handle.handle,
-                },
-            )
-            .and_then(|reply| match reply {
-                DatabaseReply::FileSize { size, .. } => Ok(size),
-                _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-            });
-        let close = self.request(
-            node,
-            DatabaseOp::Close {
-                handle: handle.handle,
-            },
-        );
-        self.lock_state()?
-            .close(handle.handle)
-            .map_err(vset_error)?;
-        match result {
-            Ok(size) => close.map(|_| size),
-            Err(error) => Err(error),
+        match self.request(node, DatabaseOp::Stat { file })? {
+            DatabaseReply::Stat {
+                exists: true, size, ..
+            } => Ok(size),
+            DatabaseReply::Stat { exists: false, .. } => {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            }
+            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
         }
     }
 
@@ -560,6 +531,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                     break;
                 }
             }
+            self.remember_dax_clean(node.inode, &backing, base, offset, len)?;
             return Ok((backing, base));
         }
 
@@ -580,6 +552,82 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
             entry.insert(backing);
         }
         Ok((files[&node.inode].try_clone()?, 0))
+    }
+
+    fn remember_dax_clean(
+        &self,
+        inode: u64,
+        backing: &File,
+        base: u64,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
+        let page_bytes = page_size() as u64;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let mut clean = Vec::new();
+        let mut cursor = offset;
+        while cursor < end {
+            let take = usize::try_from((end - cursor).min(page_bytes)).expect("page sized");
+            let mut bytes = vec![0; take];
+            backing.read_exact_at(&mut bytes, base + cursor)?;
+            clean.push(((inode, cursor), bytes));
+            cursor += take as u64;
+        }
+        let mut shadows = self
+            .dax_clean
+            .lock()
+            .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+        shadows.extend(clean);
+        Self::bound_dax_clean(&mut shadows);
+        Ok(())
+    }
+
+    fn bound_dax_clean(clean: &mut std::collections::BTreeMap<(u64, u64), Vec<u8>>) {
+        let max_pages = usize::try_from(
+            DAX_WINDOW_SIZE / u64::try_from(page_size()).expect("page size fits u64"),
+        )
+        .expect("DAX page count fits usize");
+        while clean.len() > max_pages {
+            clean.pop_first();
+        }
+    }
+
+    fn submit_dax_write(
+        &self,
+        node: Node,
+        handle: u64,
+        offset: Option<u64>,
+        bytes: &mut Vec<u8>,
+        clean_pages: &mut Vec<(u64, Vec<u8>)>,
+    ) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let offset = offset.expect("nonempty DAX batch has an offset");
+        let payload = std::mem::take(bytes);
+        match self.request(
+            node,
+            DatabaseOp::Write {
+                handle,
+                offset,
+                bytes: payload,
+            },
+        )? {
+            DatabaseReply::Written { .. } => {
+                let mut clean = self
+                    .dax_clean
+                    .lock()
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?;
+                for (page_offset, bytes) in clean_pages.drain(..) {
+                    clean.insert((node.inode, page_offset), bytes);
+                }
+                Self::bound_dax_clean(&mut clean);
+                Ok(())
+            }
+            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+        }
     }
 
     fn flush_dax_inode(&self, node: Node, file: VsetFsFile, handle: u64) -> io::Result<()> {
@@ -603,30 +651,62 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                 .vset
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
             let (backing, base) = self.io.dax_file(vset, durable)?;
+            let mut pages = std::collections::BTreeSet::new();
             for mapping in mappings {
                 let end = (mapping.file_offset + mapping.len).min(size);
                 let mut cursor = mapping.file_offset;
                 while cursor < end {
-                    let take = usize::try_from(
-                        (end - cursor).min(blockd_core::database::MAX_DATABASE_IO as u64),
-                    )
-                    .expect("bounded by database request limit");
-                    let mut bytes = vec![0; take];
-                    backing.read_exact_at(&mut bytes, base + cursor)?;
-                    match self.request(
-                        node,
-                        DatabaseOp::Write {
-                            handle,
-                            offset: cursor,
-                            bytes,
-                        },
-                    )? {
-                        DatabaseReply::Written { .. } => {}
-                        _ => return Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                    }
-                    cursor += take as u64;
+                    pages.insert(cursor);
+                    cursor += (end - cursor).min(page_size() as u64);
                 }
             }
+            let mut batch_offset = None;
+            let mut batch = Vec::new();
+            let mut clean_pages = Vec::new();
+            for cursor in pages {
+                let take =
+                    usize::try_from((size - cursor).min(page_size() as u64)).expect("page sized");
+                let mut bytes = vec![0; take];
+                backing.read_exact_at(&mut bytes, base + cursor)?;
+                let unchanged = self
+                    .dax_clean
+                    .lock()
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EIO))?
+                    .get(&(node.inode, cursor))
+                    .is_some_and(|clean| *clean == bytes);
+                if unchanged {
+                    self.submit_dax_write(
+                        node,
+                        handle,
+                        batch_offset,
+                        &mut batch,
+                        &mut clean_pages,
+                    )?;
+                    batch_offset = None;
+                    continue;
+                }
+                let contiguous =
+                    batch_offset.is_some_and(|start| start + batch.len() as u64 == cursor);
+                if !batch.is_empty()
+                    && (!contiguous
+                        || batch.len() + bytes.len() > blockd_core::database::MAX_DATABASE_IO)
+                {
+                    self.submit_dax_write(
+                        node,
+                        handle,
+                        batch_offset,
+                        &mut batch,
+                        &mut clean_pages,
+                    )?;
+                    batch_offset = None;
+                }
+                if batch_offset.is_none() {
+                    batch_offset = Some(cursor);
+                }
+                batch.extend_from_slice(&bytes);
+                clean_pages.push((cursor, bytes));
+            }
+            self.submit_dax_write(node, handle, batch_offset, &mut batch, &mut clean_pages)?;
         } else {
             let name = self.shm_name(node.inode)?;
             let size = self.lock_state()?.shm(&name).map_or(0, <[u8]>::len);
@@ -794,10 +874,10 @@ impl<I: DatabaseIo> FileSystem for VsetFilesystem<I> {
             .lock_state()?
             .lookup(parent, name)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-        if let NodeKind::File(file) = node.kind {
-            let exists = if let Some(durable) = file.durable_file() {
-                self.durable_exists(node, durable)?
-            } else {
+        if let NodeKind::File(file) = node.kind
+            && file.durable_file().is_none()
+        {
+            let exists = {
                 let state = self.lock_state()?;
                 state
                     .export_name(node.inode)
@@ -1465,6 +1545,8 @@ mod tests {
         handles: BTreeMap<u64, DatabaseFile>,
         sequence: u64,
         syncs: u64,
+        writes: u64,
+        requests: u64,
         restored_attachments: Vec<(VsetId, AttachmentId)>,
     }
 
@@ -1478,6 +1560,7 @@ mod tests {
         fn request(&self, request: DatabaseRequest) -> DatabaseReply {
             let req = request.req;
             let mut state = self.state.lock().unwrap();
+            state.requests += 1;
             match request.op {
                 DatabaseOp::Open {
                     handle,
@@ -1547,6 +1630,7 @@ mod tests {
                     let file_bytes = state.files.get_mut(&file).unwrap();
                     file_bytes.resize(file_bytes.len().max(end), 0);
                     file_bytes[start..end].copy_from_slice(&bytes);
+                    state.writes += 1;
                     state.sequence += 1;
                     DatabaseReply::Written {
                         req,
@@ -1586,6 +1670,11 @@ mod tests {
                 DatabaseOp::Access { file } => DatabaseReply::Access {
                     req,
                     exists: state.files.contains_key(&file),
+                },
+                DatabaseOp::Stat { file } => DatabaseReply::Stat {
+                    req,
+                    exists: state.files.contains_key(&file),
+                    size: state.files.get(&file).map_or(0, |bytes| bytes.len() as u64),
                 },
                 DatabaseOp::Delete { file } => {
                     state.files.remove(&file);
@@ -1862,6 +1951,173 @@ mod tests {
         let fake = fs.io.state.lock().unwrap();
         assert_eq!(fake.syncs, 1);
         assert!(fake.handles.is_empty());
+    }
+
+    #[test]
+    fn durable_lookup_and_getattr_each_use_one_metadata_request() {
+        let (fs, directory) = filesystem();
+        let ctx = Context::new();
+        let (entry, _, _, _) = fs
+            .create(
+                &ctx,
+                directory,
+                c"database.sqlite",
+                CreateIn {
+                    flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+                    mode: 0o600,
+                    ..CreateIn::default()
+                },
+            )
+            .unwrap();
+        fs.io.state.lock().unwrap().requests = 0;
+        fs.lookup(&ctx, directory, c"database.sqlite").unwrap();
+        assert_eq!(fs.io.state.lock().unwrap().requests, 1);
+        fs.io.state.lock().unwrap().requests = 0;
+        fs.getattr(&ctx, entry.inode, None).unwrap();
+        assert_eq!(fs.io.state.lock().unwrap().requests, 1);
+    }
+
+    #[test]
+    fn dax_fsync_writes_only_pages_changed_since_the_last_flush() {
+        let (fs, directory) = filesystem();
+        let ctx = Context::new();
+        let (entry, handle, _, _) = fs
+            .create(
+                &ctx,
+                directory,
+                c"database.sqlite",
+                CreateIn {
+                    flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+                    mode: 0o600,
+                    ..CreateIn::default()
+                },
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        let page_bytes = page_size();
+        let original = vec![0x11; page_bytes * 2];
+        let mut input = TestReader(Cursor::new(original.clone()));
+        fs.write(
+            &ctx,
+            entry.inode,
+            handle,
+            &mut input,
+            u32::try_from(original.len()).unwrap(),
+            0,
+            None,
+            false,
+            0,
+            0,
+        )
+        .unwrap();
+        let backing = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        backing.set_len(original.len() as u64).unwrap();
+        fs.io
+            .state
+            .lock()
+            .unwrap()
+            .dax
+            .insert(DatabaseFile::Main, backing.try_clone().unwrap());
+        let mut recorder = MapRecorder::default();
+        fs.setupmapping(
+            &ctx,
+            entry.inode,
+            handle,
+            0,
+            original.len() as u64,
+            SetupmappingFlags::WRITE.bits(),
+            0,
+            &mut recorder,
+        )
+        .unwrap();
+        fs.io.state.lock().unwrap().writes = 0;
+
+        fs.fsync(&ctx, entry.inode, false, handle).unwrap();
+        assert_eq!(fs.io.state.lock().unwrap().writes, 0);
+
+        let dirty = vec![0x7b; page_bytes];
+        backing.write_all_at(&dirty, page_bytes as u64).unwrap();
+        fs.fsync(&ctx, entry.inode, false, handle).unwrap();
+        let fake = fs.io.state.lock().unwrap();
+        assert_eq!(fake.writes, 1);
+        assert_eq!(&fake.files[&DatabaseFile::Main][page_bytes..], dirty);
+    }
+
+    #[test]
+    #[ignore = "performance profile; run explicitly in release mode"]
+    #[allow(clippy::disallowed_types)]
+    fn profile_metadata_and_dax_writeback_shape() {
+        let (fs, directory) = filesystem();
+        let ctx = Context::new();
+        let (entry, handle, _, _) = fs
+            .create(
+                &ctx,
+                directory,
+                c"database.sqlite",
+                CreateIn {
+                    flags: (libc::O_CREAT | libc::O_RDWR) as u32,
+                    mode: 0o600,
+                    ..CreateIn::default()
+                },
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        let mapped_bytes = 8 * 1024 * 1024;
+        let contents = vec![0x2d; mapped_bytes];
+        let backing = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        backing.set_len(mapped_bytes as u64).unwrap();
+        backing.write_all_at(&contents, 0).unwrap();
+        {
+            let mut fake = fs.io.state.lock().unwrap();
+            fake.files.insert(DatabaseFile::Main, contents);
+            fake.dax
+                .insert(DatabaseFile::Main, backing.try_clone().unwrap());
+        }
+        let mut recorder = MapRecorder::default();
+        fs.setupmapping(
+            &ctx,
+            entry.inode,
+            handle,
+            0,
+            mapped_bytes as u64,
+            SetupmappingFlags::WRITE.bits(),
+            0,
+            &mut recorder,
+        )
+        .unwrap();
+
+        fs.io.state.lock().unwrap().requests = 0;
+        let metadata_started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            fs.getattr(&ctx, entry.inode, None).unwrap();
+        }
+        let metadata_elapsed = metadata_started.elapsed();
+        assert_eq!(fs.io.state.lock().unwrap().requests, 10_000);
+
+        fs.io.state.lock().unwrap().writes = 0;
+        let clean_started = std::time::Instant::now();
+        fs.fsync(&ctx, entry.inode, false, handle).unwrap();
+        let clean_elapsed = clean_started.elapsed();
+        assert_eq!(fs.io.state.lock().unwrap().writes, 0);
+
+        backing
+            .write_all_at(&vec![0x7b; page_size()], page_size() as u64)
+            .unwrap();
+        let dirty_started = std::time::Instant::now();
+        fs.fsync(&ctx, entry.inode, false, handle).unwrap();
+        let dirty_elapsed = dirty_started.elapsed();
+        assert_eq!(fs.io.state.lock().unwrap().writes, 1);
+
+        eprintln!("── PROFILE: vsetfs metadata + 8 MiB DAX fsync ──");
+        eprintln!(
+            "  10k getattr calls: {:.1}ms, exactly one daemon request each",
+            metadata_elapsed.as_secs_f64() * 1_000.0
+        );
+        eprintln!(
+            "  clean fsync: {:.1}ms, zero database writes; one-page dirty fsync: {:.1}ms, one write",
+            clean_elapsed.as_secs_f64() * 1_000.0,
+            dirty_elapsed.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]

@@ -98,6 +98,17 @@ fn boot(
     name: &str,
     vset: VsetId,
 ) -> (FcVm, VsetFsEndpoint, blockd_core::database::AttachmentId) {
+    boot_with_vcpus(artifacts, runtime, vm, name, vset, 1)
+}
+
+fn boot_with_vcpus(
+    artifacts: &Artifacts,
+    runtime: Arc<Runtime>,
+    vm: VmId,
+    name: &str,
+    vset: VsetId,
+    vcpu_count: u8,
+) -> (FcVm, VsetFsEndpoint, blockd_core::database::AttachmentId) {
     let socket = artifacts.scratch.join(format!("{name}.vhost-user-fs"));
     let endpoint = VsetFsEndpoint::bind(runtime, vm, &socket, "vsets").expect("vsetfs endpoint");
     let export = endpoint.attach("orders", vset).expect("database export");
@@ -114,7 +125,7 @@ fn boot(
         ),
     );
     machine.configure_vsetfs(&socket);
-    machine.boot(&artifacts.kernel, &artifacts.initramfs, MEM_MIB);
+    machine.boot_with_vcpus(&artifacts.kernel, &artifacts.initramfs, MEM_MIB, vcpu_count);
     machine.wait_line("READY");
     (machine, endpoint, export.attachment)
 }
@@ -343,4 +354,71 @@ fn open_sqlite_connection_survives_firecracker_memory_snapshot() {
     assert_eq!(restored.cmd("db-close", "DBCLOSED"), "");
     restored.kill();
     restored_fs.wait().expect("restored backend exit");
+}
+
+#[test]
+#[ignore = "performance profile; requires staged Firecracker artifacts"]
+fn profile_parallel_virtiofs_request_queues() {
+    let artifacts = artifacts("parallel-queues");
+    let config = runtime_config(&artifacts.scratch);
+    let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
+    let runtime = Arc::new(Runtime::new(&config, store));
+    let exports = [
+        ("orders", VsetId(90)),
+        ("users", VsetId(91)),
+        ("inventory", VsetId(92)),
+        ("audit", VsetId(93)),
+    ];
+    for (_, vset) in exports {
+        runtime.create_vset(vset, VsetConfig::database(512, false));
+    }
+    let (mut machine, filesystem, _) = boot_with_vcpus(
+        &artifacts,
+        Arc::clone(&runtime),
+        VmId(86),
+        "parallel-queues",
+        exports[0].1,
+        4,
+    );
+    for &(name, vset) in &exports[1..] {
+        filesystem.attach(name, vset).unwrap();
+    }
+    let status = machine.cmd("fs-status", "FSSTATUS ");
+    if !status.starts_with("ok ") {
+        machine.kill();
+        let backend = filesystem.wait();
+        panic!("parallel filesystem did not mount: {status}; backend={backend:?}");
+    }
+    for (name, _) in exports {
+        assert!(
+            machine
+                .cmd(&format!("fs-db-create {name}"), "FSDBCREATED ")
+                .starts_with("4 1010 ")
+        );
+        assert_eq!(machine.cmd("db-close", "DBCLOSED"), "");
+    }
+
+    let single = machine.cmd("fs-open-storm orders 200", "FSOPEN ");
+    let parallel = machine.cmd("fs-open-storm orders,users,inventory,audit 200", "FSOPEN ");
+    let parse = |reply: &str| {
+        let mut fields = reply.split_whitespace();
+        let completed = fields.next().unwrap().parse::<u64>().unwrap();
+        let elapsed_us = fields.next().unwrap().parse::<u64>().unwrap();
+        (completed, elapsed_us)
+    };
+    let (single_ops, single_us) = parse(&single);
+    let (parallel_ops, parallel_us) = parse(&parallel);
+    assert_eq!(single_ops, 200);
+    assert_eq!(parallel_ops, 800);
+    let single_per_second = single_ops.saturating_mul(1_000_000) / single_us.max(1);
+    let parallel_per_second = parallel_ops.saturating_mul(1_000_000) / parallel_us.max(1);
+    eprintln!("── PROFILE: virtio-fs request queues ──");
+    eprintln!(
+        "  one queue-active worker: {single_ops} open+stat operations in {single_us}µs ({single_per_second}/s)"
+    );
+    eprintln!(
+        "  four workers/vsets:      {parallel_ops} open+stat operations in {parallel_us}µs ({parallel_per_second}/s)"
+    );
+    machine.kill();
+    filesystem.wait().expect("parallel backend exit");
 }

@@ -16,6 +16,7 @@
 mod blobscan;
 #[cfg(target_os = "linux")]
 pub mod database;
+pub mod directory_store;
 pub mod fakegcs;
 #[cfg(target_os = "linux")]
 pub mod fc;

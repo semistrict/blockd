@@ -178,10 +178,16 @@ impl FcVm {
     /// disks: the workload lives in the initramfs, so forks never contend
     /// on a writable block device).
     pub fn boot(&self, kernel: &Path, initrd: &Path, mem_mib: u32) {
+        self.boot_with_vcpus(kernel, initrd, mem_mib, 1);
+    }
+
+    /// Configure and boot a fresh microVM with an explicit virtual CPU count.
+    pub fn boot_with_vcpus(&self, kernel: &Path, initrd: &Path, mem_mib: u32, vcpu_count: u8) {
+        assert!(vcpu_count > 0, "microVM must have at least one vCPU");
         self.api(
             "PUT",
             "/machine-config",
-            &format!("{{\"vcpu_count\": 1, \"mem_size_mib\": {mem_mib}}}"),
+            &format!("{{\"vcpu_count\": {vcpu_count}, \"mem_size_mib\": {mem_mib}}}"),
         );
         self.api(
             "PUT",
@@ -936,11 +942,26 @@ pub fn upload_mem_parts(
     prefix: &str,
     part_bytes: u64,
 ) -> u64 {
-    let bytes = std::fs::read(mem_path).expect("mem file");
+    let part_bytes = usize::try_from(part_bytes).expect("fits");
+    assert!(part_bytes > 0, "snapshot part size must be nonzero");
+    let mut file = std::fs::File::open(mem_path).expect("mem file");
     let mut part = 0u64;
-    for chunk in bytes.chunks(usize::try_from(part_bytes).expect("fits")) {
+    loop {
+        let mut chunk = vec![0; part_bytes];
+        let mut used = 0;
+        while used < chunk.len() {
+            let read = file.read(&mut chunk[used..]).expect("read snapshot part");
+            if read == 0 {
+                break;
+            }
+            used += read;
+        }
+        if used == 0 {
+            break;
+        }
+        chunk.truncate(used);
         store
-            .put(&format!("{prefix}/{part:08}"), chunk.to_vec())
+            .put(&format!("{prefix}/{part:08}"), chunk)
             .expect("upload part");
         part += 1;
     }
@@ -957,22 +978,49 @@ pub async fn upload_mem_parts_async(
     prefix: String,
     part_bytes: u64,
 ) -> u64 {
-    let bytes = tokio::task::spawn_blocking(move || std::fs::read(mem_path).expect("mem file"))
-        .await
-        .expect("snapshot read task");
-    let chunks: Vec<Vec<u8>> = bytes
-        .chunks(usize::try_from(part_bytes).expect("fits"))
-        .map(<[u8]>::to_vec)
-        .collect();
-    let count = u64::try_from(chunks.len()).expect("part count fits");
-    futures_util::stream::iter(chunks.into_iter().enumerate())
-        .map(|(part, bytes)| {
-            let store = store.clone();
-            let key = format!("{prefix}/{part:08}");
-            async move { store.put(key, bytes).await.expect("upload part") }
-        })
-        .buffer_unordered(PART_FETCH_WORKERS)
-        .collect::<Vec<_>>()
-        .await;
+    let part_bytes = usize::try_from(part_bytes).expect("fits");
+    assert!(part_bytes > 0, "snapshot part size must be nonzero");
+    // A one-part handoff queue starts the first upload as soon as it is read
+    // and bounds buffered snapshot memory independently of the file size.
+    let (part_tx, part_rx) = mpsc::channel::<(u64, Vec<u8>)>(1);
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(mem_path).expect("mem file");
+        let mut part = 0u64;
+        loop {
+            let mut bytes = vec![0; part_bytes];
+            let mut used = 0;
+            while used < bytes.len() {
+                let read = file.read(&mut bytes[used..]).expect("read snapshot part");
+                if read == 0 {
+                    break;
+                }
+                used += read;
+            }
+            if used == 0 {
+                return part;
+            }
+            bytes.truncate(used);
+            if part_tx.blocking_send((part, bytes)).is_err() {
+                return part;
+            }
+            part += 1;
+        }
+    });
+    let uploaded = futures_util::stream::unfold(part_rx, |mut receiver| async move {
+        receiver.recv().await.map(|part| (part, receiver))
+    })
+    .map(|(part, bytes)| {
+        let store = store.clone();
+        let key = format!("{prefix}/{part:08}");
+        async move {
+            store.put(key, bytes).await.expect("upload part");
+            part
+        }
+    })
+    .buffer_unordered(PART_FETCH_WORKERS)
+    .collect::<Vec<_>>()
+    .await;
+    let count = reader.await.expect("snapshot read task");
+    assert_eq!(uploaded.len() as u64, count, "every read part was uploaded");
     count
 }

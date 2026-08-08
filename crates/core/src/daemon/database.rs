@@ -472,6 +472,15 @@ impl Daemon {
                 out.push(Effect::Database(DatabaseReply::Access { req, exists }));
                 true
             }
+            DatabaseOp::Stat { file } => {
+                let meta = Self::file_meta(&self.vsets[&vset], file);
+                out.push(Effect::Database(DatabaseReply::Stat {
+                    req,
+                    exists: meta.exists,
+                    size: meta.size,
+                }));
+                true
+            }
             DatabaseOp::Delete { file } => {
                 let state = self.vsets.get_mut(&vset).expect("validated");
                 if state.commit_running || !state.pending_leaves.is_empty() {

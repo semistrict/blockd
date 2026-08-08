@@ -18,6 +18,7 @@
 //!   fs-db-create <name>  → create through the stock Unix VFS      → FSDBCREATED ...
 //!   fs-db-open <name>    → reopen through the stock Unix VFS      → FSDBOPEN ...
 //!   fs-status            → report virtio-fs mount and root entries → FSSTATUS ...
+//!   fs-open-storm <names> <ops> → concurrent virtio-fs open/stat profile
 //!   off                  → reboot(RESTART) — Firecracker exits
 
 #[cfg(target_os = "linux")]
@@ -34,7 +35,7 @@ fn main() {
 mod guest {
     use blockd_platform::page_size;
     use std::fs::OpenOptions;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
@@ -183,6 +184,42 @@ mod guest {
         })
     }
 
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    fn filesystem_open_storm(names: &str, operations: usize) -> String {
+        let names = names
+            .split(',')
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if names.is_empty() || operations == 0 {
+            return "DBERR invalid-open-storm".to_owned();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(names.len()));
+        let started = std::time::Instant::now();
+        let workers = names
+            .into_iter()
+            .map(|name| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let path = format!("/vsets/{name}/database.sqlite");
+                    barrier.wait();
+                    (0..operations)
+                        .filter(|_| {
+                            std::fs::File::open(&path)
+                                .and_then(|file| file.metadata())
+                                .is_ok()
+                        })
+                        .count()
+                })
+            })
+            .collect::<Vec<_>>();
+        let completed = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap_or(0))
+            .sum::<usize>();
+        format!("FSOPEN {completed} {}", started.elapsed().as_micros())
+    }
+
     fn parse_database_args<'a>(
         parts: &mut impl Iterator<Item = &'a str>,
     ) -> Result<(u64, u64, u64, u32), String> {
@@ -236,6 +273,18 @@ mod guest {
         devices.join(",")
     }
 
+    fn virtio_drivers() -> String {
+        let Ok(entries) = std::fs::read_dir("/sys/bus/virtio/drivers") else {
+            return "no-drivers".to_owned();
+        };
+        let mut drivers = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        drivers.sort();
+        drivers.join(",")
+    }
+
     fn kernel_diagnostics() -> String {
         let Ok(mut kmsg) = OpenOptions::new()
             .read(true)
@@ -244,6 +293,7 @@ mod guest {
         else {
             return "no-kmsg".to_owned();
         };
+        let _ = kmsg.seek(SeekFrom::Start(0));
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 4096];
         loop {
@@ -468,17 +518,23 @@ mod guest {
                         .unwrap_or_default();
                     entries.sort();
                     let devices = virtio_devices();
+                    let drivers = virtio_drivers();
                     let diagnostics = kernel_diagnostics();
                     match virtiofs_mount_error {
                         None => format!(
-                            "FSSTATUS ok {} devices={devices} kmsg={diagnostics}",
+                            "FSSTATUS ok {} devices={devices} drivers={drivers} kmsg={diagnostics}",
                             entries.join(",")
                         ),
                         Some(errno) => format!(
-                            "FSSTATUS errno-{errno} {} devices={devices} kmsg={diagnostics}",
+                            "FSSTATUS errno-{errno} {} devices={devices} drivers={drivers} kmsg={diagnostics}",
                             entries.join(",")
                         ),
                     }
+                }
+                Some("fs-open-storm") => {
+                    let names = parts.next().unwrap_or_default();
+                    let operations = parts.next().unwrap_or("0").parse::<usize>().unwrap_or(0);
+                    filesystem_open_storm(names, operations)
                 }
                 Some("db-check") => match database.as_ref() {
                     Some(session) => {
