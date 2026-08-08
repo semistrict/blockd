@@ -75,7 +75,9 @@ impl Pcg64 {
 
 #[cfg(test)]
 mod tests {
-    use super::Pcg64;
+    use std::collections::BTreeSet;
+
+    use super::{Pcg64, Ppm};
 
     #[test]
     fn stream_is_pinned() {
@@ -92,5 +94,30 @@ mod tests {
                 0xed67_8f06_9353_1ac6,
             ]
         );
+    }
+
+    #[test]
+    fn streams_are_independent() {
+        let mut first = Pcg64::new(7, 1);
+        let mut second = Pcg64::new(7, 2);
+        let first_values: Vec<u64> = (0..4).map(|_| first.next_u64()).collect();
+        let second_values: Vec<u64> = (0..4).map(|_| second.next_u64()).collect();
+        assert_ne!(first_values, second_values);
+    }
+
+    #[test]
+    fn probability_and_ranges_are_pinned() {
+        let mut rng = Pcg64::new(1, 0);
+        let hits = (0..10_000).filter(|_| rng.hit(Ppm::percent(50))).count();
+        assert_eq!(hits, 5029);
+        assert!(!rng.hit(Ppm::NEVER));
+        assert!(rng.hit(Ppm::ALWAYS));
+
+        let mut rng = Pcg64::new(3, 0);
+        let mut seen = BTreeSet::new();
+        for _ in 0..1_000 {
+            seen.insert(rng.range(10, 13));
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [10, 11, 12, 13]);
     }
 }

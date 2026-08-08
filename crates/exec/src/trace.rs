@@ -76,4 +76,9 @@ mod tests {
         hash.write(b"blockd");
         assert_eq!(hash.finish(), 0x63ab_f79b_9221_c332);
     }
+
+    #[test]
+    fn empty_hash_is_the_offset_basis() {
+        assert_eq!(Fnv64::new().finish(), 0xcbf2_9ce4_8422_2325);
+    }
 }
