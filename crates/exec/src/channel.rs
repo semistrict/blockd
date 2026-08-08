@@ -133,6 +133,12 @@ pub struct Recv<'a, T> {
     receiver: &'a mut Receiver<T>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TryRecvError {
+    Empty,
+    Closed,
+}
+
 pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "bounded channel capacity must be positive");
     channel(Some(capacity))
@@ -222,6 +228,20 @@ impl<T> Clone for UnboundedSender<T> {
 impl<T> Receiver<T> {
     pub fn recv(&mut self) -> Recv<'_, T> {
         Recv { receiver: self }
+    }
+
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+        let mut state = self.state.borrow_mut();
+        if let Some(value) = state.queue.pop_front() {
+            if let Some(sender) = state.sender_waiters.pop_front() {
+                wake(&sender, WakeSource::Channel);
+            }
+            Ok(value)
+        } else if state.senders == 0 {
+            Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
     }
 }
 

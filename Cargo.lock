@@ -195,6 +195,7 @@ name = "blockd-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blockd-exec",
  "blockd-platform",
  "crc-fast",
  "lz4_flex",

@@ -110,6 +110,8 @@ struct RuntimeContext {
     observations: Rc<RefCell<Vec<String>>>,
     rng: Rc<RefCell<Option<Pcg64>>>,
     faults: Rc<RefCell<FaultConfig>>,
+    next_task: Rc<Cell<TaskId>>,
+    spawn_requests: Rc<RefCell<Vec<SpawnRequest>>>,
 }
 
 impl Clone for RuntimeContext {
@@ -123,6 +125,8 @@ impl Clone for RuntimeContext {
             observations: Rc::clone(&self.observations),
             rng: Rc::clone(&self.rng),
             faults: Rc::clone(&self.faults),
+            next_task: Rc::clone(&self.next_task),
+            spawn_requests: Rc::clone(&self.spawn_requests),
         }
     }
 }
@@ -307,6 +311,11 @@ struct Task {
     cancelled: Arc<AtomicBool>,
 }
 
+struct SpawnRequest {
+    task: TaskId,
+    actor: Task,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cancelled;
 
@@ -378,7 +387,6 @@ struct PollRecord {
 pub struct Executor {
     mode: Mode,
     context: RuntimeContext,
-    next_task: TaskId,
     tasks: BTreeMap<TaskId, Task>,
     timers: BTreeMap<(u64, u64), TimerRequest>,
     trace: TraceHasher,
@@ -406,8 +414,9 @@ impl Executor {
                 observations: Rc::new(RefCell::new(Vec::new())),
                 rng: Rc::new(RefCell::new(rng)),
                 faults: Rc::new(RefCell::new(FaultConfig::default())),
+                next_task: Rc::new(Cell::new(0)),
+                spawn_requests: Rc::new(RefCell::new(Vec::new())),
             },
-            next_task: 0,
             tasks: BTreeMap::new(),
             timers: BTreeMap::new(),
             trace: TraceHasher::new(),
@@ -431,29 +440,10 @@ impl Executor {
         F: Future<Output = T> + 'static,
         T: 'static,
     {
-        let task = self.next_task;
-        self.next_task += 1;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (sender, result) = oneshot();
-        let wrapped = async move {
-            let value = future.await;
-            let _ = sender.send(value);
-        };
-        self.tasks.insert(
-            task,
-            Task {
-                future: Box::pin(wrapped),
-                cancelled: Arc::clone(&cancelled),
-            },
-        );
+        let (task, actor, handle) = prepare_spawn(&self.context, future);
+        self.tasks.insert(task, actor);
         self.context.scheduler.schedule(task, WakeSource::Spawn);
-        TaskHandle {
-            task,
-            result,
-            cancelled,
-            scheduler: Arc::clone(&self.context.scheduler),
-            cancel_on_drop: true,
-        }
+        handle
     }
 
     pub fn block_on<F, T>(&mut self, future: F) -> T
@@ -571,6 +561,12 @@ impl Executor {
     }
 
     fn drain_registrations(&mut self) {
+        for request in self.context.spawn_requests.borrow_mut().drain(..) {
+            self.tasks.insert(request.task, request.actor);
+            self.context
+                .scheduler
+                .schedule(request.task, WakeSource::Spawn);
+        }
         for timer in self.context.timer_requests.borrow_mut().drain(..) {
             self.timers.insert((timer.at, timer.sequence), timer);
         }
@@ -603,6 +599,49 @@ impl Executor {
             }
         }
     }
+}
+
+fn prepare_spawn<F, T>(context: &RuntimeContext, future: F) -> (TaskId, Task, TaskHandle<T>)
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    let task = context.next_task.get();
+    context.next_task.set(task + 1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (sender, result) = oneshot();
+    let wrapped = async move {
+        let value = future.await;
+        let _ = sender.send(value);
+    };
+    let actor = Task {
+        future: Box::pin(wrapped),
+        cancelled: Arc::clone(&cancelled),
+    };
+    let handle = TaskHandle {
+        task,
+        result,
+        cancelled,
+        scheduler: Arc::clone(&context.scheduler),
+        cancel_on_drop: true,
+    };
+    (task, actor, handle)
+}
+
+/// Spawn a child actor from the currently running actor.
+pub fn spawn<F, T>(future: F) -> TaskHandle<T>
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    with_context(|context| {
+        let (task, actor, handle) = prepare_spawn(context, future);
+        context
+            .spawn_requests
+            .borrow_mut()
+            .push(SpawnRequest { task, actor });
+        handle
+    })
 }
 
 #[cfg(test)]
@@ -740,5 +779,24 @@ mod tests {
         }
         let hashes: BTreeSet<u64> = (0..100).map(channel_storm).collect();
         assert_eq!(hashes.len(), 100);
+    }
+
+    #[test]
+    fn actors_can_spawn_owned_children() {
+        let mut executor = Executor::simulation(8);
+        let values = Rc::new(RefCell::new(Vec::new()));
+        let output = Rc::clone(&values);
+        executor.block_on(async move {
+            let child_output = Rc::clone(&output);
+            let child = super::spawn(async move {
+                yield_now().await;
+                child_output.borrow_mut().push(2);
+                7
+            });
+            output.borrow_mut().push(1);
+            assert_eq!(child.await, Ok(7));
+            output.borrow_mut().push(3);
+        });
+        assert_eq!(*values.borrow(), [1, 2, 3]);
     }
 }

@@ -4,6 +4,7 @@
 //! events plus explicit time, and return effects. Nothing in this crate may
 //! touch a clock, a thread, an RNG, or any I/O.
 
+pub mod actor;
 pub mod cache;
 pub mod daemon;
 pub mod database;

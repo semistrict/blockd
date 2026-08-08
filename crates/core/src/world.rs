@@ -29,7 +29,7 @@ use async_trait::async_trait;
 
 use crate::database::{DatabaseReply, DatabaseRequest};
 use crate::seam::{AdminCmd, AdminReply, PeerMsg, ReqId, StoreFault};
-use crate::types::{HostId, PageId, VolumeId};
+use crate::types::{HostId, PageId, VolumeId, VsetId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlobError {
@@ -124,14 +124,15 @@ pub trait GuestMem {
     async fn fail(&self, page: PageId);
     async fn unprotect(&self, page: PageId);
     async fn evict(&self, page: PageId);
-    async fn pause(&self) -> u64;
-    async fn resume(&self);
+    async fn install_database(&self, page: PageId, bytes: Vec<u8>);
+    async fn pause(&self, vset: VsetId) -> u64;
+    async fn resume(&self, vset: VsetId);
     async fn harvest_accessed(&self) -> Vec<PageId>;
     async fn next_fault(&self) -> Option<GuestFault>;
     async fn next_sync(&self) -> Option<GuestSync>;
     async fn sync_ok(&self, req: ReqId);
     async fn sync_failed(&self, req: ReqId);
-    async fn fence(&self);
+    async fn fence(&self, vset: VsetId);
 }
 
 #[async_trait(?Send)]
