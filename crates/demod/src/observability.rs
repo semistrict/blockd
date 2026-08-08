@@ -5,14 +5,14 @@
 //! configured, so a missing collector cannot affect the daemon's work.
 
 use std::collections::BTreeMap;
-use std::fmt::{Debug, Formatter, Write as _};
+use std::fmt::{Debug, Display, Formatter, Write as _};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use blockd_core::daemon::Counters;
 use blockd_core::daemon::{DaemonStats, VsetOperations, VsetRole};
-use blockd_runtime::{HistogramSnapshot, LATENCY_BUCKETS_NS};
+use blockd_runtime::{FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS, LatencySeries};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
@@ -202,7 +202,7 @@ pub struct MetricsSnapshot {
     pub loop_idle_ns: u64,
     pub loop_occupancy: f64,
     pub loop_queue_depths: (usize, usize),
-    pub fault_latency: Vec<FaultLatencySnapshot>,
+    pub fault_latency: Vec<FaultLatency>,
     pub operation_latency: Vec<LatencySeries>,
     pub guest_pause_latency: Vec<LatencySeries>,
     pub local_io_latency: Vec<LatencySeries>,
@@ -212,18 +212,6 @@ pub struct MetricsSnapshot {
     pub blob_filesystem_space: Option<(u64, u64)>,
     pub backup_lag_age: Vec<(u64, f64)>,
     pub active_operation_age: Vec<(u64, &'static str, f64)>,
-}
-
-pub struct FaultLatencySnapshot {
-    pub vset: u64,
-    pub source: &'static str,
-    pub histogram: HistogramSnapshot,
-}
-
-pub struct LatencySeries {
-    pub operation: &'static str,
-    pub outcome: &'static str,
-    pub histogram: HistogramSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -313,24 +301,32 @@ impl Metrics {
             .expect("encode registered metrics");
         let mut out = String::from_utf8(bytes).expect("Prometheus text is UTF-8");
 
-        write!(
-            out,
-            "# HELP blockd_host_info Static identity of this daemon host.\n\
-             # TYPE blockd_host_info gauge\n\
-             blockd_host_info{{host_id=\"{}\"}} 1\n",
-            snapshot.host
-        )
-        .expect("string write");
+        append_family(
+            &mut out,
+            "blockd_host_info",
+            "Static identity of this daemon host.",
+            "gauge",
+        );
+        append_sample(
+            &mut out,
+            "blockd_host_info",
+            &format!("host_id=\"{}\"", snapshot.host),
+            1,
+        );
 
-        out.push_str("# HELP blockd_vms Current VMs by lifecycle state and backup mode.\n");
-        out.push_str("# TYPE blockd_vms gauge\n");
+        append_family(
+            &mut out,
+            "blockd_vms",
+            "Current VMs by lifecycle state and backup mode.",
+            "gauge",
+        );
         for ((state, backed), count) in &snapshot.vms {
-            writeln!(
-                out,
-                "blockd_vms{{state=\"{}\",backed=\"{backed}\"}} {count}",
-                escape_label(state)
-            )
-            .expect("string write");
+            append_sample(
+                &mut out,
+                "blockd_vms",
+                &format!("state=\"{}\",backed=\"{backed}\"", escape_label(state)),
+                count,
+            );
         }
 
         append_runtime_counters(&mut out, &snapshot.runtime);
@@ -340,15 +336,19 @@ impl Metrics {
             "Peer frames dropped because a queue was full or a peer was unavailable.",
             snapshot.peer_dropped_sends,
         );
-        out.push_str("# HELP blockd_peer_connected Whether the outbound peer connection is currently established.\n");
-        out.push_str("# TYPE blockd_peer_connected gauge\n");
+        append_family(
+            &mut out,
+            "blockd_peer_connected",
+            "Whether the outbound peer connection is currently established.",
+            "gauge",
+        );
         for (peer, connected) in &snapshot.peer_connections {
-            writeln!(
-                out,
-                "blockd_peer_connected{{peer_host=\"{peer}\"}} {}",
-                u8::from(*connected)
-            )
-            .expect("string write");
+            append_sample(
+                &mut out,
+                "blockd_peer_connected",
+                &format!("peer_host=\"{peer}\""),
+                u8::from(*connected),
+            );
         }
         append_counter(
             &mut out,
@@ -361,26 +361,30 @@ impl Metrics {
         append_backup_lag_age(&mut out, &snapshot.backup_lag_age);
         append_active_operation_age(&mut out, &snapshot.active_operation_age);
         if let Some((capacity, available)) = snapshot.blob_filesystem_space {
-            out.push_str(
-                "# HELP blockd_blob_filesystem_bytes Filesystem holding local durable blobs.\n",
+            append_family(
+                &mut out,
+                "blockd_blob_filesystem_bytes",
+                "Filesystem holding local durable blobs.",
+                "gauge",
             );
-            out.push_str("# TYPE blockd_blob_filesystem_bytes gauge\n");
-            writeln!(
-                out,
-                "blockd_blob_filesystem_bytes{{state=\"capacity\"}} {capacity}"
-            )
-            .expect("string write");
-            writeln!(
-                out,
-                "blockd_blob_filesystem_bytes{{state=\"available\"}} {available}"
-            )
-            .expect("string write");
-            writeln!(
-                out,
-                "blockd_blob_filesystem_bytes{{state=\"used\"}} {}",
-                capacity.saturating_sub(available)
-            )
-            .expect("string write");
+            append_sample(
+                &mut out,
+                "blockd_blob_filesystem_bytes",
+                "state=\"capacity\"",
+                capacity,
+            );
+            append_sample(
+                &mut out,
+                "blockd_blob_filesystem_bytes",
+                "state=\"available\"",
+                available,
+            );
+            append_sample(
+                &mut out,
+                "blockd_blob_filesystem_bytes",
+                "state=\"used\"",
+                capacity.saturating_sub(available),
+            );
         }
         append_loop_metrics(&mut out, snapshot);
         append_fault_latency(&mut out, &snapshot.fault_latency);
@@ -414,17 +418,19 @@ impl Metrics {
             "Object-store request duration in seconds, including authentication retries.",
             &snapshot.store_latency,
         );
-        out.push_str(
-            "# HELP blockd_local_io_in_flight Local durable-blob operations currently executing.\n",
+        append_family(
+            &mut out,
+            "blockd_local_io_in_flight",
+            "Local durable-blob operations currently executing.",
+            "gauge",
         );
-        out.push_str("# TYPE blockd_local_io_in_flight gauge\n");
         for (operation, value) in &snapshot.local_io_in_flight {
-            writeln!(
-                out,
-                "blockd_local_io_in_flight{{operation=\"{}\"}} {value}",
-                escape_label(operation)
-            )
-            .expect("string write");
+            append_sample(
+                &mut out,
+                "blockd_local_io_in_flight",
+                &format!("operation=\"{}\"", escape_label(operation)),
+                value,
+            );
         }
         out
     }
@@ -440,32 +446,24 @@ fn append_source_histograms(
     help: &str,
     series: &[(&'static str, HistogramSnapshot)],
 ) {
-    writeln!(out, "# HELP {name} {help}").expect("string write");
-    writeln!(out, "# TYPE {name} histogram").expect("string write");
-    let mut aggregate: BTreeMap<&str, HistogramSnapshot> = BTreeMap::new();
-    for (source, histogram) in series {
-        let entry = aggregate
-            .entry(source)
-            .or_insert_with(|| HistogramSnapshot {
-                buckets: vec![0; LATENCY_BUCKETS_NS.len()],
-                count: 0,
-                sum_ns: 0,
-            });
-        for (total, value) in entry.buckets.iter_mut().zip(&histogram.buckets) {
-            *total += value;
-        }
-        entry.count += histogram.count;
-        entry.sum_ns += histogram.sum_ns;
-    }
-    for (source, histogram) in aggregate {
+    append_family(out, name, help, "histogram");
+    for (source, histogram) in aggregate_histograms(
+        series
+            .iter()
+            .map(|(source, histogram)| (*source, histogram)),
+    ) {
         append_histogram_sample(out, name, &[("source", source)], &histogram);
     }
 }
 
 #[allow(clippy::too_many_lines)]
 fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
-    out.push_str("# HELP blockd_cache_pages Host cache pages by state.\n");
-    out.push_str("# TYPE blockd_cache_pages gauge\n");
+    append_family(
+        out,
+        "blockd_cache_pages",
+        "Host cache pages by state.",
+        "gauge",
+    );
     for (state, value) in [
         ("capacity", stats.cache_capacity_pages),
         ("resident_private", stats.resident_pages),
@@ -474,7 +472,12 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
         ("dirty", stats.dirty_pages),
         ("unstable", stats.unstable_pages),
     ] {
-        writeln!(out, "blockd_cache_pages{{state=\"{state}\"}} {value}").expect("string write");
+        append_sample(
+            out,
+            "blockd_cache_pages",
+            &format!("state=\"{state}\""),
+            value,
+        );
     }
     append_gauge(
         out,
@@ -489,40 +492,71 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
         stats.parked_faults,
     );
 
-    out.push_str("# HELP blockd_nvme_bytes Local durable storage bytes by state.\n");
-    out.push_str("# TYPE blockd_nvme_bytes gauge\n");
+    append_family(
+        out,
+        "blockd_nvme_bytes",
+        "Local durable storage bytes by state.",
+        "gauge",
+    );
     for (state, value) in [
         ("used", stats.local_blob_bytes),
         ("segment_live", stats.live_segment_bytes),
         ("segment_stored", stats.local_segment_bytes),
         ("headroom", stats.disk_headroom_bytes),
     ] {
-        writeln!(out, "blockd_nvme_bytes{{state=\"{state}\"}} {value}").expect("string write");
+        append_sample(
+            out,
+            "blockd_nvme_bytes",
+            &format!("state=\"{state}\""),
+            value,
+        );
     }
     if let Some(capacity) = stats.disk_capacity_bytes {
-        writeln!(out, "blockd_nvme_bytes{{state=\"capacity\"}} {capacity}").expect("string write");
+        append_sample(out, "blockd_nvme_bytes", "state=\"capacity\"", capacity);
     }
 
-    out.push_str("# HELP blockd_vset_state Current vset lifecycle state.\n");
-    out.push_str("# TYPE blockd_vset_state gauge\n");
-    out.push_str("# HELP blockd_vset_pages Current per-vset pages by operational state.\n");
-    out.push_str("# TYPE blockd_vset_pages gauge\n");
-    out.push_str("# HELP blockd_vset_pending Current per-vset pending work.\n");
-    out.push_str("# TYPE blockd_vset_pending gauge\n");
-    out.push_str(
-        "# HELP blockd_vset_backup_lag_captures Durable local captures not yet published.\n",
+    append_family(
+        out,
+        "blockd_vset_state",
+        "Current vset lifecycle state.",
+        "gauge",
     );
-    out.push_str("# TYPE blockd_vset_backup_lag_captures gauge\n");
-    out.push_str(
-        "# HELP blockd_vset_backup_lag_bytes Durable local segment bytes not yet published.\n",
+    append_family(
+        out,
+        "blockd_vset_pages",
+        "Current per-vset pages by operational state.",
+        "gauge",
     );
-    out.push_str("# TYPE blockd_vset_backup_lag_bytes gauge\n");
-    out.push_str(
-        "# HELP blockd_vset_operation_in_progress Whether per-vset background work is active.\n",
+    append_family(
+        out,
+        "blockd_vset_pending",
+        "Current per-vset pending work.",
+        "gauge",
     );
-    out.push_str("# TYPE blockd_vset_operation_in_progress gauge\n");
-    out.push_str("# HELP blockd_vset_segment_bytes Per-vset segment bytes by state.\n");
-    out.push_str("# TYPE blockd_vset_segment_bytes gauge\n");
+    append_family(
+        out,
+        "blockd_vset_backup_lag_captures",
+        "Durable local captures not yet published.",
+        "gauge",
+    );
+    append_family(
+        out,
+        "blockd_vset_backup_lag_bytes",
+        "Durable local segment bytes not yet published.",
+        "gauge",
+    );
+    append_family(
+        out,
+        "blockd_vset_operation_in_progress",
+        "Whether per-vset background work is active.",
+        "gauge",
+    );
+    append_family(
+        out,
+        "blockd_vset_segment_bytes",
+        "Per-vset segment bytes by state.",
+        "gauge",
+    );
     for vset in &stats.vsets {
         let id = vset.vset.0;
         let lifecycle = match vset.role {
@@ -531,47 +565,54 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
             VsetRole::Hydrating => "hydrating",
             VsetRole::Outbound => "outbound",
         };
-        writeln!(
+        append_sample(
             out,
-            "blockd_vset_state{{vset_id=\"{id}\",state=\"{lifecycle}\",backed=\"{}\"}} 1",
-            vset.backed_up
-        )
-        .expect("string write");
+            "blockd_vset_state",
+            &format!(
+                "vset_id=\"{id}\",state=\"{lifecycle}\",backed=\"{}\"",
+                vset.backed_up
+            ),
+            1,
+        );
         for (page_state, value) in [
             ("dirty", vset.dirty_pages),
             ("unstable", vset.unstable_pages),
             ("parked", vset.parked_faults),
             ("hydration_remaining", vset.hydration_remaining_pages),
         ] {
-            writeln!(
+            append_sample(
                 out,
-                "blockd_vset_pages{{vset_id=\"{id}\",state=\"{page_state}\"}} {value}"
-            )
-            .expect("string write");
+                "blockd_vset_pages",
+                &format!("vset_id=\"{id}\",state=\"{page_state}\""),
+                value,
+            );
         }
         for (kind, value) in [
             ("sync", vset.pending_syncs),
             ("map_leaf", vset.pending_leaf_spans),
         ] {
-            writeln!(
+            append_sample(
                 out,
-                "blockd_vset_pending{{vset_id=\"{id}\",kind=\"{kind}\"}} {value}"
-            )
-            .expect("string write");
+                "blockd_vset_pending",
+                &format!("vset_id=\"{id}\",kind=\"{kind}\""),
+                value,
+            );
         }
         if let Some(lag) = vset.backup_lag_captures {
-            writeln!(
+            append_sample(
                 out,
-                "blockd_vset_backup_lag_captures{{vset_id=\"{id}\"}} {lag}"
-            )
-            .expect("string write");
+                "blockd_vset_backup_lag_captures",
+                &format!("vset_id=\"{id}\""),
+                lag,
+            );
         }
         if let Some(bytes) = vset.backup_lag_bytes {
-            writeln!(
+            append_sample(
                 out,
-                "blockd_vset_backup_lag_bytes{{vset_id=\"{id}\"}} {bytes}"
-            )
-            .expect("string write");
+                "blockd_vset_backup_lag_bytes",
+                &format!("vset_id=\"{id}\""),
+                bytes,
+            );
         }
         for (operation, active) in [
             ("capture", vset.operations.active(VsetOperations::CAPTURE)),
@@ -585,150 +626,169 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
                 vset.operations.active(VsetOperations::HYDRATION),
             ),
         ] {
-            writeln!(
+            append_sample(
                 out,
-                "blockd_vset_operation_in_progress{{vset_id=\"{id}\",operation=\"{operation}\"}} {}",
-                u8::from(active)
-            )
-            .expect("string write");
+                "blockd_vset_operation_in_progress",
+                &format!("vset_id=\"{id}\",operation=\"{operation}\""),
+                u8::from(active),
+            );
         }
         for (state, value) in [
             ("live", vset.live_segment_bytes),
             ("stored", vset.local_segment_bytes),
         ] {
-            writeln!(
+            append_sample(
                 out,
-                "blockd_vset_segment_bytes{{vset_id=\"{id}\",state=\"{state}\"}} {value}"
-            )
-            .expect("string write");
+                "blockd_vset_segment_bytes",
+                &format!("vset_id=\"{id}\",state=\"{state}\""),
+                value,
+            );
         }
     }
 }
 
 fn append_backup_lag_age(out: &mut String, lag_age: &[(u64, f64)]) {
-    out.push_str(
-        "# HELP blockd_vset_backup_lag_seconds Continuous time with unpublished captures.\n",
+    append_family(
+        out,
+        "blockd_vset_backup_lag_seconds",
+        "Continuous time with unpublished captures.",
+        "gauge",
     );
-    out.push_str("# TYPE blockd_vset_backup_lag_seconds gauge\n");
     for (vset, seconds) in lag_age {
-        writeln!(
+        append_sample(
             out,
-            "blockd_vset_backup_lag_seconds{{vset_id=\"{vset}\"}} {seconds}"
-        )
-        .expect("string write");
+            "blockd_vset_backup_lag_seconds",
+            &format!("vset_id=\"{vset}\""),
+            seconds,
+        );
     }
 }
 
 fn append_active_operation_age(out: &mut String, ages: &[(u64, &'static str, f64)]) {
-    out.push_str(
-        "# HELP blockd_vset_operation_active_seconds Continuous time the current background operation has been active.\n",
+    append_family(
+        out,
+        "blockd_vset_operation_active_seconds",
+        "Continuous time the current background operation has been active.",
+        "gauge",
     );
-    out.push_str("# TYPE blockd_vset_operation_active_seconds gauge\n");
     for (vset, operation, seconds) in ages {
-        writeln!(
+        append_sample(
             out,
-            "blockd_vset_operation_active_seconds{{vset_id=\"{vset}\",operation=\"{operation}\"}} {seconds}"
-        )
-        .expect("string write");
+            "blockd_vset_operation_active_seconds",
+            &format!("vset_id=\"{vset}\",operation=\"{operation}\""),
+            seconds,
+        );
     }
 }
 
 #[allow(clippy::cast_precision_loss)]
 fn append_loop_metrics(out: &mut String, snapshot: &MetricsSnapshot) {
-    out.push_str(
-        "# HELP blockd_event_loop_events_total Event-loop decisions and effects by kind.\n",
+    append_family(
+        out,
+        "blockd_event_loop_events_total",
+        "Event-loop decisions and effects by kind.",
+        "counter",
     );
-    out.push_str("# TYPE blockd_event_loop_events_total counter\n");
-    out.push_str(
-        "# HELP blockd_event_loop_seconds_total Event-loop wall time by phase and kind.\n",
+    append_family(
+        out,
+        "blockd_event_loop_seconds_total",
+        "Event-loop wall time by phase and kind.",
+        "counter",
     );
-    out.push_str("# TYPE blockd_event_loop_seconds_total counter\n");
     for (phase, rows) in [
         ("decide", snapshot.loop_decide.as_slice()),
         ("effect", snapshot.loop_effect.as_slice()),
     ] {
         for (kind, count, ns) in rows {
-            writeln!(
+            append_sample(
                 out,
-                "blockd_event_loop_events_total{{phase=\"{phase}\",kind=\"{kind}\"}} {count}"
-            )
-            .expect("string write");
-            writeln!(
+                "blockd_event_loop_events_total",
+                &format!("phase=\"{phase}\",kind=\"{kind}\""),
+                count,
+            );
+            append_sample(
                 out,
-                "blockd_event_loop_seconds_total{{phase=\"{phase}\",kind=\"{kind}\"}} {}",
-                *ns as f64 / 1_000_000_000.0
-            )
-            .expect("string write");
+                "blockd_event_loop_seconds_total",
+                &format!("phase=\"{phase}\",kind=\"{kind}\""),
+                *ns as f64 / 1_000_000_000.0,
+            );
         }
     }
-    writeln!(
+    append_sample(
         out,
-        "blockd_event_loop_seconds_total{{phase=\"idle\",kind=\"all\"}} {}",
-        snapshot.loop_idle_ns as f64 / 1_000_000_000.0
-    )
-    .expect("string write");
-    out.push_str("# HELP blockd_event_loop_occupancy_ratio Cumulative fraction of observed loop time spent busy.\n");
-    out.push_str("# TYPE blockd_event_loop_occupancy_ratio gauge\n");
-    writeln!(
+        "blockd_event_loop_seconds_total",
+        "phase=\"idle\",kind=\"all\"",
+        snapshot.loop_idle_ns as f64 / 1_000_000_000.0,
+    );
+    append_family(
         out,
-        "blockd_event_loop_occupancy_ratio {}",
-        snapshot.loop_occupancy
-    )
-    .expect("string write");
-    out.push_str("# HELP blockd_event_loop_queue_depth Current queued events by priority lane.\n");
-    out.push_str("# TYPE blockd_event_loop_queue_depth gauge\n");
-    writeln!(
+        "blockd_event_loop_occupancy_ratio",
+        "Cumulative fraction of observed loop time spent busy.",
+        "gauge",
+    );
+    append_sample(
         out,
-        "blockd_event_loop_queue_depth{{priority=\"critical\"}} {}",
-        snapshot.loop_queue_depths.0
-    )
-    .expect("string write");
-    writeln!(
+        "blockd_event_loop_occupancy_ratio",
+        "",
+        snapshot.loop_occupancy,
+    );
+    append_family(
         out,
-        "blockd_event_loop_queue_depth{{priority=\"background\"}} {}",
-        snapshot.loop_queue_depths.1
-    )
-    .expect("string write");
+        "blockd_event_loop_queue_depth",
+        "Current queued events by priority lane.",
+        "gauge",
+    );
+    append_sample(
+        out,
+        "blockd_event_loop_queue_depth",
+        "priority=\"critical\"",
+        snapshot.loop_queue_depths.0,
+    );
+    append_sample(
+        out,
+        "blockd_event_loop_queue_depth",
+        "priority=\"background\"",
+        snapshot.loop_queue_depths.1,
+    );
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn append_fault_latency(out: &mut String, series: &[FaultLatencySnapshot]) {
-    out.push_str("# HELP blockd_page_fault_duration_seconds End-to-end page-fault service time by final source.\n");
-    out.push_str("# TYPE blockd_page_fault_duration_seconds histogram\n");
-    out.push_str("# HELP blockd_vset_page_faults_total Per-vset page faults by final source.\n");
-    out.push_str("# TYPE blockd_vset_page_faults_total counter\n");
-    out.push_str("# HELP blockd_vset_page_fault_duration_seconds_total Per-vset cumulative page-fault service time by final source.\n");
-    out.push_str("# TYPE blockd_vset_page_fault_duration_seconds_total counter\n");
-    let mut aggregate: BTreeMap<&str, HistogramSnapshot> = BTreeMap::new();
+fn append_fault_latency(out: &mut String, series: &[FaultLatency]) {
+    append_family(
+        out,
+        "blockd_page_fault_duration_seconds",
+        "End-to-end page-fault service time by final source.",
+        "histogram",
+    );
+    append_family(
+        out,
+        "blockd_vset_page_faults_total",
+        "Per-vset page faults by final source.",
+        "counter",
+    );
+    append_family(
+        out,
+        "blockd_vset_page_fault_duration_seconds_total",
+        "Per-vset cumulative page-fault service time by final source.",
+        "counter",
+    );
     for item in series {
-        let entry = aggregate
-            .entry(item.source)
-            .or_insert_with(|| HistogramSnapshot {
-                buckets: vec![0; LATENCY_BUCKETS_NS.len()],
-                count: 0,
-                sum_ns: 0,
-            });
-        for (total, value) in entry.buckets.iter_mut().zip(&item.histogram.buckets) {
-            *total += value;
-        }
-        entry.count += item.histogram.count;
-        entry.sum_ns += item.histogram.sum_ns;
-        writeln!(
+        append_sample(
             out,
-            "blockd_vset_page_faults_total{{vset_id=\"{}\",source=\"{}\"}} {}",
-            item.vset, item.source, item.histogram.count
-        )
-        .expect("string write");
-        writeln!(
+            "blockd_vset_page_faults_total",
+            &format!("vset_id=\"{}\",source=\"{}\"", item.vset.0, item.source),
+            item.histogram.count,
+        );
+        append_sample(
             out,
-            "blockd_vset_page_fault_duration_seconds_total{{vset_id=\"{}\",source=\"{}\"}} {}",
-            item.vset,
-            item.source,
-            item.histogram.sum_ns as f64 / 1_000_000_000.0
-        )
-        .expect("string write");
+            "blockd_vset_page_fault_duration_seconds_total",
+            &format!("vset_id=\"{}\",source=\"{}\"", item.vset.0, item.source),
+            item.histogram.sum_ns as f64 / 1_000_000_000.0,
+        );
     }
-    for (source, histogram) in aggregate {
+    for (source, histogram) in
+        aggregate_histograms(series.iter().map(|item| (item.source, &item.histogram)))
+    {
         append_histogram_sample(
             out,
             "blockd_page_fault_duration_seconds",
@@ -739,8 +799,7 @@ fn append_fault_latency(out: &mut String, series: &[FaultLatencySnapshot]) {
 }
 
 fn append_latency_histogram(out: &mut String, name: &str, help: &str, series: &[LatencySeries]) {
-    writeln!(out, "# HELP {name} {help}").expect("string write");
-    writeln!(out, "# TYPE {name} histogram").expect("string write");
+    append_family(out, name, help, "histogram");
     for item in series {
         append_histogram_sample(
             out,
@@ -749,6 +808,25 @@ fn append_latency_histogram(out: &mut String, name: &str, help: &str, series: &[
             &item.histogram,
         );
     }
+}
+
+fn aggregate_histograms<'a>(
+    series: impl IntoIterator<Item = (&'a str, &'a HistogramSnapshot)>,
+) -> BTreeMap<&'a str, HistogramSnapshot> {
+    let mut aggregate = BTreeMap::new();
+    for (key, histogram) in series {
+        let entry = aggregate.entry(key).or_insert_with(|| HistogramSnapshot {
+            buckets: vec![0; LATENCY_BUCKETS_NS.len()],
+            count: 0,
+            sum_ns: 0,
+        });
+        for (total, value) in entry.buckets.iter_mut().zip(&histogram.buckets) {
+            *total += value;
+        }
+        entry.count += histogram.count;
+        entry.sum_ns += histogram.sum_ns;
+    }
+    aggregate
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -763,30 +841,34 @@ fn append_histogram_sample(
         .map(|(key, value)| format!("{key}=\"{}\"", escape_label(value)))
         .collect::<Vec<_>>()
         .join(",");
+    let bucket_name = format!("{name}_bucket");
     for (upper_ns, count) in LATENCY_BUCKETS_NS.iter().zip(&histogram.buckets) {
         let upper = *upper_ns as f64 / 1_000_000_000.0;
-        writeln!(out, "{name}_bucket{{{label_text},le=\"{upper}\"}} {count}")
-            .expect("string write");
+        append_sample(
+            out,
+            &bucket_name,
+            &format!("{label_text},le=\"{upper}\""),
+            count,
+        );
     }
-    writeln!(
+    append_sample(
         out,
-        "{name}_bucket{{{label_text},le=\"+Inf\"}} {}",
-        histogram.count
-    )
-    .expect("string write");
-    writeln!(
+        &bucket_name,
+        &format!("{label_text},le=\"+Inf\""),
+        histogram.count,
+    );
+    append_sample(
         out,
-        "{name}_sum{{{label_text}}} {}",
-        histogram.sum_ns as f64 / 1_000_000_000.0
-    )
-    .expect("string write");
-    writeln!(out, "{name}_count{{{label_text}}} {}", histogram.count).expect("string write");
+        &format!("{name}_sum"),
+        &label_text,
+        histogram.sum_ns as f64 / 1_000_000_000.0,
+    );
+    append_sample(out, &format!("{name}_count"), &label_text, histogram.count);
 }
 
 fn append_gauge(out: &mut String, name: &str, help: &str, value: usize) {
-    writeln!(out, "# HELP {name} {help}").expect("string write");
-    writeln!(out, "# TYPE {name} gauge").expect("string write");
-    writeln!(out, "{name} {value}").expect("string write");
+    append_family(out, name, help, "gauge");
+    append_sample(out, name, "", value);
 }
 
 fn append_runtime_counters(out: &mut String, counters: &Counters) {
@@ -837,8 +919,12 @@ fn append_runtime_counters(out: &mut String, counters: &Counters) {
 }
 
 fn append_store_metrics(out: &mut String, store: StoreMetrics) {
-    out.push_str("# HELP blockd_store_requests_total Object-store requests by operation.\n");
-    out.push_str("# TYPE blockd_store_requests_total counter\n");
+    append_family(
+        out,
+        "blockd_store_requests_total",
+        "Object-store requests by operation.",
+        "counter",
+    );
     for (operation, value) in [
         ("put", store.puts),
         ("conditional_put", store.cas_puts),
@@ -846,11 +932,12 @@ fn append_store_metrics(out: &mut String, store: StoreMetrics) {
         ("ranged_get", store.ranged_gets),
         ("delete", store.deletes),
     ] {
-        writeln!(
+        append_sample(
             out,
-            "blockd_store_requests_total{{operation=\"{operation}\"}} {value}"
-        )
-        .expect("string write");
+            "blockd_store_requests_total",
+            &format!("operation=\"{operation}\""),
+            value,
+        );
     }
     append_counter(
         out,
@@ -870,26 +957,42 @@ fn append_store_metrics(out: &mut String, store: StoreMetrics) {
         "Object-store authentication token refreshes.",
         store.token_refreshes,
     );
-    out.push_str("# HELP blockd_store_transferred_bytes_total Object-store bytes transferred by direction.\n");
-    out.push_str("# TYPE blockd_store_transferred_bytes_total counter\n");
-    writeln!(
+    append_family(
         out,
-        "blockd_store_transferred_bytes_total{{direction=\"up\"}} {}",
-        store.bytes_up
-    )
-    .expect("string write");
-    writeln!(
+        "blockd_store_transferred_bytes_total",
+        "Object-store bytes transferred by direction.",
+        "counter",
+    );
+    append_sample(
         out,
-        "blockd_store_transferred_bytes_total{{direction=\"down\"}} {}",
-        store.bytes_down
-    )
-    .expect("string write");
+        "blockd_store_transferred_bytes_total",
+        "direction=\"up\"",
+        store.bytes_up,
+    );
+    append_sample(
+        out,
+        "blockd_store_transferred_bytes_total",
+        "direction=\"down\"",
+        store.bytes_down,
+    );
 }
 
 fn append_counter(out: &mut String, name: &str, help: &str, value: u64) {
+    append_family(out, name, help, "counter");
+    append_sample(out, name, "", value);
+}
+
+fn append_family(out: &mut String, name: &str, help: &str, kind: &str) {
     writeln!(out, "# HELP {name} {help}").expect("string write");
-    writeln!(out, "# TYPE {name} counter").expect("string write");
-    writeln!(out, "{name} {value}").expect("string write");
+    writeln!(out, "# TYPE {name} {kind}").expect("string write");
+}
+
+fn append_sample(out: &mut String, name: &str, labels: &str, value: impl Display) {
+    if labels.is_empty() {
+        writeln!(out, "{name} {value}").expect("string write");
+    } else {
+        writeln!(out, "{name}{{{labels}}} {value}").expect("string write");
+    }
 }
 
 fn escape_label(value: &str) -> String {
@@ -954,8 +1057,8 @@ mod tests {
             loop_idle_ns: 0,
             loop_occupancy: 0.0,
             loop_queue_depths: (0, 0),
-            fault_latency: vec![FaultLatencySnapshot {
-                vset: 42,
+            fault_latency: vec![FaultLatency {
+                vset: blockd_core::types::VsetId(42),
                 source: "local_nvme",
                 histogram: HistogramSnapshot {
                     buckets: vec![1; LATENCY_BUCKETS_NS.len()],
@@ -975,6 +1078,15 @@ mod tests {
         };
 
         let text = metrics.encode(&snapshot);
+        // The registry prefix includes a real elapsed HTTP duration. The
+        // custom suffix is deterministic and must remain byte-identical.
+        let custom = &text[text
+            .find("# HELP blockd_host_info")
+            .expect("custom metric families")..];
+        let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        assert_eq!((custom.len(), custom_hash), (14_724, 0x9887_d33b_ebd1_1920));
         assert!(text.contains(
             "blockd_http_requests_total{method=\"POST\",route=\"/vm/{id}/work\",status_code=\"200\"} 1"
         ));
@@ -1003,5 +1115,71 @@ mod tests {
     #[test]
     fn labels_are_escaped_for_prometheus_text_format() {
         assert_eq!(escape_label("a\\b\n\"c"), "a\\\\b\\n\\\"c");
+    }
+
+    #[test]
+    fn fault_latency_encoding_is_byte_pinned() {
+        let series = [
+            FaultLatency {
+                vset: blockd_core::types::VsetId(42),
+                source: "local_nvme",
+                histogram: HistogramSnapshot {
+                    buckets: vec![1; LATENCY_BUCKETS_NS.len()],
+                    count: 1,
+                    sum_ns: 1_000_000_000,
+                },
+            },
+            FaultLatency {
+                vset: blockd_core::types::VsetId(7),
+                source: "local_nvme",
+                histogram: HistogramSnapshot {
+                    buckets: vec![2; LATENCY_BUCKETS_NS.len()],
+                    count: 2,
+                    sum_ns: 2_000_000_000,
+                },
+            },
+        ];
+        let mut text = String::new();
+        append_fault_latency(&mut text, &series);
+        assert_eq!(
+            text,
+            concat!(
+                "# HELP blockd_page_fault_duration_seconds End-to-end page-fault service time by final source.\n",
+                "# TYPE blockd_page_fault_duration_seconds histogram\n",
+                "# HELP blockd_vset_page_faults_total Per-vset page faults by final source.\n",
+                "# TYPE blockd_vset_page_faults_total counter\n",
+                "# HELP blockd_vset_page_fault_duration_seconds_total Per-vset cumulative page-fault service time by final source.\n",
+                "# TYPE blockd_vset_page_fault_duration_seconds_total counter\n",
+                "blockd_vset_page_faults_total{vset_id=\"42\",source=\"local_nvme\"} 1\n",
+                "blockd_vset_page_fault_duration_seconds_total{vset_id=\"42\",source=\"local_nvme\"} 1\n",
+                "blockd_vset_page_faults_total{vset_id=\"7\",source=\"local_nvme\"} 2\n",
+                "blockd_vset_page_fault_duration_seconds_total{vset_id=\"7\",source=\"local_nvme\"} 2\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.00001\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.000025\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.00005\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.0001\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.00025\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.0005\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.001\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.0025\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.005\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.01\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.025\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.05\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.1\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.25\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.5\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"1\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"2.5\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"5\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"10\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"30\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"60\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"300\"} 3\n",
+                "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"+Inf\"} 3\n",
+                "blockd_page_fault_duration_seconds_sum{source=\"local_nvme\"} 3\n",
+                "blockd_page_fault_duration_seconds_count{source=\"local_nvme\"} 3\n",
+            )
+        );
     }
 }

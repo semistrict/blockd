@@ -35,15 +35,14 @@ mod store;
 pub mod vsetfs;
 
 pub use blobscan::scan_blob_dir;
-pub use gcs::{GcsConfig, GcsLatency, GcsStats, GcsStore};
+pub use gcs::{GcsConfig, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
-pub use host::{
-    FaultLatency, GuestPauseLatency, LocalIoLatency, Runtime, RuntimeConfig,
-    RuntimeOperationLatency,
-};
+pub use host::{Runtime, RuntimeConfig};
 #[cfg(target_os = "linux")]
 pub use loopstats::LoopStats;
-pub use metrics::{AtomicHistogram, HistogramSnapshot, LATENCY_BUCKETS_NS};
+pub use metrics::{
+    AtomicHistogram, FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS, LatencySeries,
+};
 pub use peer::{PeerConfig, PeerNet, PeerTlsConfig};
 pub use replica_recovery::{
     InstallReplicaRecoveryError, InstalledReplicaRecovery, install_replica_recovery,

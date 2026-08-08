@@ -5,6 +5,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use blockd_core::types::VsetId;
+
 pub const LATENCY_BUCKETS_NS: [u64; 22] = [
     10_000,
     25_000,
@@ -36,6 +38,20 @@ pub struct HistogramSnapshot {
     pub buckets: Vec<u64>,
     pub count: u64,
     pub sum_ns: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatencySeries {
+    pub operation: &'static str,
+    pub outcome: &'static str,
+    pub histogram: HistogramSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaultLatency {
+    pub vset: VsetId,
+    pub source: &'static str,
+    pub histogram: HistogramSnapshot,
 }
 
 #[derive(Debug)]

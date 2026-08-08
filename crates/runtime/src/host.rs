@@ -33,7 +33,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
 use crate::loopstats::{LoopStats, effect_kind, event_kind};
-use crate::metrics::{AtomicHistogram, HistogramSnapshot};
+use crate::metrics::{AtomicHistogram, FaultLatency, LatencySeries};
 use crate::peer::{PeerConfig, PeerNet};
 use crate::store::ObjectStore;
 
@@ -181,38 +181,11 @@ struct FaultInFlight {
     span: tracing::Span,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FaultLatency {
-    pub vset: VsetId,
-    pub source: &'static str,
-    pub histogram: HistogramSnapshot,
-}
-
 const OPERATION_NAMES: [&str; 5] = ["create", "checkpoint", "restore", "migration", "sync"];
 const OPERATION_OUTCOMES: [&str; 2] = ["success", "failed"];
 const LOCAL_IO_NAMES: [&str; 4] = ["write", "read", "ranged_read", "delete"];
 const LOCAL_IO_OUTCOMES: [&str; 2] = ["success", "missing"];
 const PAUSE_NAMES: [&str; 2] = ["checkpoint", "migration"];
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeOperationLatency {
-    pub operation: &'static str,
-    pub outcome: &'static str,
-    pub histogram: HistogramSnapshot,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalIoLatency {
-    pub operation: &'static str,
-    pub outcome: &'static str,
-    pub histogram: HistogramSnapshot,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GuestPauseLatency {
-    pub operation: &'static str,
-    pub histogram: HistogramSnapshot,
-}
 
 pub(crate) enum Msg {
     Ev(Event),
@@ -894,11 +867,11 @@ impl Runtime {
         snapshots
     }
 
-    pub fn operation_latency(&self) -> Vec<RuntimeOperationLatency> {
+    pub fn operation_latency(&self) -> Vec<LatencySeries> {
         let mut snapshots = Vec::new();
         for (operation, operation_name) in OPERATION_NAMES.iter().enumerate() {
             for (outcome, outcome_name) in OPERATION_OUTCOMES.iter().enumerate() {
-                snapshots.push(RuntimeOperationLatency {
+                snapshots.push(LatencySeries {
                     operation: operation_name,
                     outcome: outcome_name,
                     histogram: self.shared.operation_latency[operation][outcome].snapshot(),
@@ -908,11 +881,11 @@ impl Runtime {
         snapshots
     }
 
-    pub fn local_io_latency(&self) -> Vec<LocalIoLatency> {
+    pub fn local_io_latency(&self) -> Vec<LatencySeries> {
         let mut snapshots = Vec::new();
         for (operation, operation_name) in LOCAL_IO_NAMES.iter().enumerate() {
             for (outcome, outcome_name) in LOCAL_IO_OUTCOMES.iter().enumerate() {
-                snapshots.push(LocalIoLatency {
+                snapshots.push(LatencySeries {
                     operation: operation_name,
                     outcome: outcome_name,
                     histogram: self.shared.local_io_latency[operation][outcome].snapshot(),
@@ -930,12 +903,13 @@ impl Runtime {
             .collect()
     }
 
-    pub fn guest_pause_latency(&self) -> Vec<GuestPauseLatency> {
+    pub fn guest_pause_latency(&self) -> Vec<LatencySeries> {
         PAUSE_NAMES
             .iter()
             .zip(&self.shared.pause_latency)
-            .map(|(operation, histogram)| GuestPauseLatency {
+            .map(|(operation, histogram)| LatencySeries {
                 operation,
+                outcome: "success",
                 histogram: histogram.snapshot(),
             })
             .collect()

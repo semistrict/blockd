@@ -26,7 +26,7 @@ use blockd_core::seam::StoreFault;
 use bytes::Bytes;
 use tokio::sync::Mutex;
 
-use crate::metrics::{AtomicHistogram, HistogramSnapshot};
+use crate::metrics::{AtomicHistogram, LatencySeries};
 use crate::store::{GetResult, ObjectStore};
 
 /// R4.6: no object exceeds 64 MiB; anything larger is a protocol
@@ -79,23 +79,16 @@ const GCS_OPERATION_NAMES: [&str; GCS_OPERATIONS] = [
 ];
 const GCS_OUTCOME_NAMES: [&str; GCS_OUTCOMES] = ["success", "unavailable", "conflict"];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GcsLatency {
-    pub operation: &'static str,
-    pub outcome: &'static str,
-    pub histogram: HistogramSnapshot,
-}
-
 impl GcsStats {
     fn observe(&self, operation: usize, outcome: usize, elapsed: Duration) {
         self.latency[operation][outcome].observe(elapsed);
     }
 
-    pub fn latency(&self) -> Vec<GcsLatency> {
+    pub fn latency(&self) -> Vec<LatencySeries> {
         let mut snapshots = Vec::with_capacity(GCS_OPERATIONS * GCS_OUTCOMES);
         for (operation, operation_name) in GCS_OPERATION_NAMES.iter().enumerate() {
             for (outcome, outcome_name) in GCS_OUTCOME_NAMES.iter().enumerate() {
-                snapshots.push(GcsLatency {
+                snapshots.push(LatencySeries {
                     operation: operation_name,
                     outcome: outcome_name,
                     histogram: self.latency[operation][outcome].snapshot(),

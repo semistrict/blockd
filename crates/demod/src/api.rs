@@ -24,9 +24,7 @@ use tower_http::timeout::TimeoutLayer;
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-use crate::observability::{
-    FaultLatencySnapshot, LatencySeries, Metrics, MetricsSnapshot, StoreMetrics,
-};
+use crate::observability::{Metrics, MetricsSnapshot, StoreMetrics};
 use crate::vm::Demod;
 
 const MAX_REQUEST_BODY_BYTES: usize = 1024;
@@ -444,56 +442,12 @@ fn metrics_text(state: &Arc<Demod>) -> String {
         loop_idle_ns: loop_stats.idle_ns(),
         loop_occupancy: loop_stats.occupancy(),
         loop_queue_depths: state.rt.loop_queue_depths(),
-        fault_latency: state
-            .rt
-            .fault_latency()
-            .into_iter()
-            .map(|item| FaultLatencySnapshot {
-                vset: item.vset.0,
-                source: item.source,
-                histogram: item.histogram,
-            })
-            .collect(),
-        operation_latency: state
-            .rt
-            .operation_latency()
-            .into_iter()
-            .map(|item| LatencySeries {
-                operation: item.operation,
-                outcome: item.outcome,
-                histogram: item.histogram,
-            })
-            .collect(),
-        guest_pause_latency: state
-            .rt
-            .guest_pause_latency()
-            .into_iter()
-            .map(|item| LatencySeries {
-                operation: item.operation,
-                outcome: "success",
-                histogram: item.histogram,
-            })
-            .collect(),
-        local_io_latency: state
-            .rt
-            .local_io_latency()
-            .into_iter()
-            .map(|item| LatencySeries {
-                operation: item.operation,
-                outcome: item.outcome,
-                histogram: item.histogram,
-            })
-            .collect(),
+        fault_latency: state.rt.fault_latency(),
+        operation_latency: state.rt.operation_latency(),
+        guest_pause_latency: state.rt.guest_pause_latency(),
+        local_io_latency: state.rt.local_io_latency(),
         local_io_in_flight: state.rt.local_io_in_flight(),
-        store_latency: store
-            .latency()
-            .into_iter()
-            .map(|item| LatencySeries {
-                operation: item.operation,
-                outcome: item.outcome,
-                histogram: item.histogram,
-            })
-            .collect(),
+        store_latency: store.latency(),
         firecracker_fault_latency: state.firecracker_fault_latency(),
         blob_filesystem_space: state.rt.blob_filesystem_space(),
         backup_lag_age: state
