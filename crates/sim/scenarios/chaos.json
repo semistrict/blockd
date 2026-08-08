@@ -1,0 +1,26 @@
+{
+  "extends": ["single-host-base"],
+  "schema": 1,
+  "name": "chaos",
+  "description": "Single-host checkpoint, crash, bit-rot, and object-store chaos.",
+  "kind": "single-host",
+  "topology": {
+    "backed_vsets": 1,
+    "pages_per_volume": 12
+  },
+  "workload": {
+    "horizon": "3s",
+    "checkpoint_interval": "300ms"
+  },
+  "nemeses": {
+    "restart_delay": { "min": "10ms", "max": "300ms" },
+    "crash_mean_interval": "600ms",
+    "bitflip_mean_interval": "500ms",
+    "store_outage": { "start": "1200ms", "end": "1900ms" }
+  },
+  "coverage": [
+    { "metric": "daemon-crash", "label": "daemon crash" },
+    { "metric": "bit-flip", "label": "bit flip" },
+    { "metric": "store-retry", "label": "store retry" }
+  ]
+}

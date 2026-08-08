@@ -258,6 +258,7 @@ dependencies = [
  "blockd-hostmem",
  "blockd-sim",
  "blockd-vsetfs",
+ "blockd-workload",
  "bytes",
  "futures-util",
  "httpdate",
@@ -277,6 +278,9 @@ name = "blockd-sim"
 version = "0.1.0"
 dependencies = [
  "blockd-core",
+ "blockd-workload",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -303,6 +307,14 @@ dependencies = [
  "virtio-queue",
  "vm-memory",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "blockd-workload"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

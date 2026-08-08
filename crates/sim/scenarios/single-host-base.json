@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "name": "single-host-base",
+  "description": "One host with local durability and no injected faults.",
+  "kind": "single-host",
+  "daemon": {
+    "cache_pages": 256,
+    "writeback_interval": "20ms",
+    "backup_retry": "200ms",
+    "disk_capacity_bytes": null,
+    "disk_headroom_bytes": 0,
+    "wedge_ticks": 25
+  },
+  "storage": {
+    "blob_device": {
+      "read_latency": { "min": "20us", "max": "150us" },
+      "write_latency": { "min": "30us", "max": "400us" },
+      "ns_per_byte": 1
+    },
+    "object_store": {
+      "latency": { "min": "5ms", "max": "60ms" },
+      "ns_per_byte": 5
+    }
+  },
+  "topology": {
+    "hosts": null,
+    "vset_count": 3,
+    "backed_vsets": 0,
+    "nonbacked_vsets": null,
+    "disk_volumes": 2,
+    "pages_per_volume": 16,
+    "durability": "local",
+    "replica_placement": null
+  },
+  "workload": {
+    "horizon": "2s",
+    "think": { "min": "1ms", "max": "5ms" },
+    "checkpoint_interval": null,
+    "sync_share_ppm": null,
+    "hot_pages": null
+  },
+  "nemeses": {
+    "restart_delay": { "min": "10ms", "max": "500ms" }
+  },
+  "coverage": []
+}

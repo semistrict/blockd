@@ -18,6 +18,7 @@ use blockd_core::journal::VsetConfig;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig, S3Store};
+use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};
 
 const VSET: VsetId = VsetId(1);
 
@@ -61,70 +62,109 @@ fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
     }
 }
 
-/// The same seeded workload model as `e2e_linux.rs`, retargetable at
-/// whichever runtime currently runs the vset.
-struct Workload {
-    lcg: u64,
+struct MigrationBackend<'a> {
+    hosts: [&'a Runtime; 2],
+    current: usize,
     config: VsetConfig,
-    model: BTreeMap<PageId, u64>,
+    pause: Duration,
+    migrations: u64,
+    verified_model: Option<WorkloadModel>,
 }
 
-impl Workload {
-    fn new(seed: u64, config: VsetConfig) -> Workload {
-        Workload {
-            lcg: seed.max(1),
+impl<'a> MigrationBackend<'a> {
+    fn new(a: &'a Runtime, b: &'a Runtime, config: VsetConfig) -> Self {
+        Self {
+            hosts: [a, b],
+            current: 0,
             config,
-            model: BTreeMap::new(),
+            pause: Duration::ZERO,
+            migrations: 0,
+            verified_model: None,
         }
     }
 
-    fn next(&mut self) -> u64 {
-        self.lcg = self
-            .lcg
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        self.lcg
+    fn runtime(&self) -> &Runtime {
+        self.hosts[self.current]
     }
 
-    fn random_page(&mut self) -> PageId {
-        let idx =
-            u8::try_from(self.next() % u64::from(self.config.disk_volumes) + 1).expect("fits");
-        let page =
-            u32::try_from(self.next() % u64::from(self.config.pages_per_volume)).expect("fits");
-        pid(idx, page)
+    fn page_id(page: LogicalPage) -> PageId {
+        pid(page.volume, page.page)
     }
 
-    fn step(&mut self, rt: &Runtime, op: u64) {
-        let page = self.random_page();
-        if self.next().is_multiple_of(4) {
-            self.verify_page(rt, page);
-        } else {
-            let value = 0x1000_0000 + op;
-            rt.guest_write(VSET, page, value);
-            self.model.insert(page, value);
+    fn verify_page(&self, page: LogicalPage, expected: u64) -> Result<(), String> {
+        let bytes = self.runtime().guest_read(VSET, Self::page_id(page));
+        let actual = u64::from_le_bytes(bytes[0..8].try_into().expect("sized"));
+        if actual != expected {
+            return Err(format!(
+                "{page:?}: observed {actual:#x}, expected {expected:#x}"
+            ));
         }
+        if bytes[8..].iter().any(|&byte| byte != 0) {
+            return Err(format!("{page:?}: fill tail corrupted"));
+        }
+        Ok(())
     }
 
-    fn verify_page(&self, rt: &Runtime, page: PageId) {
-        let bytes = rt.guest_read(VSET, page);
-        let want = self.model.get(&page).copied().unwrap_or(0);
-        assert_eq!(
-            u64::from_le_bytes(bytes[0..8].try_into().expect("sized")),
-            want,
-            "{page:?}: word 0 diverged from the model"
-        );
-        assert!(
-            bytes[8..].iter().all(|&b| b == 0),
-            "{page:?}: fill tail corrupted"
-        );
+    fn verify(&self, model: &WorkloadModel, scope: VerifyScope) -> Result<(), String> {
+        for (page, expected) in model.pages(scope) {
+            self.verify_page(page, expected)?;
+        }
+        Ok(())
+    }
+}
+
+impl Backend for MigrationBackend<'_> {
+    type Error = String;
+
+    fn supports(&self, capability: Capability) -> bool {
+        matches!(
+            capability,
+            Capability::Create
+                | Capability::Data
+                | Capability::Sync
+                | Capability::Migrate
+                | Capability::Verify
+        )
     }
 
-    fn verify_all(&self, rt: &Runtime) {
-        for idx in 1..=self.config.disk_volumes {
-            for page in 0..self.config.pages_per_volume {
-                self.verify_page(rt, pid(idx, page));
+    fn execute(&mut self, operation: Operation, model: &WorkloadModel) -> Result<(), Self::Error> {
+        match operation {
+            Operation::Create => self.hosts[0].create_vset(VSET, self.config),
+            Operation::Read { page } => self.verify_page(page, model.expected(page))?,
+            Operation::Write { page, value } => {
+                self.runtime().guest_write(VSET, Self::page_id(page), value);
             }
+            Operation::Sync { volume } => {
+                if !self.runtime().guest_sync(VSET, VolumeIdx(volume)) {
+                    return Err(format!("sync rejected for volume {volume}"));
+                }
+            }
+            Operation::Migrate { to_host } => {
+                let destination = usize::from(to_host);
+                if self.current != 0 || destination != 1 {
+                    return Err(format!(
+                        "unsupported migration route {} -> {destination}",
+                        self.current
+                    ));
+                }
+                self.hosts[destination].expect_migration(VSET, self.config);
+                let started = Instant::now();
+                self.hosts[self.current].migrate_out(VSET, HostId(to_host));
+                let verdict = self.hosts[destination].wait_migrated_in(VSET);
+                self.pause = started.elapsed();
+                if !matches!(verdict, Verdict::Resume { .. }) {
+                    return Err(format!("migration verdict was {verdict:?}"));
+                }
+                self.current = destination;
+                self.migrations += 1;
+            }
+            Operation::Verify { scope } => {
+                self.verify(model, scope)?;
+                self.verified_model = Some(model.clone());
+            }
+            _ => unreachable!("capability checked before execution"),
         }
+        Ok(())
     }
 }
 
@@ -168,41 +208,22 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
     let a = Runtime::new(&runtime_config("host-a", 0, peer_a), store.clone());
     let b = Runtime::new(&runtime_config("host-b", 1, peer_b), store.clone());
 
-    // A non-backed vset (the mode that must migrate, R7.2) does real work
-    // on A — enough distinct pages that the post-copy tail is nontrivial.
-    let vc = VsetConfig::compute(2, 64, false);
-    a.create_vset(VSET, vc);
-    let mut workload = Workload::new(0xB10C_D001, vc);
-    for op in 0..600 {
-        workload.step(&a, op);
-        if op % 97 == 0 {
-            assert!(a.guest_sync(VSET, VolumeIdx(1)), "sync on A");
-        }
-    }
-
-    // Hand off: B expects the inbound vset BEFORE the offer can arrive.
-    b.expect_migration(VSET, vc);
-    let paused = Instant::now();
-    a.migrate_out(VSET, HostId(1));
-    let verdict = b.wait_migrated_in(VSET);
-    let pause = paused.elapsed();
-    assert!(
-        matches!(verdict, Verdict::Resume { .. }),
-        "migration verdict was {verdict:?}"
+    let spec = blockd_workload::load("migration").expect("migration workload");
+    let vc = VsetConfig::compute(
+        spec.shape.disk_volumes,
+        spec.shape.pages_per_volume,
+        spec.shape.backed_up,
     );
-    // R7.1: the whole guest-observed handoff stays far inside 500ms.
-    assert!(pause < Duration::from_millis(500), "handoff took {pause:?}");
+    let mut backend = MigrationBackend::new(&a, &b, vc);
+    let outcome = blockd_workload::run(&spec, &mut backend).expect("migration workload");
 
-    // The SAME workload model continues on B: post-migration writes land
-    // on the destination, reads verify against everything A ever wrote —
-    // served by demand fetches from A over real TCP until hydrated.
-    for op in 600..900 {
-        workload.step(&b, op);
-        if op % 97 == 0 {
-            assert!(b.guest_sync(VSET, VolumeIdx(1)), "sync on B");
-        }
-    }
-    workload.verify_all(&b);
+    // R7.1: the whole guest-observed handoff stays far inside 500ms.
+    assert!(
+        backend.pause < Duration::from_millis(500),
+        "handoff took {:?}",
+        backend.pause
+    );
+    assert_eq!(backend.migrations, outcome.migrations);
 
     // Hydration drains the tail without the guest's help; the destination
     // releases the source, and the source reclaims the vset to NOTHING.
@@ -220,7 +241,15 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
     }
 
     // Everything still verifies afterwards, from B's own storage alone.
-    workload.verify_all(&b);
+    backend
+        .verify(
+            backend
+                .verified_model
+                .as_ref()
+                .expect("workload performed verification"),
+            VerifyScope::Disk,
+        )
+        .expect("destination remains readable");
     assert_eq!(a.incidents(), Vec::<String>::new());
     assert_eq!(b.incidents(), Vec::<String>::new());
     // The wire really carried the drain (hydration pulled pages from A).

@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "name": "checkpoint-recovery",
+  "seed": 7,
+  "shape": {
+    "disk_volumes": 2,
+    "pages_per_volume": 16,
+    "backed_up": false
+  },
+  "phases": [
+    { "op": "create" },
+    {
+      "op": "run",
+      "operations": 200,
+      "write_ppm": 750000,
+      "sync_every": 50,
+      "access": { "volumes": "all", "hot": null }
+    },
+    { "op": "checkpoint" },
+    { "op": "crash" },
+    { "op": "restore" },
+    { "op": "verify", "scope": "all" },
+    {
+      "op": "run",
+      "operations": 100,
+      "write_ppm": 750000,
+      "sync_every": 50,
+      "access": { "volumes": "all", "hot": null }
+    },
+    { "op": "checkpoint" },
+    { "op": "verify", "scope": "all" }
+  ]
+}

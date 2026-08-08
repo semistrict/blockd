@@ -12,7 +12,10 @@ use std::time::Instant;
 
 use blockd_core::daemon::Counters;
 use blockd_core::daemon::{DaemonStats, VsetOperations, VsetRole};
-use blockd_runtime::{FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS, LatencySeries};
+use blockd_runtime::{
+    CapacitySignal, CapacityState, FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS,
+    LatencySeries,
+};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
@@ -197,6 +200,7 @@ pub struct MetricsSnapshot {
     pub peer_connections: Vec<(u16, bool)>,
     pub incidents: u64,
     pub daemon: DaemonStats,
+    pub capacity: CapacitySignal,
     pub loop_decide: Vec<(&'static str, u64, u64)>,
     pub loop_effect: Vec<(&'static str, u64, u64)>,
     pub loop_idle_ns: u64,
@@ -358,6 +362,7 @@ impl Metrics {
         );
         append_store_metrics(&mut out, snapshot.store);
         append_daemon_state(&mut out, &snapshot.daemon);
+        append_capacity_signal(&mut out, snapshot.capacity);
         append_backup_lag_age(&mut out, &snapshot.backup_lag_age);
         append_active_operation_age(&mut out, &snapshot.active_operation_age);
         if let Some((capacity, available)) = snapshot.blob_filesystem_space {
@@ -644,6 +649,67 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
                 value,
             );
         }
+    }
+}
+
+fn append_capacity_signal(out: &mut String, signal: CapacitySignal) {
+    append_family(
+        out,
+        "blockd_capacity_state",
+        "Smoothed host capacity state recommended to the control plane.",
+        "gauge",
+    );
+    for state in [
+        CapacityState::Normal,
+        CapacityState::Constrained,
+        CapacityState::Critical,
+    ] {
+        append_sample(
+            out,
+            "blockd_capacity_state",
+            &format!("state=\"{}\"", state.as_str()),
+            u8::from(signal.state == state),
+        );
+    }
+    append_family(
+        out,
+        "blockd_capacity_limiting_reason",
+        "The pressure source currently limiting host capacity.",
+        "gauge",
+    );
+    append_sample(
+        out,
+        "blockd_capacity_limiting_reason",
+        &format!(
+            "reason=\"{}\"",
+            signal
+                .limiting_reason
+                .map_or("none", |reason| reason.as_str())
+        ),
+        1,
+    );
+    append_gauge(
+        out,
+        "blockd_capacity_admission_percent",
+        "Recommended percentage of the host's ordinary placement budget.",
+        signal.admission_percent.into(),
+    );
+    append_family(
+        out,
+        "blockd_capacity_optional_work_allowed",
+        "Whether optional control-plane work should be scheduled on this host.",
+        "gauge",
+    );
+    for (work, allowed) in [
+        ("migration", signal.allow_migrations),
+        ("prefetch", signal.allow_prefetch),
+    ] {
+        append_sample(
+            out,
+            "blockd_capacity_optional_work_allowed",
+            &format!("work=\"{work}\""),
+            u8::from(allowed),
+        );
     }
 }
 
@@ -1006,6 +1072,33 @@ fn escape_label(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn constrained_capacity() -> CapacitySignal {
+        CapacitySignal {
+            state: CapacityState::Constrained,
+            limiting_reason: Some(blockd_runtime::CapacityReason::BackupLag),
+            admission_percent: 25,
+            allow_migrations: false,
+            allow_prefetch: false,
+        }
+    }
+
+    fn assert_capacity_metrics(text: &str) {
+        assert!(text.contains("blockd_capacity_state{state=\"constrained\"} 1"));
+        assert!(text.contains("blockd_capacity_limiting_reason{reason=\"backup_lag\"} 1"));
+        assert!(text.contains("blockd_capacity_admission_percent 25"));
+        assert!(text.contains("blockd_capacity_optional_work_allowed{work=\"migration\"} 0"));
+    }
+
+    fn assert_custom_suffix_pinned(text: &str) {
+        let custom = &text[text
+            .find("# HELP blockd_host_info")
+            .expect("custom metric families")..];
+        let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        assert_eq!((custom.len(), custom_hash), (15_641, 0xa9bd_5b32_a38f_8524));
+    }
+
     #[test]
     fn metrics_use_normalized_routes_and_include_runtime_state() {
         let metrics = Arc::new(Metrics::new());
@@ -1052,6 +1145,7 @@ mod tests {
                 }],
                 ..DaemonStats::default()
             },
+            capacity: constrained_capacity(),
             loop_decide: vec![("GuestFault", 2, 1_000)],
             loop_effect: Vec::new(),
             loop_idle_ns: 0,
@@ -1080,13 +1174,7 @@ mod tests {
         let text = metrics.encode(&snapshot);
         // The registry prefix includes a real elapsed HTTP duration. The
         // custom suffix is deterministic and must remain byte-identical.
-        let custom = &text[text
-            .find("# HELP blockd_host_info")
-            .expect("custom metric families")..];
-        let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-        assert_eq!((custom.len(), custom_hash), (14_724, 0x9887_d33b_ebd1_1920));
+        assert_custom_suffix_pinned(&text);
         assert!(text.contains(
             "blockd_http_requests_total{method=\"POST\",route=\"/vm/{id}/work\",status_code=\"200\"} 1"
         ));
@@ -1096,6 +1184,7 @@ mod tests {
         assert!(text.contains("blockd_store_requests_total{operation=\"get\"} 3"));
         assert!(text.contains("blockd_vms{state=\"running\",backed=\"true\"} 2"));
         assert!(text.contains("blockd_cache_pages{state=\"dirty\"} 3"));
+        assert_capacity_metrics(&text);
         assert!(text.contains("blockd_vset_backup_lag_captures{vset_id=\"42\"} 6"));
         assert!(text.contains("blockd_vset_backup_lag_bytes{vset_id=\"42\"} 3072"));
         assert!(text.contains("blockd_vset_backup_lag_seconds{vset_id=\"42\"} 12.5"));

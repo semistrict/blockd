@@ -11,6 +11,7 @@
 //!   fill <seed> <pages>  → write patterns over N native guest pages → FILLED <fnv>
 //!   sum <pages>          → checksum the first N native guest pages  → SUM <fnv>
 //!   mark <page> <value>  → write one word (divergence)             → MARKED
+//!   read <page>          → read the page's modeled first word      → VALUE <value>
 //!   db-create <vset> <vm> <generation> <port> → WAL database       → DBCREATED ...
 //!   db-open   <vset> <vm> <generation> <port> → reopen database    → DBOPEN ...
 //!   db-check             → query rows + integrity                  → DBCHECK ...
@@ -464,6 +465,11 @@ mod guest {
                     let value: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
                     arena[page.min(ARENA_PAGES - 1) * words_per_page] = value;
                     "MARKED".to_owned()
+                }
+                Some("read") => {
+                    let page: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    let value = arena[page.min(ARENA_PAGES - 1) * words_per_page];
+                    format!("VALUE {value}")
                 }
                 Some(command @ ("db-create" | "db-open")) => {
                     let create = command == "db-create";

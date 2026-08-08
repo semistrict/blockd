@@ -1,0 +1,13 @@
+{
+  "extends": ["peer-transition-before-cas"],
+  "schema": 1,
+  "name": "peer-transition-after-seed",
+  "description": "Crash the primary after seeding a replacement stash but before activation CAS.",
+  "kind": "cluster",
+  "nemeses": {
+    "fault_points": ["crash-primary-after-seed-before-active-cas"]
+  },
+  "coverage": [
+    { "metric": "peer-fault", "fault_point": "crash-primary-after-seed-before-active-cas", "label": "primary crash after replacement seed" }
+  ]
+}

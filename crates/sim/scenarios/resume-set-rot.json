@@ -1,0 +1,30 @@
+{
+  "extends": ["cluster"],
+  "schema": 1,
+  "name": "resume-set-rot",
+  "description": "A corrupted resume set costs only prefetch warmth across two successive restores.",
+  "kind": "cluster",
+  "topology": {
+    "vset_count": 1,
+    "pages_per_volume": 16
+  },
+  "workload": {
+    "horizon": "4s"
+  },
+  "nemeses": {
+    "kill_hosts": [
+      { "at": "1500ms", "host": 0 },
+      { "at": "2800ms", "host": 1 }
+    ],
+    "race_restore": false,
+    "rot_resume_set_at": "2700ms"
+  },
+  "coverage": [
+    { "metric": "orphan-restore", "label": "successive restores" }
+  ],
+  "outcomes": [
+    { "metric": "orphan-restore", "label": "restore count", "min": 2, "max": 2 },
+    { "metric": "prefetch-fill", "label": "corrupted resume-set prefetches", "max": 0 },
+    { "metric": "guest-death", "label": "guest deaths", "max": 0 }
+  ]
+}

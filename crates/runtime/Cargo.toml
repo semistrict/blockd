@@ -39,6 +39,7 @@ tokio-rustls = "0.26.4"
 # The differential recovery test replays simulation-produced blob sets
 # through the runtime's on-disk scan path.
 blockd-sim = { path = "../sim" }
+blockd-workload = { path = "../workload" }
 rcgen = { version = "0.14.7", default-features = false, features = ["ring"] }
 tempfile = "3.23.0"
 

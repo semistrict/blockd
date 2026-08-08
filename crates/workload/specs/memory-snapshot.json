@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "name": "memory-snapshot",
+  "seed": 7,
+  "shape": {
+    "disk_volumes": 1,
+    "pages_per_volume": 256,
+    "backed_up": false
+  },
+  "phases": [
+    { "op": "create" },
+    {
+      "op": "run",
+      "operations": 256,
+      "write_ppm": 800000,
+      "sync_every": null,
+      "access": { "volumes": "memory", "hot": null }
+    },
+    { "op": "checkpoint" },
+    { "op": "crash" },
+    { "op": "restore" },
+    { "op": "verify", "scope": "memory" },
+    { "op": "fork", "copies": 3 }
+  ]
+}

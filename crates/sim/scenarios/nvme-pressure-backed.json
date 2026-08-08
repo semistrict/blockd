@@ -1,0 +1,23 @@
+{
+  "extends": ["single-host-base"],
+  "schema": 1,
+  "name": "nvme-pressure-backed",
+  "description": "Backed segments are reclaimed under bounded NVMe pressure without killing a guest.",
+  "kind": "single-host",
+  "daemon": {
+    "cache_pages": 24,
+    "disk_capacity_bytes": { "uniform": { "min": 225280, "max": 307200 } },
+    "disk_headroom_bytes": { "uniform": { "min": 49152, "max": 81920 } }
+  },
+  "topology": {
+    "vset_count": 1,
+    "backed_vsets": 1
+  },
+  "coverage": [
+    { "metric": "nvme-reclaim", "label": "NVMe reclaim" },
+    { "metric": "nvme-stall", "label": "NVMe pressure stall" }
+  ],
+  "outcomes": [
+    { "metric": "guest-death", "label": "guest deaths", "max": 0 }
+  ]
+}

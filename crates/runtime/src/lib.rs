@@ -14,6 +14,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod blobscan;
+mod capacity;
 #[cfg(target_os = "linux")]
 pub mod database;
 pub mod directory_store;
@@ -35,6 +36,9 @@ mod store;
 pub mod vsetfs;
 
 pub use blobscan::scan_blob_dir;
+pub use capacity::{
+    CapacityController, CapacityInputs, CapacityReason, CapacitySignal, CapacityState,
+};
 pub use gcs::{GcsConfig, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
 pub use host::{Runtime, RuntimeConfig};

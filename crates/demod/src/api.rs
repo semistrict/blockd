@@ -437,6 +437,7 @@ fn metrics_text(state: &Arc<Demod>) -> String {
             .collect(),
         incidents: u64::try_from(state.rt.incidents().len()).unwrap_or(u64::MAX),
         daemon: state.rt.daemon_stats(),
+        capacity: state.rt.capacity_signal(),
         loop_decide: loop_stats.decide_totals(),
         loop_effect: loop_stats.effect_totals(),
         loop_idle_ns: loop_stats.idle_ns(),
@@ -482,10 +483,12 @@ fn status_value(state: &Arc<Demod>) -> Value {
         })
         .collect::<Vec<_>>();
     let counters = state.rt.counters();
+    let capacity = state.rt.capacity_signal();
     let store = &state.store.stats;
     json!({
         "host": state.cfg.host.0,
         "vms": vms,
+        "capacity": capacity_value(capacity),
         "counters": {
             "fills": counters.fills,
             "pages_flushed": counters.pages_flushed,
@@ -510,6 +513,16 @@ fn status_value(state: &Arc<Demod>) -> Value {
     })
 }
 
+fn capacity_value(signal: blockd_runtime::CapacitySignal) -> Value {
+    json!({
+        "state": signal.state.as_str(),
+        "limiting_reason": signal.limiting_reason.map(blockd_runtime::CapacityReason::as_str),
+        "admission_percent": signal.admission_percent,
+        "allow_migrations": signal.allow_migrations,
+        "allow_prefetch": signal.allow_prefetch,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +540,27 @@ mod tests {
         assert_eq!(
             parse_id("not-an-id").expect_err("invalid id").status,
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn capacity_status_is_actionable() {
+        let value = capacity_value(blockd_runtime::CapacitySignal {
+            state: blockd_runtime::CapacityState::Critical,
+            limiting_reason: Some(blockd_runtime::CapacityReason::DiskHeadroom),
+            admission_percent: 0,
+            allow_migrations: false,
+            allow_prefetch: false,
+        });
+        assert_eq!(
+            value,
+            json!({
+                "state": "critical",
+                "limiting_reason": "disk_headroom",
+                "admission_percent": 0,
+                "allow_migrations": false,
+                "allow_prefetch": false,
+            })
         );
     }
 }

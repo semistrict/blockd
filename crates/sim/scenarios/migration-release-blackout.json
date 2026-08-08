@@ -1,0 +1,33 @@
+{
+  "extends": ["cluster"],
+  "schema": 1,
+  "name": "migration-release-blackout",
+  "description": "A Released-message blackout wedges both migration ends and then converges without residue.",
+  "kind": "cluster",
+  "topology": {
+    "hosts": 2,
+    "vset_count": 1,
+    "nonbacked_vsets": 1
+  },
+  "nemeses": {
+    "kill_hosts": [],
+    "race_restore": false,
+    "migrate_at": { "at": "1500ms", "vset": 1, "to": 1 },
+    "drop_peer": {
+      "kind": "released",
+      "window": { "start": "1500ms", "end": "3100ms" }
+    }
+  },
+  "coverage": [
+    { "metric": "completed-migration", "label": "completed migration" },
+    { "metric": "nemesis-drop", "label": "Released message drop" },
+    { "metric": "wedge-hydration", "label": "hydration wedge" },
+    { "metric": "wedge-outbound", "label": "outbound wedge" },
+    { "metric": "release", "label": "post-heal release" }
+  ],
+  "outcomes": [
+    { "metric": "guest-death", "label": "guest deaths", "max": 0 },
+    { "metric": "parked-end", "label": "parked fills at drain", "max": 0 },
+    { "metric": "hydrating-end", "label": "hydrating vsets at drain", "max": 0 }
+  ]
+}

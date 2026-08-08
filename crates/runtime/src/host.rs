@@ -36,6 +36,7 @@ use crate::loopstats::{LoopStats, effect_kind, event_kind};
 use crate::metrics::{AtomicHistogram, FaultLatency, LatencySeries};
 use crate::peer::{PeerConfig, PeerNet};
 use crate::store::ObjectStore;
+use crate::{CapacityController, CapacityInputs, CapacitySignal};
 
 pub struct RuntimeConfig {
     pub daemon: DaemonConfig,
@@ -289,6 +290,8 @@ struct Shared {
     daemon_stats: Mutex<blockd_core::daemon::DaemonStats>,
     replica_metrics: Mutex<Vec<blockd_core::daemon::ReplicaVsetMetrics>>,
     replica_spool_metrics: Mutex<Vec<blockd_core::daemon::ReplicaSpoolMetrics>>,
+    /// Smoothed host pressure recommendation for placement and optional work.
+    capacity: Mutex<CapacityController>,
     /// Loop-thread time attribution (R9.2's perf side): decide vs effect
     /// execution vs idle, by kind.
     stats: LoopStats,
@@ -320,6 +323,7 @@ impl Shared {
             daemon_stats: Mutex::new(daemon_stats),
             replica_metrics: Mutex::new(replica_metrics),
             replica_spool_metrics: Mutex::new(replica_spool_metrics),
+            capacity: Mutex::new(CapacityController::default()),
             stats: LoopStats::default(),
             fault_in_flight: Mutex::new(BTreeMap::new()),
             operation_latency: std::array::from_fn(|_| {
@@ -680,6 +684,7 @@ impl Runtime {
             daemon.replica_metrics(),
             daemon.replica_spool_metrics(),
         ));
+        update_capacity_signal(&shared, &tx);
 
         let replica_prepare = spawn_replica_prepare_workers(&tx);
         let peers = config.peer.as_ref().map(|p| {
@@ -763,6 +768,7 @@ impl Runtime {
                         Msg::Stop => break,
                     };
                     let refresh_observability = matches!(event, Event::Timer(_));
+                    let refresh_capacity = matches!(&event, Event::Timer(TimerId::Writeback));
                     let kind = event_kind(&event);
                     let source = fault_source_of_event(&event);
                     let started = Instant::now();
@@ -785,6 +791,9 @@ impl Runtime {
                         *shared.replica_metrics.lock().expect("lock") = daemon.replica_metrics();
                         *shared.replica_spool_metrics.lock().expect("lock") =
                             daemon.replica_spool_metrics();
+                        if refresh_capacity {
+                            update_capacity_signal(&shared, &effect_context.tx);
+                        }
                     }
                     shared
                         .stats
@@ -820,6 +829,11 @@ impl Runtime {
 
     pub fn daemon_stats(&self) -> blockd_core::daemon::DaemonStats {
         self.shared.daemon_stats.lock().expect("lock").clone()
+    }
+
+    /// Current host-capacity recommendation for control-plane consumers.
+    pub fn capacity_signal(&self) -> CapacitySignal {
+        self.shared.capacity.lock().expect("lock").signal()
     }
 
     pub fn backup_lag_age(&self) -> Vec<(VsetId, Duration)> {
@@ -1518,6 +1532,70 @@ fn operation_name(operation: u8) -> &'static str {
         blockd_core::daemon::VsetOperations::HYDRATION => "hydration",
         _ => unreachable!("known background operation"),
     }
+}
+
+fn update_capacity_signal(shared: &Shared, queue: &LoopQueue) {
+    let daemon = shared.daemon_stats.lock().expect("lock").clone();
+    let (critical_queue_depth, background_queue_depth) = queue.depths();
+    let local_io_in_flight = shared
+        .local_io_in_flight
+        .iter()
+        .map(|value| value.load(Ordering::Relaxed))
+        .sum();
+    let oldest_backup_lag = shared
+        .backup_lag_started
+        .lock()
+        .expect("lock")
+        .values()
+        .map(Instant::elapsed)
+        .max()
+        .unwrap_or_default();
+
+    let replica_metrics = shared.replica_metrics.lock().expect("lock");
+    let stash_missing = replica_metrics
+        .iter()
+        .any(|metric| metric.assignment_epoch.is_none() || metric.active_peer.is_none());
+    let stash_replacement_active = replica_metrics
+        .iter()
+        .any(|metric| metric.transition_peer.is_some());
+    drop(replica_metrics);
+
+    let spool_metrics = shared.replica_spool_metrics.lock().expect("lock");
+    let (peer_spool_used_bytes, peer_spool_capacity_bytes) = spool_metrics
+        .iter()
+        .filter(|metric| metric.source_capacity_bytes > 0)
+        .max_by(|left, right| {
+            (u128::from(left.stored_bytes) * u128::from(right.source_capacity_bytes))
+                .cmp(&(u128::from(right.stored_bytes) * u128::from(left.source_capacity_bytes)))
+        })
+        .map_or((0, 0), |metric| {
+            (metric.stored_bytes, metric.source_capacity_bytes)
+        });
+    drop(spool_metrics);
+
+    let inputs = CapacityInputs {
+        cache_capacity_pages: daemon.cache_capacity_pages,
+        cache_used_pages: daemon
+            .resident_pages
+            .saturating_add(daemon.shared_resident_pages)
+            .saturating_add(daemon.reserved_pages),
+        dirty_pages: daemon.dirty_pages,
+        pressure_waiting_faults: daemon.pressure_waiting_faults,
+        disk_used_bytes: daemon.local_blob_bytes,
+        disk_capacity_bytes: daemon.disk_capacity_bytes,
+        disk_headroom_bytes: daemon.disk_headroom_bytes,
+        local_io_in_flight,
+        loop_busy_ns: shared.stats.busy_ns(),
+        loop_idle_ns: shared.stats.idle_ns(),
+        critical_queue_depth,
+        background_queue_depth,
+        oldest_backup_lag,
+        peer_spool_used_bytes,
+        peer_spool_capacity_bytes,
+        stash_missing,
+        stash_replacement_active,
+    };
+    shared.capacity.lock().expect("lock").observe(inputs);
 }
 
 fn update_active_operations(shared: &Shared, stats: &blockd_core::daemon::DaemonStats) {

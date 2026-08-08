@@ -1,0 +1,32 @@
+{
+  "extends": ["cluster"],
+  "schema": 1,
+  "name": "peer-stash",
+  "description": "Peer-stashed durability under lossy links and a prolonged object-store outage.",
+  "kind": "cluster",
+  "topology": {
+    "vset_count": 3,
+    "nonbacked_vsets": 0,
+    "durability": "peer-stashed",
+    "replica_placement": {
+      "mode": "weighted-hosts",
+      "membership_epoch": 1,
+      "local_failure_domain": 1
+    }
+  },
+  "workload": {
+    "sync_share_ppm": 350000
+  },
+  "nemeses": {
+    "kill_hosts": [],
+    "race_restore": false,
+    "peer_drop": { "numerator": 1, "denominator": 12 },
+    "peer_dup": { "numerator": 1, "denominator": 10 },
+    "store_outage": { "start": "400ms", "end": "2200ms" }
+  },
+  "coverage": [
+    { "metric": "replica-commit", "label": "replica commit" },
+    { "metric": "store-unavailable", "label": "store unavailable" },
+    { "metric": "peer-drop", "label": "peer drop" }
+  ]
+}

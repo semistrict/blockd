@@ -1,0 +1,27 @@
+{
+  "extends": ["cluster"],
+  "schema": 1,
+  "name": "migration",
+  "description": "Migrations overlap host crashes, lossy peers, duplicate delivery, and a store outage.",
+  "kind": "cluster",
+  "topology": {
+    "vset_count": 4,
+    "nonbacked_vsets": 2
+  },
+  "nemeses": {
+    "restart_delay": { "min": "50ms", "max": "200ms" },
+    "crash_mean_interval": "1100ms",
+    "migrate_mean_interval": "400ms",
+    "peer_drop": { "numerator": 1, "denominator": 8 },
+    "peer_dup": { "numerator": 1, "denominator": 8 },
+    "store_outage": { "start": "1800ms", "end": "2600ms" },
+    "kill_hosts": [],
+    "race_restore": false
+  },
+  "coverage": [
+    { "metric": "host-recovery", "label": "host recovery" },
+    { "metric": "completed-migration", "label": "completed migration" },
+    { "metric": "peer-drop", "label": "peer drop" },
+    { "metric": "peer-duplicate", "label": "peer duplicate" }
+  ]
+}

@@ -14,4 +14,5 @@ pub mod kernel;
 pub mod oracle;
 pub mod presets;
 pub mod rng;
+pub mod scenario;
 pub mod world;

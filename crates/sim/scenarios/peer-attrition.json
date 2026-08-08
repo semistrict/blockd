@@ -1,0 +1,20 @@
+{
+  "extends": ["peer-stash"],
+  "schema": 1,
+  "name": "peer-attrition",
+  "description": "Lose the active stash peer long enough to force fenced replacement and residue recovery.",
+  "kind": "cluster",
+  "topology": { "vset_count": 1 },
+  "workload": { "horizon": "2s" },
+  "nemeses": {
+    "restart_delay": { "min": "700ms", "max": "800ms" },
+    "peer_drop": { "numerator": 0, "denominator": 1 },
+    "peer_dup": { "numerator": 0, "denominator": 1 },
+    "store_outage": null,
+    "crash_hosts": [{ "at": "400ms", "host": { "stash_rank": 0 } }]
+  },
+  "coverage": [
+    { "metric": "host-recovery", "label": "host recovery" },
+    { "metric": "replica-commit", "label": "replica commit" }
+  ]
+}

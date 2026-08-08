@@ -73,15 +73,63 @@ Keep the same machine, build profile, CPU governor, and background load when
 comparing revisions. The printed shape assertions ensure the intended path ran;
 the measurements themselves are evidence, not portable pass/fail gates.
 
+## Shared declarative workloads
+
+Checked workload documents under `crates/workload/specs` expand into a stable
+operation stream over create, read, write, sync, checkpoint, migration, crash,
+restore, verification, and fork. The shared logical page model emits operation
+counts plus canonical all-page and disk-page hashes; adapters keep their native
+timings, fault counters, pause measurements, and other backend metrics separate.
+
+Portable differential coverage runs the same steady-I/O and checkpoint-recovery
+definitions through the reference model and deterministic simulator:
+
+```sh
+cargo test -p blockd-workload
+cargo test -p blockd-sim --test workload
+```
+
+The Linux kernel lane also runs those definitions through real userfaultfd,
+disk, timer, recovery, and TCP migration paths. The Firecracker lane runs the
+memory snapshot definition inside a guest, including snapshot, process death,
+restore, verification, and isolated forks. The bare decider profile consumes
+`decider-throughput`, so its correctness shape and performance measurements
+come from the same checked operation stream:
+
+```sh
+cargo test --release -p blockd-runtime --test perf_decider \
+  profile_decider_event_ceiling -- --nocapture
+cargo test -p blockd-runtime --test fc_e2e_linux \
+  declarative_memory_snapshot_runs_inside_firecracker
+```
+
 ## Deterministic simulation ensembles
 
-Three shared presets continuously search beyond the permanent regression seed
-corpora:
+Checked-in scenario specifications under `crates/sim/scenarios` compose daemon,
+storage, topology, workload, and nemesis settings. The fixed scenarios preserve
+the permanent regression corpora and their historical traces:
 
 - `chaos`: single-host crashes, bit rot, and a store outage.
 - `cluster`: host loss followed by racing restore claims.
 - `migration`: concurrent migration, crashes, lossy and duplicating peer
   traffic, and a store outage.
+- `peer-stash`: peer-stashed durability with lossy traffic and a store outage.
+- `peer-rare`: targeted rare-branch peer-stash fault injection.
+- `cold-restore-outage`: cold demand fills parked across a store outage.
+- `nvme-pressure-backed` and `nvme-pressure-unbacked`: reclaimable and
+  irreducible disk-pressure behavior.
+- `migration-release-blackout` and `migration-leaf-blackout`: targeted
+  migration wedges followed by convergence.
+- `hot-compaction`: hot-set churn with cold survivors pinning segments.
+- `resume-set-rot` and `leaf-rot`: benign and loud recovery-corruption
+  verdicts.
+- `peer-commit-crashes`, `peer-transfer-crashes`, and the three
+  `peer-transition-*` scenarios: every peer-stash crash boundary.
+
+The `explore` scenario adds deterministic bounded distributions over operational
+settings, topology, workload pacing, and nemesis rates. A seed always realizes
+the same configuration, and scenario draws use an independent RNG stream so
+they do not perturb the simulator's trace RNG.
 
 Run an automation-equivalent shard locally with:
 
@@ -90,7 +138,7 @@ scripts/run-sim-ensemble.sh migration 0 250 artifacts/simulation/local
 ```
 
 The runner builds the optimized simulator, records the revision and seed
-range, and requires aggregate evidence that the preset's distinguishing faults
+range, and requires aggregate evidence that the scenario's distinguishing faults
 actually occurred. The sweep itself retains its original lightweight command:
 
 ```sh
@@ -101,16 +149,22 @@ Set `BLOCKD_SWEEP_REQUIRE_COVERAGE=1` to enable aggregate coverage gates and
 `BLOCKD_SWEEP_ARTIFACT_DIR=<path>` to retain failure evidence without using the
 wrapper.
 
+Scenario `outcomes` are checked on every seed even when aggregate coverage is
+disabled. They express exact or bounded verdicts such as zero surviving parked
+fills, zero guest deaths after a recoverable fault, or exactly one loud guest
+death after deliberately corrupting an indispensable map leaf.
+
 Every invariant or liveness failure is immediately replayed with the same seed.
-Its artifact contains both reports, both trace hashes, the full preset
-configuration, whether replay was identical, and an exact replay command.
+Its artifact contains both reports, both trace hashes, the fully composed
+scenario specification, the realized configuration, whether replay was
+identical, and an exact replay command.
 
 ## Automation policy
 
-Changes and main-branch updates run 1,000 seeds per preset in four independent
-shards. The nightly job starts from a range derived from its run identifier and
-runs 16,000 new seeds per preset. Failed shards retain their evidence for 30
-days.
+Changes and main-branch updates run 1,000 seeds per automated scenario in four
+independent shards. The nightly job starts from a range derived from its run
+identifier and runs 16,000 new seeds per scenario. Failed shards retain their
+evidence for 30 days.
 
 Any seed that exposes a defect must be added to the matching permanent corpus
 before the fix merges. The regression test must assert the intended correct

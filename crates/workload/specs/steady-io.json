@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "name": "steady-io",
+  "seed": 7,
+  "shape": {
+    "disk_volumes": 2,
+    "pages_per_volume": 16,
+    "backed_up": false
+  },
+  "phases": [
+    { "op": "create" },
+    {
+      "op": "run",
+      "operations": 200,
+      "write_ppm": 750000,
+      "sync_every": 50,
+      "access": { "volumes": "disk", "hot": null }
+    },
+    { "op": "verify", "scope": "disk" }
+  ]
+}

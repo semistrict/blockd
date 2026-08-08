@@ -1,0 +1,19 @@
+{
+  "extends": ["peer-attrition"],
+  "schema": 1,
+  "name": "placement-fear",
+  "description": "Four-host placement loses successive stash candidates during fenced replacement.",
+  "kind": "cluster",
+  "topology": { "hosts": 4 },
+  "workload": { "horizon": "4s" },
+  "nemeses": {
+    "restart_delay": { "min": "900ms", "max": "1s" },
+    "crash_hosts": [
+      { "at": "400ms", "host": { "stash_rank": 0 } },
+      { "at": "750ms", "host": { "stash_rank": 1 } }
+    ]
+  },
+  "coverage": [
+    { "metric": "host-recovery", "label": "host recovery" }
+  ]
+}

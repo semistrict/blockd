@@ -1,0 +1,40 @@
+{
+  "extends": ["cluster"],
+  "schema": 1,
+  "name": "migration-leaf-blackout",
+  "description": "A multi-leaf migration parks faults while Leaf replies are blacked out and resumes after healing.",
+  "kind": "cluster",
+  "daemon": {
+    "cache_pages": 16384
+  },
+  "topology": {
+    "hosts": 2,
+    "vset_count": 1,
+    "nonbacked_vsets": 1,
+    "pages_per_volume": 5000
+  },
+  "workload": {
+    "horizon": "3s",
+    "think": { "min": "20us", "max": "100us" },
+    "sync_share_ppm": 1000
+  },
+  "nemeses": {
+    "kill_hosts": [],
+    "race_restore": false,
+    "migrate_at": { "at": "1200ms", "vset": 1, "to": 1 },
+    "drop_peer": {
+      "kind": "leaf",
+      "window": { "start": "1150ms", "end": "2400ms" }
+    }
+  },
+  "coverage": [
+    { "metric": "completed-migration", "label": "completed migration" },
+    { "metric": "nemesis-drop", "label": "Leaf message drop" },
+    { "metric": "wedge", "label": "migration wedge" },
+    { "metric": "leaf-fill", "label": "post-heal leaf fill" }
+  ],
+  "outcomes": [
+    { "metric": "guest-death", "label": "guest deaths", "max": 0 },
+    { "metric": "parked-end", "label": "parked fills at drain", "max": 0 }
+  ]
+}

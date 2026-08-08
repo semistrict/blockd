@@ -1,0 +1,53 @@
+{
+  "extends": ["migration"],
+  "schema": 1,
+  "name": "explore",
+  "description": "Bounded migration exploration across operational, topology, workload, and nemesis parameters.",
+  "kind": "cluster",
+  "daemon": {
+    "cache_pages": { "uniform": { "min": 64, "max": 512 } },
+    "writeback_interval": { "uniform": { "min": "10ms", "max": "40ms" } },
+    "backup_retry": { "uniform": { "min": "50ms", "max": "250ms" } },
+    "wedge_ticks": { "uniform": { "min": 20, "max": 50 } }
+  },
+  "topology": {
+    "hosts": { "uniform": { "min": 3, "max": 5 } },
+    "vset_count": { "uniform": { "min": 3, "max": 6 } },
+    "nonbacked_vsets": { "uniform": { "min": 1, "max": 2 } },
+    "pages_per_volume": { "uniform": { "min": 8, "max": 24 } }
+  },
+  "workload": {
+    "think": {
+      "min": { "uniform": { "min": "500us", "max": "2ms" } },
+      "max": { "uniform": { "min": "3ms", "max": "8ms" } }
+    },
+    "checkpoint_interval": { "uniform": { "min": "200ms", "max": "500ms" } },
+    "sync_share_ppm": { "uniform": { "min": 100000, "max": 400000 } }
+  },
+  "nemeses": {
+    "restart_delay": {
+      "min": { "uniform": { "min": "25ms", "max": "100ms" } },
+      "max": { "uniform": { "min": "150ms", "max": "400ms" } }
+    },
+    "crash_mean_interval": { "uniform": { "min": "700ms", "max": "1500ms" } },
+    "migrate_mean_interval": { "uniform": { "min": "250ms", "max": "700ms" } },
+    "peer_drop": {
+      "numerator": 1,
+      "denominator": { "uniform": { "min": 6, "max": 16 } }
+    },
+    "peer_dup": {
+      "numerator": 1,
+      "denominator": { "uniform": { "min": 6, "max": 16 } }
+    },
+    "store_outage": {
+      "start": { "uniform": { "min": "1200ms", "max": "1800ms" } },
+      "end": { "uniform": { "min": "2400ms", "max": "3200ms" } }
+    }
+  },
+  "coverage": [
+    { "metric": "host-recovery", "label": "host recovery" },
+    { "metric": "completed-migration", "label": "completed migration" },
+    { "metric": "peer-drop", "label": "peer drop" },
+    { "metric": "peer-duplicate", "label": "peer duplicate" }
+  ]
+}

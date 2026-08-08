@@ -16,9 +16,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use blockd_hostmem::page_size;
 use blockd_runtime::fc::{FcVm, rss_pss_of_pid, serve_uffd};
+use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};
 
 const MEM_MIB: u32 = 128;
 const WORKLOAD_PAGES: usize = 4096;
@@ -72,6 +74,206 @@ fn boot_vm(art: &Artifacts, name: &str) -> FcVm {
     let vm = FcVm::spawn(&art.fc, &art.scratch.join(format!("{name}.sock")));
     vm.boot(&art.kernel, &art.initrd, MEM_MIB);
     vm
+}
+
+#[derive(Debug, Default)]
+struct FirecrackerWorkloadMetrics {
+    commands: u64,
+    checkpoints: u64,
+    restores: u64,
+    forks: u64,
+    checkpoint_time: Duration,
+    restore_time: Duration,
+    fork_time: Duration,
+}
+
+struct FirecrackerBackend<'a> {
+    art: &'a Artifacts,
+    vm: Option<FcVm>,
+    snapshot: PathBuf,
+    memory: PathBuf,
+    metrics: FirecrackerWorkloadMetrics,
+}
+
+impl<'a> FirecrackerBackend<'a> {
+    fn new(art: &'a Artifacts) -> Self {
+        Self {
+            art,
+            vm: None,
+            snapshot: art.scratch.join("workload.vmstate"),
+            memory: art.scratch.join("workload.mem"),
+            metrics: FirecrackerWorkloadMetrics::default(),
+        }
+    }
+
+    fn vm(&mut self) -> &mut FcVm {
+        self.vm.as_mut().expect("microVM is running")
+    }
+
+    fn read_page(&mut self, page: LogicalPage) -> Result<u64, String> {
+        if page.volume != 0 {
+            return Err(format!(
+                "Firecracker arena has no disk volume {}",
+                page.volume
+            ));
+        }
+        let observed = self.vm().cmd(&format!("read {}", page.page), "VALUE ");
+        self.metrics.commands += 1;
+        observed
+            .parse()
+            .map_err(|error| format!("invalid value for {page:?}: {observed:?}: {error}"))
+    }
+
+    fn verify(&mut self, model: &WorkloadModel, scope: VerifyScope) -> Result<(), String> {
+        for (page, expected) in model.pages(scope) {
+            let observed = self.read_page(page)?;
+            if observed != expected {
+                return Err(format!(
+                    "{page:?}: observed {observed:#x}, expected {expected:#x}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Backend for FirecrackerBackend<'_> {
+    type Error = String;
+
+    fn supports(&self, capability: Capability) -> bool {
+        matches!(
+            capability,
+            Capability::Create
+                | Capability::Data
+                | Capability::Checkpoint
+                | Capability::Crash
+                | Capability::Restore
+                | Capability::Verify
+                | Capability::Fork
+        )
+    }
+
+    #[allow(clippy::too_many_lines)] // one arm per guest/lifecycle operation
+    fn execute(&mut self, operation: Operation, model: &WorkloadModel) -> Result<(), Self::Error> {
+        match operation {
+            Operation::Create => {
+                let mut vm = boot_vm(self.art, "workload-base");
+                vm.wait_line("READY");
+                self.vm = Some(vm);
+            }
+            Operation::Read { page } => {
+                let observed = self.read_page(page)?;
+                let expected = model.expected(page);
+                if observed != expected {
+                    return Err(format!(
+                        "{page:?}: observed {observed:#x}, expected {expected:#x}"
+                    ));
+                }
+            }
+            Operation::Write { page, value } => {
+                if page.volume != 0 {
+                    return Err(format!(
+                        "Firecracker arena has no disk volume {}",
+                        page.volume
+                    ));
+                }
+                self.vm()
+                    .cmd(&format!("mark {} {value}", page.page), "MARKED");
+                self.metrics.commands += 1;
+            }
+            Operation::Checkpoint => {
+                let started = Instant::now();
+                let snapshot = self.snapshot.clone();
+                let memory = self.memory.clone();
+                self.vm().pause();
+                self.vm().snapshot(&snapshot, &memory);
+                self.vm().resume();
+                self.metrics.checkpoint_time += started.elapsed();
+                self.metrics.checkpoints += 1;
+            }
+            Operation::Crash => {
+                self.vm.take().expect("microVM is running").kill();
+            }
+            Operation::Restore => {
+                let started = Instant::now();
+                let restored = FcVm::spawn(
+                    &self.art.fc,
+                    &self.art.scratch.join("workload-restored.sock"),
+                );
+                restored.load_snapshot(&self.snapshot, &self.memory, None);
+                self.vm = Some(restored);
+                self.metrics.restore_time += started.elapsed();
+                self.metrics.restores += 1;
+            }
+            Operation::Verify { scope } => self.verify(model, scope)?,
+            Operation::Fork { copies } => {
+                let started = Instant::now();
+                let mut forks: Vec<FcVm> = (0..copies)
+                    .map(|copy| {
+                        let fork = FcVm::spawn(
+                            &self.art.fc,
+                            &self.art.scratch.join(format!("workload-fork-{copy}.sock")),
+                        );
+                        fork.load_snapshot(&self.snapshot, &self.memory, None);
+                        fork
+                    })
+                    .collect();
+                for fork in &mut forks {
+                    for (page, expected) in model.pages(VerifyScope::Memory) {
+                        let observed = fork
+                            .cmd(&format!("read {}", page.page), "VALUE ")
+                            .parse::<u64>()
+                            .map_err(|error| error.to_string())?;
+                        if observed != expected {
+                            return Err(format!(
+                                "fork {page:?}: observed {observed:#x}, expected {expected:#x}"
+                            ));
+                        }
+                    }
+                }
+                let mut diverged = Vec::new();
+                for (copy, fork) in forks.iter_mut().enumerate() {
+                    let value = 0xF000_0000 + u64::try_from(copy).expect("copy fits");
+                    fork.cmd(&format!("mark 0 {value}"), "MARKED");
+                }
+                for (copy, fork) in forks.iter_mut().enumerate() {
+                    let expected = 0xF000_0000 + u64::try_from(copy).expect("copy fits");
+                    let observed = fork.cmd("read 0", "VALUE ");
+                    if observed != expected.to_string() {
+                        return Err(format!(
+                            "fork {copy} observed {observed} after isolated write, expected {expected}"
+                        ));
+                    }
+                    diverged.push(observed);
+                }
+                diverged.sort();
+                diverged.dedup();
+                if diverged.len() != usize::from(copies) {
+                    return Err("fork writes were not isolated".to_owned());
+                }
+                for fork in forks {
+                    fork.kill();
+                }
+                self.metrics.fork_time += started.elapsed();
+                self.metrics.forks += u64::from(copies);
+            }
+            _ => unreachable!("capability checked before execution"),
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn declarative_memory_snapshot_runs_inside_firecracker() {
+    let art = artifacts("shared-workload");
+    let spec = blockd_workload::load("memory-snapshot").expect("memory workload");
+    let mut backend = FirecrackerBackend::new(&art);
+    let outcome = blockd_workload::run(&spec, &mut backend).expect("Firecracker workload");
+
+    assert_eq!(backend.metrics.checkpoints, outcome.checkpoints);
+    assert_eq!(backend.metrics.restores, outcome.restores);
+    assert_eq!(backend.metrics.forks, outcome.forks);
+    assert!(backend.metrics.commands >= outcome.reads + outcome.writes);
 }
 
 /// Boot → the guest works and audits itself.

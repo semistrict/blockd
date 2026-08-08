@@ -10,6 +10,7 @@ members = [
     "crates/sim",
     "crates/sqlite-vfs",
     "crates/vsetfs",
+    "crates/workload",
 ]
 
 [workspace.package]

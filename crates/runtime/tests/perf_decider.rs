@@ -20,11 +20,10 @@ use blockd_core::daemon::{Daemon, DaemonConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, StoreFault, TimerId};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
+use blockd_workload::{
+    Backend, Capability, LogicalPage, Operation, WorkloadModel, WorkloadOutcome,
+};
 
-/// Pages per vset volume — a small sandbox working set.
-const PAGES_PER_VOLUME: u32 = 512;
-/// Ops per scale point; enough for many writeback cycles.
-const OPS: u64 = 400_000;
 /// Virtual milliseconds advance every this many ops (drives timers).
 const OPS_PER_MS: u64 = 512;
 
@@ -335,70 +334,104 @@ impl World {
     }
 }
 
-/// Seeded LCG, same recipe the e2e workloads use.
-struct Lcg(u64);
+struct DeciderBackend {
+    world: World,
+    vsets: u64,
+    data_ops: u64,
+}
 
-impl Lcg {
-    fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        self.0
+impl DeciderBackend {
+    fn new(vsets: u64) -> Self {
+        Self {
+            world: World::new(DaemonConfig {
+                host: HostId(0),
+                cache_pages: 1 << 22,
+                writeback_interval: millis(5),
+                backup_retry: millis(20),
+                disk_capacity: None,
+                disk_headroom: 0,
+                wedge_ticks: 500,
+                replica_placement: None,
+            }),
+            vsets,
+            data_ops: 0,
+        }
+    }
+
+    fn page(&self, logical: LogicalPage) -> PageId {
+        PageId {
+            volume: VolumeId {
+                vset: VsetId(self.data_ops % self.vsets + 1),
+                idx: VolumeIdx(logical.volume),
+            },
+            page: PageNo(logical.page),
+        }
     }
 }
 
-fn drive(vsets: u64) -> World {
-    let config = VsetConfig::compute(1, PAGES_PER_VOLUME, false);
-    let mut world = World::new(DaemonConfig {
-        host: HostId(0),
-        cache_pages: 1 << 22, // never under pressure: measure decide, not eviction storms
-        writeback_interval: millis(5),
-        backup_retry: millis(20),
-        disk_capacity: None,
-        disk_headroom: 0,
-        wedge_ticks: 500,
-        replica_placement: None,
-    });
-    for n in 0..vsets {
-        world.step(
-            Event::Admin(AdminCmd::CreateVset {
-                req: ReqId(n + 1),
-                vset: VsetId(n + 1),
-                config,
-                from_base: None,
-            }),
-            Bucket::Admin,
-        );
-    }
-    let created = world
-        .admin
-        .iter()
-        .filter(|reply| matches!(reply, AdminReply::VsetCreated { .. }))
-        .count();
-    assert_eq!(created, usize::try_from(vsets).expect("fits"));
+impl Backend for DeciderBackend {
+    type Error = &'static str;
 
-    // The guest workload: uniform writes across every vset's disk volume.
-    // First touches miss-fault; captures WP-arm; re-touches wp-fault.
-    let mut lcg = Lcg(42);
-    for op in 0..OPS {
-        let page = PageId {
-            volume: VolumeId {
-                vset: VsetId(op % vsets + 1),
-                idx: VolumeIdx(1),
-            },
-            page: PageNo(u32::try_from(lcg.next() % u64::from(PAGES_PER_VOLUME)).expect("fits")),
-        };
-        match world.resident.get(&page) {
-            None => world.step(Event::GuestFault { page, write: true }, Bucket::FaultMiss),
-            Some(false) => world.step(Event::GuestFault { page, write: true }, Bucket::FaultWp),
-            Some(true) => {} // resident and writable: the guest writes for free
-        }
-        if (op + 1).is_multiple_of(OPS_PER_MS) {
-            world.advance(millis(1));
-        }
+    fn supports(&self, capability: Capability) -> bool {
+        matches!(capability, Capability::Create | Capability::Data)
     }
-    world
+
+    fn execute(&mut self, operation: Operation, model: &WorkloadModel) -> Result<(), Self::Error> {
+        match operation {
+            Operation::Create => {
+                let shape = model.shape();
+                let config = VsetConfig::compute(
+                    shape.disk_volumes,
+                    shape.pages_per_volume,
+                    shape.backed_up,
+                );
+                for n in 0..self.vsets {
+                    self.world.step(
+                        Event::Admin(AdminCmd::CreateVset {
+                            req: ReqId(n + 1),
+                            vset: VsetId(n + 1),
+                            config,
+                            from_base: None,
+                        }),
+                        Bucket::Admin,
+                    );
+                }
+                let created = self
+                    .world
+                    .admin
+                    .iter()
+                    .filter(|reply| matches!(reply, AdminReply::VsetCreated { .. }))
+                    .count();
+                assert_eq!(created, usize::try_from(self.vsets).expect("fits"));
+            }
+            Operation::Read { page } | Operation::Write { page, .. } => {
+                let page = self.page(page);
+                let write = matches!(operation, Operation::Write { .. });
+                match self.world.resident.get(&page) {
+                    None => self
+                        .world
+                        .step(Event::GuestFault { page, write }, Bucket::FaultMiss),
+                    Some(false) if write => self
+                        .world
+                        .step(Event::GuestFault { page, write }, Bucket::FaultWp),
+                    Some(_) => {}
+                }
+                self.data_ops += 1;
+                if self.data_ops.is_multiple_of(OPS_PER_MS) {
+                    self.world.advance(millis(1));
+                }
+            }
+            _ => return Err("unsupported operation in decider profile"),
+        }
+        Ok(())
+    }
+}
+
+fn drive(vsets: u64) -> (World, WorkloadOutcome) {
+    let spec = blockd_workload::load("decider-throughput").expect("performance workload");
+    let mut backend = DeciderBackend::new(vsets);
+    let outcome = blockd_workload::run(&spec, &mut backend).expect("decider workload");
+    (backend.world, outcome)
 }
 
 /// 2a-full's target number: ONE vset with a giant dirty set. Before the
@@ -475,7 +508,7 @@ fn profile_decider_event_ceiling() {
     eprintln!("── PROFILE: bare Daemon::step ceiling (zero-cost I/O, one thread) ──");
     for vsets in [1u64, 100, 300] {
         let started = Instant::now();
-        let world = drive(vsets);
+        let (world, outcome) = drive(vsets);
         let wall = started.elapsed();
 
         let (events, step_ns): (u64, u64) = world
@@ -524,8 +557,9 @@ fn profile_decider_event_ceiling() {
         assert!(counters.pages_flushed > 0, "capture never flushed a page");
         let faults = world.times[&Bucket::FaultMiss].0 + world.times[&Bucket::FaultWp].0;
         assert!(
-            faults > OPS / 20,
-            "workload barely faulted: {faults} of {OPS} ops"
+            faults > outcome.writes / 20,
+            "workload barely faulted: {faults} of {} writes",
+            outcome.writes
         );
         // Sanity ceiling only — real regressions move the printed numbers.
         assert!(

@@ -1,0 +1,29 @@
+{
+  "extends": ["single-host-base"],
+  "schema": 1,
+  "name": "hot-compaction",
+  "description": "A small hot set churns continuously while cold survivors pin segments and force compaction.",
+  "kind": "single-host",
+  "daemon": {
+    "cache_pages": 8192
+  },
+  "topology": {
+    "vset_count": 1,
+    "backed_vsets": 0,
+    "pages_per_volume": 4096
+  },
+  "workload": {
+    "horizon": "2s",
+    "think": { "min": "10us", "max": "50us" },
+    "sync_share_ppm": 1000,
+    "hot_pages": { "share_ppm": 900000, "pages": 32 }
+  },
+  "coverage": [
+    { "metric": "records-written", "label": "compaction records" },
+    { "metric": "pages-flushed", "label": "hot-set page flushes" }
+  ],
+  "outcomes": [
+    { "metric": "guest-death", "label": "guest deaths", "max": 0 },
+    { "metric": "space-amplification-ppm", "label": "segment space amplification", "max": 2500000 }
+  ]
+}

@@ -6,13 +6,16 @@
 //! pauses cross the boundary. A run is `(seed, config) → RunReport`,
 //! byte-for-byte replayable.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blockd_core::daemon::{Counters, Daemon, DaemonConfig};
 use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout::{self, BlobName};
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, Verdict};
-use blockd_core::types::{PageId, SimTime, VsetId, micros, millis};
+use blockd_core::types::{PageId, PageNo, SimTime, VolumeId, VolumeIdx, VsetId, micros, millis};
+use blockd_workload::{
+    LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
+};
 
 use crate::guest::{
     AttemptResult, FillResult, Guest, GuestState, PendingOp, UnparkResult, VsetMem,
@@ -188,7 +191,50 @@ enum Ev {
 enum AdminKind {
     Create(VsetId),
     Checkpoint(VsetId),
+    ScriptCheckpoint(VsetId),
     Restore(VsetId),
+}
+
+#[derive(Debug)]
+enum ScriptPending {
+    Operation(Operation),
+    VerificationRead,
+}
+
+#[derive(Debug)]
+struct ScriptedWorkload {
+    name: String,
+    program: Program,
+    model: WorkloadModel,
+    pending: Option<ScriptPending>,
+    verification: VecDeque<LogicalPage>,
+    verify_operation: Option<Operation>,
+    finished: bool,
+}
+
+impl ScriptedWorkload {
+    fn new(spec: WorkloadSpec) -> Result<Self, String> {
+        let name = spec.name.clone();
+        let shape = spec.shape;
+        let program = Program::new(spec).map_err(|error| error.to_string())?;
+        Ok(Self {
+            name,
+            program,
+            model: WorkloadModel::new(shape),
+            pending: None,
+            verification: VecDeque::new(),
+            verify_operation: None,
+            finished: false,
+        })
+    }
+
+    fn complete(&mut self, operation: Operation) {
+        self.model.complete(operation);
+    }
+
+    fn outcome(&self) -> WorkloadOutcome {
+        self.model.outcome(&self.name)
+    }
 }
 
 /// The daemon's synchronous window onto the mappings.
@@ -239,7 +285,16 @@ struct Harness {
     pause_started: BTreeMap<VsetId, SimTime>,
     last_counters: Counters,
     report: RunReport,
+    scripted: Option<ScriptedWorkload>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WorkloadRunReport {
+    pub simulation: RunReport,
+    pub workload: WorkloadOutcome,
+}
+
+type HarnessRun = (RunReport, Vec<(String, Vec<u8>)>, Option<ScriptedWorkload>);
 
 /// Arm the run's fault plan: Poisson streams, the outage window, and the
 /// scheduled adversarial instants (targeted rot, exact crashes).
@@ -273,11 +328,50 @@ pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
     run_final_blobs(seed, config).0
 }
 
+/// Execute a declarative workload through the simulator's real guest/fault,
+/// sync, checkpoint, and recovery paths.
+pub fn run_workload(
+    seed: u64,
+    config: HarnessConfig,
+    spec: WorkloadSpec,
+) -> Result<WorkloadRunReport, String> {
+    spec.validate().map_err(|error| error.to_string())?;
+    if config.vset_count != 1 {
+        return Err("scripted workloads require exactly one vset".to_owned());
+    }
+    if config.vset_config.disk_volumes != spec.shape.disk_volumes
+        || config.vset_config.pages_per_volume != spec.shape.pages_per_volume
+        || (config.backed_vsets == 1) != spec.shape.backed_up
+    {
+        return Err("simulator vset shape does not match workload shape".to_owned());
+    }
+    let scripted = ScriptedWorkload::new(spec)?;
+    let (simulation, _, scripted) = run_inner(seed, config, Some(scripted));
+    let scripted = scripted.expect("scripted run retains its state");
+    if !scripted.finished {
+        return Err(format!(
+            "workload {} did not finish before the simulation horizon (completed={}, violations={:?})",
+            scripted.name,
+            scripted.outcome().completed,
+            simulation.violations
+        ));
+    }
+    Ok(WorkloadRunReport {
+        simulation,
+        workload: scripted.outcome(),
+    })
+}
+
 /// Run, and also export the blob device's final contents verbatim — every
 /// name and byte exactly as the run left them, torn tails and bit rot
 /// included. The differential recovery test writes these to a real
 /// directory and demands the runtime's on-disk scan recover identically.
 pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(String, Vec<u8>)>) {
+    let (report, blobs, _) = run_inner(seed, config, None);
+    (report, blobs)
+}
+
+fn run_inner(seed: u64, config: HarnessConfig, scripted: Option<ScriptedWorkload>) -> HarnessRun {
     let kernel = Kernel::new(seed);
     let (daemon, effects) = Daemon::new(config.daemon.clone());
     let bdev = BlobDev::new(config.bdev.clone());
@@ -301,6 +395,7 @@ pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(Str
         pause_started: BTreeMap::new(),
         last_counters: Counters::default(),
         report: RunReport::default(),
+        scripted,
     };
     h.apply_effects(effects);
 
@@ -367,7 +462,7 @@ pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(Str
         .scan()
         .map(|(name, bytes)| (name.clone(), bytes.clone()))
         .collect();
-    (h.report, blobs)
+    (h.report, blobs, h.scripted)
 }
 
 impl Harness {
@@ -867,6 +962,27 @@ impl Harness {
         if self.daemon.is_none() {
             return;
         }
+        if self.guests.get(&vset).is_some_and(|guest| {
+            guest.state == GuestState::Idle && !guest.paused && !guest.fsck.is_empty()
+        }) {
+            let Harness {
+                kernel,
+                guests,
+                oracle,
+                ..
+            } = self;
+            let op = guests
+                .get_mut(&vset)
+                .expect("guest exists")
+                .next_op(kernel.rng(), |volume| oracle.next_vol_seq(volume))
+                .expect("recovery verification is a read");
+            self.attempt_op(vset, op);
+            return;
+        }
+        if self.scripted.is_some() {
+            self.scripted_guest_step(vset);
+            return;
+        }
         let Harness {
             kernel,
             guests,
@@ -888,6 +1004,167 @@ impl Harness {
                 self.step_daemon(Event::GuestSync { req, volume });
             }
             Ok(op) => self.attempt_op(vset, op),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // one arm per shared operation kind
+    fn scripted_guest_step(&mut self, vset: VsetId) {
+        let Some(guest) = self.guests.get(&vset) else {
+            return;
+        };
+        if guest.state != GuestState::Idle || guest.paused {
+            return;
+        }
+        if self
+            .scripted
+            .as_ref()
+            .is_some_and(|script| script.pending.is_some())
+        {
+            return;
+        }
+
+        loop {
+            let next_verification = self
+                .scripted
+                .as_mut()
+                .and_then(|script| script.verification.pop_front());
+            if let Some(page) = next_verification {
+                self.scripted.as_mut().expect("script exists").pending =
+                    Some(ScriptPending::VerificationRead);
+                self.attempt_op(
+                    vset,
+                    PendingOp::Read {
+                        page: sim_page(vset, page),
+                    },
+                );
+                return;
+            }
+
+            let verification_done = self
+                .scripted
+                .as_ref()
+                .is_some_and(|script| script.verify_operation.is_some());
+            if verification_done {
+                let operation = self
+                    .scripted
+                    .as_mut()
+                    .expect("script exists")
+                    .verify_operation
+                    .take()
+                    .expect("verification exists");
+                self.scripted
+                    .as_mut()
+                    .expect("script exists")
+                    .complete(operation);
+                continue;
+            }
+
+            let operation = self
+                .scripted
+                .as_mut()
+                .expect("script exists")
+                .program
+                .next();
+            let Some(operation) = operation else {
+                self.scripted.as_mut().expect("script exists").finished = true;
+                return;
+            };
+            match operation {
+                Operation::Read { page } => {
+                    self.scripted.as_mut().expect("script exists").pending =
+                        Some(ScriptPending::Operation(operation));
+                    self.attempt_op(
+                        vset,
+                        PendingOp::Read {
+                            page: sim_page(vset, page),
+                        },
+                    );
+                    return;
+                }
+                Operation::Write { page, .. } => {
+                    let page = sim_page(vset, page);
+                    let vol_seq = self.oracle.next_vol_seq(page.volume);
+                    self.scripted.as_mut().expect("script exists").pending =
+                        Some(ScriptPending::Operation(operation));
+                    self.attempt_op(vset, PendingOp::Write { page, vol_seq });
+                    return;
+                }
+                Operation::Sync { volume } => {
+                    let volume = sim_volume(vset, volume);
+                    let req = self.req();
+                    self.sync_reqs.insert(req, vset);
+                    self.guests.get_mut(&vset).expect("guest exists").state =
+                        GuestState::Syncing { req, volume };
+                    self.scripted.as_mut().expect("script exists").pending =
+                        Some(ScriptPending::Operation(operation));
+                    self.step_daemon(Event::GuestSync { req, volume });
+                    return;
+                }
+                Operation::Checkpoint => {
+                    let req = self.req();
+                    self.admin_reqs
+                        .insert(req, AdminKind::ScriptCheckpoint(vset));
+                    self.scripted.as_mut().expect("script exists").pending =
+                        Some(ScriptPending::Operation(operation));
+                    self.step_daemon(Event::Admin(AdminCmd::Checkpoint { req, vset }));
+                    return;
+                }
+                Operation::Crash => {
+                    self.scripted
+                        .as_mut()
+                        .expect("script exists")
+                        .complete(operation);
+                    self.crash();
+                    return;
+                }
+                Operation::Restore => {
+                    self.scripted
+                        .as_mut()
+                        .expect("script exists")
+                        .complete(operation);
+                }
+                Operation::Verify { scope } => {
+                    let pages = self
+                        .scripted
+                        .as_ref()
+                        .expect("script exists")
+                        .model
+                        .pages(scope)
+                        .map(|(page, _)| page)
+                        .collect();
+                    let script = self.scripted.as_mut().expect("script exists");
+                    script.verification = pages;
+                    script.verify_operation = Some(operation);
+                }
+                Operation::Create => {
+                    self.report
+                        .violations
+                        .push("workload issued create after vset creation".to_owned());
+                    self.scripted.as_mut().expect("script exists").finished = true;
+                    return;
+                }
+                Operation::Migrate { .. } | Operation::Fork { .. } => {
+                    self.report.violations.push(format!(
+                        "single-host simulator does not support {:?}",
+                        operation.capability()
+                    ));
+                    self.scripted.as_mut().expect("script exists").finished = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn complete_script_pending(&mut self) {
+        let pending = self
+            .scripted
+            .as_mut()
+            .and_then(|script| script.pending.take());
+        if let Some(ScriptPending::Operation(operation)) = pending {
+            self.scripted
+                .as_mut()
+                .expect("script exists")
+                .complete(operation);
         }
     }
 
@@ -924,6 +1201,9 @@ impl Harness {
                 }
             },
         );
+        if !matches!(op, PendingOp::Fsck { .. }) {
+            self.complete_script_pending();
+        }
         if self.within_horizon() || fsck_pending {
             self.schedule_guest(vset);
         }
@@ -1010,6 +1290,7 @@ impl Harness {
         guest.state = GuestState::Idle;
         guest.completed += 1;
         self.oracle.on_sync_ok(volume);
+        self.complete_script_pending();
         if self.within_horizon() {
             self.schedule_guest(vset);
         }
@@ -1034,6 +1315,7 @@ impl Harness {
 
     // ── admin ───────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)] // one arm per admin reply kind
     fn admin_reply(&mut self, reply: AdminReply) {
         match reply {
             AdminReply::VsetCreated { req, vset } => {
@@ -1051,6 +1333,17 @@ impl Harness {
                 guest.sync_share = self.config.guest_sync_share;
                 guest.hot_pages = self.config.guest_hot_pages;
                 self.guests.insert(vset, guest);
+                if let Some(script) = &mut self.scripted {
+                    match script.program.next() {
+                        Some(Operation::Create) => script.complete(Operation::Create),
+                        other => {
+                            self.report
+                                .violations
+                                .push(format!("workload must begin with create, got {other:?}"));
+                            script.finished = true;
+                        }
+                    }
+                }
                 self.schedule_guest(vset);
                 if let Some(interval) = self.config.checkpoint_interval {
                     let at = self.next_after(interval);
@@ -1058,7 +1351,12 @@ impl Harness {
                 }
             }
             AdminReply::CheckpointDone { req, .. } => {
-                self.admin_reqs.remove(&req);
+                if let Some(AdminKind::ScriptCheckpoint(vset)) = self.admin_reqs.remove(&req) {
+                    self.complete_script_pending();
+                    if self.within_horizon() {
+                        self.schedule_guest(vset);
+                    }
+                }
             }
             // Lineage and migration replies are exercised by the dedicated
             // suites (single hosts have no peers).
@@ -1122,6 +1420,12 @@ impl Harness {
                 // anything else is a harness bug.
                 match self.admin_reqs.remove(&req) {
                     Some(AdminKind::Checkpoint(_)) => {}
+                    Some(AdminKind::ScriptCheckpoint(vset)) => {
+                        self.report
+                            .violations
+                            .push(format!("scripted checkpoint failed for {vset:?}"));
+                        self.scripted.as_mut().expect("script exists").finished = true;
+                    }
                     other => self
                         .report
                         .violations
@@ -1218,6 +1522,20 @@ impl Harness {
                 }
             }
         }
+    }
+}
+
+fn sim_volume(vset: VsetId, volume: u8) -> VolumeId {
+    VolumeId {
+        vset,
+        idx: VolumeIdx(volume),
+    }
+}
+
+fn sim_page(vset: VsetId, page: LogicalPage) -> PageId {
+    PageId {
+        volume: sim_volume(vset, page.volume),
+        page: PageNo(page.page),
     }
 }
 

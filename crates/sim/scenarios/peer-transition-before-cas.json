@@ -1,0 +1,19 @@
+{
+  "extends": ["peer-attrition"],
+  "schema": 1,
+  "name": "peer-transition-before-cas",
+  "description": "Crash the primary immediately before naming a replacement stash by CAS.",
+  "kind": "cluster",
+  "workload": { "horizon": "4s" },
+  "nemeses": {
+    "peer_drop": { "numerator": 1, "denominator": 12 },
+    "peer_dup": { "numerator": 1, "denominator": 10 },
+    "fault_points": ["crash-primary-before-transition-cas"]
+  },
+  "coverage": [
+    { "metric": "peer-fault", "fault_point": "crash-primary-before-transition-cas", "label": "primary crash before transition CAS" }
+  ],
+  "outcomes": [
+    { "metric": "guest-death", "label": "guest deaths", "max": 0 }
+  ]
+}

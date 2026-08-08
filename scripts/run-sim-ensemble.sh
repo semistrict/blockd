@@ -3,19 +3,24 @@
 set -eu
 
 if [ "$#" -ne 4 ]; then
-    echo "usage: $0 <chaos|cluster|migration> <start-seed> <count> <artifact-dir>" >&2
+    echo "usage: $0 <scenario> <start-seed> <count> <artifact-dir>" >&2
     exit 2
 fi
 
-preset=$1
+scenario=$1
 start=$2
 count=$3
 artifact_dir=$4
 
-case "$preset" in
-    chaos|cluster|migration) ;;
+case "$scenario" in
+    chaos|cluster|migration|peer-stash|peer-rare|explore|\
+    cold-restore-outage|nvme-pressure-backed|nvme-pressure-unbacked|\
+    migration-release-blackout|migration-leaf-blackout|hot-compaction|\
+    resume-set-rot|leaf-rot|peer-commit-crashes|peer-transfer-crashes|\
+    peer-transition-before-cas|peer-transition-after-seed|\
+    peer-transition-after-active) ;;
     *)
-        echo "unknown preset: $preset" >&2
+        echo "unknown scenario: $scenario" >&2
         exit 2
         ;;
 esac
@@ -36,11 +41,11 @@ esac
 
 mkdir -p "$artifact_dir"
 {
-    echo "preset: $preset"
+    echo "scenario: $scenario"
     echo "start seed: $start"
     echo "count: $count"
     echo "revision: $(git rev-parse HEAD)"
-    echo "replay command: scripts/run-sim-ensemble.sh $preset $start $count $artifact_dir"
+    echo "replay command: scripts/run-sim-ensemble.sh $scenario $start $count $artifact_dir"
 } >"$artifact_dir/ensemble.txt"
 
 cargo build --release -p blockd-sim --bin sweep
@@ -48,7 +53,7 @@ cargo build --release -p blockd-sim --bin sweep
 set +e
 BLOCKD_SWEEP_ARTIFACT_DIR=$artifact_dir \
 BLOCKD_SWEEP_REQUIRE_COVERAGE=1 \
-    target/release/sweep "$preset" "$start" "$count" \
+    target/release/sweep "$scenario" "$start" "$count" \
     >"$artifact_dir/sweep.log" 2>&1
 status=$?
 set -e

@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "name": "cluster",
+  "description": "Three hosts race exactly one orphan restore after a deterministic kill.",
+  "kind": "cluster",
+  "daemon": {
+    "cache_pages": 128,
+    "writeback_interval": "20ms",
+    "backup_retry": "100ms",
+    "disk_capacity_bytes": null,
+    "disk_headroom_bytes": 0,
+    "wedge_ticks": 25
+  },
+  "storage": {
+    "blob_device": {
+      "read_latency": { "min": "20us", "max": "150us" },
+      "write_latency": { "min": "30us", "max": "400us" },
+      "ns_per_byte": 1
+    },
+    "object_store": {
+      "latency": { "min": "5ms", "max": "60ms" },
+      "ns_per_byte": 5
+    }
+  },
+  "topology": {
+    "hosts": 3,
+    "vset_count": 3,
+    "backed_vsets": null,
+    "nonbacked_vsets": 0,
+    "disk_volumes": 2,
+    "pages_per_volume": 16,
+    "durability": "backup",
+    "replica_placement": null
+  },
+  "workload": {
+    "horizon": "4s",
+    "think": { "min": "1ms", "max": "5ms" },
+    "checkpoint_interval": "300ms",
+    "sync_share_ppm": null,
+    "hot_pages": null
+  },
+  "nemeses": {
+    "restart_delay": { "min": "50ms", "max": "200ms" },
+    "kill_hosts": [{ "at": "1500ms", "host": 0 }],
+    "race_restore": true
+  },
+  "coverage": [
+    { "metric": "orphan-restore", "label": "orphan restore" },
+    { "metric": "restore-claim-race", "label": "restore claim race" }
+  ]
+}

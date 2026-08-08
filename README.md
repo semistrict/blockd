@@ -91,6 +91,20 @@ operator-facing groups include:
 - assignment claims/conflicts/fences, liveness wedges, per-peer connectivity,
   peer drops, incidents, store failures/retries, transferred bytes, and the
   existing correctness counters.
+- a host-capacity recommendation (`normal`, `constrained`, or `critical`), its
+  bounded limiting reason, an admission-budget percentage, and whether new
+  migrations and speculative prefetch should be scheduled.
+
+The capacity recommendation is refreshed on the periodic writeback tick.
+Escalation is immediate; recovery requires three lower-pressure samples and
+moves down one state at a time. Initial constrained/critical thresholds are
+85%/95% cache use, 50%/75% dirty cache, 80%/95% peer-spool use and event-loop
+occupancy, 16/64 local I/O operations in flight, 30/300 seconds of backup lag,
+and two/one configured NVMe headroom windows remaining. Event-loop queue depth
+and peer-stash availability also contribute. The recommendation is observable
+only: it does not reject guest faults, weaken sync, or automatically change
+placement. `/status` exposes the structured decision and `/metrics` exposes
+the same bounded state for fleet automation.
 
 Classic histograms are aggregated by bounded source/operation labels. Per-vset
 fault series expose count and cumulative duration without histogram buckets;

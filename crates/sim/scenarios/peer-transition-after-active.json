@@ -1,0 +1,13 @@
+{
+  "extends": ["peer-transition-before-cas"],
+  "schema": 1,
+  "name": "peer-transition-after-active",
+  "description": "Crash the primary after activating a replacement stash but before its next commit.",
+  "kind": "cluster",
+  "nemeses": {
+    "fault_points": ["crash-primary-after-active-cas-before-commit"]
+  },
+  "coverage": [
+    { "metric": "peer-fault", "fault_point": "crash-primary-after-active-cas-before-commit", "label": "primary crash after replacement activation" }
+  ]
+}

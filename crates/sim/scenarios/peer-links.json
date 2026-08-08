@@ -1,0 +1,29 @@
+{
+  "extends": ["peer-stash"],
+  "schema": 1,
+  "name": "peer-links",
+  "description": "Directional partitions of the active stash link combined with an object-store outage.",
+  "kind": "cluster",
+  "topology": { "vset_count": 1 },
+  "workload": { "horizon": "2s" },
+  "nemeses": {
+    "peer_drop": { "numerator": 0, "denominator": 1 },
+    "peer_dup": { "numerator": 0, "denominator": 1 },
+    "peer_link_outages": [
+      {
+        "window": { "start": "300ms", "end": "650ms" },
+        "from": 0,
+        "to": { "stash_rank": 0 }
+      },
+      {
+        "window": { "start": "700ms", "end": "1050ms" },
+        "from": { "stash_rank": 0 },
+        "to": 0
+      }
+    ],
+    "store_outage": { "start": "1100ms", "end": "1450ms" }
+  },
+  "coverage": [
+    { "metric": "store-unavailable", "label": "store unavailable" }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "extends": ["cluster"],
+  "schema": 1,
+  "name": "cold-restore-outage",
+  "description": "A restored guest parks cold demand fills during an object-store outage and converges after healing.",
+  "kind": "cluster",
+  "topology": {
+    "vset_count": 1,
+    "pages_per_volume": 64
+  },
+  "workload": {
+    "horizon": "5s"
+  },
+  "nemeses": {
+    "kill_hosts": [{ "at": "1500ms", "host": 0 }],
+    "store_outage": { "start": "1900ms", "end": "2600ms" }
+  },
+  "coverage": [
+    { "metric": "orphan-restore", "label": "orphan restore" },
+    { "metric": "store-retry", "label": "cold store retry" },
+    { "metric": "wedge-guest", "label": "parked guest wedge" }
+  ],
+  "outcomes": [
+    { "metric": "guest-death", "label": "guest deaths", "max": 0 },
+    { "metric": "parked-end", "label": "parked fills at drain", "max": 0 }
+  ]
+}

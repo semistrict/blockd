@@ -1,0 +1,30 @@
+{
+  "extends": ["peer-attrition"],
+  "schema": 1,
+  "name": "peer-rare",
+  "description": "Aggressive deterministic schedule for rare peer-stash fault branches.",
+  "kind": "cluster",
+  "workload": { "horizon": "8s" },
+  "nemeses": {
+    "crash_hosts": [{ "at": "2s", "host": { "stash_rank": 0 } }],
+    "peer_drop": { "numerator": 1, "denominator": 12 },
+    "peer_dup": { "numerator": 1, "denominator": 10 },
+    "store_outage": { "start": "200ms", "end": "800ms" },
+    "fault_points": [
+      "replica-retry-timer",
+      "duplicate-ack",
+      "status-reconciliation",
+      "assignment-cas-race",
+      "store-unknown-result",
+      "restart-scan"
+    ]
+  },
+  "coverage": [
+    { "metric": "peer-fault", "fault_point": "replica-retry-timer", "label": "replica retry timer" },
+    { "metric": "peer-fault", "fault_point": "duplicate-ack", "label": "duplicate acknowledgement" },
+    { "metric": "peer-fault", "fault_point": "status-reconciliation", "label": "status reconciliation" },
+    { "metric": "peer-fault", "fault_point": "assignment-cas-race", "label": "assignment CAS race" },
+    { "metric": "peer-fault", "fault_point": "store-unknown-result", "label": "unknown store result" },
+    { "metric": "peer-fault", "fault_point": "restart-scan", "label": "restart scan" }
+  ]
+}
