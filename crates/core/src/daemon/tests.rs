@@ -2208,7 +2208,7 @@ fn database_byte_io_sync_truncate_and_recreate_are_exact() {
         [Effect::Database(DatabaseReply::Opened { req: ReqId(102) })]
     );
 
-    let bytes: Vec<u8> = (0u32..5000)
+    let bytes: Vec<u8> = (0..page_size())
         .map(|i| u8::try_from(i % 251).expect("below 251"))
         .collect();
     assert_eq!(
@@ -2237,7 +2237,7 @@ fn database_byte_io_sync_truncate_and_recreate_are_exact() {
             DatabaseOp::Read {
                 handle: 1,
                 offset: 100,
-                len: 5000,
+                len: u32::try_from(bytes.len()).expect("page size fits"),
             },
         ),
         [Effect::Database(DatabaseReply::Read {
@@ -2731,24 +2731,32 @@ fn database_prune_is_rejected_while_an_incremental_capture_is_armed() {
             create: true,
         },
     );
-    let written = database_request(
-        &mut daemon,
-        &mem,
-        attachment,
-        721,
-        DatabaseOp::Write {
-            handle: 1,
-            offset: 0,
-            bytes: vec![0x33; page_size() * 65],
-        },
-    );
-    assert!(written.iter().any(|effect| matches!(
-        effect,
-        Effect::Database(DatabaseReply::Written {
-            req: ReqId(721),
-            ..
-        })
-    )));
+    let pages_per_write = crate::database::MAX_DATABASE_IO / page_size();
+    let mut written_pages = 0usize;
+    let mut req = 721;
+    while written_pages < 65 {
+        let pages = (65 - written_pages).min(pages_per_write);
+        let written = database_request(
+            &mut daemon,
+            &mem,
+            attachment,
+            req,
+            DatabaseOp::Write {
+                handle: 1,
+                offset: u64::try_from(written_pages * page_size()).expect("bounded"),
+                bytes: vec![0x33; page_size() * pages],
+            },
+        );
+        assert!(written.iter().any(|effect| matches!(
+            effect,
+            Effect::Database(DatabaseReply::Written {
+                req: written_req,
+                ..
+            }) if *written_req == ReqId(req)
+        )));
+        written_pages += pages;
+        req += 1;
+    }
 
     let armed = daemon.step(Event::Timer(TimerId::Writeback), &mem);
     assert!(armed.iter().any(|effect| matches!(
@@ -2765,13 +2773,13 @@ fn database_prune_is_rejected_while_an_incremental_capture_is_armed() {
             &mut daemon,
             &mem,
             attachment,
-            722,
+            req,
             DatabaseOp::Delete {
                 file: DatabaseFile::Main,
             },
         ),
         [Effect::Database(DatabaseReply::Failed {
-            req: ReqId(722),
+            req: ReqId(req),
             error: crate::database::DatabaseError::Busy,
         })]
     );

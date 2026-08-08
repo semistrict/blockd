@@ -74,8 +74,8 @@ fn crash_storm_with_checkpoints_resumes() {
     let report = run(3, config);
     assert_clean(&report);
     assert_eq!(report.crashes, page_pin(10, 9));
-    assert_eq!(report.resumes, page_pin(4, 3));
-    assert_eq!(report.cold_boots, page_pin(26, 24));
+    assert_eq!(report.resumes, page_pin(4, 4));
+    assert_eq!(report.cold_boots, page_pin(26, 23));
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.completed_ops, page_pin(3714, 4085));

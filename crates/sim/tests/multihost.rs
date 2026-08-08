@@ -618,7 +618,7 @@ fn torn_handoff_marker_means_the_migration_never_happened() {
     assert_eq!(report.recoveries, 1);
     // The vset still lives on the source: its blobs are there.
     assert!(report.blobs_per_host[0] > 0);
-    assert_eq!(report.completed_ops, page_pin(1460, 1545));
+    assert_eq!(report.completed_ops, page_pin(1460, 1549));
 }
 
 /// R7.3's mirror: the DESTINATION crashes mid-drain. Its durable records

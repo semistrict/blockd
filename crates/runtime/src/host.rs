@@ -562,6 +562,7 @@ impl Runtime {
                         }
                         Msg::Stop => break,
                     };
+                    let refresh_observability = matches!(event, Event::Timer(_));
                     let kind = event_kind(&event);
                     let source = fault_source_of_event(&event);
                     let started = Instant::now();
@@ -570,13 +571,15 @@ impl Runtime {
                         daemon.step(event, &MapView { vsets: &vsets })
                     };
                     *shared.counters.lock().expect("lock") = daemon.counters;
-                    let daemon_stats = daemon.stats();
-                    update_backup_lag(&shared, &daemon_stats);
-                    update_active_operations(&shared, &daemon_stats);
-                    *shared.daemon_stats.lock().expect("lock") = daemon_stats;
-                    *shared.replica_metrics.lock().expect("lock") = daemon.replica_metrics();
-                    *shared.replica_spool_metrics.lock().expect("lock") =
-                        daemon.replica_spool_metrics();
+                    if refresh_observability {
+                        let daemon_stats = daemon.stats();
+                        update_backup_lag(&shared, &daemon_stats);
+                        update_active_operations(&shared, &daemon_stats);
+                        *shared.daemon_stats.lock().expect("lock") = daemon_stats;
+                        *shared.replica_metrics.lock().expect("lock") = daemon.replica_metrics();
+                        *shared.replica_spool_metrics.lock().expect("lock") =
+                            daemon.replica_spool_metrics();
+                    }
                     shared
                         .stats
                         .record_decide(kind, elapsed_ns(started.elapsed()));
@@ -2167,6 +2170,52 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(fault_reader_count.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).expect("cleanup test blobs");
+    }
+
+    #[test]
+    fn daemon_observability_refreshes_only_on_timer_events() {
+        let root = std::env::temp_dir().join(format!(
+            "blockd-observability-cadence-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = Runtime::new(
+            &RuntimeConfig {
+                daemon: DaemonConfig {
+                    host: blockd_core::types::HostId(0),
+                    cache_pages: 8,
+                    writeback_interval: blockd_core::types::secs(60),
+                    backup_retry: blockd_core::types::millis(20),
+                    disk_capacity: None,
+                    disk_headroom: 0,
+                    wedge_ticks: 25,
+                    replica_placement: None,
+                },
+                blob_dir: root.clone(),
+                peer: None,
+            },
+            Arc::new(crate::s3::S3Store::new()),
+        );
+
+        let first = VsetId(1);
+        runtime.create_vset(first, VsetConfig::database(1, false));
+        assert!(runtime.daemon_stats().vsets.is_empty());
+
+        runtime.tx.push(Msg::Ev(Event::Timer(TimerId::Writeback)));
+        runtime.create_vset(VsetId(2), VsetConfig::database(1, false));
+        let published = runtime.daemon_stats();
+        assert_eq!(
+            published
+                .vsets
+                .iter()
+                .map(|stats| stats.vset)
+                .collect::<Vec<_>>(),
+            [first]
+        );
+
+        drop(runtime);
         std::fs::remove_dir_all(root).expect("cleanup test blobs");
     }
 
