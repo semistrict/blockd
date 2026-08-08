@@ -224,6 +224,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blockd-exec"
+version = "0.1.0"
+
+[[package]]
 name = "blockd-fc-guest"
 version = "0.1.0"
 dependencies = [

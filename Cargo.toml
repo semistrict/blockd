@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/core",
     "crates/demod",
+    "crates/exec",
     "crates/fc-guest",
     "crates/hostmem",
     "crates/platform",
@@ -46,6 +47,9 @@ missing_panics_doc = "allow"
 # integer state machines — optimization cannot change behavior, and the
 # determinism suite would catch it if it somehow did).
 [profile.dev.package.blockd-core]
+opt-level = 2
+
+[profile.dev.package.blockd-exec]
 opt-level = 2
 
 [profile.dev.package.blockd-sim]
