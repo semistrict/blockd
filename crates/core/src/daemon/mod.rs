@@ -27,6 +27,7 @@
 //! disk. The watermark is monotone across records, so reclaiming the record
 //! that originally covered a sync can never lose the constraint.
 
+pub mod actors;
 mod backup;
 mod capture;
 mod database;
