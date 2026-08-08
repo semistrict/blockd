@@ -36,6 +36,7 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 disallowed_types = "deny"
 disallowed_methods = "deny"
+await_holding_refcell_ref = "deny"
 # Pedantic relaxations that fight the sans-IO style.
 module_name_repetitions = "allow"
 must_use_candidate = "allow"

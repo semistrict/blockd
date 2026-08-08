@@ -158,3 +158,29 @@ impl<T> Future for Recv<'_, T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::Executor;
+
+    use super::{BACKGROUND_SHARE, Lane, injector};
+
+    #[test]
+    fn background_lane_cannot_starve() {
+        let (sender, mut receiver) = injector();
+        for value in 0..(BACKGROUND_SHARE + 2) {
+            sender.push(Lane::Critical, value).unwrap();
+        }
+        sender.push(Lane::Background, u32::MAX).unwrap();
+
+        let mut executor = Executor::production();
+        let values = executor.block_on(async move {
+            let mut values = Vec::new();
+            for _ in 0..=BACKGROUND_SHARE {
+                values.push(receiver.recv().await.unwrap());
+            }
+            values
+        });
+        assert_eq!(values[BACKGROUND_SHARE as usize], u32::MAX);
+    }
+}

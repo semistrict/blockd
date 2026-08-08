@@ -194,12 +194,21 @@ fn file_worker(root: &Path, receiver: &Arc<Mutex<Receiver<FileJob>>>) {
                         .map_err(|_| BlobError::Io)
                         .and_then(|len| {
                             let mut bytes = vec![0; len];
-                            file.read_at(&mut bytes, offset)
-                                .map(|read| {
-                                    bytes.truncate(read);
-                                    Some(bytes)
-                                })
-                                .map_err(|_| BlobError::Io)
+                            let mut read = 0;
+                            while read < len {
+                                let position = offset
+                                    .checked_add(u64::try_from(read).map_err(|_| BlobError::Io)?)
+                                    .ok_or(BlobError::Io)?;
+                                let count = file
+                                    .read_at(&mut bytes[read..], position)
+                                    .map_err(|_| BlobError::Io)?;
+                                if count == 0 {
+                                    break;
+                                }
+                                read += count;
+                            }
+                            bytes.truncate(read);
+                            Ok(Some(bytes))
                         }),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(_) => Err(BlobError::Io),
