@@ -16,7 +16,7 @@ use blockd_exec::{TaskHandle, TaskId, delay, spawn};
 use crate::daemon::{Daemon, DaemonConfig};
 use crate::layout;
 use crate::replica_spool::seal_verified_replica_artifact;
-use crate::seam::{Effect, Event, HostMap, PeerMsg};
+use crate::seam::{Effect, Event, HostMap, PeerMsg, TimerId};
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
 
 pub trait ActorWorld: Blobs + Store + Peers + GuestMem + AdminIo + HostMap + 'static {}
@@ -68,12 +68,14 @@ impl ActorGroup {
 pub async fn host_actor<W: ActorWorld>(config: DaemonConfig, world: Rc<W>) {
     let (events, mut inbox) = unbounded();
     let mut actors = ActorGroup::new();
+    let writeback_interval = config.writeback_interval;
 
     actors.spawn(admin_source(Rc::clone(&world), events.clone()));
     actors.spawn(database_source(Rc::clone(&world), events.clone()));
     actors.spawn(peer_source(Rc::clone(&world), events.clone()));
     actors.spawn(fault_source(Rc::clone(&world), events.clone()));
     actors.spawn(sync_source(Rc::clone(&world), events.clone()));
+    actors.spawn(writeback_ticker(writeback_interval, events.clone()));
 
     let (mut daemon, effects) = Daemon::new(config);
     spawn_effects(&mut actors, &world, &events, effects);
@@ -92,7 +94,25 @@ fn spawn_effects<W: ActorWorld>(
     effects: Vec<Effect>,
 ) {
     for effect in effects {
+        if matches!(
+            effect,
+            Effect::SetTimer {
+                timer: TimerId::Writeback,
+                ..
+            }
+        ) {
+            continue;
+        }
         actors.spawn(apply_effect(Rc::clone(world), events.clone(), effect));
+    }
+}
+
+async fn writeback_ticker(interval: u64, events: UnboundedSender<Event>) {
+    loop {
+        delay(interval).await;
+        if events.send(Event::Timer(TimerId::Writeback)).is_err() {
+            return;
+        }
     }
 }
 

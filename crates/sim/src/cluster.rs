@@ -28,6 +28,8 @@ use crate::oracle::Oracle;
 use crate::world::blobdev::{BdevIo, BlobDev, BlobDevConfig};
 use crate::world::store::{ObjectStore, StoreConfig, StoreCounters, Version};
 
+pub use blockd_exec::FaultPoint;
+
 /// One peer message kind, as the wedge nemesis targets them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PeerKind {
@@ -133,30 +135,6 @@ pub struct ClusterConfig {
     pub sabotage: Option<Sabotage>,
     /// Override the guests' sync share of the op mix (`None` = default).
     pub guest_sync_share: Option<crate::rng::Ppm>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum FaultPoint {
-    ReplicaRetryTimer,
-    DuplicateAck,
-    StatusReconciliation,
-    ReleaseOverlap,
-    AssignmentCasRace,
-    StoreUnknownResult,
-    RestartScan,
-    CrashPeerAfterCommitBeforeAck,
-    CrashPrimaryAfterAckBeforeSyncOk,
-    CrashPrimaryAfterSyncOk,
-    CrashPeerAfterUploadBeforeHead,
-    CrashPrimaryAfterHeadBeforeRelease,
-    CrashPrimaryBeforeTransitionCas,
-    CrashPrimaryAfterSeedBeforeActiveCas,
-    CrashPrimaryAfterActiveCasBeforeCommit,
-    CrashPrimaryBeforeClosureCapture,
-    CrashPrimaryAfterClosureCapture,
-    CrashPrimaryDuringArtifactTransfer,
-    CrashPeerAfterDataFlushBeforeCommit,
-    CrashPeerDuringUpload,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
