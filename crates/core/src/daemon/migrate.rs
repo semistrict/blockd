@@ -33,12 +33,13 @@ pub const MAGIC_HANDOFF: u32 = u32::from_le_bytes(*b"BHF1");
 pub(super) const OFFER_RETRY: u64 = millis(5);
 /// An unanswered peer fetch re-issues after this long — peer RTT is
 /// microseconds, so this only fires across losses and source downtime.
-pub(super) const PEER_RETRY: u64 = millis(5);
+pub(super) const PEER_RETRY: u64 = millis(50);
 /// Background tail-drain cadence and per-tick fetch budget (R7.1): the
 /// destination pulls the source-homed remainder until nothing references
 /// the source, then releases it.
 pub(super) const HYDRATE_TICK: u64 = millis(10);
-const HYDRATE_BATCH: usize = 8;
+pub(super) const HYDRATE_BATCH: usize = 64;
+const HYDRATE_SCAN_BATCH: usize = 256;
 
 /// The synthetic request id of a re-offer started by crash recovery — it
 /// has no admin caller to answer.
@@ -567,6 +568,11 @@ impl Daemon {
         state.best = Some((record.capture_seq, record.seq));
         state.best_record = Some(record);
         state.peer_source = Some(from);
+        state.hydration_remaining_pages = state
+            .page_locs
+            .values()
+            .filter(|(_, loc)| loc.base == 0 && loc.fence < state.fence)
+            .count();
         state.migrated_verdict = Some(verdict);
         self.vsets.insert(vset, state);
         self.request_pending_leaves(vset, out);
@@ -744,38 +750,105 @@ impl Daemon {
     }
 
     /// A peer fetch went unanswered (lost message or source downtime):
-    /// re-run the fill ladder for the page, which re-issues the fetch with
-    /// a fresh io — stale replies to the old io fall into the ignore path.
+    /// resend the same request id so a slow original reply remains useful.
     pub(super) fn peer_retry(
         &mut self,
         io: crate::seam::IoId,
         mem: &dyn crate::seam::HostMap,
         out: &mut Vec<Effect>,
     ) {
-        match self.pending.remove(&io) {
-            Some(Pending::PeerFetch {
+        let Some(pending) = self.pending.get(&io).cloned() else {
+            return;
+        };
+        match pending {
+            Pending::PeerFetch {
                 page,
                 write,
                 generation,
                 loc,
-            }) => {
-                self.counters.peer_retries += 1;
-                self.fill_read_done(page, write, generation, loc, None, out);
+            } => {
+                if !self.resend_peer_range(io, page.volume.vset, loc, out) {
+                    self.pending.remove(&io);
+                    self.fill_read_done(page, write, generation, loc, None, out);
+                }
             }
-            Some(Pending::DatabasePeerFetch {
+            Pending::DatabasePeerFetch {
                 vset,
                 page,
                 generation,
                 loc,
-            }) => {
-                self.counters.peer_retries += 1;
-                self.database_peer_retry(vset, page, generation, loc, mem, out);
+            } => {
+                if !self.resend_peer_range(io, vset, loc, out) {
+                    self.pending.remove(&io);
+                    self.database_peer_retry(vset, page, generation, loc, mem, out);
+                }
             }
-            Some(other) => {
-                self.pending.insert(io, other);
+            Pending::PeerLeafFetch { vset, ptr, .. } => {
+                if let Some(source) = self.vsets.get(&vset).and_then(|state| state.peer_source) {
+                    self.counters.peer_retries += 1;
+                    out.push(Effect::PeerSend {
+                        to: source,
+                        msg: PeerMsg::FetchLeaf {
+                            io,
+                            vset,
+                            base: ptr.base,
+                            fence: ptr.fence,
+                            id: ptr.id,
+                        },
+                    });
+                    out.push(Effect::SetTimer {
+                        timer: TimerId::PeerRetry(io),
+                        after: PEER_RETRY,
+                    });
+                } else {
+                    self.pending.remove(&io);
+                    self.request_pending_leaves(vset, out);
+                }
             }
-            None => {}
+            Pending::HydrateFetch { page, generation } => {
+                let retry = self.vsets.get(&page.volume.vset).and_then(|state| {
+                    let _source = state.peer_source?;
+                    let &(current, loc) = state.page_locs.get(&page)?;
+                    (current == generation && loc.base == 0 && loc.fence < state.fence)
+                        .then_some(loc)
+                });
+                if let Some(loc) = retry {
+                    self.resend_peer_range(io, page.volume.vset, loc, out);
+                } else {
+                    self.pending.remove(&io);
+                }
+            }
+            _ => {}
         }
+    }
+
+    fn resend_peer_range(
+        &mut self,
+        io: crate::seam::IoId,
+        vset: VsetId,
+        loc: PageLoc,
+        out: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(source) = self.vsets.get(&vset).and_then(|state| state.peer_source) else {
+            return false;
+        };
+        self.counters.peer_retries += 1;
+        out.push(Effect::PeerSend {
+            to: source,
+            msg: PeerMsg::FetchRange {
+                io,
+                vset,
+                fence: loc.fence,
+                seg: loc.seg,
+                offset: loc.offset,
+                len: loc.len,
+            },
+        });
+        out.push(Effect::SetTimer {
+            timer: TimerId::PeerRetry(io),
+            after: PEER_RETRY,
+        });
+        true
     }
 
     // ── hydration: the post-copy tail drain (R7.1) ──────────────────────
@@ -791,22 +864,10 @@ impl Daemon {
             return; // released and acked: hydration is over
         };
         let fence = state.fence;
-        // The MAP hydrates before the data: guests park on unhydrated
-        // spans, so leaves are the wider blocker — and the tick doubles as
-        // the retry for their lost fetches (drop stale in-flight entries;
-        // arrival is idempotent).
+        // The MAP hydrates before the data: guests park on unhydrated spans,
+        // so leaves are the wider blocker. Per-request timers retry losses;
+        // this tick only keeps the bounded window full.
         if !state.pending_leaves.is_empty() {
-            let in_flight: Vec<crate::seam::IoId> = self
-                .pending
-                .iter()
-                .filter(|(_, p)| {
-                    matches!(p, Pending::PeerLeafFetch { vset: owner, .. } if *owner == vset)
-                })
-                .map(|(&io, _)| io)
-                .collect();
-            for io in in_flight {
-                self.pending.remove(&io);
-            }
             self.request_pending_leaves(vset, out);
             out.push(Effect::SetTimer {
                 timer: TimerId::Hydrate(vset),
@@ -817,15 +878,7 @@ impl Daemon {
         let Some(state) = self.vsets.get(&vset) else {
             return;
         };
-        // The tail: pages whose durable home is still a source segment
-        // (base-origin pages live in the store, not on the source).
-        let foreign: Vec<(PageId, Gen, PageLoc)> = state
-            .page_locs
-            .iter()
-            .filter(|&(_, &(_, loc))| loc.base == 0 && loc.fence < fence)
-            .map(|(&page, &(generation, loc))| (page, generation, loc))
-            .collect();
-        if foreign.is_empty() {
+        if state.hydration_remaining_pages == 0 {
             out.push(Effect::PeerSend {
                 to: source,
                 msg: PeerMsg::Released { vset },
@@ -836,9 +889,15 @@ impl Daemon {
             });
             return;
         }
+        let scanned = self.hydration_scan(vset);
+        let (in_flight, hydrate_in_flight) = self.hydration_in_flight(vset);
+        let available = HYDRATE_BATCH.saturating_sub(hydrate_in_flight);
         let mut issued = 0;
         let mut marked = 0u64;
-        for (page, generation, loc) in foreign {
+        for (page, generation, loc) in scanned {
+            if loc.base != 0 || loc.fence >= fence {
+                continue;
+            }
             if self.cache.is_resident(page) {
                 // The bytes are already in guest memory: dirtying the page
                 // is enough — writeback re-homes it into our own segment.
@@ -848,20 +907,10 @@ impl Daemon {
                 }
                 continue;
             }
-            if issued >= HYDRATE_BATCH {
+            if issued >= available {
                 break;
             }
-            let in_flight = self.pending.values().any(|p| {
-                matches!(
-                    p,
-                    Pending::Fetch { page: q, .. }
-                    | Pending::StoreFetch { page: q, .. }
-                    | Pending::PeerFetch { page: q, .. }
-                    | Pending::DatabasePeerFetch { page: q, .. }
-                    | Pending::HydrateFetch { page: q, .. } if *q == page
-                )
-            });
-            if in_flight {
+            if in_flight.contains(&page) {
                 continue;
             }
             let io = self.io();
@@ -878,6 +927,10 @@ impl Daemon {
                     len: loc.len,
                 },
             });
+            out.push(Effect::SetTimer {
+                timer: TimerId::PeerRetry(io),
+                after: PEER_RETRY,
+            });
             issued += 1;
         }
         if marked > 0 {
@@ -892,6 +945,59 @@ impl Daemon {
             timer: TimerId::Hydrate(vset),
             after: HYDRATE_TICK,
         });
+    }
+
+    fn hydration_in_flight(&self, vset: VsetId) -> (std::collections::BTreeSet<PageId>, usize) {
+        let mut pages = std::collections::BTreeSet::new();
+        let mut hydration = 0;
+        for pending in self.pending.values() {
+            let page = match pending {
+                Pending::Fetch { page, .. }
+                | Pending::StoreFetch { page, .. }
+                | Pending::PeerFetch { page, .. }
+                | Pending::DatabasePeerFetch { page, .. }
+                | Pending::HydrateFetch { page, .. } => *page,
+                _ => continue,
+            };
+            pages.insert(page);
+            hydration += usize::from(matches!(
+                pending,
+                Pending::HydrateFetch { .. } if page.volume.vset == vset
+            ));
+        }
+        (pages, hydration)
+    }
+
+    /// Return the next bounded serving-map slice and advance its cursor.
+    fn hydration_scan(&mut self, vset: VsetId) -> Vec<(PageId, Gen, PageLoc)> {
+        let state = &self.vsets[&vset];
+        let mut scanned = Vec::with_capacity(HYDRATE_SCAN_BATCH);
+        match state.hydrate_cursor {
+            Some(cursor) => scanned.extend(
+                state
+                    .page_locs
+                    .range((
+                        std::ops::Bound::Excluded(cursor),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .take(HYDRATE_SCAN_BATCH)
+                    .map(|(&page, &(generation, loc))| (page, generation, loc)),
+            ),
+            None => scanned.extend(
+                state
+                    .page_locs
+                    .iter()
+                    .take(HYDRATE_SCAN_BATCH)
+                    .map(|(&page, &(generation, loc))| (page, generation, loc)),
+            ),
+        }
+        let reached_end = scanned.len() < HYDRATE_SCAN_BATCH;
+        let state = self.vsets.get_mut(&vset).expect("hydrating vset");
+        state.hydrate_cursor = scanned.last().map(|(page, _, _)| *page);
+        if reached_end {
+            state.hydrate_cursor = None;
+        }
+        scanned
     }
 
     /// A hydration fetch arrived: install it like a prefetch — never evict

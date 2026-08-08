@@ -170,10 +170,11 @@ async fn a_cas_conflict_heads_for_the_current_generation() {
     let _ = v1;
 }
 
-/// Transient statuses and dead connections are `Unavailable` — the
-/// daemon's retry timers own the response. The store never invents data.
+/// Transient statuses and dead connections are retried with bounded jitter;
+/// an exhausted retry budget remains `Unavailable`. The store never invents
+/// data.
 #[tokio::test]
-async fn transient_faults_map_to_unavailable() {
+async fn transient_faults_retry_then_map_exhaustion_to_unavailable() {
     let (fake, endpoint) = FakeGcs::start();
     let store = store_against(&endpoint);
     store.put("k", b"seed".to_vec()).await.expect("seed");
@@ -184,14 +185,16 @@ async fn transient_faults_map_to_unavailable() {
         Fault::DropConnection,
     ] {
         fake.faults.lock().expect("lock").push(fault);
-        assert_eq!(
-            store.get("k").await,
-            Err(StoreFault::Unavailable),
-            "{fault:?} must be retryable"
+        assert!(
+            matches!(store.get("k").await, Ok(Some(_))),
+            "{fault:?} must recover on retry"
         );
     }
-    // The fault drained: the same get now succeeds (fresh connection).
-    assert!(matches!(store.get("k").await, Ok(Some(_))));
+    fake.faults
+        .lock()
+        .expect("lock")
+        .extend([Fault::Status(503); 3]);
+    assert_eq!(store.get("k").await, Err(StoreFault::Unavailable));
 }
 
 /// One 401 buys one token refresh and a retry; the operation succeeds.
@@ -255,6 +258,31 @@ async fn independent_requests_are_in_flight_together() {
     assert!(
         fake.max_in_flight.load(Ordering::SeqCst) >= 2,
         "object requests must overlap rather than occupy a thread serially"
+    );
+}
+
+#[tokio::test]
+async fn reads_and_uploads_use_independent_connection_pools() {
+    let (fake, endpoint) = FakeGcs::start();
+    let store = store_against(&endpoint);
+    store.put("a", b"1".to_vec()).await.expect("put");
+    assert!(matches!(store.get("a").await, Ok(Some(_))));
+
+    let seen = fake.seen.lock().expect("lock");
+    let put_peer = seen
+        .iter()
+        .find(|request| request.method == "PUT")
+        .expect("PUT observed")
+        .peer;
+    let get_peer = seen
+        .iter()
+        .find(|request| request.method == "GET")
+        .expect("GET observed")
+        .peer;
+    assert_ne!(
+        put_peer.port(),
+        get_peer.port(),
+        "read and write clients must not share one transport connection"
     );
 }
 

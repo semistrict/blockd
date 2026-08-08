@@ -383,7 +383,7 @@ fn migration_moves_a_nonbacked_vset_losslessly() {
     // non-backed vset wrote nothing to the store (R4.4), so zero restores.
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, page_pin(1773, 1493));
+    assert_eq!(report.completed_ops, page_pin(1717, 1593));
     // R7.1: the guest-observed pause — source pause through destination
     // resume — stays far inside the 500 ms budget.
     assert!(
@@ -400,7 +400,7 @@ fn migration_moves_a_nonbacked_vset_losslessly() {
 #[test]
 fn source_death_mid_drain_costs_the_nonbacked_vset_loudly() {
     let config = ClusterConfig {
-        kill_hosts_at: vec![(millis(1520), 0)],
+        kill_hosts_at: vec![(millis(1502), 0)],
         ..migrate_config()
     };
     let report = run(7, config);
@@ -409,7 +409,7 @@ fn source_death_mid_drain_costs_the_nonbacked_vset_loudly() {
     // The destination's guest died at its first peer fetch the dead source
     // could not answer (the sanctioned R7.3 loss).
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, page_pin(581, 595));
+    assert_eq!(report.completed_ops, page_pin(642, 585));
 }
 
 /// R6.2: a restore onto a host with none of the vset's bytes reaches its
@@ -574,7 +574,7 @@ fn hydration_drains_the_tail_and_releases_the_source() {
         report.wedged_guests + report.wedged_hydration + report.wedged_outbound,
         0
     );
-    assert_eq!(report.completed_ops, page_pin(1614, 1669));
+    assert_eq!(report.completed_ops, page_pin(1582, 1557));
 }
 
 /// The recovery side of the two-sided handoff (R7.2): a source that
@@ -584,7 +584,7 @@ fn hydration_drains_the_tail_and_releases_the_source() {
 #[test]
 fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
     let config = ClusterConfig {
-        crash_hosts_at: vec![(millis(1520), 0)],
+        crash_hosts_at: vec![(millis(1502), 0)],
         ..migrate_config()
     };
     let report = run(7, config);
@@ -596,7 +596,7 @@ fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
     // released and reclaimed.
     assert_eq!(report.releases, 1);
     assert_eq!(report.blobs_per_host[0], 0);
-    assert_eq!(report.completed_ops, page_pin(1348, 1638));
+    assert_eq!(report.completed_ops, page_pin(1557, 1711));
 }
 
 /// A crash that tears the handoff marker means the migration never
@@ -630,7 +630,7 @@ fn torn_handoff_marker_means_the_migration_never_happened() {
 #[test]
 fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
     let config = ClusterConfig {
-        crash_hosts_at: vec![(millis(1520), 1)],
+        crash_hosts_at: vec![(millis(1502), 1)],
         ..migrate_config()
     };
     let report = run(7, config);
@@ -642,7 +642,7 @@ fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
     // Released and reclaimed: the source holds nothing.
     assert_eq!(report.blobs_per_host[0], 0);
     // Well past the old die-loudly count (592): the guest lived on.
-    assert_eq!(report.completed_ops, page_pin(1508, 1483));
+    assert_eq!(report.completed_ops, page_pin(1682, 1501));
 }
 
 /// R8.3 on the demand-fill path: a store outage while a restored vset is
@@ -776,7 +776,7 @@ fn migration_survives_a_lossy_duplicating_peer_channel() {
         report.peer_drops,
         report.peer_dups
     );
-    assert_eq!(report.completed_ops, page_pin(1463, 1524));
+    assert_eq!(report.completed_ops, page_pin(1460, 1784));
 }
 
 #[test]
@@ -963,7 +963,7 @@ fn migration_hydrates_multi_leaf_maps_from_the_source() {
     // throughput concern, not a correctness one, and is asserted by the
     // small-map release tests).
     assert!(report.hydrate_fills > 0);
-    assert_eq!(report.completed_ops, page_pin(29162, 28884));
+    assert_eq!(report.completed_ops, page_pin(34726, 34462));
 }
 
 /// A leaf object rotten in the store makes exactly its span unservable:

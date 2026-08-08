@@ -28,6 +28,7 @@ const RESUME_RECORD_WINDOW: u64 = millis(1000);
 /// Resume sets stay small — they exist to beat demand faulting to the
 /// working set, not to rehydrate the vset.
 pub(super) const RESUME_SET_MAX: usize = 512;
+const LEAF_FETCH_IN_FLIGHT: usize = 32;
 
 fn encode_resume_set(vset: VsetId, pages: &[PageId]) -> Vec<u8> {
     let mut e = Enc::new();
@@ -328,23 +329,28 @@ impl Daemon {
             return;
         };
         let peer = state.peer_source;
+        let in_flight: BTreeSet<u32> = self
+            .pending
+            .values()
+            .filter_map(|pending| match pending {
+                Pending::LeafGet {
+                    vset: owner, span, ..
+                }
+                | Pending::PeerLeafFetch {
+                    vset: owner, span, ..
+                } if *owner == vset => Some(*span),
+                _ => None,
+            })
+            .collect();
+        let available = LEAF_FETCH_IN_FLIGHT.saturating_sub(in_flight.len());
         let pending: Vec<(u32, LeafPtr)> = state
             .pending_leaves
             .iter()
+            .filter(|(span, _)| !in_flight.contains(span))
+            .take(available)
             .map(|(&span, &ptr)| (span, ptr))
             .collect();
         for (span, ptr) in pending {
-            let in_flight = self.pending.values().any(|p| {
-                matches!(
-                    p,
-                    Pending::LeafGet { vset: v, span: s, .. }
-                    | Pending::PeerLeafFetch { vset: v, span: s, .. }
-                        if *v == vset && *s == span
-                )
-            });
-            if in_flight {
-                continue;
-            }
             let io = self.io();
             if let Some(source) = peer {
                 self.pending
@@ -358,6 +364,10 @@ impl Daemon {
                         fence: ptr.fence,
                         id: ptr.id,
                     },
+                });
+                out.push(Effect::SetTimer {
+                    timer: TimerId::PeerRetry(io),
+                    after: super::migrate::PEER_RETRY,
                 });
             } else {
                 self.pending
@@ -446,6 +456,7 @@ impl Daemon {
                 out.push(Effect::FillFailed { page });
             }
             self.drive_database(vset_id, mem, out);
+            self.request_pending_leaves(vset_id, out);
             return;
         };
         let blob = bytes.expect("decoded from bytes");
@@ -496,6 +507,7 @@ impl Daemon {
             self.fault(page, write, mem, out);
         }
         self.drive_database(vset_id, mem, out);
+        self.request_pending_leaves(vset_id, out);
     }
 
     // ── resume sets (R6.2) ──────────────────────────────────────────────

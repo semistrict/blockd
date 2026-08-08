@@ -34,6 +34,7 @@ mod guest;
 mod lineage;
 mod migrate;
 mod recover;
+pub use recover::RecoveryBlob;
 mod replica;
 mod restore;
 
@@ -320,7 +321,7 @@ struct Capture {
     record: Option<JournalRecord>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Pending {
     SegWrite {
         vset: VsetId,
@@ -784,6 +785,10 @@ struct Vset {
     outbound: Option<HostId>,
     /// Destination-side: the source peer serving our post-copy tail.
     peer_source: Option<HostId>,
+    /// Foreign page locations left to re-home from `peer_source`.
+    hydration_remaining_pages: usize,
+    /// Incremental cursor and cycle state for bounded hydration scans.
+    hydrate_cursor: Option<PageId>,
     /// Reply verdict for an inbound migration, delivered when its first
     /// record lands.
     migrated_verdict: Option<crate::seam::Verdict>,
@@ -895,6 +900,8 @@ impl Vset {
             migrate: None,
             outbound: None,
             peer_source: None,
+            hydration_remaining_pages: 0,
+            hydrate_cursor: None,
             migrated_verdict: None,
             wedge: Wedge::default(),
             migration_head_claimed: false,
@@ -911,7 +918,11 @@ impl Vset {
     /// Every supersession moves the old location's bytes from live to
     /// dead in its segment's accounting — the signal compaction reads.
     fn map_adopt(&mut self, page: PageId, generation: Gen, loc: PageLoc) {
-        match self.page_locs.get(&page).copied() {
+        let old = self.page_locs.get(&page).copied();
+        let was_foreign = self.peer_source.is_some()
+            && old.is_some_and(|(_, old)| old.base == 0 && old.fence < self.fence);
+        let is_foreign = self.peer_source.is_some() && loc.base == 0 && loc.fence < self.fence;
+        match old {
             Some((have, _)) if have >= generation => return,
             Some((_, old)) if old.base == 0 => {
                 if let Some(live) = self.seg_live.get_mut(&(old.fence, old.seg)) {
@@ -927,6 +938,30 @@ impl Vset {
             *self.seg_live.entry((loc.fence, loc.seg)).or_insert(0) += u64::from(loc.len);
         }
         self.page_locs.insert(page, (generation, loc));
+        match (was_foreign, is_foreign) {
+            (true, false) => {
+                self.hydration_remaining_pages = self.hydration_remaining_pages.saturating_sub(1);
+            }
+            (false, true) => self.hydration_remaining_pages += 1,
+            _ => {}
+        }
+    }
+
+    fn map_remove(&mut self, page: PageId) {
+        let Some((_, old)) = self.page_locs.remove(&page) else {
+            return;
+        };
+        if old.base == 0 {
+            if let Some(live) = self.seg_live.get_mut(&(old.fence, old.seg)) {
+                *live = live.saturating_sub(u64::from(old.len));
+                if *live == 0 {
+                    self.seg_live.remove(&(old.fence, old.seg));
+                }
+            }
+            if self.peer_source.is_some() && old.fence < self.fence {
+                self.hydration_remaining_pages = self.hydration_remaining_pages.saturating_sub(1);
+            }
+        }
     }
 
     /// Rebuild the live accounting after a wholesale map replacement
@@ -1058,15 +1093,7 @@ impl Daemon {
                 let unstable_pages = self.cache.unstable_pages_of(vset).len();
                 let outage_parked = state.store_fill_retry.len()
                     + state.leaf_waiters.values().map(Vec::len).sum::<usize>();
-                let hydration_remaining_pages = if state.peer_source.is_some() {
-                    state
-                        .page_locs
-                        .values()
-                        .filter(|(_, loc)| loc.base == 0 && loc.fence < state.fence)
-                        .count()
-                } else {
-                    0
-                };
+                let hydration_remaining_pages = state.hydration_remaining_pages;
                 let live_segment_bytes = state.seg_live.values().sum();
                 let local_segment_bytes = state.seg_blobs.iter().map(|&(_, _, bytes)| bytes).sum();
                 let best = state.best.map_or(0, |(capture, _)| capture);

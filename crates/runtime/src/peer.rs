@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use blockd_core::format::{Dec, FRAME_HEADER};
 use blockd_core::peer::{MAGIC_PEER, MAX_PEER_PAYLOAD, decode_peer, encode_peer_version};
@@ -79,10 +79,14 @@ struct ServerTls {
 /// bounded memory beats delivery the protocol never needed guaranteed.
 const SEND_QUEUE: usize = 128;
 
-/// Bound how long an outbound connection can hide a remote restart behind a
-/// half-open TCP tunnel. This also makes a newly presented leaf certificate
-/// observable during a rolling rotation without paying a handshake per frame.
-const MAX_CONNECTION_AGE: Duration = Duration::from_secs(1);
+/// Bound how long an outbound connection can retain an old peer certificate.
+/// Renewal is prepared in parallel while the established stream keeps serving
+/// frames, so rotation never puts a handshake in the next frame's path.
+const MAX_CONNECTION_AGE: Duration = Duration::from_mins(5);
+
+/// Large frames contain replica artifacts. Their checksum and owned payload
+/// decode are CPU/memory work and must not monopolize the peer I/O thread.
+const DECODE_OFFLOAD_THRESHOLD: usize = 1024 * 1024;
 
 pub struct PeerNet {
     senders: BTreeMap<HostId, Sender<Vec<u8>>>,
@@ -237,29 +241,53 @@ async fn sender_loop(
     dropped_sends: Arc<AtomicU64>,
     tls: Option<ClientTls>,
 ) {
-    let mut conn: Option<(Box<dyn PeerIo>, Instant)> = None;
-    while let Some(frame) = rx.recv().await {
-        if conn
-            .as_ref()
-            .is_some_and(|(_, established)| established.elapsed() >= MAX_CONNECTION_AGE)
+    let mut conn: Option<Box<dyn PeerIo>> = None;
+    let mut renewal: Option<tokio::task::JoinHandle<Option<Box<dyn PeerIo>>>> = None;
+    loop {
+        if conn.is_none()
+            && let Some(task) = renewal.take()
         {
-            conn = None;
-            connected.store(false, Ordering::Relaxed);
+            task.abort();
+        }
+        if let Some(task) = renewal.as_mut() {
+            tokio::select! {
+                renewed = task => {
+                    renewal = None;
+                    if let Ok(Some(stream)) = renewed {
+                        conn = Some(stream);
+                        connected.store(true, Ordering::Relaxed);
+                    }
+                    if conn.is_some() {
+                        renewal = Some(spawn_connection_renewal(addr, tls.clone()));
+                    }
+                    continue;
+                }
+                frame = rx.recv() => {
+                    let Some(frame) = frame else { break };
+                    if !write_peer_frame(&mut conn, &frame).await {
+                        dropped_sends.fetch_add(1, Ordering::SeqCst);
+                        connected.store(false, Ordering::Relaxed);
+                        tracing::warn!(peer_host = peer.0, %addr, "peer connection lost");
+                        conn = None;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        let Some(frame) = rx.recv().await else { break };
+        if conn.is_none() {
+            conn = connect(addr, tls.as_ref()).await;
+            connected.store(conn.is_some(), Ordering::Relaxed);
+            if conn.is_some() {
+                renewal = Some(spawn_connection_renewal(addr, tls.clone()));
+            }
         }
         if conn.is_none() {
-            conn = connect(addr, tls.as_ref())
-                .await
-                .map(|stream| (stream, Instant::now()));
-            connected.store(conn.is_some(), Ordering::Relaxed);
-        }
-        let Some((stream, _)) = conn.as_mut() else {
             dropped_sends.fetch_add(1, Ordering::SeqCst);
             continue; // peer unreachable: drop the frame
-        };
-        if !matches!(
-            timeout(Duration::from_secs(5), stream.write_all(&frame)).await,
-            Ok(Ok(()))
-        ) {
+        }
+        if !write_peer_frame(&mut conn, &frame).await {
             dropped_sends.fetch_add(1, Ordering::SeqCst);
             connected.store(false, Ordering::Relaxed);
             tracing::warn!(peer_host = peer.0, %addr, "peer connection lost");
@@ -267,6 +295,26 @@ async fn sender_loop(
         }
     }
     connected.store(false, Ordering::Relaxed);
+}
+
+fn spawn_connection_renewal(
+    addr: SocketAddr,
+    tls: Option<ClientTls>,
+) -> tokio::task::JoinHandle<Option<Box<dyn PeerIo>>> {
+    tokio::spawn(async move {
+        tokio::time::sleep(MAX_CONNECTION_AGE).await;
+        connect(addr, tls.as_ref()).await
+    })
+}
+
+async fn write_peer_frame(conn: &mut Option<Box<dyn PeerIo>>, frame: &[u8]) -> bool {
+    let Some(stream) = conn.as_mut() else {
+        return false;
+    };
+    matches!(
+        timeout(Duration::from_secs(5), stream.write_all(frame)).await,
+        Ok(Ok(()))
+    )
 }
 
 async fn connect(addr: SocketAddr, tls: Option<&ClientTls>) -> Option<Box<dyn PeerIo>> {
@@ -368,7 +416,14 @@ async fn reader_loop(
         if stream.read_exact(&mut frame[start..]).await.is_err() {
             return;
         }
-        let Ok((from, msg)) = decode_peer(&frame) else {
+        let decoded = if frame.len() >= DECODE_OFFLOAD_THRESHOLD {
+            tokio::task::spawn_blocking(move || decode_peer(&frame))
+                .await
+                .unwrap_or(Err(blockd_core::format::DecodeError))
+        } else {
+            decode_peer(&frame)
+        };
+        let Ok((from, msg)) = decoded else {
             return; // damage: drop it and the connection (R8.1)
         };
         if authenticated.is_some_and(|identity| identity != from) {

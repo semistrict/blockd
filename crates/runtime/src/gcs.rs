@@ -19,10 +19,11 @@
 //! scoped to the one bucket.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use blockd_core::seam::StoreFault;
+use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::metrics::{AtomicHistogram, HistogramSnapshot};
@@ -34,6 +35,10 @@ const MAX_OBJECT: u64 = 64 * 1024 * 1024 + 4096;
 
 /// Refresh the token while this much of its lifetime remains.
 const TOKEN_SLACK: Duration = Duration::from_mins(5);
+const MAX_TRANSIENT_RETRIES: u32 = 2;
+const RETRY_BASE: Duration = Duration::from_millis(100);
+const RETRY_CAP: Duration = Duration::from_secs(2);
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct GcsConfig {
@@ -116,8 +121,13 @@ struct CachedToken {
 
 pub struct GcsStore {
     cfg: GcsConfig,
-    client: reqwest::Client,
+    /// Reads and writes intentionally use independent connection pools. A
+    /// fault-critical ranged GET must not share an HTTP/2 congestion window
+    /// with the large immutable uploads running in the background lane.
+    read_client: reqwest::Client,
+    write_client: reqwest::Client,
     token: Mutex<Option<CachedToken>>,
+    retry_nonce: AtomicU64,
     pub stats: GcsStats,
 }
 
@@ -187,18 +197,42 @@ fn abort(context: &str, detail: &str) -> ! {
     std::process::abort()
 }
 
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value).ok().map(|deadline| {
+                deadline
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default()
+            })
+        })
+}
+
 impl GcsStore {
     pub fn new(cfg: GcsConfig) -> GcsStore {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(8)
-            .build()
-            .expect("GCS HTTP client");
+        let make_client = || {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(8)
+                .build()
+                .expect("GCS HTTP client")
+        };
+        let retry_seed = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                elapsed.as_secs() ^ u64::from(elapsed.subsec_nanos()).rotate_left(32)
+            })
+            ^ u64::from(std::process::id());
         GcsStore {
             cfg,
-            client,
+            read_client: make_client(),
+            write_client: make_client(),
             token: Mutex::new(None),
+            retry_nonce: AtomicU64::new(retry_seed),
             stats: GcsStats::default(),
         }
     }
@@ -245,7 +279,7 @@ impl GcsStore {
         );
         self.stats.token_refreshes.fetch_add(1, Ordering::SeqCst);
         let result = self
-            .client
+            .write_client
             .get(&url)
             .header("Metadata-Flavor", "Google")
             .send()
@@ -273,22 +307,34 @@ impl GcsStore {
         method: &str,
         key: &str,
         headers: &[(&str, String)],
-        body: Option<&[u8]>,
+        body: Option<&Bytes>,
     ) -> Result<GcsResponse, StoreFault> {
         let url = self.object_url(key);
         let mut refreshed = false;
+        let mut transient_retries = 0;
         loop {
             let bearer = self.token().await?;
+            let client = if matches!(method, "GET" | "HEAD") {
+                &self.read_client
+            } else {
+                &self.write_client
+            };
             let method = reqwest::Method::from_bytes(method.as_bytes())
                 .expect("supported object-store method");
-            let mut request = self.client.request(method, &url).bearer_auth(&bearer);
+            let mut request = client.request(method, &url).bearer_auth(&bearer);
             for (name, value) in headers {
                 request = request.header(*name, value);
             }
             if let Some(bytes) = body {
-                request = request.body(bytes.to_vec());
+                request = request.body(bytes.clone());
             }
             let Ok(mut resp) = request.send().await else {
+                if transient_retries < MAX_TRANSIENT_RETRIES {
+                    let delay = self.retry_delay(transient_retries, None);
+                    transient_retries += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
                 self.stats.unavailable.fetch_add(1, Ordering::SeqCst);
                 return Err(StoreFault::Unavailable);
             };
@@ -299,6 +345,17 @@ impl GcsStore {
                 continue;
             }
             if matches!(status, 408 | 429 | 500..=599) {
+                if transient_retries < MAX_TRANSIENT_RETRIES {
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(parse_retry_after);
+                    let delay = self.retry_delay(transient_retries, retry_after);
+                    transient_retries += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
                 self.stats.unavailable.fetch_add(1, Ordering::SeqCst);
                 return Err(StoreFault::Unavailable);
             }
@@ -336,6 +393,23 @@ impl GcsStore {
                 body,
             });
         }
+    }
+
+    fn retry_delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        if let Some(delay) = retry_after {
+            return delay.min(RETRY_AFTER_CAP);
+        }
+        let exponent = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+        let cap = RETRY_BASE.saturating_mul(exponent).min(RETRY_CAP);
+        let mut value = self.retry_nonce.fetch_add(1, Ordering::Relaxed);
+        // SplitMix64: cheap per-request diffusion so simultaneous failures do
+        // not wake every host on the same retry boundary.
+        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        let cap_nanos = u64::try_from(cap.as_nanos()).unwrap_or(u64::MAX);
+        Duration::from_nanos(value % cap_nanos.max(1))
     }
 
     fn generation_or_abort(context: &str, resp: &GcsResponse) -> u64 {
@@ -397,7 +471,7 @@ impl ObjectStore for GcsStore {
 impl GcsStore {
     pub async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, StoreFault> {
         let started = Instant::now();
-        let result = self.put_inner(key, &bytes).await;
+        let result = self.put_inner(key, Bytes::from(bytes)).await;
         self.stats
             .observe(0, outcome_of(&result), started.elapsed());
         result
@@ -410,7 +484,7 @@ impl GcsStore {
         bytes: Vec<u8>,
     ) -> Result<u64, StoreFault> {
         let started = Instant::now();
-        let result = self.put_cas_inner(key, expected, &bytes).await;
+        let result = self.put_cas_inner(key, expected, Bytes::from(bytes)).await;
         self.stats
             .observe(1, outcome_of(&result), started.elapsed());
         result
@@ -442,12 +516,12 @@ impl GcsStore {
             .observe(4, outcome_of(&result), started.elapsed());
     }
 
-    async fn put_inner(&self, key: &str, bytes: &[u8]) -> Result<u64, StoreFault> {
+    async fn put_inner(&self, key: &str, bytes: Bytes) -> Result<u64, StoreFault> {
         self.stats.puts.fetch_add(1, Ordering::SeqCst);
         self.stats
             .bytes_up
             .fetch_add(bytes.len() as u64, Ordering::SeqCst);
-        let resp = self.request("PUT", key, &[], Some(bytes)).await?;
+        let resp = self.request("PUT", key, &[], Some(&bytes)).await?;
         match resp.status {
             200 => Ok(Self::generation_or_abort("PUT", &resp)),
             status => abort(
@@ -464,7 +538,7 @@ impl GcsStore {
         &self,
         key: &str,
         expected: Option<u64>,
-        bytes: &[u8],
+        bytes: Bytes,
     ) -> Result<u64, StoreFault> {
         self.stats.cas_puts.fetch_add(1, Ordering::SeqCst);
         self.stats
@@ -472,7 +546,7 @@ impl GcsStore {
             .fetch_add(bytes.len() as u64, Ordering::SeqCst);
         let precondition = expected.unwrap_or(0).to_string();
         let headers = [("x-goog-if-generation-match", precondition)];
-        let resp = self.request("PUT", key, &headers, Some(bytes)).await?;
+        let resp = self.request("PUT", key, &headers, Some(&bytes)).await?;
         match resp.status {
             200 => Ok(Self::generation_or_abort("CAS PUT", &resp)),
             // The condition failed: someone else holds the key. Any
@@ -591,5 +665,30 @@ mod tests {
             endpoint: "http://127.0.0.1".to_owned(),
             metadata_endpoint: "http://127.0.0.1".to_owned(),
         });
+    }
+
+    #[test]
+    fn retry_after_is_honored_and_capped() {
+        let store = GcsStore::new(GcsConfig {
+            bucket: "bucket".to_owned(),
+            prefix: String::new(),
+            endpoint: "https://storage.googleapis.com".to_owned(),
+            metadata_endpoint: "http://metadata.google.internal".to_owned(),
+        });
+        assert_eq!(
+            store.retry_delay(0, Some(Duration::from_secs(7))),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            store.retry_delay(0, Some(Duration::from_mins(1))),
+            RETRY_AFTER_CAP
+        );
+        assert!(store.retry_delay(0, None) < RETRY_BASE);
+        assert!(store.retry_delay(1, None) < RETRY_BASE * 2);
+        assert_eq!(parse_retry_after("7"), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 1970 00:00:00 GMT"),
+            Some(Duration::ZERO)
+        );
     }
 }

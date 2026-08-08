@@ -12,6 +12,16 @@ use crate::replica_spool::scan_replica_spool;
 use crate::seam::{Effect, Verdict};
 use crate::types::{JournalSeq, PageId, SegId, VolumeId, VsetId};
 
+/// One local recovery entry. Segment contents are verified lazily on first
+/// read, so callers may omit their bytes while still reporting the on-disk
+/// length. Metadata-bearing blobs must provide their complete contents.
+#[derive(Clone, Copy)]
+pub struct RecoveryBlob<'a> {
+    pub name: &'a str,
+    pub bytes: &'a [u8],
+    pub len: u64,
+}
+
 impl Daemon {
     /// Rebuild a daemon from a scan of the local device. Only journal blobs
     /// are decoded (records carry every location); segment bytes are
@@ -21,6 +31,23 @@ impl Daemon {
     pub fn recover<'a>(
         config: DaemonConfig,
         blobs: impl Iterator<Item = (&'a str, &'a [u8])>,
+    ) -> (Daemon, BTreeMap<VsetId, Verdict>, Vec<Effect>) {
+        Self::recover_with_metadata(
+            config,
+            blobs.map(|(name, bytes)| RecoveryBlob {
+                name,
+                bytes,
+                len: bytes.len() as u64,
+            }),
+        )
+    }
+
+    /// Runtime recovery variant that avoids loading segment payloads merely
+    /// to learn their sizes.
+    #[allow(clippy::too_many_lines)]
+    pub fn recover_with_metadata<'a>(
+        config: DaemonConfig,
+        blobs: impl Iterator<Item = RecoveryBlob<'a>>,
     ) -> (Daemon, BTreeMap<VsetId, Verdict>, Vec<Effect>) {
         struct Found<'a> {
             records: Vec<JournalRecord>,
@@ -42,8 +69,8 @@ impl Daemon {
         // tiebreak, which duplicate-seq record wins `record_ws`). Sorting
         // here makes every production recovery byte-identical to the one
         // the simulation proved on the same bytes.
-        let mut scan: Vec<(&'a str, &'a [u8])> = blobs.collect();
-        scan.sort_unstable_by_key(|&(name, _)| name);
+        let mut scan: Vec<RecoveryBlob<'a>> = blobs.collect();
+        scan.sort_unstable_by_key(|blob| blob.name);
         let mut found: BTreeMap<VsetId, Found> = BTreeMap::new();
         // The fence floor: the highest fence this disk has EVER held per
         // vset, including vsets recovery abandons as unrestorable. Their
@@ -53,7 +80,7 @@ impl Daemon {
         // surviving write-once names. Adoption goes strictly above this.
         let mut fence_floors: BTreeMap<VsetId, u64> = BTreeMap::new();
         let mut replica_blobs: BTreeMap<ReplicaKey, BTreeMap<u64, &'a [u8]>> = BTreeMap::new();
-        for (name, bytes) in scan {
+        for RecoveryBlob { name, bytes, len } in scan {
             let Some(parsed) = layout::parse_blob(name) else {
                 continue;
             };
@@ -113,7 +140,7 @@ impl Daemon {
                     }
                 }
                 BlobName::Segment { fence, seg, .. } => {
-                    f.seg_names.push((fence, seg, bytes.len() as u64));
+                    f.seg_names.push((fence, seg, len));
                     f.max_seg = f.max_seg.max(seg.0 + 1);
                 }
                 BlobName::Leaf { fence, id, .. } => {
@@ -380,6 +407,11 @@ impl Daemon {
             // re-offers (it never saw the accept) get re-acked instead of
             // igniting a second runner.
             state.peer_source = chosen.migrated_from;
+            state.hydration_remaining_pages = state
+                .page_locs
+                .values()
+                .filter(|(_, loc)| loc.base == 0 && loc.fence < state.fence)
+                .count();
             let hydrating = chosen.migrated_from.is_some();
             if hydrating {
                 state.pending_leaves = chosen

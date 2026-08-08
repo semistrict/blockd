@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use futures_util::stream;
@@ -26,6 +26,7 @@ pub struct Seen {
     pub method: String,
     pub path: String,
     pub headers: BTreeMap<String, String>,
+    pub peer: SocketAddr,
 }
 
 /// A scripted deviation from stateful behavior, applied to the next
@@ -98,7 +99,12 @@ impl FakeGcs {
                         .fallback(handle)
                         .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
                         .with_state(server);
-                    axum::serve(listener, app).await.expect("serve fake GCS");
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                    .expect("serve fake GCS");
                 });
             })
             .expect("spawn fake GCS");
@@ -158,6 +164,7 @@ impl FakeGcs {
 
 async fn handle(
     State(server): State<Arc<FakeGcs>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -184,6 +191,7 @@ async fn handle(
     let seen = Seen {
         method: method.to_string(),
         path: uri.path().to_owned(),
+        peer,
         headers: headers
             .iter()
             .filter_map(|(name, value)| {

@@ -27,12 +27,18 @@ cargo test --release -p blockd-core profile_one_mib_database_write_slices -- --i
 # 300k-page capture: total throughput and the worst bounded continuation.
 cargo test --release -p blockd-runtime --test perf_decider profile_huge_vset_capture_stall -- --nocapture
 
+# 300k-page migration hydration: one bounded map slice and fetch batch.
+cargo test --release -p blockd-core profile_300k_page_hydration_tick -- --ignored --nocapture
+
 # Replica artifact preparation: old inline-equivalent time versus bounded
 # peer-I/O queue submission and worker completion.
 cargo test --release -p blockd-core --test perf_replica -- --ignored --nocapture
 
 # Directory-backed store: 8192 bounded 4 KiB reads from one 32 MiB object.
 cargo test --release -p blockd-runtime profile_bounded_directory_range_reads -- --ignored --nocapture
+
+# Startup scan: eight sparse 64 MiB segments, reporting logical versus loaded bytes.
+cargo test --release -p blockd-runtime profile_recovery_scan_skips_large_segment_payloads -- --ignored --nocapture
 ```
 
 On Linux, the real-userfaultfd noisy-neighbor profile adds end-to-end probe

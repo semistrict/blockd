@@ -265,7 +265,10 @@ impl LoopQueue {
             | Msg::Stop => true,
             Msg::Ev(Event::PeerDelivered { msg, .. }) => matches!(
                 msg,
-                blockd_core::seam::PeerMsg::Page { .. } | blockd_core::seam::PeerMsg::Leaf { .. }
+                blockd_core::seam::PeerMsg::Page { .. }
+                    | blockd_core::seam::PeerMsg::Leaf { .. }
+                    | blockd_core::seam::PeerMsg::FetchRange { .. }
+                    | blockd_core::seam::PeerMsg::FetchLeaf { .. }
             ),
             Msg::Ev(_) => false,
         };
@@ -476,7 +479,7 @@ fn execute_fault_work(work: FaultWork) {
                 tracing::error!(?page, %error, "fatal fill completion failure");
                 std::process::abort();
             }
-            complete_fault(&shared, page, source, "served");
+            complete_fault(&shared, Some(&host), page, source, "served");
         }
         FaultWork::Unprotect { shared, host, page } => {
             let index = host.page_index(page);
@@ -488,7 +491,13 @@ fn execute_fault_work(work: FaultWork) {
                 tracing::error!(?page, %error, "fatal unprotect failure");
                 std::process::abort();
             }
-            complete_fault(&shared, page, FaultSource::WriteProtect, "served");
+            complete_fault(
+                &shared,
+                Some(&host),
+                page,
+                FaultSource::WriteProtect,
+                "served",
+            );
         }
         FaultWork::Evict { host, page } => {
             let index = host.page_index(page);
@@ -620,12 +629,12 @@ impl Runtime {
         store: Arc<dyn ObjectStore>,
         vset_configs: &BTreeMap<VsetId, VsetConfig>,
     ) -> (Runtime, BTreeMap<VsetId, Verdict>) {
-        let blobs = crate::blobscan::scan_blob_dir(&config.blob_dir);
-        let (daemon, verdicts, effects) = Daemon::recover(
+        let blobs = crate::blobscan::scan_blob_dir_for_recovery(&config.blob_dir);
+        let (daemon, verdicts, effects) = Daemon::recover_with_metadata(
             config.daemon.clone(),
             blobs
                 .iter()
-                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+                .map(crate::blobscan::ScannedBlob::recovery_blob),
         );
         let mut hosts = BTreeMap::new();
         for (&vset, &vc) in vset_configs {
@@ -1460,7 +1469,13 @@ fn fault_source_of_event(event: &Event) -> Option<FaultSource> {
     }
 }
 
-fn complete_fault(shared: &Shared, page: PageId, source: FaultSource, outcome: &'static str) {
+fn complete_fault(
+    shared: &Shared,
+    host: Option<&VsetHost>,
+    page: PageId,
+    source: FaultSource,
+    outcome: &'static str,
+) {
     let fault = {
         let mut pending = shared.fault_in_flight.lock().expect("lock");
         let fault = pending.get_mut(&page).and_then(VecDeque::pop_front);
@@ -1473,13 +1488,7 @@ fn complete_fault(shared: &Shared, page: PageId, source: FaultSource, outcome: &
         return; // unsolicited prefetch/hydration fill
     };
     let elapsed = fault.started.elapsed();
-    if let Some(host) = shared
-        .vsets
-        .lock()
-        .expect("lock")
-        .get(&page.volume.vset)
-        .cloned()
-    {
+    if let Some(host) = host {
         host.fault_latency[source.index()].observe(elapsed);
     }
     fault.span.record("source", source.name());
@@ -1573,7 +1582,7 @@ fn update_active_operations(shared: &Shared, stats: &blockd_core::daemon::Daemon
 fn apply_effect(
     effect: Effect,
     shared: &Arc<Shared>,
-    store_tx: &mpsc::Sender<StoreJob>,
+    store_tx: &StoreSenders,
     blob_tx: &Sender<BlobJob>,
     blob_delete_tx: &Sender<BlobJob>,
     replica_tx: &Sender<BlobJob>,
@@ -1608,7 +1617,7 @@ fn apply_effect(
         }
         Effect::FillShared { .. } => unreachable!("base sharing is not wired in e2e v1"),
         Effect::FillFailed { page } => {
-            complete_fault(shared, page, FaultSource::Unservable, "failed");
+            complete_fault(shared, None, page, FaultSource::Unservable, "failed");
             // Unservable page: in production this SIGBUSes the guest. The
             // e2e scenarios never sanction it — die loudly right here.
             tracing::error!(?page, "fatal unservable page");
@@ -1923,7 +1932,8 @@ fn for_each_contiguous_run(indices: &mut Vec<usize>, mut visit: impl FnMut(usize
 /// Concurrent object-store round-trips. The daemon's own pipelines bound
 /// what is outstanding (one publish per vset, deduped cold fetches); this
 /// only caps the parallelism of what it issues.
-const STORE_WORKERS: usize = 8;
+const STORE_CRITICAL_WORKERS: usize = 2;
+const STORE_BACKGROUND_WORKERS: usize = 6;
 const STORE_QUEUE_CAPACITY: usize = 1024;
 
 /// Local disks can service independent segment reads concurrently. This is
@@ -2143,12 +2153,29 @@ enum StoreJob {
     },
 }
 
+#[derive(Clone)]
+struct StoreSenders {
+    critical: mpsc::Sender<StoreJob>,
+    background: mpsc::Sender<StoreJob>,
+}
+
+impl StoreSenders {
+    fn try_send(&self, job: StoreJob) -> Result<(), mpsc::error::TrySendError<StoreJob>> {
+        if matches!(job, StoreJob::Get { .. } | StoreJob::GetRange { .. }) {
+            self.critical.try_send(job)
+        } else {
+            self.background.try_send(job)
+        }
+    }
+}
+
 async fn store_worker_loop(
     mut rx: mpsc::Receiver<StoreJob>,
     store: Arc<dyn ObjectStore>,
     tx: Arc<LoopQueue>,
+    concurrency: usize,
 ) {
-    let concurrency = Arc::new(tokio::sync::Semaphore::new(STORE_WORKERS));
+    let concurrency = Arc::new(tokio::sync::Semaphore::new(concurrency));
     while let Some(job) = rx.recv().await {
         let permit = concurrency
             .clone()
@@ -2247,18 +2274,40 @@ fn spawn_io_workers(
         thread::spawn(move || timer_loop(&timer_rx, &tx));
     }
 
-    let (store_tx, store_rx) = mpsc::channel::<StoreJob>(STORE_QUEUE_CAPACITY);
+    let (store_critical_tx, store_critical_rx) = mpsc::channel::<StoreJob>(STORE_QUEUE_CAPACITY);
+    let (store_background_tx, store_background_rx) =
+        mpsc::channel::<StoreJob>(STORE_QUEUE_CAPACITY);
+    let store_tx = StoreSenders {
+        critical: store_critical_tx,
+        background: store_background_tx,
+    };
     {
         let store = store.clone();
         let tx = tx.clone();
         thread::Builder::new()
             .name("blockd-store-io".to_owned())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                     .expect("store I/O runtime");
-                runtime.block_on(store_worker_loop(store_rx, store, tx));
+                runtime.block_on(async move {
+                    tokio::join!(
+                        store_worker_loop(
+                            store_critical_rx,
+                            store.clone(),
+                            tx.clone(),
+                            STORE_CRITICAL_WORKERS,
+                        ),
+                        store_worker_loop(
+                            store_background_rx,
+                            store,
+                            tx,
+                            STORE_BACKGROUND_WORKERS,
+                        ),
+                    );
+                });
             })
             .expect("spawn store I/O runtime");
     }
@@ -2311,7 +2360,7 @@ fn spawn_io_workers(
 
 /// The job senders `spawn_io_workers` hands back, one per lane.
 struct IoLanes {
-    store: mpsc::Sender<StoreJob>,
+    store: StoreSenders,
     blob: Sender<BlobJob>,
     blob_delete: Sender<BlobJob>,
     replica: Sender<BlobJob>,
@@ -2324,7 +2373,58 @@ fn elapsed_ns(elapsed: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
     use super::*;
+
+    struct SaturatedStore {
+        uploads_started: AtomicUsize,
+        read_completed: AtomicBool,
+        release_uploads: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for SaturatedStore {
+        async fn put(
+            self: Arc<Self>,
+            _key: String,
+            _bytes: Vec<u8>,
+        ) -> Result<u64, blockd_core::seam::StoreFault> {
+            self.uploads_started.fetch_add(1, Ordering::SeqCst);
+            self.release_uploads
+                .acquire()
+                .await
+                .expect("release semaphore open")
+                .forget();
+            Ok(1)
+        }
+
+        async fn put_cas(
+            self: Arc<Self>,
+            _key: String,
+            _expected: Option<u64>,
+            _bytes: Vec<u8>,
+        ) -> Result<u64, blockd_core::seam::StoreFault> {
+            unreachable!("profile only submits unconditional uploads")
+        }
+
+        async fn get(self: Arc<Self>, _key: String) -> crate::store::GetResult {
+            self.read_completed.store(true, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn get_range(
+            self: Arc<Self>,
+            _key: String,
+            _offset: u64,
+            _len: u64,
+        ) -> crate::store::GetResult {
+            self.read_completed.store(true, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn delete(self: Arc<Self>, _key: String) {}
+    }
 
     fn test_shared() -> Arc<Shared> {
         Arc::new(Shared {
@@ -2451,9 +2551,122 @@ mod tests {
     }
 
     #[test]
+    fn store_reads_have_admission_when_background_queue_is_full() {
+        let (critical_tx, mut critical_rx) = mpsc::channel(1);
+        let (background_tx, _background_rx) = mpsc::channel(1);
+        let senders = StoreSenders {
+            critical: critical_tx,
+            background: background_tx,
+        };
+        senders
+            .try_send(StoreJob::Put {
+                io: IoId(1),
+                key: "large".to_owned(),
+                bytes: vec![0; 64],
+            })
+            .expect("first background job fits");
+        assert!(matches!(
+            senders.try_send(StoreJob::Put {
+                io: IoId(2),
+                key: "blocked".to_owned(),
+                bytes: Vec::new(),
+            }),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        senders
+            .try_send(StoreJob::GetRange {
+                io: IoId(3),
+                key: "fault".to_owned(),
+                offset: 9,
+                len: 4096,
+            })
+            .expect("critical queue remains available");
+        assert!(matches!(
+            critical_rx.try_recv().expect("critical job queued"),
+            StoreJob::GetRange { io: IoId(3), .. }
+        ));
+    }
+
+    #[test]
+    fn store_read_worker_runs_while_every_upload_worker_is_blocked() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let store = Arc::new(SaturatedStore {
+                uploads_started: AtomicUsize::new(0),
+                read_completed: AtomicBool::new(false),
+                release_uploads: tokio::sync::Semaphore::new(0),
+            });
+            let tx = LoopQueue::new();
+            let (critical_tx, critical_rx) = mpsc::channel(STORE_QUEUE_CAPACITY);
+            let (background_tx, background_rx) = mpsc::channel(STORE_QUEUE_CAPACITY);
+            let critical = tokio::spawn(store_worker_loop(
+                critical_rx,
+                store.clone(),
+                tx.clone(),
+                STORE_CRITICAL_WORKERS,
+            ));
+            let background = tokio::spawn(store_worker_loop(
+                background_rx,
+                store.clone(),
+                tx,
+                STORE_BACKGROUND_WORKERS,
+            ));
+            for io in 0..STORE_BACKGROUND_WORKERS {
+                background_tx
+                    .send(StoreJob::Put {
+                        io: IoId(u64::try_from(io).expect("fits")),
+                        key: format!("upload-{io}"),
+                        bytes: Vec::new(),
+                    })
+                    .await
+                    .expect("background worker open");
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while store.uploads_started.load(Ordering::SeqCst) < STORE_BACKGROUND_WORKERS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all upload workers saturated");
+
+            critical_tx
+                .send(StoreJob::GetRange {
+                    io: IoId(99),
+                    key: "fault".to_owned(),
+                    offset: 0,
+                    len: 4096,
+                })
+                .await
+                .expect("critical worker open");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !store.read_completed.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fault read bypassed saturated uploads");
+
+            store.release_uploads.add_permits(STORE_BACKGROUND_WORKERS);
+            drop(critical_tx);
+            drop(background_tx);
+            critical.await.expect("critical worker");
+            background.await.expect("background worker");
+        });
+    }
+
+    #[test]
     fn queued_blob_io_does_not_block_followup_effects() {
         let shared = test_shared();
-        let (store_tx, _store_rx) = mpsc::channel(1);
+        let (store_critical_tx, _store_critical_rx) = mpsc::channel(1);
+        let (store_background_tx, _store_background_rx) = mpsc::channel(1);
+        let store_tx = StoreSenders {
+            critical: store_critical_tx,
+            background: store_background_tx,
+        };
         // No worker receives from this channel: it models every disk worker
         // being occupied by a slow filesystem operation.
         let (blob_tx, blob_rx) = channel();

@@ -1190,7 +1190,7 @@ impl Daemon {
         pages.sort_unstable();
         pages.dedup();
         for page in pages {
-            state.page_locs.remove(&page);
+            state.map_remove(page);
             state.overlay.remove(&page);
             let span = span_of(page);
             state

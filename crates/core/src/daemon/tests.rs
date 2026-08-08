@@ -106,6 +106,198 @@ fn operational_snapshot_tracks_dirty_and_parked_state() {
 }
 
 #[test]
+fn hydration_tick_scans_and_issues_bounded_batches() {
+    let (mut daemon, _) = Daemon::new(DaemonConfig {
+        host: HostId(0),
+        cache_pages: 128,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: None,
+    });
+    let mut state = Vset::new(VsetConfig::compute(1, 1024, false));
+    state.ready = true;
+    state.fence = 2;
+    state.peer_source = Some(HostId(1));
+    for page_no in 0..1024 {
+        let page = PageId {
+            volume: VolumeId {
+                vset: VSET,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(page_no),
+        };
+        state.page_locs.insert(
+            page,
+            (
+                Gen(u64::from(page_no)),
+                crate::segment::PageLoc {
+                    base: 0,
+                    fence: 1,
+                    seg: SegId(0),
+                    offset: page_no,
+                    len: 1,
+                },
+            ),
+        );
+    }
+    state.hydration_remaining_pages = state.page_locs.len();
+    daemon.vsets.insert(VSET, state);
+
+    let effects = daemon.step(Event::Timer(TimerId::Hydrate(VSET)), &NoMem);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(
+                effect,
+                Effect::PeerSend {
+                    msg: PeerMsg::FetchRange { .. },
+                    ..
+                }
+            ))
+            .count(),
+        super::migrate::HYDRATE_BATCH
+    );
+    assert_eq!(daemon.pending.len(), super::migrate::HYDRATE_BATCH);
+    assert_eq!(daemon.vsets[&VSET].hydration_remaining_pages, 1024);
+    assert_eq!(
+        daemon.vsets[&VSET].hydrate_cursor.map(|page| page.page.0),
+        Some(255)
+    );
+}
+
+#[test]
+fn peer_retry_preserves_the_original_request_for_a_late_reply() {
+    let (mut daemon, _) = Daemon::new(DaemonConfig {
+        host: HostId(0),
+        cache_pages: 8,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: None,
+    });
+    let mut state = Vset::new(config());
+    state.ready = true;
+    state.fence = 2;
+    state.peer_source = Some(HostId(1));
+    daemon.vsets.insert(VSET, state);
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(2),
+    };
+    let loc = crate::segment::PageLoc {
+        base: 0,
+        fence: 1,
+        seg: SegId(3),
+        offset: 17,
+        len: 4096,
+    };
+    let io = IoId(41);
+    daemon.pending.insert(
+        io,
+        Pending::PeerFetch {
+            page,
+            write: false,
+            generation: Gen(9),
+            loc,
+        },
+    );
+
+    let effects = daemon.step(Event::Timer(TimerId::PeerRetry(io)), &NoMem);
+
+    assert!(matches!(
+        daemon.pending.get(&io),
+        Some(Pending::PeerFetch { page: pending, .. }) if *pending == page
+    ));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::PeerSend {
+            to: HostId(1),
+            msg: PeerMsg::FetchRange { io: retried, .. },
+        } if *retried == io
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SetTimer {
+            timer: TimerId::PeerRetry(retried),
+            ..
+        } if *retried == io
+    )));
+}
+
+#[test]
+#[ignore = "performance profile; run explicitly in release mode"]
+#[allow(clippy::disallowed_types)]
+fn profile_300k_page_hydration_tick() {
+    let (mut daemon, _) = Daemon::new(DaemonConfig {
+        host: HostId(0),
+        cache_pages: 128,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: None,
+    });
+    let mut state = Vset::new(VsetConfig::compute(1, 300_000, false));
+    state.ready = true;
+    state.fence = 2;
+    state.peer_source = Some(HostId(1));
+    for page_no in 0..300_000 {
+        state.page_locs.insert(
+            PageId {
+                volume: VolumeId {
+                    vset: VSET,
+                    idx: VolumeIdx(1),
+                },
+                page: PageNo(page_no),
+            },
+            (
+                Gen(u64::from(page_no)),
+                crate::segment::PageLoc {
+                    base: 0,
+                    fence: 1,
+                    seg: SegId(0),
+                    offset: page_no,
+                    len: 1,
+                },
+            ),
+        );
+    }
+    state.hydration_remaining_pages = state.page_locs.len();
+    daemon.vsets.insert(VSET, state);
+
+    let started = std::time::Instant::now();
+    let effects = daemon.step(Event::Timer(TimerId::Hydrate(VSET)), &NoMem);
+    let elapsed = started.elapsed();
+    let issued = effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::PeerSend {
+                    msg: PeerMsg::FetchRange { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    eprintln!("300k hydration tick: elapsed={elapsed:?}, issued={issued}");
+    assert_eq!(issued, super::migrate::HYDRATE_BATCH);
+    assert_eq!(
+        daemon.vsets[&VSET].hydrate_cursor.map(|page| page.page.0),
+        Some(255)
+    );
+}
+
+#[test]
 fn checkpoint_retries_replay_their_outcome() {
     // R3.5: a retried request replays its outcome — same epoch, no new
     // pause, no new capture.
