@@ -9,10 +9,11 @@
 pub mod cluster;
 pub mod guest;
 pub mod harness;
-pub mod hash;
 pub mod kernel;
 pub mod oracle;
 pub mod presets;
-pub mod rng;
 pub mod scenario;
 pub mod world;
+
+pub use blockd_exec::rng;
+pub use blockd_exec::trace as hash;
