@@ -809,6 +809,31 @@ struct Publish {
     leaves_todo: Vec<(u64, u64)>,
 }
 
+#[derive(Clone, Copy)]
+enum StoreCopyArtifact {
+    Segment { fence: u64, seg: SegId },
+    Leaf { fence: u64, id: u64 },
+}
+
+impl StoreCopyArtifact {
+    fn next(segs: &[(u64, SegId)], leaves: &[(u64, u64)]) -> Option<Self> {
+        segs.last()
+            .map(|&(fence, seg)| StoreCopyArtifact::Segment { fence, seg })
+            .or_else(|| {
+                leaves
+                    .last()
+                    .map(|&(fence, id)| StoreCopyArtifact::Leaf { fence, id })
+            })
+    }
+
+    fn blob_name(self, vset: VsetId) -> String {
+        match self {
+            StoreCopyArtifact::Segment { fence, seg } => layout::segment_blob(vset, fence, seg),
+            StoreCopyArtifact::Leaf { fence, id } => layout::leaf_blob(vset, fence, id),
+        }
+    }
+}
+
 /// One sequential passive-replica transfer. At most one message is awaiting
 /// an ACK, which bounds memory and makes retry identity explicit.
 #[derive(Debug)]
@@ -917,6 +942,10 @@ impl Vset {
         if !self.config.durability.requires_peer_sync() {
             self.sync_ack_through = self.sync_ack_through.max(self.local_covered_through);
         }
+    }
+
+    fn parked_fill_count(&self) -> usize {
+        self.store_fill_retry.len() + self.leaf_waiters.values().map(Vec::len).sum::<usize>()
     }
 
     /// Install the recovery map and record metadata shared by store restore
@@ -1124,21 +1153,7 @@ impl Daemon {
     /// A bounded, current-state view for production telemetry (R9.2).
     #[allow(clippy::too_many_lines)]
     pub fn stats(&self) -> DaemonStats {
-        let mut blocked: BTreeMap<VsetId, usize> = BTreeMap::new();
-        for &(page, _) in &self.waiters {
-            *blocked.entry(page.volume.vset).or_default() += 1;
-        }
-        for pending in self.pending.values() {
-            let page = match pending {
-                Pending::Fetch { page, .. }
-                | Pending::StoreFetch { page, .. }
-                | Pending::PeerFetch { page, .. } => Some(*page),
-                _ => None,
-            };
-            if let Some(page) = page {
-                *blocked.entry(page.volume.vset).or_default() += 1;
-            }
-        }
+        let blocked = self.blocked_fills_by_vset();
 
         let vsets = self
             .vsets
@@ -1146,8 +1161,7 @@ impl Daemon {
             .map(|(&vset, state)| {
                 let dirty_pages = self.cache.dirty_pages_of(vset).len();
                 let unstable_pages = self.cache.unstable_pages_of(vset).len();
-                let outage_parked = state.store_fill_retry.len()
-                    + state.leaf_waiters.values().map(Vec::len).sum::<usize>();
+                let outage_parked = state.parked_fill_count();
                 let hydration_remaining_pages = state.hydration_remaining_pages;
                 let live_segment_bytes = state.seg_live.values().sum();
                 let local_segment_bytes = state.seg_blobs.iter().map(|&(_, _, bytes)| bytes).sum();
@@ -1696,11 +1710,6 @@ impl Daemon {
         self.cache.base_resident_count()
     }
 
-    /// Test/oracle introspection: faults waiting on pressure right now.
-    pub fn waiting_guests(&self) -> usize {
-        self.waiters.len()
-    }
-
     /// Test/oracle introspection: every parked fill — pressure waiters,
     /// outage-parked store fills, faults parked on unhydrated spans. A
     /// healed world must drain this to zero (the liveness oracle).
@@ -1709,10 +1718,25 @@ impl Daemon {
             + self
                 .vsets
                 .values()
-                .map(|s| {
-                    s.store_fill_retry.len() + s.leaf_waiters.values().map(Vec::len).sum::<usize>()
-                })
+                .map(Vset::parked_fill_count)
                 .sum::<usize>()
+    }
+
+    fn blocked_fills_by_vset(&self) -> BTreeMap<VsetId, usize> {
+        let mut blocked = BTreeMap::new();
+        for &(page, _) in &self.waiters {
+            *blocked.entry(page.volume.vset).or_default() += 1;
+        }
+        for pending in self.pending.values() {
+            let (Pending::Fetch { page, .. }
+            | Pending::StoreFetch { page, .. }
+            | Pending::PeerFetch { page, .. }) = pending
+            else {
+                continue;
+            };
+            *blocked.entry(page.volume.vset).or_default() += 1;
+        }
+        blocked
     }
 
     /// Test/oracle introspection: vsets still mid-hydration — a post-copy
@@ -1757,29 +1781,15 @@ impl Daemon {
         if threshold == 0 {
             return;
         }
-        let mut blocked: BTreeMap<VsetId, usize> = BTreeMap::new();
-        for &(page, _) in &self.waiters {
-            *blocked.entry(page.volume.vset).or_default() += 1;
-        }
         // In-flight demand fetches count as blocked too: an outage-parked
         // fill spends part of every retry cycle in flight, and a watch
         // that only saw the parked half would reset in the gaps. Healthy
         // fetches complete and bump the progress signal, so counting them
         // costs nothing.
-        for p in self.pending.values() {
-            let (Pending::Fetch { page, .. }
-            | Pending::StoreFetch { page, .. }
-            | Pending::PeerFetch { page, .. }) = p
-            else {
-                continue;
-            };
-            *blocked.entry(page.volume.vset).or_default() += 1;
-        }
+        let blocked = self.blocked_fills_by_vset();
         for (vset_id, state) in &mut self.vsets {
+            let parked = blocked.get(vset_id).copied().unwrap_or(0) + state.parked_fill_count();
             let w = &mut state.wedge;
-            let parked = blocked.get(vset_id).copied().unwrap_or(0)
-                + state.store_fill_retry.len()
-                + state.leaf_waiters.values().map(Vec::len).sum::<usize>();
             Self::watch(
                 parked > 0,
                 w.fills,

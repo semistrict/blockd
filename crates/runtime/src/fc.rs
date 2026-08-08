@@ -937,35 +937,18 @@ async fn serve_one_shmem(
 /// segment objects under `prefix` (each well inside the 64 MiB object
 /// contract, R4.6). Returns the part count.
 pub fn upload_mem_parts(
-    store: &crate::s3::S3Store,
+    store: &Arc<crate::s3::S3Store>,
     mem_path: &Path,
     prefix: &str,
     part_bytes: u64,
 ) -> u64 {
-    let part_bytes = usize::try_from(part_bytes).expect("fits");
-    assert!(part_bytes > 0, "snapshot part size must be nonzero");
-    let mut file = std::fs::File::open(mem_path).expect("mem file");
-    let mut part = 0u64;
-    loop {
-        let mut chunk = vec![0; part_bytes];
-        let mut used = 0;
-        while used < chunk.len() {
-            let read = file.read(&mut chunk[used..]).expect("read snapshot part");
-            if read == 0 {
-                break;
-            }
-            used += read;
-        }
-        if used == 0 {
-            break;
-        }
-        chunk.truncate(used);
-        store
-            .put(&format!("{prefix}/{part:08}"), chunk)
-            .expect("upload part");
-        part += 1;
-    }
-    part
+    let runtime = tokio::runtime::Runtime::new().expect("snapshot upload runtime");
+    runtime.block_on(upload_mem_parts_async(
+        store.clone(),
+        mem_path.to_owned(),
+        prefix.to_owned(),
+        part_bytes,
+    ))
 }
 
 /// Asynchronous production uploader. File reading stays on Tokio's blocking

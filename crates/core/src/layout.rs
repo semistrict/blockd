@@ -167,6 +167,14 @@ pub enum StoreKey {
     },
 }
 
+fn hex_pair(value: &str) -> Option<(u64, u64)> {
+    let (left, right) = value.split_once('-')?;
+    Some((
+        u64::from_str_radix(left, 16).ok()?,
+        u64::from_str_radix(right, 16).ok()?,
+    ))
+}
+
 pub fn parse_key(key: &str) -> Option<StoreKey> {
     if let Some(rest) = key.strip_prefix("v/") {
         let (vset_hex, rest) = rest.split_once('/')?;
@@ -175,28 +183,24 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
             return Some(StoreKey::Head { vset });
         }
         if let Some(body) = rest.strip_prefix("m/") {
-            let (fence_hex, seq_hex) = body.split_once('-')?;
+            let (fence, seq) = hex_pair(body)?;
             return Some(StoreKey::Manifest {
                 vset,
-                fence: u64::from_str_radix(fence_hex, 16).ok()?,
-                seq: JournalSeq(u64::from_str_radix(seq_hex, 16).ok()?),
+                fence,
+                seq: JournalSeq(seq),
             });
         }
         if let Some(body) = rest.strip_prefix("s/") {
-            let (fence_hex, seg_hex) = body.split_once('-')?;
+            let (fence, seg) = hex_pair(body)?;
             return Some(StoreKey::Segment {
                 vset,
-                fence: u64::from_str_radix(fence_hex, 16).ok()?,
-                seg: SegId(u64::from_str_radix(seg_hex, 16).ok()?),
+                fence,
+                seg: SegId(seg),
             });
         }
         if let Some(body) = rest.strip_prefix("l/") {
-            let (fence_hex, id_hex) = body.split_once('-')?;
-            return Some(StoreKey::Leaf {
-                vset,
-                fence: u64::from_str_radix(fence_hex, 16).ok()?,
-                id: u64::from_str_radix(id_hex, 16).ok()?,
-            });
+            let (fence, id) = hex_pair(body)?;
+            return Some(StoreKey::Leaf { vset, fence, id });
         }
         return None;
     }
@@ -207,20 +211,16 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
             return Some(StoreKey::BaseRecord { base });
         }
         if let Some(body) = rest.strip_prefix("s/") {
-            let (fence_hex, seg_hex) = body.split_once('-')?;
+            let (fence, seg) = hex_pair(body)?;
             return Some(StoreKey::BaseSegment {
                 base,
-                fence: u64::from_str_radix(fence_hex, 16).ok()?,
-                seg: SegId(u64::from_str_radix(seg_hex, 16).ok()?),
+                fence,
+                seg: SegId(seg),
             });
         }
         if let Some(body) = rest.strip_prefix("l/") {
-            let (fence_hex, id_hex) = body.split_once('-')?;
-            return Some(StoreKey::BaseLeaf {
-                base,
-                fence: u64::from_str_radix(fence_hex, 16).ok()?,
-                id: u64::from_str_radix(id_hex, 16).ok()?,
-            });
+            let (fence, id) = hex_pair(body)?;
+            return Some(StoreKey::BaseLeaf { base, fence, id });
         }
         return None;
     }
@@ -294,21 +294,17 @@ pub fn parse_blob(name: &str) -> Option<BlobName> {
         .strip_prefix("j/")
         .and_then(|r| r.strip_suffix(".recm").or_else(|| r.strip_suffix(".rec")))
     {
-        let (fence_hex, seq_hex) = body.split_once('-')?;
-        let fence = u64::from_str_radix(fence_hex, 16).ok()?;
-        let seq = JournalSeq(u64::from_str_radix(seq_hex, 16).ok()?);
+        let (fence, seq) = hex_pair(body)?;
+        let seq = JournalSeq(seq);
         return Some(BlobName::Journal { vset, fence, seq });
     }
     if let Some(body) = rest.strip_prefix("s/").and_then(|r| r.strip_suffix(".seg")) {
-        let (fence_hex, seg_hex) = body.split_once('-')?;
-        let fence = u64::from_str_radix(fence_hex, 16).ok()?;
-        let seg = SegId(u64::from_str_radix(seg_hex, 16).ok()?);
+        let (fence, seg) = hex_pair(body)?;
+        let seg = SegId(seg);
         return Some(BlobName::Segment { vset, fence, seg });
     }
     if let Some(body) = rest.strip_prefix("l/").and_then(|r| r.strip_suffix(".map")) {
-        let (fence_hex, id_hex) = body.split_once('-')?;
-        let fence = u64::from_str_radix(fence_hex, 16).ok()?;
-        let id = u64::from_str_radix(id_hex, 16).ok()?;
+        let (fence, id) = hex_pair(body)?;
         return Some(BlobName::Leaf { vset, fence, id });
     }
     if let Some(body) = rest

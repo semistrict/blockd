@@ -73,6 +73,10 @@ use crate::journal::VsetConfig;
 use crate::types::{Epoch, HostId, PageId, SegId, VmId, VolumeId, VsetId};
 use std::fmt;
 
+/// Largest object accepted by the durable-store seam, including framing
+/// overhead for payloads whose unframed contract is 64 MiB.
+pub const MAX_OBJECT_BYTES: u32 = 64 * 1024 * 1024 + 4096;
+
 /// Daemon-issued I/O id, unique per daemon incarnation.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IoId(pub u64);

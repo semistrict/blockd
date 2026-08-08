@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::format::{Dec, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
+use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
 use crate::journal::{DurabilityMode, JournalRecord};
 use crate::mapleaf::MapLeaf;
 use crate::replica_wire::{
@@ -50,6 +50,12 @@ pub struct ReplicaSpoolScan {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ReplicaSpoolError;
+
+impl From<DecodeError> for ReplicaSpoolError {
+    fn from(_: DecodeError) -> Self {
+        ReplicaSpoolError
+    }
+}
 
 pub fn seal_replica_artifact(
     source: HostId,
@@ -224,20 +230,19 @@ fn check_identity(
 }
 
 fn open_artifact(bytes: &[u8]) -> Result<ReplicaArtifactFrame, ReplicaSpoolError> {
-    let payload = open_frame(MAGIC_REPLICA_ARTIFACT, bytes).map_err(|_| ReplicaSpoolError)?;
+    let payload = open_frame(MAGIC_REPLICA_ARTIFACT, bytes)?;
     let mut d = Dec::new(payload);
-    if d.u16().map_err(|_| ReplicaSpoolError)? != 1 {
+    if d.u16()? != 1 {
         return Err(ReplicaSpoolError);
     }
-    let source = HostId(d.u16().map_err(|_| ReplicaSpoolError)?);
-    let vset = VsetId(d.u64().map_err(|_| ReplicaSpoolError)?);
-    let assignment_epoch = d.u64().map_err(|_| ReplicaSpoolError)?;
-    let artifact = decode_artifact(&mut d).map_err(|_| ReplicaSpoolError)?;
-    let checksum = d.u32().map_err(|_| ReplicaSpoolError)?;
-    let len =
-        usize::try_from(d.u32().map_err(|_| ReplicaSpoolError)?).map_err(|_| ReplicaSpoolError)?;
-    let artifact_bytes = d.bytes(len).map_err(|_| ReplicaSpoolError)?.to_vec();
-    d.finish().map_err(|_| ReplicaSpoolError)?;
+    let source = HostId(d.u16()?);
+    let vset = VsetId(d.u64()?);
+    let assignment_epoch = d.u64()?;
+    let artifact = decode_artifact(&mut d)?;
+    let checksum = d.u32()?;
+    let len = usize::try_from(d.u32()?).map_err(|_| ReplicaSpoolError)?;
+    let artifact_bytes = d.bytes(len)?.to_vec();
+    d.finish()?;
     if crc32c(&artifact_bytes) != checksum {
         return Err(ReplicaSpoolError);
     }
@@ -253,30 +258,29 @@ fn open_artifact(bytes: &[u8]) -> Result<ReplicaArtifactFrame, ReplicaSpoolError
 }
 
 fn open_commit(bytes: &[u8]) -> Result<ReplicaCommitFrame, ReplicaSpoolError> {
-    let payload = open_frame(MAGIC_REPLICA_COMMIT, bytes).map_err(|_| ReplicaSpoolError)?;
+    let payload = open_frame(MAGIC_REPLICA_COMMIT, bytes)?;
     let mut d = Dec::new(payload);
-    if d.u16().map_err(|_| ReplicaSpoolError)? != 1 {
+    if d.u16()? != 1 {
         return Err(ReplicaSpoolError);
     }
-    let source = HostId(d.u16().map_err(|_| ReplicaSpoolError)?);
-    let vset = VsetId(d.u64().map_err(|_| ReplicaSpoolError)?);
-    let assignment_epoch = d.u64().map_err(|_| ReplicaSpoolError)?;
-    let info = decode_commit_info(&mut d).map_err(|_| ReplicaSpoolError)?;
-    let count = d.u32().map_err(|_| ReplicaSpoolError)?;
+    let source = HostId(d.u16()?);
+    let vset = VsetId(d.u64()?);
+    let assignment_epoch = d.u64()?;
+    let info = decode_commit_info(&mut d)?;
+    let count = d.u32()?;
     if count > 1_000_000 {
         return Err(ReplicaSpoolError);
     }
     let mut required = Vec::new();
     for _ in 0..count {
-        required.push(decode_artifact(&mut d).map_err(|_| ReplicaSpoolError)?);
+        required.push(decode_artifact(&mut d)?);
     }
     if required.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(ReplicaSpoolError);
     }
-    let len =
-        usize::try_from(d.u32().map_err(|_| ReplicaSpoolError)?).map_err(|_| ReplicaSpoolError)?;
-    let record = d.bytes(len).map_err(|_| ReplicaSpoolError)?.to_vec();
-    d.finish().map_err(|_| ReplicaSpoolError)?;
+    let len = usize::try_from(d.u32()?).map_err(|_| ReplicaSpoolError)?;
+    let record = d.bytes(len)?.to_vec();
+    d.finish()?;
     verify_record(vset, info, &record)?;
     Ok(ReplicaCommitFrame {
         source,
@@ -295,14 +299,13 @@ fn verify_artifact(
 ) -> Result<(), ReplicaSpoolError> {
     match artifact {
         ReplicaArtifact::Segment { fence, seg } => {
-            let (got_vset, got_fence, got_seg, _) =
-                scan_segment(bytes).map_err(|_| ReplicaSpoolError)?;
+            let (got_vset, got_fence, got_seg, _) = scan_segment(bytes)?;
             if (got_vset, got_fence, got_seg) != (vset, fence, seg) {
                 return Err(ReplicaSpoolError);
             }
         }
         ReplicaArtifact::Leaf { fence, id } => {
-            MapLeaf::decode(vset, fence, id, bytes).map_err(|_| ReplicaSpoolError)?;
+            MapLeaf::decode(vset, fence, id, bytes)?;
         }
     }
     Ok(())
@@ -313,7 +316,7 @@ fn verify_record(
     info: ReplicaCommitInfo,
     bytes: &[u8],
 ) -> Result<(), ReplicaSpoolError> {
-    let record = JournalRecord::decode(vset, bytes).map_err(|_| ReplicaSpoolError)?;
+    let record = JournalRecord::decode(vset, bytes)?;
     if record.config.durability != DurabilityMode::PeerStashed
         || record.fence != info.writer_fence
         || record.seq != info.seq

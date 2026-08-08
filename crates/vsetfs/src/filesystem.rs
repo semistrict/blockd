@@ -28,6 +28,19 @@ use crate::transport::DAX_WINDOW_SIZE;
 const ATTR_TIMEOUT: Duration = Duration::from_mins(1);
 const ENTRY_TIMEOUT: Duration = Duration::from_mins(1);
 
+fn protocol_error() -> io::Error {
+    io::Error::from_raw_os_error(libc::EPROTO)
+}
+
+macro_rules! expect_reply {
+    ($reply:expr, $pattern:pat => $value:expr) => {
+        match $reply {
+            $pattern => Ok($value),
+            _ => Err(protocol_error()),
+        }
+    };
+}
+
 pub trait DatabaseIo: Send + Sync + 'static {
     fn request(&self, request: DatabaseRequest) -> DatabaseReply;
 
@@ -199,7 +212,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                 }
                 Ok(_) => {
                     self.rollback_restore(&restored, &opened, &attachments);
-                    return Err(io::Error::from_raw_os_error(libc::EPROTO));
+                    return Err(protocol_error());
                 }
                 Err(error) => {
                     self.rollback_restore(&restored, &opened, &attachments);
@@ -244,15 +257,15 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
         for mapping in mappings {
             let (node, file, handle, temporary) = self.acquire_dax_inode_handle(mapping.inode)?;
             if temporary && let Some(durable) = file.durable_file() {
-                match self.request(node, DatabaseOp::Access { file: durable })? {
-                    DatabaseReply::Access { exists: false, .. } => {
-                        self.lock_state()?
-                            .unmap(mapping.window_offset, mapping.len)
-                            .map_err(vset_error)?;
-                        continue;
-                    }
-                    DatabaseReply::Access { exists: true, .. } => {}
-                    _ => return Err(io::Error::from_raw_os_error(libc::EPROTO)),
+                let exists = expect_reply!(
+                    self.request(node, DatabaseOp::Access { file: durable })?,
+                    DatabaseReply::Access { exists, .. } => exists
+                )?;
+                if !exists {
+                    self.lock_state()?
+                        .unmap(mapping.window_offset, mapping.len)
+                        .map_err(vset_error)?;
+                    continue;
                 }
                 self.open_durable(node, durable, handle)?;
             }
@@ -267,10 +280,10 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
             )?;
             if temporary {
                 if file.durable_file().is_some() {
-                    match self.request(node, DatabaseOp::Close { handle })? {
-                        DatabaseReply::Closed { .. } => {}
-                        _ => return Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                    }
+                    expect_reply!(
+                        self.request(node, DatabaseOp::Close { handle })?,
+                        DatabaseReply::Closed { .. } => ()
+                    )?;
                 }
                 self.lock_state()?.close(handle).map_err(vset_error)?;
             }
@@ -307,26 +320,26 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
         });
         match reply {
             reply if reply.req() == req => Ok(reply),
-            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+            _ => Err(protocol_error()),
         }
     }
 
     fn durable_exists(&self, node: Node, file: DatabaseFile) -> io::Result<bool> {
-        match self.request(node, DatabaseOp::Access { file })? {
-            DatabaseReply::Access { exists, .. } => Ok(exists),
-            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-        }
+        expect_reply!(
+            self.request(node, DatabaseOp::Access { file })?,
+            DatabaseReply::Access { exists, .. } => exists
+        )
     }
 
     fn durable_size(&self, node: Node, file: DatabaseFile) -> io::Result<u64> {
-        match self.request(node, DatabaseOp::Stat { file })? {
-            DatabaseReply::Stat {
-                exists: true, size, ..
-            } => Ok(size),
-            DatabaseReply::Stat { exists: false, .. } => {
-                Err(io::Error::from_raw_os_error(libc::ENOENT))
-            }
-            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+        let (exists, size) = expect_reply!(
+            self.request(node, DatabaseOp::Stat { file })?,
+            DatabaseReply::Stat { exists, size, .. } => (exists, size)
+        )?;
+        if exists {
+            Ok(size)
+        } else {
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
         }
     }
 
@@ -406,17 +419,17 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
     }
 
     fn open_durable(&self, node: Node, file: DatabaseFile, handle: u64) -> io::Result<()> {
-        match self.request(
-            node,
-            DatabaseOp::Open {
-                handle,
-                file,
-                create: false,
-            },
-        )? {
-            DatabaseReply::Opened { .. } => Ok(()),
-            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-        }
+        expect_reply!(
+            self.request(
+                node,
+                DatabaseOp::Open {
+                    handle,
+                    file,
+                    create: false,
+                },
+            )?,
+            DatabaseReply::Opened { .. } => ()
+        )
     }
 
     fn finish_dax_inode_handle(
@@ -432,10 +445,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
         }
         let remote_close = if file.durable_file().is_some() {
             self.request(node, DatabaseOp::Close { handle })
-                .and_then(|reply| match reply {
-                    DatabaseReply::Closed { .. } => Ok(()),
-                    _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                })
+                .and_then(|reply| expect_reply!(reply, DatabaseReply::Closed { .. } => ()))
         } else {
             Ok(())
         };
@@ -455,10 +465,10 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
         if file.durable_file().is_none() {
             return Ok(());
         }
-        match self.request(node, DatabaseOp::Sync { handle })? {
-            DatabaseReply::Synced { .. } => Ok(()),
-            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-        }
+        expect_reply!(
+            self.request(node, DatabaseOp::Sync { handle })?,
+            DatabaseReply::Synced { .. } => ()
+        )
     }
 
     fn dax_backing(
@@ -478,17 +488,17 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
             while cursor < len {
                 let take = (len - cursor).min(blockd_core::database::MAX_DATABASE_IO as u64);
                 let take = u32::try_from(take).expect("bounded by database request limit");
-                let DatabaseReply::Read { bytes, .. } = self.request(
-                    node,
-                    DatabaseOp::Read {
-                        handle,
-                        offset: offset + cursor,
-                        len: take,
-                    },
-                )?
-                else {
-                    return Err(io::Error::from_raw_os_error(libc::EPROTO));
-                };
+                let bytes = expect_reply!(
+                    self.request(
+                        node,
+                        DatabaseOp::Read {
+                            handle,
+                            offset: offset + cursor,
+                            len: take,
+                        },
+                    )?,
+                    DatabaseReply::Read { bytes, .. } => bytes
+                )?;
                 if bytes.is_empty() {
                     break;
                 }
@@ -574,14 +584,15 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
         }
         let offset = offset.expect("nonempty DAX batch has an offset");
         let payload = std::mem::take(bytes);
-        match self.request(
-            node,
-            DatabaseOp::Write {
-                handle,
-                offset,
-                bytes: payload,
-            },
-        )? {
+        expect_reply!(
+            self.request(
+                node,
+                DatabaseOp::Write {
+                    handle,
+                    offset,
+                    bytes: payload,
+                },
+            )?,
             DatabaseReply::Written { .. } => {
                 let mut clean = self
                     .dax_clean
@@ -591,10 +602,8 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                     clean.insert((node.inode, page_offset), bytes);
                 }
                 Self::bound_dax_clean(&mut clean);
-                Ok(())
             }
-            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-        }
+        )
     }
 
     fn flush_dax_inode(&self, node: Node, file: VsetFsFile, handle: u64) -> io::Result<()> {
@@ -609,11 +618,10 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
             return Ok(());
         }
         if let Some(durable) = file.durable_file() {
-            let DatabaseReply::FileSize { size, .. } =
-                self.request(node, DatabaseOp::FileSize { handle })?
-            else {
-                return Err(io::Error::from_raw_os_error(libc::EPROTO));
-            };
+            let size = expect_reply!(
+                self.request(node, DatabaseOp::FileSize { handle })?,
+                DatabaseReply::FileSize { size, .. } => size
+            )?;
             let vset = node
                 .vset
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -736,10 +744,10 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                 if file.durable_file().is_none() {
                     return Ok(());
                 }
-                match self.request(node, DatabaseOp::Sync { handle })? {
-                    DatabaseReply::Synced { .. } => Ok(()),
-                    _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                }
+                expect_reply!(
+                    self.request(node, DatabaseOp::Sync { handle })?,
+                    DatabaseReply::Synced { .. } => ()
+                )
             });
 
             self.finish_dax_inode_handle(node, file, handle, temporary, flush_result)?;
@@ -755,10 +763,10 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
         size: u64,
     ) -> io::Result<()> {
         if file.durable_file().is_some() {
-            match self.request(node, DatabaseOp::Truncate { handle, size })? {
-                DatabaseReply::Truncated { .. } => Ok(()),
-                _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-            }
+            expect_reply!(
+                self.request(node, DatabaseOp::Truncate { handle, size })?,
+                DatabaseReply::Truncated { .. } => ()
+            )
         } else {
             let name = self.shm_name(node.inode)?;
             let mut state = self.lock_state()?;
@@ -970,17 +978,17 @@ impl<I: DatabaseIo> FileSystem for VsetFilesystem<I> {
         }
         let (node, file) = self.inode_and_handle(inode, handle)?;
         let bytes = if file.durable_file().is_some() {
-            match self.request(
-                node,
-                DatabaseOp::Read {
-                    handle,
-                    offset,
-                    len: size,
-                },
-            )? {
-                DatabaseReply::Read { bytes, .. } => bytes,
-                _ => return Err(io::Error::from_raw_os_error(libc::EPROTO)),
-            }
+            expect_reply!(
+                self.request(
+                    node,
+                    DatabaseOp::Read {
+                        handle,
+                        offset,
+                        len: size,
+                    },
+                )?,
+                DatabaseReply::Read { bytes, .. } => bytes
+            )?
         } else {
             let name = self.shm_name(inode)?;
             let state = self.lock_state()?;
@@ -1032,17 +1040,17 @@ impl<I: DatabaseIo> FileSystem for VsetFilesystem<I> {
         let mut bytes = vec![0; size as usize];
         reader.read_exact(&mut bytes)?;
         if file.durable_file().is_some() {
-            match self.request(
-                node,
-                DatabaseOp::Write {
-                    handle,
-                    offset,
-                    bytes,
-                },
-            )? {
-                DatabaseReply::Written { .. } => Ok(size as usize),
-                _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-            }
+            expect_reply!(
+                self.request(
+                    node,
+                    DatabaseOp::Write {
+                        handle,
+                        offset,
+                        bytes,
+                    },
+                )?,
+                DatabaseReply::Written { .. } => size as usize
+            )
         } else {
             let name = self.shm_name(inode)?;
             self.lock_state()?
@@ -1094,10 +1102,7 @@ impl<I: DatabaseIo> FileSystem for VsetFilesystem<I> {
             .map(|_| ());
         let durable_close = if file.durable_file().is_some() {
             self.request(node, DatabaseOp::Close { handle })
-                .and_then(|reply| match reply {
-                    DatabaseReply::Closed { .. } => Ok(()),
-                    _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                })
+                .and_then(|reply| expect_reply!(reply, DatabaseReply::Closed { .. } => ()))
         } else {
             Ok(())
         };
@@ -1117,10 +1122,10 @@ impl<I: DatabaseIo> FileSystem for VsetFilesystem<I> {
             return Err(io::Error::from_raw_os_error(libc::EISDIR));
         };
         if let Some(file) = file.durable_file() {
-            match self.request(node, DatabaseOp::Delete { file })? {
-                DatabaseReply::Deleted { .. } => Ok(()),
-                _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-            }
+            expect_reply!(
+                self.request(node, DatabaseOp::Delete { file })?,
+                DatabaseReply::Deleted { .. } => ()
+            )
         } else {
             let export = self.shm_name(node.inode)?;
             self.lock_state()?.delete_shm(&export).map_err(vset_error)?;
@@ -1434,7 +1439,7 @@ fn core_lock(lock: ByteRangeLock) -> FileLock {
     }
 }
 
-fn database_error(error: DatabaseError) -> io::Error {
+pub fn database_error(error: DatabaseError) -> io::Error {
     io::Error::from_raw_os_error(match error {
         DatabaseError::NotAttached | DatabaseError::StaleAttachment => libc::ESTALE,
         DatabaseError::Draining | DatabaseError::Busy => libc::EBUSY,

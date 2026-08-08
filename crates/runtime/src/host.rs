@@ -304,6 +304,41 @@ struct Shared {
     next_req: AtomicU64,
 }
 
+impl Shared {
+    fn new(
+        vsets: BTreeMap<VsetId, Arc<VsetHost>>,
+        daemon_stats: blockd_core::daemon::DaemonStats,
+        replica_metrics: Vec<blockd_core::daemon::ReplicaVsetMetrics>,
+        replica_spool_metrics: Vec<blockd_core::daemon::ReplicaSpoolMetrics>,
+    ) -> Shared {
+        Shared {
+            vsets: Mutex::new(vsets),
+            sync_waiters: Mutex::new(BTreeMap::new()),
+            database_waiters: Mutex::new(BTreeMap::new()),
+            incidents: Mutex::new(Vec::new()),
+            counters: Mutex::new(blockd_core::daemon::Counters::default()),
+            daemon_stats: Mutex::new(daemon_stats),
+            replica_metrics: Mutex::new(replica_metrics),
+            replica_spool_metrics: Mutex::new(replica_spool_metrics),
+            stats: LoopStats::default(),
+            fault_in_flight: Mutex::new(BTreeMap::new()),
+            operation_latency: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicHistogram::default())
+            }),
+            local_io_latency: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicHistogram::default())
+            }),
+            local_io_in_flight: std::array::from_fn(|_| AtomicU64::new(0)),
+            pause_expected: Mutex::new(BTreeMap::new()),
+            pause_in_flight: Mutex::new(BTreeMap::new()),
+            pause_latency: std::array::from_fn(|_| AtomicHistogram::default()),
+            backup_lag_started: Mutex::new(BTreeMap::new()),
+            operation_started: Mutex::new(BTreeMap::new()),
+            next_req: AtomicU64::new(1),
+        }
+    }
+}
+
 /// The daemon's synchronous window onto the mappings. Capture arms write
 /// protection in one batched effect before scheduling reads, so this view
 /// only copies bytes and never issues an ioctl per page.
@@ -639,31 +674,12 @@ impl Runtime {
         let rx = tx.clone();
         let (admin_tx, admin_rx) = channel::<AdminReply>();
         let daemon_stats = daemon.stats();
-        let shared = Arc::new(Shared {
-            vsets: Mutex::new(hosts),
-            sync_waiters: Mutex::new(BTreeMap::new()),
-            database_waiters: Mutex::new(BTreeMap::new()),
-            incidents: Mutex::new(Vec::new()),
-            counters: Mutex::new(blockd_core::daemon::Counters::default()),
-            daemon_stats: Mutex::new(daemon_stats),
-            replica_metrics: Mutex::new(daemon.replica_metrics()),
-            replica_spool_metrics: Mutex::new(daemon.replica_spool_metrics()),
-            stats: LoopStats::default(),
-            fault_in_flight: Mutex::new(BTreeMap::new()),
-            operation_latency: std::array::from_fn(|_| {
-                std::array::from_fn(|_| AtomicHistogram::default())
-            }),
-            local_io_latency: std::array::from_fn(|_| {
-                std::array::from_fn(|_| AtomicHistogram::default())
-            }),
-            local_io_in_flight: std::array::from_fn(|_| AtomicU64::new(0)),
-            pause_expected: Mutex::new(BTreeMap::new()),
-            pause_in_flight: Mutex::new(BTreeMap::new()),
-            pause_latency: std::array::from_fn(|_| AtomicHistogram::default()),
-            backup_lag_started: Mutex::new(BTreeMap::new()),
-            operation_started: Mutex::new(BTreeMap::new()),
-            next_req: AtomicU64::new(1),
-        });
+        let shared = Arc::new(Shared::new(
+            hosts,
+            daemon_stats,
+            daemon.replica_metrics(),
+            daemon.replica_spool_metrics(),
+        ));
 
         let replica_prepare = spawn_replica_prepare_workers(&tx);
         let peers = config.peer.as_ref().map(|p| {
@@ -703,41 +719,26 @@ impl Runtime {
         let fault_effects = fault_io.handle.clone();
         let fault_work = fault_io.work.clone();
 
-        let IoLanes {
-            store: store_tx,
-            blob: blob_tx,
-            blob_delete: blob_delete_tx,
-            replica: replica_tx,
-            timer: timer_tx,
-        } = spawn_io_workers(&config.blob_dir, store, &tx, &shared);
+        let effect_context = EffectContext {
+            shared: shared.clone(),
+            io: spawn_io_workers(&config.blob_dir, store, &tx, &shared),
+            admin: admin_tx,
+            tx: tx.clone(),
+            peers: peers.clone(),
+            self_id: config.daemon.host,
+            fault_io: fault_effects,
+            fault_work,
+        };
 
         // The event loop: the daemon lives here.
         let loop_thread = {
             let shared = shared.clone();
-            let tx = tx.clone();
-            let peers = peers.clone();
-            let self_id = config.daemon.host;
             thread::spawn(move || {
                 let apply = |effects: Vec<Effect>, source: Option<FaultSource>| {
                     for effect in effects {
                         let kind = effect_kind(&effect);
                         let started = Instant::now();
-                        apply_effect(
-                            effect,
-                            &shared,
-                            &store_tx,
-                            &blob_tx,
-                            &blob_delete_tx,
-                            &replica_tx,
-                            &timer_tx,
-                            &admin_tx,
-                            &tx,
-                            peers.as_ref(),
-                            self_id,
-                            source,
-                            &fault_effects,
-                            &fault_work,
-                        );
+                        apply_effect(effect, &effect_context, source);
                         shared
                             .stats
                             .record_effect(kind, elapsed_ns(started.elapsed()));
@@ -771,7 +772,7 @@ impl Runtime {
                             event,
                             &MapView {
                                 vsets: &vsets,
-                                fault_work: &fault_work,
+                                fault_work: &effect_context.fault_work,
                             },
                         )
                     };
@@ -1022,16 +1023,7 @@ impl Runtime {
     )]
     pub fn create_vset(&self, vset: VsetId, config: VsetConfig) {
         let started = Instant::now();
-        assert_peer_stash_transport(config, self.authenticated_peers);
-        let host = VsetHost::new(config);
-        self.shared
-            .vsets
-            .lock()
-            .expect("lock")
-            .insert(vset, host.clone());
-        if config.kind == VsetKind::Compute {
-            self.spawn_fault_reader(vset, host);
-        }
+        self.install_vset_host(vset, config);
         let req = self.req();
         self.tx.push(Msg::Ev(Event::Admin(AdminCmd::CreateVset {
             req,
@@ -1172,16 +1164,7 @@ impl Runtime {
     )]
     pub fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
         let started = Instant::now();
-        assert_peer_stash_transport(config, self.authenticated_peers);
-        let host = VsetHost::new(config);
-        self.shared
-            .vsets
-            .lock()
-            .expect("lock")
-            .insert(vset, host.clone());
-        if config.kind == VsetKind::Compute {
-            self.spawn_fault_reader(vset, host);
-        }
+        self.install_vset_host(vset, config);
         let req = self.req();
         self.tx
             .push(Msg::Ev(Event::Admin(AdminCmd::RestoreVset { req, vset })));
@@ -1209,6 +1192,10 @@ impl Runtime {
     /// effects (fills, the eventual resume) index this host's vsets and
     /// would find nothing otherwise.
     pub fn expect_migration(&self, vset: VsetId, config: VsetConfig) {
+        self.install_vset_host(vset, config);
+    }
+
+    fn install_vset_host(&self, vset: VsetId, config: VsetConfig) {
         assert_peer_stash_transport(config, self.authenticated_peers);
         let host = VsetHost::new(config);
         self.shared
@@ -1552,23 +1539,20 @@ fn update_active_operations(shared: &Shared, stats: &blockd_core::daemon::Daemon
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn apply_effect(
-    effect: Effect,
-    shared: &Arc<Shared>,
-    store_tx: &StoreSenders,
-    blob_tx: &Sender<BlobJob>,
-    blob_delete_tx: &Sender<BlobJob>,
-    replica_tx: &Sender<BlobJob>,
-    timer_tx: &Sender<(TimerId, u64)>,
-    admin_tx: &Sender<AdminReply>,
-    tx: &Arc<LoopQueue>,
-    peers: Option<&Arc<PeerNet>>,
-    self_id: blockd_core::types::HostId,
-    source: Option<FaultSource>,
-    fault_io: &tokio::runtime::Handle,
-    fault_work: &tokio::sync::mpsc::Sender<FaultWork>,
-) {
+#[allow(clippy::too_many_lines)]
+fn apply_effect(effect: Effect, context: &EffectContext, source: Option<FaultSource>) {
+    let shared = &context.shared;
+    let store_tx = &context.io.store;
+    let blob_tx = &context.io.blob;
+    let blob_delete_tx = &context.io.blob_delete;
+    let replica_tx = &context.io.replica;
+    let timer_tx = &context.io.timer;
+    let admin_tx = &context.admin;
+    let tx = &context.tx;
+    let peers = context.peers.as_ref();
+    let self_id = context.self_id;
+    let fault_io = &context.fault_io;
+    let fault_work = &context.fault_work;
     match effect {
         Effect::Fill {
             page,
@@ -1666,14 +1650,11 @@ fn apply_effect(
                     .insert(vset, (operation, Instant::now()));
             }
             let host = shared.vsets.lock().expect("lock")[&vset].clone();
-            let state = host.ctl.state.lock().expect("lock");
+            let mut state = host.ctl.state.lock().expect("lock");
+            state.pause_requested = true;
             if state.in_op {
-                let mut state = state;
-                state.pause_requested = true;
                 // The op boundary sends Quiesced; GuestPaused follows.
             } else {
-                let mut state = state;
-                state.pause_requested = true;
                 drop(state);
                 tx.push(Msg::Quiesced(vset));
             }
@@ -2327,6 +2308,17 @@ struct IoLanes {
     timer: Sender<(TimerId, u64)>,
 }
 
+struct EffectContext {
+    shared: Arc<Shared>,
+    io: IoLanes,
+    admin: Sender<AdminReply>,
+    tx: Arc<LoopQueue>,
+    peers: Option<Arc<PeerNet>>,
+    self_id: blockd_core::types::HostId,
+    fault_io: tokio::runtime::Handle,
+    fault_work: tokio::sync::mpsc::Sender<FaultWork>,
+}
+
 fn elapsed_ns(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).expect("fits")
 }
@@ -2387,31 +2379,12 @@ mod tests {
     }
 
     fn test_shared() -> Arc<Shared> {
-        Arc::new(Shared {
-            vsets: Mutex::new(BTreeMap::new()),
-            sync_waiters: Mutex::new(BTreeMap::new()),
-            database_waiters: Mutex::new(BTreeMap::new()),
-            incidents: Mutex::new(Vec::new()),
-            counters: Mutex::new(blockd_core::daemon::Counters::default()),
-            daemon_stats: Mutex::new(blockd_core::daemon::DaemonStats::default()),
-            replica_metrics: Mutex::new(Vec::new()),
-            replica_spool_metrics: Mutex::new(Vec::new()),
-            stats: LoopStats::default(),
-            fault_in_flight: Mutex::new(BTreeMap::new()),
-            operation_latency: std::array::from_fn(|_| {
-                std::array::from_fn(|_| AtomicHistogram::default())
-            }),
-            local_io_latency: std::array::from_fn(|_| {
-                std::array::from_fn(|_| AtomicHistogram::default())
-            }),
-            local_io_in_flight: std::array::from_fn(|_| AtomicU64::new(0)),
-            pause_expected: Mutex::new(BTreeMap::new()),
-            pause_in_flight: Mutex::new(BTreeMap::new()),
-            pause_latency: std::array::from_fn(|_| AtomicHistogram::default()),
-            backup_lag_started: Mutex::new(BTreeMap::new()),
-            operation_started: Mutex::new(BTreeMap::new()),
-            next_req: AtomicU64::new(1),
-        })
+        Arc::new(Shared::new(
+            BTreeMap::new(),
+            blockd_core::daemon::DaemonStats::default(),
+            Vec::new(),
+            Vec::new(),
+        ))
     }
 
     #[test]
@@ -2636,6 +2609,22 @@ mod tests {
         let (admin_tx, _admin_rx) = channel();
         let tx = LoopQueue::new();
         let mut fault_io = spawn_fault_io_runtime();
+        let context = EffectContext {
+            shared: shared.clone(),
+            io: IoLanes {
+                store: store_tx,
+                blob: blob_tx,
+                blob_delete: blob_delete_tx,
+                replica: replica_tx,
+                timer: timer_tx,
+            },
+            admin: admin_tx,
+            tx,
+            peers: None,
+            self_id: blockd_core::types::HostId(0),
+            fault_io: fault_io.handle.clone(),
+            fault_work: fault_io.work.clone(),
+        };
 
         apply_effect(
             Effect::BlobWrite {
@@ -2643,38 +2632,16 @@ mod tests {
                 name: "held/blob".to_owned(),
                 bytes: b"payload".to_vec(),
             },
-            &shared,
-            &store_tx,
-            &blob_tx,
-            &blob_delete_tx,
-            &replica_tx,
-            &timer_tx,
-            &admin_tx,
-            &tx,
+            &context,
             None,
-            blockd_core::types::HostId(0),
-            None,
-            &fault_io.handle,
-            &fault_io.work,
         );
         apply_effect(
             Effect::SetTimer {
                 timer: TimerId::Backup(VsetId(9)),
                 after: 123,
             },
-            &shared,
-            &store_tx,
-            &blob_tx,
-            &blob_delete_tx,
-            &replica_tx,
-            &timer_tx,
-            &admin_tx,
-            &tx,
+            &context,
             None,
-            blockd_core::types::HostId(0),
-            None,
-            &fault_io.handle,
-            &fault_io.work,
         );
 
         assert!(matches!(

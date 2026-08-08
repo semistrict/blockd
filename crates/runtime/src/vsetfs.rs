@@ -11,7 +11,7 @@ use blockd_core::seam::DetachMode;
 use blockd_core::types::{VmId, VsetId};
 use blockd_core::vsetfs::{AttachedExport, DaxMapping, VsetFsState};
 use blockd_vsetfs::{
-    DatabaseIo, RestoredAttachment, VsetFilesystem, VsetFsBackend, serve_vhost_user,
+    DatabaseIo, RestoredAttachment, VsetFilesystem, VsetFsBackend, database_error, serve_vhost_user,
 };
 
 use crate::Runtime;
@@ -66,18 +66,7 @@ impl DatabaseIo for RuntimeDatabaseIo {
                     created: true,
                 })
                 .ok_or_else(|| io::Error::from_raw_os_error(libc::EBUSY)),
-            DatabaseReply::Failed { error, .. } => Err(io::Error::from_raw_os_error(match error {
-                blockd_core::database::DatabaseError::Draining
-                | blockd_core::database::DatabaseError::Busy => libc::EBUSY,
-                blockd_core::database::DatabaseError::TooLarge => libc::EFBIG,
-                blockd_core::database::DatabaseError::InvalidRequest => libc::EINVAL,
-                blockd_core::database::DatabaseError::InvalidHandle => libc::EBADF,
-                blockd_core::database::DatabaseError::AlreadyOpen => libc::EEXIST,
-                blockd_core::database::DatabaseError::NotFound => libc::ENOENT,
-                blockd_core::database::DatabaseError::Io => libc::EIO,
-                blockd_core::database::DatabaseError::NotAttached
-                | blockd_core::database::DatabaseError::StaleAttachment => libc::ESTALE,
-            })),
+            DatabaseReply::Failed { error, .. } => Err(database_error(error)),
             _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
         }
     }

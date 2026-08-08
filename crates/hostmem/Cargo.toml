@@ -23,4 +23,4 @@ missing_panics_doc = "allow"
 
 [dependencies]
 blockd-platform = { path = "../platform" }
-libc = "0.2.189"
+libc.workspace = true

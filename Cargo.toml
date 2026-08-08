@@ -17,6 +17,15 @@ edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.97"
 
+[workspace.dependencies]
+async-trait = "0.1.91"
+axum = "0.8.9"
+libc = "0.2.189"
+reqwest = { version = "0.13.4", default-features = false }
+rusqlite = "0.40.1"
+tokio = "1.53.1"
+tracing = "0.1.44"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

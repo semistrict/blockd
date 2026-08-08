@@ -15,17 +15,17 @@ workspace = true
 [dependencies]
 blockd-core = { path = "../core" }
 blockd-runtime = { path = "../runtime" }
-async-trait = "0.1.91"
-axum = { version = "0.8.9", features = ["http1", "json", "tokio"] }
+async-trait.workspace = true
+axum = { workspace = true, features = ["http1", "json", "tokio"] }
 opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry-http = { version = "0.32.0", default-features = false }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace"] }
 prometheus = { version = "0.14.0", default-features = false, features = ["process"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["hickory-dns", "http2", "rustls"] }
+reqwest = { workspace = true, features = ["hickory-dns", "http2", "rustls"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tower-http = { version = "0.7.0", features = ["limit", "timeout"] }
-tracing = "0.1.44"
+tracing.workspace = true
 tracing-opentelemetry = { version = "0.33.0", default-features = false, features = ["tracing-log"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }

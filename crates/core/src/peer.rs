@@ -15,14 +15,14 @@ use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
 };
-use crate::seam::{IoId, PeerMsg};
+use crate::seam::{IoId, MAX_OBJECT_BYTES, PeerMsg};
 use crate::types::{HostId, SegId, VsetId};
 
 pub const MAGIC_PEER: u32 = u32::from_le_bytes(*b"BPM1");
 
 /// Frame payload cap for transports: R4.6's 64 MiB object cap bounds every
 /// embedded blob, so anything larger is a desynced or hostile stream.
-pub const MAX_PEER_PAYLOAD: u32 = 64 * 1024 * 1024 + 4096;
+pub const MAX_PEER_PAYLOAD: u32 = MAX_OBJECT_BYTES;
 
 fn opt_bytes(e: &mut Enc, bytes: Option<&[u8]>) {
     match bytes {

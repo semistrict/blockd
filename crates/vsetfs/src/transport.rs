@@ -32,7 +32,7 @@ const MAX_QUEUE_SIZE: usize = 32_768;
 const VIRTIO_F_VERSION_1: u64 = 32;
 const VIRTIO_RING_F_INDIRECT_DESC: u64 = 28;
 const MAX_SNAPSHOT_BYTES: u64 = 80 * 1024 * 1024;
-pub const DAX_WINDOW_SIZE: u64 = 64 * 1024 * 1024;
+pub(crate) const DAX_WINDOW_SIZE: u64 = 64 * 1024 * 1024;
 const FORCED_DAX_UNMAP_MARKER: u8 = 0xbd;
 
 struct DaxRequest {
@@ -95,7 +95,7 @@ impl FsCacheReqHandler for DaxRequest {
 }
 
 /// The high-priority queue plus the configured request queues.
-pub const VHOST_USER_FS_QUEUES: usize = REQUEST_QUEUES as usize + 1;
+const VHOST_USER_FS_QUEUES: usize = REQUEST_QUEUES as usize + 1;
 
 type GuestMemory = GuestMemoryMmap<()>;
 type AtomicGuestMemory = GuestMemoryAtomic<GuestMemory>;

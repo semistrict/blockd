@@ -152,11 +152,17 @@ fn file_from_flags(flags: c_int) -> Option<DatabaseFile> {
 }
 
 fn is_remote_name(name: &CStr, vset: VsetId) -> bool {
-    let bytes = name.to_bytes();
+    remote_file(name, vset).is_some()
+}
+
+fn remote_file(name: &CStr, vset: VsetId) -> Option<DatabaseFile> {
     let prefix = format!("vset-{}", vset.0);
-    bytes == prefix.as_bytes()
-        || bytes == format!("{prefix}-wal").as_bytes()
-        || bytes == format!("{prefix}-journal").as_bytes()
+    match name.to_bytes().strip_prefix(prefix.as_bytes())? {
+        b"" => Some(DatabaseFile::Main),
+        b"-wal" => Some(DatabaseFile::Wal),
+        b"-journal" => Some(DatabaseFile::Journal),
+        _ => None,
+    }
 }
 
 fn local_name(state: &VfsState) -> CString {
@@ -558,15 +564,7 @@ unsafe extern "C" fn x_delete(
             return ffi::SQLITE_IOERR_DELETE;
         }
         let name_ref = unsafe { CStr::from_ptr(name) };
-        let file = if is_remote_name(name_ref, state.vset) {
-            if name_ref.to_bytes().ends_with(b"-wal") {
-                DatabaseFile::Wal
-            } else if name_ref.to_bytes().ends_with(b"-journal") {
-                DatabaseFile::Journal
-            } else {
-                DatabaseFile::Main
-            }
-        } else {
+        let Some(file) = remote_file(name_ref, state.vset) else {
             let Some(call) = (unsafe { (*state.parent).xDelete }) else {
                 return ffi::SQLITE_IOERR_DELETE;
             };
@@ -606,18 +604,11 @@ unsafe extern "C" fn x_access(
             return ffi::SQLITE_IOERR_ACCESS;
         }
         let name_ref = unsafe { CStr::from_ptr(name) };
-        if !is_remote_name(name_ref, state.vset) {
+        let Some(file) = remote_file(name_ref, state.vset) else {
             let Some(call) = (unsafe { (*state.parent).xAccess }) else {
                 return ffi::SQLITE_IOERR_ACCESS;
             };
             return unsafe { call(state.parent, name, flags, output) };
-        }
-        let file = if name_ref.to_bytes().ends_with(b"-wal") {
-            DatabaseFile::Wal
-        } else if name_ref.to_bytes().ends_with(b"-journal") {
-            DatabaseFile::Journal
-        } else {
-            DatabaseFile::Main
         };
         match one_shot(state, DatabaseOp::Access { file }) {
             Ok(DatabaseReply::Access { exists, .. }) => {

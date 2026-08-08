@@ -38,6 +38,6 @@ pub use blockd_platform::page_size;
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    DirectFile, FaultEvent, GuestView, HostRegion, PageBuf, Uffd, UffdFeatures,
-    file_resident_bytes, punch_hole_file, recv_with_fd,
+    FaultEvent, GuestView, HostRegion, Uffd, UffdFeatures, file_resident_bytes, punch_hole_file,
+    recv_with_fd,
 };

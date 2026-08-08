@@ -22,16 +22,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use blockd_core::seam::StoreFault;
+use blockd_core::seam::{MAX_OBJECT_BYTES, StoreFault};
 use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::metrics::{AtomicHistogram, LatencySeries};
 use crate::store::{GetResult, ObjectStore};
-
-/// R4.6: no object exceeds 64 MiB; anything larger is a protocol
-/// violation, not data.
-const MAX_OBJECT: u64 = 64 * 1024 * 1024 + 4096;
 
 /// Refresh the token while this much of its lifetime remains.
 const TOKEN_SLACK: Duration = Duration::from_mins(5);
@@ -359,7 +355,7 @@ impl GcsStore {
                 .and_then(|v| v.parse::<u64>().ok());
             if resp
                 .content_length()
-                .is_some_and(|length| length > MAX_OBJECT)
+                .is_some_and(|length| length > u64::from(MAX_OBJECT_BYTES))
             {
                 abort("response body", "object exceeds maximum size");
             }
@@ -368,7 +364,7 @@ impl GcsStore {
                 match resp.chunk().await {
                     Ok(Some(chunk)) => {
                         let next = body.len().saturating_add(chunk.len());
-                        if u64::try_from(next).unwrap_or(u64::MAX) > MAX_OBJECT {
+                        if u64::try_from(next).unwrap_or(u64::MAX) > u64::from(MAX_OBJECT_BYTES) {
                             abort("response body", "object exceeds maximum size");
                         }
                         body.extend_from_slice(&chunk);

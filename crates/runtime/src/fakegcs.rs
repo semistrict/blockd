@@ -16,9 +16,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::Response;
+use blockd_core::seam::MAX_OBJECT_BYTES;
 use futures_util::stream;
-
-const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024 + 4096;
 
 /// One parsed request, recorded for assertions.
 #[derive(Clone, Debug)]
@@ -97,7 +96,9 @@ impl FakeGcs {
                         .expect("async fake GCS listener");
                     let app = Router::new()
                         .fallback(handle)
-                        .layer(DefaultBodyLimit::max(MAX_OBJECT_BYTES))
+                        .layer(DefaultBodyLimit::max(
+                            usize::try_from(MAX_OBJECT_BYTES).expect("object cap fits usize"),
+                        ))
                         .with_state(server);
                     axum::serve(
                         listener,

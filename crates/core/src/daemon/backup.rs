@@ -9,7 +9,7 @@
 //! Store faults never lose queued work (R8.3): the publish is dropped and a
 //! retry timer re-derives it from current local truth.
 
-use super::{Daemon, Pending, Publish};
+use super::{Daemon, Pending, Publish, StoreCopyArtifact};
 use crate::head::{HeadRecord, ManifestPtr};
 use crate::journal::DurabilityMode;
 use crate::layout;
@@ -86,35 +86,24 @@ impl Daemon {
         let Some(publish) = &mut state.publish else {
             return;
         };
-        if let Some(&(fence, seg)) = publish.segs_todo.last() {
+        if let Some(artifact) = StoreCopyArtifact::next(&publish.segs_todo, &publish.leaves_todo) {
             let io = self.io();
-            self.pending.insert(
-                io,
-                Pending::PubSegRead {
+            let pending = match artifact {
+                StoreCopyArtifact::Segment { fence, seg } => Pending::PubSegRead {
                     vset: vset_id,
                     fence,
                     seg,
                 },
-            );
-            out.push(Effect::BlobRead {
-                io,
-                name: layout::segment_blob(vset_id, fence, seg),
-            });
-            return;
-        }
-        if let Some(&(fence, id)) = publish.leaves_todo.last() {
-            let io = self.io();
-            self.pending.insert(
-                io,
-                Pending::PubLeafRead {
+                StoreCopyArtifact::Leaf { fence, id } => Pending::PubLeafRead {
                     vset: vset_id,
                     fence,
                     id,
                 },
-            );
+            };
+            self.pending.insert(io, pending);
             out.push(Effect::BlobRead {
                 io,
-                name: layout::leaf_blob(vset_id, fence, id),
+                name: artifact.blob_name(vset_id),
             });
             return;
         }

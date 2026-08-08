@@ -6,6 +6,6 @@ mod filesystem;
 mod transport;
 
 #[cfg(target_os = "linux")]
-pub use filesystem::{DatabaseIo, RestoredAttachment, VsetFilesystem};
+pub use filesystem::{DatabaseIo, RestoredAttachment, VsetFilesystem, database_error};
 #[cfg(target_os = "linux")]
-pub use transport::{VHOST_USER_FS_QUEUES, VsetFsBackend, serve_vhost_user};
+pub use transport::{VsetFsBackend, serve_vhost_user};

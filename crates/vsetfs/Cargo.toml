@@ -13,7 +13,7 @@ blockd-core = { path = "../core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuse-backend-rs = { version = "0.14.0", default-features = false, features = ["virtiofs"] }
-libc = "0.2.180"
+libc.workspace = true
 vhost = { version = "0.16.0", features = ["vhost-user-backend"] }
 vhost-user-backend = "0.22.0"
 virtio-queue = "0.17.0"

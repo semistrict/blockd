@@ -35,6 +35,13 @@ pub enum VsetFsFile {
 }
 
 impl VsetFsFile {
+    pub const ALL: [VsetFsFile; 4] = [
+        VsetFsFile::Main,
+        VsetFsFile::Wal,
+        VsetFsFile::Journal,
+        VsetFsFile::Shm,
+    ];
+
     pub const fn name(self) -> &'static str {
         match self {
             VsetFsFile::Main => "database.sqlite",
@@ -214,10 +221,6 @@ impl VsetFsState {
         self.handles.len()
     }
 
-    pub fn mapping_count(&self) -> usize {
-        self.mappings.len()
-    }
-
     pub fn node(&self, inode: u64) -> Option<Node> {
         self.nodes.get(&inode).copied()
     }
@@ -239,18 +242,13 @@ impl VsetFsState {
                 .collect()),
             Some(NodeKind::Attachment) => {
                 let export = self.export_for_inode(inode).ok_or(VsetFsError::NotFound)?;
-                Ok([
-                    VsetFsFile::Main,
-                    VsetFsFile::Wal,
-                    VsetFsFile::Journal,
-                    VsetFsFile::Shm,
-                ]
-                .into_iter()
-                .filter_map(|file| {
-                    self.node(export.file_inode(file))
-                        .map(|node| (file.name().to_owned(), node))
-                })
-                .collect())
+                Ok(VsetFsFile::ALL
+                    .into_iter()
+                    .filter_map(|file| {
+                        self.node(export.file_inode(file))
+                            .map(|node| (file.name().to_owned(), node))
+                    })
+                    .collect())
             }
             _ => Err(VsetFsError::InvalidState),
         }
@@ -269,15 +267,10 @@ impl VsetFsState {
                     return None;
                 }
                 let export = self.export_for_inode(parent)?;
-                [
-                    VsetFsFile::Main,
-                    VsetFsFile::Wal,
-                    VsetFsFile::Journal,
-                    VsetFsFile::Shm,
-                ]
-                .into_iter()
-                .find(|file| file.name() == name)
-                .and_then(|file| self.node(export.file_inode(file)))
+                VsetFsFile::ALL
+                    .into_iter()
+                    .find(|file| file.name() == name)
+                    .and_then(|file| self.node(export.file_inode(file)))
             }
         }
     }
@@ -702,16 +695,7 @@ impl VsetFsState {
             .ok_or(VsetFsError::NotFound)?
             .shm
             .len();
-        let total = self
-            .exports
-            .values()
-            .map(|export| export.shm.len())
-            .sum::<usize>()
-            - old_len
-            + bytes.len();
-        if total > MAX_SHM_TOTAL {
-            return Err(VsetFsError::TooLarge);
-        }
+        self.check_shm_budget(old_len, bytes.len())?;
         let export = self.exports.get_mut(name).expect("checked above");
         export.shm = bytes;
         export.shm_exists = true;
@@ -750,16 +734,7 @@ impl VsetFsState {
         if !export.shm_exists {
             return Err(VsetFsError::NotFound);
         }
-        let growth = end.saturating_sub(export.shm.len());
-        let total = self
-            .exports
-            .values()
-            .map(|entry| entry.shm.len())
-            .sum::<usize>()
-            .checked_add(growth)
-            .filter(|total| *total <= MAX_SHM_TOTAL)
-            .ok_or(VsetFsError::TooLarge)?;
-        let _ = total;
+        self.check_shm_budget(export.shm.len(), export.shm.len().max(end))?;
         let export = self.exports.get_mut(name).expect("checked above");
         export.shm.resize(export.shm.len().max(end), 0);
         export.shm[offset..end].copy_from_slice(bytes);
@@ -775,21 +750,24 @@ impl VsetFsState {
         if !export.shm_exists {
             return Err(VsetFsError::NotFound);
         }
-        let growth = size.saturating_sub(export.shm.len());
-        let total = self
-            .exports
-            .values()
-            .map(|entry| entry.shm.len())
-            .sum::<usize>()
-            .checked_add(growth)
-            .filter(|total| *total <= MAX_SHM_TOTAL)
-            .ok_or(VsetFsError::TooLarge)?;
-        let _ = total;
+        self.check_shm_budget(export.shm.len(), size)?;
         self.exports
             .get_mut(name)
             .expect("checked above")
             .shm
             .resize(size, 0);
+        Ok(())
+    }
+
+    fn check_shm_budget(&self, old_len: usize, new_len: usize) -> Result<(), VsetFsError> {
+        self.exports
+            .values()
+            .map(|entry| entry.shm.len())
+            .sum::<usize>()
+            .checked_sub(old_len)
+            .and_then(|total| total.checked_add(new_len))
+            .filter(|total| *total <= MAX_SHM_TOTAL)
+            .ok_or(VsetFsError::TooLarge)?;
         Ok(())
     }
 
@@ -1036,12 +1014,7 @@ impl VsetFsState {
         {
             return Err(VsetFsError::InvalidState);
         }
-        for file in [
-            VsetFsFile::Main,
-            VsetFsFile::Wal,
-            VsetFsFile::Journal,
-            VsetFsFile::Shm,
-        ] {
+        for file in VsetFsFile::ALL {
             let inode = export.file_inode(file);
             if self
                 .nodes

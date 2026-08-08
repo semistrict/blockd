@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Daemon, Pending, Vset};
+use super::{Daemon, Pending, StoreCopyArtifact, Vset};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
@@ -88,23 +88,18 @@ impl Daemon {
         let Some(keep) = &state.keep else {
             return;
         };
-        if let Some(&(fence, seg)) = keep.segs_todo.last() {
+        if let Some(artifact) = StoreCopyArtifact::next(&keep.segs_todo, &keep.leaves_todo) {
             let io = self.io();
-            self.pending
-                .insert(io, Pending::KeepSegRead { vset, fence, seg });
+            let pending = match artifact {
+                StoreCopyArtifact::Segment { fence, seg } => {
+                    Pending::KeepSegRead { vset, fence, seg }
+                }
+                StoreCopyArtifact::Leaf { fence, id } => Pending::KeepLeafRead { vset, fence, id },
+            };
+            self.pending.insert(io, pending);
             out.push(Effect::BlobRead {
                 io,
-                name: layout::segment_blob(vset, fence, seg),
-            });
-            return;
-        }
-        if let Some(&(fence, id)) = keep.leaves_todo.last() {
-            let io = self.io();
-            self.pending
-                .insert(io, Pending::KeepLeafRead { vset, fence, id });
-            out.push(Effect::BlobRead {
-                io,
-                name: layout::leaf_blob(vset, fence, id),
+                name: artifact.blob_name(vset),
             });
             return;
         }
@@ -282,7 +277,6 @@ impl Daemon {
         });
     }
 
-    #[allow(clippy::used_underscore_binding)]
     pub(super) fn fork_base_done(
         &mut self,
         vset: VsetId,
@@ -290,12 +284,6 @@ impl Daemon {
         result: Result<Option<(u64, Vec<u8>)>, StoreFault>,
         out: &mut Vec<Effect>,
     ) {
-        if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
-            eprintln!(
-                "[fork_base_done] {vset:?} base={base} ok={}",
-                result.is_ok()
-            );
-        }
         let Some(state) = self.vsets.get_mut(&vset) else {
             return;
         };

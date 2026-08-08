@@ -21,9 +21,9 @@ blockd-core = { path = "../core" }
 libsqlite3-sys = { version = "0.38.1", features = ["bundled_bindings"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
-async-trait = "0.1.91"
+async-trait.workspace = true
 blockd-runtime = { path = "../runtime" }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled"] }

@@ -39,10 +39,13 @@ fn store_and_shmem(tag: &str) -> (Arc<S3Store>, Arc<std::fs::File>, PathBuf) {
         .map(|i| u8::try_from((i / PART_BYTES + 1) * 17 % 251).expect("fits"))
         .collect();
     std::fs::write(&mem_path, &mem).expect("mem file");
-    let mut store = S3Store::new();
+    let mut store = Arc::new(S3Store::new());
     let parts = upload_mem_parts(&store, &mem_path, "v/0000000000000009/mem", PART_BYTES);
     assert_eq!(parts, PARTS);
-    store.s3.set_latency(S3LatencyModel::same_region());
+    Arc::get_mut(&mut store)
+        .expect("upload released its store reference")
+        .s3
+        .set_latency(S3LatencyModel::same_region());
     let shmem_file = scratch.join("shmem");
     let shmem = Arc::new(
         std::fs::OpenOptions::new()
@@ -53,7 +56,7 @@ fn store_and_shmem(tag: &str) -> (Arc<S3Store>, Arc<std::fs::File>, PathBuf) {
             .expect("shmem"),
     );
     shmem.set_len(MEM_BYTES).expect("size");
-    (Arc::new(store), shmem, scratch)
+    (store, shmem, scratch)
 }
 
 fn cold_table(store: &Arc<S3Store>, shmem: &Arc<std::fs::File>, readahead: u64) -> Arc<PartTable> {

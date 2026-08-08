@@ -20,16 +20,103 @@
 // nondeterministic side of the seam.
 #![allow(clippy::cast_possible_truncation, clippy::disallowed_methods)]
 
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use blockd_hostmem::{DirectFile, GuestView, HostRegion, PageBuf, Uffd, UffdFeatures, page_size};
+use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 
 const BASE_PAGES: usize = 256; // 1 MiB base image
 const VMS: usize = 32;
 const PRIVATE_PAGES: usize = 64;
 const DIVERGE: usize = 8; // pages each VM writes
+
+struct PageBuf {
+    ptr: *mut u8,
+}
+
+impl PageBuf {
+    fn new() -> PageBuf {
+        let layout = std::alloc::Layout::from_size_align(page_size(), page_size()).expect("layout");
+        // SAFETY: nonzero size; deallocated with the same layout in Drop.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "aligned alloc failed");
+        PageBuf { ptr }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: one system page is owned by this buffer.
+        unsafe { std::slice::from_raw_parts(self.ptr, page_size()) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: one system page is owned by this buffer.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, page_size()) }
+    }
+}
+
+impl Drop for PageBuf {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(page_size(), page_size()).expect("layout");
+        // SAFETY: allocated in `new` with this exact layout.
+        unsafe { std::alloc::dealloc(self.ptr, layout) }
+    }
+}
+
+struct DirectFile {
+    file: std::fs::File,
+}
+
+impl DirectFile {
+    fn create(path: &str) -> io::Result<DirectFile> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        Ok(DirectFile { file })
+    }
+
+    fn write_page(&self, page: usize, buf: &PageBuf) -> io::Result<()> {
+        // SAFETY: aligned page-sized buffer; pwrite on our own fd.
+        let n = unsafe {
+            libc::pwrite(
+                self.file.as_raw_fd(),
+                buf.ptr.cast(),
+                page_size(),
+                libc::off_t::try_from(page * page_size()).expect("fits"),
+            )
+        };
+        if n != page_size().cast_signed() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn read_page(&self, page: usize, buf: &mut PageBuf) -> io::Result<()> {
+        // SAFETY: aligned page-sized buffer; pread on our own fd.
+        let n = unsafe {
+            libc::pread(
+                self.file.as_raw_fd(),
+                buf.ptr.cast(),
+                page_size(),
+                libc::off_t::try_from(page * page_size()).expect("fits"),
+            )
+        };
+        if n != page_size().cast_signed() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+}
 
 fn base_pattern(page: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; page_size()];
@@ -303,7 +390,7 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
     assert_eq!(got, want);
 }
 
-/// blockd's memory-reclaim-by-"swap" (R2.4/R2.7): dirty guest pages are
+/// A memory-reclaim-by-"swap" experiment: dirty guest pages are
 /// written back to a real disk file, the shmem backing is punched free —
 /// PHYSICAL MEMORY GOES TO ZERO — and later guest touches demand-page the
 /// bytes back in from disk, one page per touch. The guest's own written
@@ -318,7 +405,7 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
     let uffd = Arc::new(uffd);
 
     // The "NVMe segment": a real file on persistent disk (/var/tmp, never
-    // tmpfs), opened O_DIRECT — the production write path's mechanism.
+    // tmpfs), opened O_DIRECT to keep this test's disk copy out of cache.
     // Page I/O moves straight between our aligned buffers and the device;
     // no page-cache copy of the data exists anywhere to begin with.
     let path = format!("/var/tmp/blockd-swap-test-{}", std::process::id());
@@ -365,7 +452,7 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
 
     // ── Swap out ────────────────────────────────────────────────────────
     // Writeback: capture every page through the daemon view onto disk,
-    // durably, via O_DIRECT (the local segment write of R2.4). Direct I/O
+    // durably, via O_DIRECT. Direct I/O
     // means the ONLY RAM copy of the data is the shmem page we are about
     // to reclaim.
     let mut buf = PageBuf::new();
