@@ -20,8 +20,9 @@ use blockd_core::format::{Dec, FRAME_HEADER};
 use blockd_core::peer::{MAGIC_PEER, MAX_PEER_PAYLOAD, decode_peer, encode_peer_version};
 use blockd_core::seam::PeerMsg;
 use blockd_core::types::HostId;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
@@ -59,6 +60,37 @@ pub struct PeerTlsConfig {
     pub server_names: BTreeMap<HostId, String>,
     /// Exact leaf certificate DER → authenticated host identity.
     pub certificate_identities: BTreeMap<Vec<u8>, HostId>,
+}
+
+impl PeerTlsConfig {
+    pub fn from_der(
+        roots: RootCertStore,
+        certificate: Vec<u8>,
+        private_key: &[u8],
+        server_names: BTreeMap<HostId, String>,
+        certificate_identities: BTreeMap<Vec<u8>, HostId>,
+    ) -> Self {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certificate = CertificateDer::from(certificate);
+        let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key.to_vec()));
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
+            .build()
+            .expect("client verifier");
+        let server = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![certificate.clone()], key())
+            .expect("server identity");
+        let client = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![certificate], key())
+            .expect("client identity");
+        Self {
+            server: Arc::new(server),
+            client: Arc::new(client),
+            server_names,
+            certificate_identities,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -440,8 +472,7 @@ mod tests {
 
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use rustls::RootCertStore;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use rustls::server::WebPkiClientVerifier;
+    use rustls::pki_types::CertificateDer;
 
     use super::*;
     use blockd_core::types::VsetId;
@@ -469,7 +500,6 @@ mod tests {
     }
 
     fn tls(host: usize) -> PeerTlsConfig {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let identities = identities();
         let mut roots = RootCertStore::empty();
         for identity in identities {
@@ -477,31 +507,15 @@ mod tests {
                 .add(CertificateDer::from(identity.certificate.clone()))
                 .expect("test trust anchor");
         }
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
-            .build()
-            .expect("client verifier");
-        let certificate = CertificateDer::from(identities[host].certificate.clone());
-        let key = || {
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                identities[host].private_key.clone(),
-            ))
-        };
-        let server = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(vec![certificate.clone()], key())
-            .expect("server identity");
-        let client = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![certificate], key())
-            .expect("client identity");
-        PeerTlsConfig {
-            server: Arc::new(server),
-            client: Arc::new(client),
-            server_names: BTreeMap::from([
+        PeerTlsConfig::from_der(
+            roots,
+            identities[host].certificate.clone(),
+            &identities[host].private_key,
+            BTreeMap::from([
                 (HostId(0), "host0.test".to_owned()),
                 (HostId(1), "host1.test".to_owned()),
             ]),
-            certificate_identities: identities
+            identities
                 .iter()
                 .enumerate()
                 .map(|(host, identity)| {
@@ -511,7 +525,7 @@ mod tests {
                     )
                 })
                 .collect(),
-        }
+        )
     }
 
     fn free_addr() -> SocketAddr {

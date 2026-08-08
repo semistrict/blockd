@@ -543,40 +543,14 @@ impl VsetFsState {
     }
 
     pub fn lock(&mut self, lock: ByteRangeLock) -> Result<(), VsetFsError> {
-        let requested = self.handle(lock.handle).ok_or(VsetFsError::NotFound)?;
+        let inode = self.handle(lock.handle).ok_or(VsetFsError::NotFound)?.inode;
         let requested_end = range_end(lock.start, lock.len)?;
         if self.conflicting_lock(lock)?.is_some() {
             return Err(VsetFsError::Conflict);
         }
 
-        let handles = &self.handles;
-        let mut replacement = Vec::with_capacity(self.locks.len().saturating_add(2));
-        for existing in self.locks.iter().copied() {
-            let same_owner_and_inode = handles.get(&existing.handle).is_some_and(|handle| {
-                handle.inode == requested.inode && existing.owner == lock.owner
-            });
-            if !same_owner_and_inode
-                || !ranges_overlap(existing.start, existing.len, lock.start, lock.len)
-            {
-                replacement.push(existing);
-                continue;
-            }
-            let existing_end =
-                range_end(existing.start, existing.len).expect("stored lock range was validated");
-            if existing.start < lock.start {
-                replacement.push(ByteRangeLock {
-                    len: lock.start - existing.start,
-                    ..existing
-                });
-            }
-            if requested_end < existing_end {
-                replacement.push(ByteRangeLock {
-                    start: requested_end,
-                    len: range_len(requested_end, existing_end),
-                    ..existing
-                });
-            }
-        }
+        let (mut replacement, _) =
+            self.split_lock_range(inode, lock.owner, lock.start, lock.len, requested_end);
         replacement.push(lock);
         if replacement.len() > MAX_LOCKS {
             return Err(VsetFsError::TooLarge);
@@ -601,37 +575,9 @@ impl VsetFsState {
         start: u64,
         len: u64,
     ) -> Result<(), VsetFsError> {
-        self.handle(handle).ok_or(VsetFsError::NotFound)?;
-        let requested = self.handle(handle).expect("checked above");
+        let inode = self.handle(handle).ok_or(VsetFsError::NotFound)?.inode;
         let unlock_end = range_end(start, len)?;
-        let handles = &self.handles;
-        let mut found = false;
-        let mut replacement = Vec::with_capacity(self.locks.len().saturating_add(1));
-        for existing in self.locks.iter().copied() {
-            let same_owner_and_inode = handles
-                .get(&existing.handle)
-                .is_some_and(|state| state.inode == requested.inode && existing.owner == owner);
-            if !same_owner_and_inode || !ranges_overlap(existing.start, existing.len, start, len) {
-                replacement.push(existing);
-                continue;
-            }
-            found = true;
-            let existing_end =
-                range_end(existing.start, existing.len).expect("stored lock range was validated");
-            if existing.start < start {
-                replacement.push(ByteRangeLock {
-                    len: start - existing.start,
-                    ..existing
-                });
-            }
-            if unlock_end < existing_end {
-                replacement.push(ByteRangeLock {
-                    start: unlock_end,
-                    len: range_len(unlock_end, existing_end),
-                    ..existing
-                });
-            }
-        }
+        let (mut replacement, found) = self.split_lock_range(inode, owner, start, len, unlock_end);
         if !found {
             return Err(VsetFsError::NotFound);
         }
@@ -649,6 +595,45 @@ impl VsetFsState {
         });
         self.locks = replacement;
         Ok(())
+    }
+
+    fn split_lock_range(
+        &self,
+        inode: u64,
+        owner: u64,
+        start: u64,
+        len: u64,
+        end: u64,
+    ) -> (Vec<ByteRangeLock>, bool) {
+        let handles = &self.handles;
+        let mut found = false;
+        let mut replacement = Vec::with_capacity(self.locks.len().saturating_add(2));
+        for existing in self.locks.iter().copied() {
+            let same_owner_and_inode = handles
+                .get(&existing.handle)
+                .is_some_and(|state| state.inode == inode && existing.owner == owner);
+            if !same_owner_and_inode || !ranges_overlap(existing.start, existing.len, start, len) {
+                replacement.push(existing);
+                continue;
+            }
+            found = true;
+            let existing_end =
+                range_end(existing.start, existing.len).expect("stored lock range was validated");
+            if existing.start < start {
+                replacement.push(ByteRangeLock {
+                    len: start - existing.start,
+                    ..existing
+                });
+            }
+            if end < existing_end {
+                replacement.push(ByteRangeLock {
+                    start: end,
+                    len: range_len(end, existing_end),
+                    ..existing
+                });
+            }
+        }
+        (replacement, found)
     }
 
     pub fn unlock_owner(&mut self, inode: u64, owner: u64) -> Result<(), VsetFsError> {

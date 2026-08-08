@@ -12,8 +12,11 @@
 //! verbatim, damage included (R8.1: the reader decides).
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::seam::{IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo};
-use crate::types::{HostId, JournalSeq, SegId, VsetId};
+use crate::replica_wire::{
+    decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
+};
+use crate::seam::{IoId, PeerMsg};
+use crate::types::{HostId, SegId, VsetId};
 
 pub const MAGIC_PEER: u32 = u32::from_le_bytes(*b"BPM1");
 
@@ -41,49 +44,6 @@ fn decode_opt_bytes(d: &mut Dec) -> Result<Option<Vec<u8>>, DecodeError> {
         }
         _ => Err(DecodeError),
     }
-}
-
-fn artifact(e: &mut Enc, artifact: ReplicaArtifact) {
-    match artifact {
-        ReplicaArtifact::Segment { fence, seg } => {
-            e.u8(0);
-            e.u64(fence);
-            e.u64(seg.0);
-        }
-        ReplicaArtifact::Leaf { fence, id } => {
-            e.u8(1);
-            e.u64(fence);
-            e.u64(id);
-        }
-    }
-}
-
-fn decode_artifact(d: &mut Dec) -> Result<ReplicaArtifact, DecodeError> {
-    match d.u8()? {
-        0 => Ok(ReplicaArtifact::Segment {
-            fence: d.u64()?,
-            seg: SegId(d.u64()?),
-        }),
-        1 => Ok(ReplicaArtifact::Leaf {
-            fence: d.u64()?,
-            id: d.u64()?,
-        }),
-        _ => Err(DecodeError),
-    }
-}
-
-fn commit_info(e: &mut Enc, info: ReplicaCommitInfo) {
-    e.u64(info.writer_fence);
-    e.u64(info.seq.0);
-    e.u64(info.sync_covered_through);
-}
-
-fn decode_commit_info(d: &mut Dec) -> Result<ReplicaCommitInfo, DecodeError> {
-    Ok(ReplicaCommitInfo {
-        writer_fence: d.u64()?,
-        seq: JournalSeq(d.u64()?),
-        sync_covered_through: d.u64()?,
-    })
 }
 
 /// Encode one message as a sealed frame carrying the sender's identity.
@@ -190,7 +150,7 @@ pub fn encode_peer_version(
             e.u8(8);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
-            artifact(&mut e, *id);
+            encode_artifact(&mut e, *id);
             e.u32(*checksum);
             e.u32(u32::try_from(bytes.len()).expect("artifact fits u32"));
             e.bytes(bytes);
@@ -204,7 +164,7 @@ pub fn encode_peer_version(
             e.u8(9);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
-            artifact(&mut e, *id);
+            encode_artifact(&mut e, *id);
             e.u32(*checksum);
         }
         PeerMsg::ReplicaCommit {
@@ -217,10 +177,10 @@ pub fn encode_peer_version(
             e.u8(10);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
-            commit_info(&mut e, *info);
+            encode_commit_info(&mut e, *info);
             e.u32(u32::try_from(required.len()).expect("required count fits u32"));
             for id in required {
-                artifact(&mut e, *id);
+                encode_artifact(&mut e, *id);
             }
             e.u32(u32::try_from(record.len()).expect("record fits u32"));
             e.bytes(record);
@@ -233,7 +193,7 @@ pub fn encode_peer_version(
             e.u8(11);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
-            commit_info(&mut e, *info);
+            encode_commit_info(&mut e, *info);
         }
         PeerMsg::ReplicaStatus {
             vset,
@@ -255,7 +215,7 @@ pub fn encode_peer_version(
                 None => e.u8(0),
                 Some(info) => {
                     e.u8(1);
-                    commit_info(&mut e, *info);
+                    encode_commit_info(&mut e, *info);
                 }
             }
         }
@@ -267,7 +227,7 @@ pub fn encode_peer_version(
             e.u8(14);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
-            commit_info(&mut e, *info);
+            encode_commit_info(&mut e, *info);
         }
         PeerMsg::ReplicaRelease {
             vset,
@@ -277,7 +237,7 @@ pub fn encode_peer_version(
             e.u8(15);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
-            commit_info(&mut e, *through);
+            encode_commit_info(&mut e, *through);
         }
         PeerMsg::ReplicaReleaseAck {
             vset,
@@ -287,7 +247,7 @@ pub fn encode_peer_version(
             e.u8(16);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
-            commit_info(&mut e, *through);
+            encode_commit_info(&mut e, *through);
         }
     }
     Ok(seal_frame(MAGIC_PEER, &e.finish()))
@@ -432,6 +392,8 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
 mod tests {
     use super::*;
     use crate::format::crc32c;
+    use crate::seam::{ReplicaArtifact, ReplicaCommitInfo};
+    use crate::types::JournalSeq;
 
     #[allow(clippy::too_many_lines)]
     fn samples() -> Vec<PeerMsg> {

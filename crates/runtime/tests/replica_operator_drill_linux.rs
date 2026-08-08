@@ -2,75 +2,20 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::head::HeadRecord;
 use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout;
-use blockd_core::placement::PeerCandidate;
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
+use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_runtime::fakegcs::{FakeGcs, Fault};
-use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, PeerConfig, Runtime, RuntimeConfig};
+use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, Runtime};
 
 mod support;
 
 const VSET: VsetId = VsetId(1);
-
-fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("address")
-}
-
-fn root(iteration: usize, host: usize) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "blockd-operator-drill-{}-{iteration}-{host}",
-        std::process::id()
-    ))
-}
-
-fn runtime_config(host: u16, root: PathBuf, addresses: [SocketAddr; 3]) -> RuntimeConfig {
-    RuntimeConfig {
-        daemon: DaemonConfig {
-            host: HostId(host),
-            cache_pages: 64,
-            writeback_interval: millis(5),
-            backup_retry: millis(20),
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 500,
-            replica_placement: Some(ReplicaPlacementConfig {
-                membership_epoch: 1,
-                local_failure_domain: host + 1,
-                roster: (0..3)
-                    .map(|candidate| PeerCandidate {
-                        host: HostId(candidate),
-                        weight: 1,
-                        failure_domain: candidate + 1,
-                        drained: false,
-                    })
-                    .collect(),
-            }),
-        },
-        blob_dir: root,
-        peer: Some(PeerConfig {
-            listen: addresses[usize::from(host)],
-            peers: addresses
-                .into_iter()
-                .enumerate()
-                .map(|(id, address)| (HostId(u16::try_from(id).expect("fits")), address))
-                .collect(),
-            outbound_protocol_versions: BTreeMap::new(),
-            tls: Some(support::peer_tls(usize::from(host), 3)),
-        }),
-    }
-}
 
 fn store(endpoint: &str, prefix: &str) -> Arc<GcsStore> {
     Arc::new(GcsStore::new(GcsConfig {
@@ -91,15 +36,20 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
     for iteration in 0..iterations {
         let (fake, endpoint) = FakeGcs::start();
         let prefix = format!("drill-{iteration}/");
-        let addresses = [free_addr(), free_addr(), free_addr()];
-        let roots = [root(iteration, 0), root(iteration, 1), root(iteration, 2)];
-        for root in &roots {
-            let _ = std::fs::remove_dir_all(root);
-        }
+        let addresses = [
+            support::free_addr(),
+            support::free_addr(),
+            support::free_addr(),
+        ];
+        let roots = [
+            support::temp_root(&format!("operator-drill-{iteration}-0")),
+            support::temp_root(&format!("operator-drill-{iteration}-1")),
+            support::temp_root(&format!("operator-drill-{iteration}-2")),
+        ];
         let configs = [
-            runtime_config(0, roots[0].clone(), addresses),
-            runtime_config(1, roots[1].clone(), addresses),
-            runtime_config(2, roots[2].clone(), addresses),
+            support::three_host_runtime_config(0, roots[0].clone(), addresses),
+            support::three_host_runtime_config(1, roots[1].clone(), addresses),
+            support::three_host_runtime_config(2, roots[2].clone(), addresses),
         ];
         let a = Runtime::new(&configs[0], store(&endpoint, &prefix));
         let b = Runtime::new(&configs[1], store(&endpoint, &prefix));

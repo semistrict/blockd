@@ -3,42 +3,16 @@
 //! local durable state is destroyed (R6.1 on one host). Exact assertions —
 //! runs are deterministic.
 
-use blockd_core::daemon::DaemonConfig;
-use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
-use blockd_core::types::{HostId, VsetId, millis, page_size, secs};
+use blockd_core::types::{VsetId, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
-use blockd_sim::world::blobdev::BlobDevConfig;
-use blockd_sim::world::store::StoreConfig;
 
 fn base_config() -> HarnessConfig {
-    HarnessConfig {
-        daemon: DaemonConfig {
-            host: HostId(0),
-            cache_pages: 256,
-            writeback_interval: millis(20),
-            backup_retry: millis(100),
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 25,
-            replica_placement: None,
-        },
-        bdev: BlobDevConfig::nvme(),
-        store: StoreConfig::s3(),
-        vset_count: 2,
-        backed_vsets: 1,
-        // Durability is overridden per vset by `backed_vsets`.
-        vset_config: VsetConfig::compute(2, 16, false),
-        horizon: secs(2),
-        think: (millis(1), millis(5)),
-        checkpoint_interval: None,
-        faults: FaultPlan::none(),
-        sabotage: None,
-        guest_sync_share: None,
-        guest_hot_pages: None,
-        rot_records_at: vec![],
-        crash_at: vec![],
-    }
+    let mut config = blockd_sim::presets::single_host_base();
+    config.daemon.backup_retry = millis(100);
+    config.vset_count = 2;
+    config.backed_vsets = 1;
+    config
 }
 
 fn assert_clean(report: &RunReport) {

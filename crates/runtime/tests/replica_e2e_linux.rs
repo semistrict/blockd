@@ -6,78 +6,20 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::head::HeadRecord;
 use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout;
-use blockd_core::placement::PeerCandidate;
 use blockd_core::replica_recovery::{ReplicaResidue, export_replica_recovery};
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
-use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig, S3Store, install_replica_recovery};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_runtime::{Runtime, S3Store, install_replica_recovery};
 
 mod support;
 
 const VSET: VsetId = VsetId(1);
-
-fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("blockd-replica-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    path
-}
-
-fn placement(host: u16) -> ReplicaPlacementConfig {
-    ReplicaPlacementConfig {
-        membership_epoch: 1,
-        local_failure_domain: host + 1,
-        roster: (0..3)
-            .map(|candidate| PeerCandidate {
-                host: HostId(candidate),
-                weight: 1,
-                failure_domain: candidate + 1,
-                drained: false,
-            })
-            .collect(),
-    }
-}
-
-fn runtime_config(
-    host: u16,
-    root: PathBuf,
-    listen: SocketAddr,
-    peers: BTreeMap<HostId, SocketAddr>,
-) -> RuntimeConfig {
-    RuntimeConfig {
-        daemon: DaemonConfig {
-            host: HostId(host),
-            cache_pages: 64,
-            writeback_interval: millis(5),
-            backup_retry: millis(20),
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 500,
-            replica_placement: Some(placement(host)),
-        },
-        blob_dir: root,
-        peer: Some(PeerConfig {
-            listen,
-            peers,
-            outbound_protocol_versions: BTreeMap::new(),
-            tls: Some(support::peer_tls(usize::from(host), 3)),
-        }),
-    }
-}
 
 fn spool_files(root: &Path, source: HostId, vset: VsetId) -> Vec<(u64, PathBuf)> {
     fn visit(
@@ -116,22 +58,25 @@ fn spool_files(root: &Path, source: HostId, vset: VsetId) -> Vec<(u64, PathBuf)>
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks() {
-    let addresses = [free_addr(), free_addr(), free_addr()];
-    let peers: BTreeMap<HostId, SocketAddr> = addresses
-        .iter()
-        .enumerate()
-        .map(|(host, &address)| (HostId(u16::try_from(host).expect("fits")), address))
-        .collect();
-    let roots = [temp_dir("a"), temp_dir("b"), temp_dir("c")];
+    let addresses = [
+        support::free_addr(),
+        support::free_addr(),
+        support::free_addr(),
+    ];
+    let roots = [
+        support::temp_root("replica-a"),
+        support::temp_root("replica-b"),
+        support::temp_root("replica-c"),
+    ];
     let store = Arc::new(S3Store::new());
-    let a_config = runtime_config(0, roots[0].clone(), addresses[0], peers.clone());
+    let a_config = support::three_host_runtime_config(0, roots[0].clone(), addresses);
     let a = Runtime::new(&a_config, store.clone());
     let b = Runtime::new(
-        &runtime_config(1, roots[1].clone(), addresses[1], peers.clone()),
+        &support::three_host_runtime_config(1, roots[1].clone(), addresses),
         store.clone(),
     );
     let c = Runtime::new(
-        &runtime_config(2, roots[2].clone(), addresses[2], peers),
+        &support::three_host_runtime_config(2, roots[2].clone(), addresses),
         store.clone(),
     );
     let config = VsetConfig {
@@ -194,13 +139,7 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
     .expect("fenced recovery promotion");
 
     let (recovered, verdicts) = Runtime::recover(
-        &runtime_config(0, roots[0].clone(), addresses[0], {
-            let mut roster = BTreeMap::new();
-            roster.insert(HostId(0), addresses[0]);
-            roster.insert(HostId(1), addresses[1]);
-            roster.insert(HostId(2), addresses[2]);
-            roster
-        }),
+        &support::three_host_runtime_config(0, roots[0].clone(), addresses),
         store.clone(),
         &BTreeMap::from([(VSET, config)]),
     );
@@ -252,26 +191,24 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement() {
-    let addresses = [free_addr(), free_addr(), free_addr()];
-    let peers: BTreeMap<HostId, SocketAddr> = addresses
-        .iter()
-        .enumerate()
-        .map(|(host, &address)| (HostId(u16::try_from(host).expect("fits")), address))
-        .collect();
+    let addresses = [
+        support::free_addr(),
+        support::free_addr(),
+        support::free_addr(),
+    ];
     let roots = [
-        temp_dir("replace-a"),
-        temp_dir("replace-b"),
-        temp_dir("replace-c"),
+        support::temp_root("replica-replace-a"),
+        support::temp_root("replica-replace-b"),
+        support::temp_root("replica-replace-c"),
     ];
     let store = Arc::new(S3Store::new());
     let mut runtimes: Vec<Option<Runtime>> = (0..3)
         .map(|host| {
             Some(Runtime::new(
-                &runtime_config(
+                &support::three_host_runtime_config(
                     host,
                     roots[usize::from(host)].clone(),
-                    addresses[usize::from(host)],
-                    peers.clone(),
+                    addresses,
                 ),
                 store.clone(),
             ))
@@ -368,7 +305,7 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
     .await
     .expect("install fenced replacement recovery");
     let (recovered, verdicts) = Runtime::recover(
-        &runtime_config(0, roots[0].clone(), addresses[0], peers),
+        &support::three_host_runtime_config(0, roots[0].clone(), addresses),
         store.clone(),
         &BTreeMap::from([(VSET, config)]),
     );

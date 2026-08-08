@@ -1949,6 +1949,19 @@ enum BlobJob {
     },
 }
 
+/// Sync directory entries from the immediate parent through the blob root,
+/// preserving the child-to-root durability order.
+fn fsync_to_root(root: &Path, parent: &Path) -> std::io::Result<()> {
+    let mut dir = parent;
+    loop {
+        std::fs::File::open(dir)?.sync_all()?;
+        if dir == root {
+            return Ok(());
+        }
+        dir = dir.parent().expect("under root");
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn blob_worker_loop(
     rx: &Arc<Mutex<Receiver<BlobJob>>>,
@@ -1975,17 +1988,7 @@ fn blob_worker_loop(
                 // Durability includes the directory entries: a record acked
                 // as durable must survive power loss of a freshly created
                 // path, so fsync every directory up to the blob root.
-                let mut dir = parent;
-                loop {
-                    std::fs::File::open(dir)
-                        .expect("open dir")
-                        .sync_all()
-                        .expect("fsync dir");
-                    if dir == root {
-                        break;
-                    }
-                    dir = dir.parent().expect("under root");
-                }
+                fsync_to_root(root, parent).expect("fsync dirs");
                 shared.local_io_in_flight[0].fetch_sub(1, Ordering::Relaxed);
                 shared.local_io_latency[0][0].observe(started.elapsed());
                 Some(Event::BlobWriteDone { io })
@@ -2001,17 +2004,7 @@ fn blob_worker_loop(
                     .expect("open replica spool");
                 file.write_all(&bytes).expect("append replica frame");
                 file.sync_all().expect("fsync replica spool");
-                let mut dir = parent;
-                loop {
-                    std::fs::File::open(dir)
-                        .expect("open dir")
-                        .sync_all()
-                        .expect("fsync dir");
-                    if dir == root {
-                        break;
-                    }
-                    dir = dir.parent().expect("under root");
-                }
+                fsync_to_root(root, parent).expect("fsync dirs");
                 Some(Event::BlobWriteDone { io })
             }
             BlobJob::Read { io, name } => {
@@ -2066,14 +2059,7 @@ fn blob_worker_loop(
                         }
                     }
                     for parent in parents {
-                        let mut dir = parent;
-                        loop {
-                            std::fs::File::open(&dir)?.sync_all()?;
-                            if dir == root {
-                                break;
-                            }
-                            dir = dir.parent().expect("under root").to_path_buf();
-                        }
+                        fsync_to_root(root, &parent)?;
                     }
                     Ok(())
                 })();

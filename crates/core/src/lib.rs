@@ -18,6 +18,7 @@ pub mod peer;
 pub mod placement;
 pub mod replica_recovery;
 pub mod replica_spool;
+mod replica_wire;
 pub mod seam;
 pub mod segment;
 pub mod types;

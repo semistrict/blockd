@@ -242,24 +242,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
     pub fn restore_dax_mappings(&self, vu_req: &mut dyn FsCacheReqHandler) -> io::Result<()> {
         let mappings = self.lock_state()?.mappings().to_vec();
         for mapping in mappings {
-            let (node, file, handle, temporary) = {
-                let mut state = self.lock_state()?;
-                let node = state
-                    .node(mapping.inode)
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
-                let NodeKind::File(file) = node.kind else {
-                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
-                };
-                if let Some(handle) = state.handle_for_inode(mapping.inode) {
-                    (node, file, handle, false)
-                } else {
-                    let handle = state
-                        .open(mapping.inode, libc::O_RDWR as u32)
-                        .map_err(vset_error)?
-                        .handle;
-                    (node, file, handle, true)
-                }
-            };
+            let (node, file, handle, temporary) = self.acquire_dax_inode_handle(mapping.inode)?;
             if temporary && let Some(durable) = file.durable_file() {
                 match self.request(node, DatabaseOp::Access { file: durable })? {
                     DatabaseReply::Access { exists: false, .. } => {
@@ -271,17 +254,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                     DatabaseReply::Access { exists: true, .. } => {}
                     _ => return Err(io::Error::from_raw_os_error(libc::EPROTO)),
                 }
-                match self.request(
-                    node,
-                    DatabaseOp::Open {
-                        handle,
-                        file: durable,
-                        create: false,
-                    },
-                )? {
-                    DatabaseReply::Opened { .. } => {}
-                    _ => return Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                }
+                self.open_durable(node, durable, handle)?;
             }
             let (backing, base) =
                 self.dax_backing(node, file, handle, mapping.file_offset, mapping.len)?;
@@ -413,43 +386,37 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
         Ok((node, file))
     }
 
-    fn dax_inode_handle(&self, inode: u64) -> io::Result<(Node, VsetFsFile, u64, bool)> {
-        let (node, file, handle, temporary) = {
-            let mut state = self.lock_state()?;
-            let node = state
-                .node(inode)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
-            let NodeKind::File(file) = node.kind else {
-                return Err(io::Error::from_raw_os_error(libc::EINVAL));
-            };
-            if let Some(handle) = state.handle_for_inode(inode) {
-                (node, file, handle, false)
-            } else {
-                let handle = state
-                    .open(inode, libc::O_RDWR as u32)
-                    .map_err(vset_error)?
-                    .handle;
-                (node, file, handle, true)
-            }
+    fn acquire_dax_inode_handle(&self, inode: u64) -> io::Result<(Node, VsetFsFile, u64, bool)> {
+        let mut state = self.lock_state()?;
+        let node = state
+            .node(inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
+        let NodeKind::File(file) = node.kind else {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
         };
-        if temporary && let Some(durable) = file.durable_file() {
-            let opened = self.request(
-                node,
-                DatabaseOp::Open {
-                    handle,
-                    file: durable,
-                    create: false,
-                },
-            );
-            if !matches!(opened, Ok(DatabaseReply::Opened { .. })) {
-                let _ = self.lock_state()?.close(handle);
-                return match opened {
-                    Err(error) => Err(error),
-                    Ok(_) => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                };
-            }
+        if let Some(handle) = state.handle_for_inode(inode) {
+            Ok((node, file, handle, false))
+        } else {
+            let handle = state
+                .open(inode, libc::O_RDWR as u32)
+                .map_err(vset_error)?
+                .handle;
+            Ok((node, file, handle, true))
         }
-        Ok((node, file, handle, temporary))
+    }
+
+    fn open_durable(&self, node: Node, file: DatabaseFile, handle: u64) -> io::Result<()> {
+        match self.request(
+            node,
+            DatabaseOp::Open {
+                handle,
+                file,
+                create: false,
+            },
+        )? {
+            DatabaseReply::Opened { .. } => Ok(()),
+            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
+        }
     }
 
     fn finish_dax_inode_handle(
@@ -734,24 +701,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
             .map(|mapping| mapping.inode)
             .collect();
         for inode in inodes {
-            let (node, file, handle, temporary) = {
-                let mut state = self.lock_state()?;
-                let node = state
-                    .node(inode)
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ESTALE))?;
-                let NodeKind::File(file) = node.kind else {
-                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
-                };
-                if let Some(handle) = state.handle_for_inode(inode) {
-                    (node, file, handle, false)
-                } else {
-                    let handle = state
-                        .open(inode, libc::O_RDWR as u32)
-                        .map_err(vset_error)?
-                        .handle;
-                    (node, file, handle, true)
-                }
-            };
+            let (node, file, handle, temporary) = self.acquire_dax_inode_handle(inode)?;
 
             if let Some(durable) = file.durable_file() {
                 let exists = match self.durable_exists(node, durable) {
@@ -774,27 +724,12 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                 }
             }
 
-            let mut durable_open = false;
-            if temporary && let Some(durable) = file.durable_file() {
-                let open_result = self.request(
-                    node,
-                    DatabaseOp::Open {
-                        handle,
-                        file: durable,
-                        create: false,
-                    },
-                );
-                match open_result {
-                    Ok(DatabaseReply::Opened { .. }) => durable_open = true,
-                    Ok(_) => {
-                        let _ = self.lock_state()?.close(handle);
-                        return Err(io::Error::from_raw_os_error(libc::EPROTO));
-                    }
-                    Err(error) => {
-                        let _ = self.lock_state()?.close(handle);
-                        return Err(error);
-                    }
-                }
+            if temporary
+                && let Some(durable) = file.durable_file()
+                && let Err(error) = self.open_durable(node, durable, handle)
+            {
+                let _ = self.lock_state()?.close(handle);
+                return Err(error);
             }
 
             let flush_result = self.flush_dax_inode(node, file, handle).and_then(|()| {
@@ -807,21 +742,7 @@ impl<I: DatabaseIo> VsetFilesystem<I> {
                 }
             });
 
-            if temporary {
-                let durable_close = if durable_open {
-                    self.request(node, DatabaseOp::Close { handle })
-                        .and_then(|reply| match reply {
-                            DatabaseReply::Closed { .. } => Ok(()),
-                            _ => Err(io::Error::from_raw_os_error(libc::EPROTO)),
-                        })
-                } else {
-                    Ok(())
-                };
-                let state_close = self.lock_state()?.close(handle).map_err(vset_error);
-                flush_result.and(durable_close).and(state_close)?;
-            } else {
-                flush_result?;
-            }
+            self.finish_dax_inode_handle(node, file, handle, temporary, flush_result)?;
         }
         Ok(())
     }
@@ -1359,7 +1280,15 @@ impl<I: DatabaseIo> FileSystem for VsetFilesystem<I> {
         // mapping can outlive the final guest handle. Open a temporary handle
         // for the database I/O needed to materialize such faults.
         let (node, file, handle, temporary) = if handle == u64::MAX {
-            self.dax_inode_handle(inode)?
+            let acquired = self.acquire_dax_inode_handle(inode)?;
+            if acquired.3
+                && let Some(durable) = acquired.1.durable_file()
+                && let Err(error) = self.open_durable(acquired.0, durable, acquired.2)
+            {
+                let _ = self.lock_state()?.close(acquired.2);
+                return Err(error);
+            }
+            acquired
         } else {
             let (node, file) = self.inode_and_handle(inode, handle)?;
             (node, file, handle, false)
@@ -1414,7 +1343,14 @@ impl<I: DatabaseIo> FileSystem for VsetFilesystem<I> {
             }
         }
         for inode in affected {
-            let (node, file, handle, temporary) = self.dax_inode_handle(inode)?;
+            let (node, file, handle, temporary) = self.acquire_dax_inode_handle(inode)?;
+            if temporary
+                && let Some(durable) = file.durable_file()
+                && let Err(error) = self.open_durable(node, durable, handle)
+            {
+                let _ = self.lock_state()?.close(handle);
+                return Err(error);
+            }
             let operation = self.flush_dax_inode(node, file, handle);
             self.finish_dax_inode_handle(node, file, handle, temporary, operation)?;
         }

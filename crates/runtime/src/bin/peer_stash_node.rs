@@ -25,9 +25,8 @@ mod linux {
     use blockd_core::placement::PeerCandidate;
     use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
     use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, PeerTlsConfig, Runtime, RuntimeConfig};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use rustls::server::WebPkiClientVerifier;
-    use rustls::{ClientConfig, RootCertStore, ServerConfig};
+    use rustls::RootCertStore;
+    use rustls::pki_types::CertificateDer;
 
     const VSET: VsetId = VsetId(1);
     const VSET_CONFIG: VsetConfig = VsetConfig {
@@ -126,7 +125,6 @@ mod linux {
     }
 
     fn tls(config: &Config) -> PeerTlsConfig {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut roots = RootCertStore::empty();
         let mut certificate_identities = BTreeMap::new();
         for (&host, paths) in &config.identities {
@@ -138,25 +136,13 @@ mod linux {
                 certificate_identities.insert(certificate, host);
             }
         }
-        let certificate = CertificateDer::from(pem(&config.certificate));
-        let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pem(&config.private_key)));
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
-            .build()
-            .expect("client verifier");
-        let server = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(vec![certificate.clone()], key())
-            .expect("server identity");
-        let client = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![certificate], key())
-            .expect("client identity");
-        PeerTlsConfig {
-            server: Arc::new(server),
-            client: Arc::new(client),
-            server_names: config.server_names.clone(),
+        PeerTlsConfig::from_der(
+            roots,
+            pem(&config.certificate),
+            &pem(&config.private_key),
+            config.server_names.clone(),
             certificate_identities,
-        }
+        )
     }
 
     fn runtime_config(config: &Config) -> RuntimeConfig {

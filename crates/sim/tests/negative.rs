@@ -11,32 +11,9 @@ use blockd_sim::world::blobdev::BlobDevConfig;
 use blockd_sim::world::store::StoreConfig;
 
 fn base_config() -> HarnessConfig {
-    HarnessConfig {
-        daemon: DaemonConfig {
-            host: HostId(0),
-            cache_pages: 256,
-            writeback_interval: millis(20),
-            backup_retry: millis(200),
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 25,
-            replica_placement: None,
-        },
-        bdev: BlobDevConfig::nvme(),
-        store: StoreConfig::s3(),
-        vset_count: 2,
-        backed_vsets: 0,
-        vset_config: VsetConfig::compute(2, 16, false),
-        horizon: secs(2),
-        think: (millis(1), millis(5)),
-        checkpoint_interval: None,
-        faults: FaultPlan::none(),
-        sabotage: None,
-        guest_sync_share: None,
-        guest_hot_pages: None,
-        rot_records_at: vec![],
-        crash_at: vec![],
-    }
+    let mut config = blockd_sim::presets::single_host_base();
+    config.vset_count = 2;
+    config
 }
 
 #[test]

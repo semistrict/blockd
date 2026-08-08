@@ -1,14 +1,92 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock};
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
+use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
-use blockd_runtime::PeerTlsConfig;
+use blockd_core::types::millis;
+use blockd_runtime::{PeerConfig, PeerTlsConfig, RuntimeConfig};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
 
 const MAX_TEST_HOSTS: usize = 3;
+
+#[allow(dead_code)]
+pub(crate) fn free_addr() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("address")
+}
+
+#[allow(dead_code)]
+pub(crate) fn temp_root(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("blockd-runtime-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    path
+}
+
+#[allow(dead_code)]
+pub(crate) fn base_daemon_config(host: u16) -> DaemonConfig {
+    DaemonConfig {
+        host: HostId(host),
+        cache_pages: 64,
+        writeback_interval: millis(5),
+        backup_retry: millis(20),
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 500,
+        replica_placement: None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn three_host_roster(
+    addresses: [SocketAddr; MAX_TEST_HOSTS],
+) -> BTreeMap<HostId, SocketAddr> {
+    addresses
+        .into_iter()
+        .enumerate()
+        .map(|(host, address)| (HostId(u16::try_from(host).expect("fits")), address))
+        .collect()
+}
+
+#[allow(dead_code)]
+pub(crate) fn three_host_runtime_config(
+    host: u16,
+    blob_dir: PathBuf,
+    addresses: [SocketAddr; MAX_TEST_HOSTS],
+) -> RuntimeConfig {
+    let mut daemon = base_daemon_config(host);
+    daemon.replica_placement = Some(ReplicaPlacementConfig {
+        membership_epoch: 1,
+        local_failure_domain: host + 1,
+        roster: (0..MAX_TEST_HOSTS)
+            .map(|candidate| {
+                let candidate = u16::try_from(candidate).expect("fits");
+                PeerCandidate {
+                    host: HostId(candidate),
+                    weight: 1,
+                    failure_domain: candidate + 1,
+                    drained: false,
+                }
+            })
+            .collect(),
+    });
+    RuntimeConfig {
+        daemon,
+        blob_dir,
+        peer: Some(PeerConfig {
+            listen: addresses[usize::from(host)],
+            peers: three_host_roster(addresses),
+            outbound_protocol_versions: BTreeMap::new(),
+            tls: Some(peer_tls(usize::from(host), MAX_TEST_HOSTS)),
+        }),
+    }
+}
 
 struct Identity {
     certificate: Vec<u8>,
@@ -47,7 +125,6 @@ pub(crate) fn rotating_peer_tls(
     trust_new: bool,
 ) -> PeerTlsConfig {
     assert!(host < host_count && host_count <= MAX_TEST_HOSTS);
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let sets = identity_sets();
     let mut roots = RootCertStore::empty();
     let mut identities = BTreeMap::new();
@@ -66,23 +143,11 @@ pub(crate) fn rotating_peer_tls(
         }
     }
     let active = &sets[usize::from(active_new)][host];
-    let certificate = CertificateDer::from(active.certificate.clone());
-    let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(active.private_key.clone()));
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
-        .build()
-        .expect("client verifier");
-    let server = ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![certificate.clone()], key())
-        .expect("server identity");
-    let client = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(vec![certificate], key())
-        .expect("client identity");
-    PeerTlsConfig {
-        server: Arc::new(server),
-        client: Arc::new(client),
-        server_names: (0..host_count)
+    PeerTlsConfig::from_der(
+        roots,
+        active.certificate.clone(),
+        &active.private_key,
+        (0..host_count)
             .map(|id| {
                 (
                     HostId(u16::try_from(id).expect("fits")),
@@ -90,6 +155,6 @@ pub(crate) fn rotating_peer_tls(
                 )
             })
             .collect(),
-        certificate_identities: identities,
-    }
+        identities,
+    )
 }

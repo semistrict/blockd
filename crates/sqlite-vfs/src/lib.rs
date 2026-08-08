@@ -656,47 +656,38 @@ unsafe extern "C" fn x_full_pathname(
     })
 }
 
+macro_rules! parent_call {
+    ($vfs:expr, $field:ident($($arg:expr),* $(,)?), $fallback:expr) => {{
+        let state = unsafe { state($vfs) };
+        unsafe {
+            (*state.parent)
+                .$field
+                .map_or($fallback, |call| call(state.parent, $($arg),*))
+        }
+    }};
+}
+
 unsafe extern "C" fn x_randomness(
     vfs: *mut ffi::sqlite3_vfs,
     amount: c_int,
     output: *mut c_char,
 ) -> c_int {
-    let state = unsafe { state(vfs) };
-    unsafe {
-        (*state.parent)
-            .xRandomness
-            .map_or(0, |call| call(state.parent, amount, output))
-    }
+    parent_call!(vfs, xRandomness(amount, output), 0)
 }
 
 unsafe extern "C" fn x_sleep(vfs: *mut ffi::sqlite3_vfs, micros: c_int) -> c_int {
-    let state = unsafe { state(vfs) };
-    unsafe {
-        (*state.parent)
-            .xSleep
-            .map_or(0, |call| call(state.parent, micros))
-    }
+    parent_call!(vfs, xSleep(micros), 0)
 }
 
 unsafe extern "C" fn x_current_time(vfs: *mut ffi::sqlite3_vfs, output: *mut f64) -> c_int {
-    let state = unsafe { state(vfs) };
-    unsafe {
-        (*state.parent)
-            .xCurrentTime
-            .map_or(ffi::SQLITE_ERROR, |call| call(state.parent, output))
-    }
+    parent_call!(vfs, xCurrentTime(output), ffi::SQLITE_ERROR)
 }
 
 unsafe extern "C" fn x_current_time_i64(
     vfs: *mut ffi::sqlite3_vfs,
     output: *mut ffi::sqlite3_int64,
 ) -> c_int {
-    let state = unsafe { state(vfs) };
-    unsafe {
-        (*state.parent)
-            .xCurrentTimeInt64
-            .map_or(ffi::SQLITE_ERROR, |call| call(state.parent, output))
-    }
+    parent_call!(vfs, xCurrentTimeInt64(output), ffi::SQLITE_ERROR)
 }
 
 unsafe extern "C" fn x_set_system_call(
@@ -704,38 +695,21 @@ unsafe extern "C" fn x_set_system_call(
     name: *const c_char,
     call: ffi::sqlite3_syscall_ptr,
 ) -> c_int {
-    let state = unsafe { state(vfs) };
-    unsafe {
-        (*state.parent)
-            .xSetSystemCall
-            .map_or(ffi::SQLITE_NOTFOUND, |forward| {
-                forward(state.parent, name, call)
-            })
-    }
+    parent_call!(vfs, xSetSystemCall(name, call), ffi::SQLITE_NOTFOUND)
 }
 
 unsafe extern "C" fn x_get_system_call(
     vfs: *mut ffi::sqlite3_vfs,
     name: *const c_char,
 ) -> ffi::sqlite3_syscall_ptr {
-    let state = unsafe { state(vfs) };
-    unsafe {
-        (*state.parent)
-            .xGetSystemCall
-            .and_then(|forward| forward(state.parent, name))
-    }
+    parent_call!(vfs, xGetSystemCall(name), None)
 }
 
 unsafe extern "C" fn x_next_system_call(
     vfs: *mut ffi::sqlite3_vfs,
     name: *const c_char,
 ) -> *const c_char {
-    let state = unsafe { state(vfs) };
-    unsafe {
-        (*state.parent)
-            .xNextSystemCall
-            .map_or(ptr::null(), |forward| forward(state.parent, name))
-    }
+    parent_call!(vfs, xNextSystemCall(name), ptr::null())
 }
 
 /// Register one attachment-scoped Unix-stream VFS. The same endpoint may

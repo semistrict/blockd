@@ -5,12 +5,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
+use crate::format::{Dec, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
 use crate::journal::{DurabilityMode, JournalRecord};
 use crate::mapleaf::MapLeaf;
+use crate::replica_wire::{
+    decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
+};
 use crate::seam::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::segment::scan_segment;
-use crate::types::{HostId, JournalSeq, SegId, VsetId};
+use crate::types::{HostId, VsetId};
 
 pub const MAGIC_REPLICA_ARTIFACT: u32 = u32::from_le_bytes(*b"BRA1");
 pub const MAGIC_REPLICA_COMMIT: u32 = u32::from_le_bytes(*b"BRC1");
@@ -47,49 +50,6 @@ pub struct ReplicaSpoolScan {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ReplicaSpoolError;
-
-fn put_artifact(e: &mut Enc, artifact: ReplicaArtifact) {
-    match artifact {
-        ReplicaArtifact::Segment { fence, seg } => {
-            e.u8(0);
-            e.u64(fence);
-            e.u64(seg.0);
-        }
-        ReplicaArtifact::Leaf { fence, id } => {
-            e.u8(1);
-            e.u64(fence);
-            e.u64(id);
-        }
-    }
-}
-
-fn get_artifact(d: &mut Dec) -> Result<ReplicaArtifact, DecodeError> {
-    match d.u8()? {
-        0 => Ok(ReplicaArtifact::Segment {
-            fence: d.u64()?,
-            seg: SegId(d.u64()?),
-        }),
-        1 => Ok(ReplicaArtifact::Leaf {
-            fence: d.u64()?,
-            id: d.u64()?,
-        }),
-        _ => Err(DecodeError),
-    }
-}
-
-fn put_info(e: &mut Enc, info: ReplicaCommitInfo) {
-    e.u64(info.writer_fence);
-    e.u64(info.seq.0);
-    e.u64(info.sync_covered_through);
-}
-
-fn get_info(d: &mut Dec) -> Result<ReplicaCommitInfo, DecodeError> {
-    Ok(ReplicaCommitInfo {
-        writer_fence: d.u64()?,
-        seq: JournalSeq(d.u64()?),
-        sync_covered_through: d.u64()?,
-    })
-}
 
 pub fn seal_replica_artifact(
     source: HostId,
@@ -130,7 +90,7 @@ pub fn seal_verified_replica_artifact(
     e.u16(source.0);
     e.u64(vset.0);
     e.u64(assignment_epoch);
-    put_artifact(&mut e, artifact);
+    encode_artifact(&mut e, artifact);
     e.u32(checksum);
     e.u32(u32::try_from(bytes.len()).map_err(|_| ReplicaSpoolError)?);
     e.bytes(bytes);
@@ -154,10 +114,10 @@ pub fn seal_replica_commit(
     e.u16(source.0);
     e.u64(vset.0);
     e.u64(assignment_epoch);
-    put_info(&mut e, info);
+    encode_commit_info(&mut e, info);
     e.u32(u32::try_from(required.len()).map_err(|_| ReplicaSpoolError)?);
     for &artifact in required {
-        put_artifact(&mut e, artifact);
+        encode_artifact(&mut e, artifact);
     }
     e.u32(u32::try_from(record.len()).map_err(|_| ReplicaSpoolError)?);
     e.bytes(record);
@@ -272,7 +232,7 @@ fn open_artifact(bytes: &[u8]) -> Result<ReplicaArtifactFrame, ReplicaSpoolError
     let source = HostId(d.u16().map_err(|_| ReplicaSpoolError)?);
     let vset = VsetId(d.u64().map_err(|_| ReplicaSpoolError)?);
     let assignment_epoch = d.u64().map_err(|_| ReplicaSpoolError)?;
-    let artifact = get_artifact(&mut d).map_err(|_| ReplicaSpoolError)?;
+    let artifact = decode_artifact(&mut d).map_err(|_| ReplicaSpoolError)?;
     let checksum = d.u32().map_err(|_| ReplicaSpoolError)?;
     let len =
         usize::try_from(d.u32().map_err(|_| ReplicaSpoolError)?).map_err(|_| ReplicaSpoolError)?;
@@ -301,14 +261,14 @@ fn open_commit(bytes: &[u8]) -> Result<ReplicaCommitFrame, ReplicaSpoolError> {
     let source = HostId(d.u16().map_err(|_| ReplicaSpoolError)?);
     let vset = VsetId(d.u64().map_err(|_| ReplicaSpoolError)?);
     let assignment_epoch = d.u64().map_err(|_| ReplicaSpoolError)?;
-    let info = get_info(&mut d).map_err(|_| ReplicaSpoolError)?;
+    let info = decode_commit_info(&mut d).map_err(|_| ReplicaSpoolError)?;
     let count = d.u32().map_err(|_| ReplicaSpoolError)?;
     if count > 1_000_000 {
         return Err(ReplicaSpoolError);
     }
     let mut required = Vec::new();
     for _ in 0..count {
-        required.push(get_artifact(&mut d).map_err(|_| ReplicaSpoolError)?);
+        required.push(decode_artifact(&mut d).map_err(|_| ReplicaSpoolError)?);
     }
     if required.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(ReplicaSpoolError);
@@ -371,7 +331,7 @@ mod tests {
     use super::*;
     use crate::journal::{RecordKind, VsetConfig};
     use crate::segment::SegmentBuilder;
-    use crate::types::{Gen, PageId, PageNo, VolumeId, VolumeIdx, page_size};
+    use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, page_size};
 
     fn fixture() -> (ReplicaArtifact, Vec<u8>, ReplicaCommitInfo, Vec<u8>) {
         let vset = VsetId(7);
@@ -431,6 +391,61 @@ mod tests {
         assert!(scan.uncommitted_artifacts.is_empty());
         assert_eq!(scan.commits.len(), 1);
         assert_eq!(scan.commits[0].info, info);
+    }
+
+    #[test]
+    fn commit_spool_frame_bytes_are_pinned() {
+        let artifact = ReplicaArtifact::Segment {
+            fence: 4,
+            seg: SegId(9),
+        };
+        let info = ReplicaCommitInfo {
+            writer_fence: 4,
+            seq: JournalSeq(8),
+            sync_covered_through: 12,
+        };
+        let record = JournalRecord {
+            config: VsetConfig {
+                kind: crate::journal::VsetKind::Compute,
+                disk_volumes: 1,
+                pages_per_volume: 16,
+                durability: DurabilityMode::PeerStashed,
+            },
+            seq: info.seq,
+            fence: info.writer_fence,
+            kind: RecordKind::Commit,
+            capture_seq: 12,
+            sync_covered_through: info.sync_covered_through,
+            database: crate::journal::DatabaseMeta::default(),
+            overlay: BTreeMap::new(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        }
+        .encode(VsetId(7));
+        let frame = seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record)
+            .expect("commit valid");
+        let expected: &[u8] = match page_size() {
+            4096 => &[
+                66, 82, 67, 49, 162, 0, 0, 0, 153, 125, 153, 154, 1, 0, 2, 0, 7, 0, 0, 0, 0, 0, 0,
+                0, 5, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 12, 0,
+                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0,
+                93, 0, 0, 0, 66, 74, 82, 49, 81, 0, 0, 0, 186, 146, 237, 236, 6, 0, 0, 16, 0, 0, 7,
+                0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 1, 16, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            16_384 => &[
+                66, 82, 67, 49, 162, 0, 0, 0, 248, 103, 143, 117, 1, 0, 2, 0, 7, 0, 0, 0, 0, 0, 0,
+                0, 5, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 12, 0,
+                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0,
+                93, 0, 0, 0, 66, 74, 82, 49, 81, 0, 0, 0, 126, 13, 221, 201, 6, 0, 0, 64, 0, 0, 7,
+                0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 1, 16, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            size => panic!("spool frame pin missing for {size}-byte pages"),
+        };
+        assert_eq!(frame, expected);
     }
 
     #[test]

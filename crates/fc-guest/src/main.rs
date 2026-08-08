@@ -56,6 +56,80 @@ mod guest {
         len: usize,
     }
 
+    fn valid_export_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }
+
+    fn database_flags(create: bool) -> OpenFlags {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | if create {
+                OpenFlags::SQLITE_OPEN_CREATE
+            } else {
+                OpenFlags::empty()
+            }
+    }
+
+    fn configure_database(
+        connection: Connection,
+        registration: Option<Registration>,
+        filesystem: bool,
+    ) -> Result<DatabaseSession, String> {
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if mode != "wal" {
+            return Err(format!("journal-mode-{mode}"));
+        }
+        let pragmas = if filesystem {
+            "PRAGMA synchronous=FULL;
+             PRAGMA wal_autocheckpoint=1;
+             PRAGMA mmap_size=67108864;"
+        } else {
+            "PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=1;"
+        };
+        connection
+            .execute_batch(pragmas)
+            .map_err(|error| error.to_string())?;
+        Ok(DatabaseSession {
+            connection,
+            _registration: registration,
+        })
+    }
+
+    fn database_reply(
+        session: &DatabaseSession,
+        create: bool,
+        created_tag: &str,
+        opened_tag: &str,
+    ) -> Result<String, String> {
+        let version: String = session
+            .connection
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap_or_else(|_| "unknown".to_owned());
+        if !create {
+            return Ok(format!("{opened_tag} {version}"));
+        }
+        session
+            .connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS firecracker_e2e(
+                     id INTEGER PRIMARY KEY,
+                     value INTEGER NOT NULL
+                 );
+                 DELETE FROM firecracker_e2e;
+                 BEGIN IMMEDIATE;
+                 INSERT INTO firecracker_e2e(value)
+                 VALUES (101), (202), (303), (404);
+                 COMMIT;",
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(format!("{created_tag} 4 1010 {version}"))
+    }
+
     impl Drop for RetainedMapping {
         fn drop(&mut self) {
             unsafe {
@@ -65,12 +139,7 @@ mod guest {
     }
 
     fn retain_filesystem_mapping(name: &str) -> Result<RetainedMapping, String> {
-        if name.is_empty()
-            || name.len() > 128
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !valid_export_name(name) {
             return Err("invalid-export-name".to_owned());
         }
         let file = OpenOptions::new()
@@ -123,65 +192,25 @@ mod guest {
             },
         )
         .map_err(|code| format!("register-{code}"))?;
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | if create {
-                OpenFlags::SQLITE_OPEN_CREATE
-            } else {
-                OpenFlags::empty()
-            };
-        let connection =
-            Connection::open_with_flags_and_vfs(format!("vset-{vset}"), flags, name.as_str())
-                .map_err(|error| error.to_string())?;
-        let mode: String = connection
-            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        if mode != "wal" {
-            return Err(format!("journal-mode-{mode}"));
-        }
-        connection
-            .execute_batch("PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=1;")
-            .map_err(|error| error.to_string())?;
-        Ok(DatabaseSession {
-            connection,
-            _registration: Some(registration),
-        })
+        let connection = Connection::open_with_flags_and_vfs(
+            format!("vset-{vset}"),
+            database_flags(create),
+            name.as_str(),
+        )
+        .map_err(|error| error.to_string())?;
+        configure_database(connection, Some(registration), false)
     }
 
     fn filesystem_database_open(name: &str, create: bool) -> Result<DatabaseSession, String> {
-        if name.is_empty()
-            || name.len() > 128
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
+        if !valid_export_name(name) {
             return Err("invalid-export-name".to_owned());
         }
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | if create {
-                OpenFlags::SQLITE_OPEN_CREATE
-            } else {
-                OpenFlags::empty()
-            };
-        let connection =
-            Connection::open_with_flags(format!("/vsets/{name}/database.sqlite"), flags)
-                .map_err(|error| error.to_string())?;
-        let mode: String = connection
-            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .map_err(|error| error.to_string())?;
-        if mode != "wal" {
-            return Err(format!("journal-mode-{mode}"));
-        }
-        connection
-            .execute_batch(
-                "PRAGMA synchronous=FULL;
-                 PRAGMA wal_autocheckpoint=1;
-                 PRAGMA mmap_size=67108864;",
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(DatabaseSession {
-            connection,
-            _registration: None,
-        })
+        let connection = Connection::open_with_flags(
+            format!("/vsets/{name}/database.sqlite"),
+            database_flags(create),
+        )
+        .map_err(|error| error.to_string())?;
+        configure_database(connection, None, true)
     }
 
     #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -437,36 +466,17 @@ mod guest {
                     "MARKED".to_owned()
                 }
                 Some(command @ ("db-create" | "db-open")) => {
-                    match parse_database_args(&mut parts).and_then(|args| {
-                        database_open(args.0, args.1, args.2, args.3, command == "db-create")
-                    }) {
+                    let create = command == "db-create";
+                    match parse_database_args(&mut parts)
+                        .and_then(|args| database_open(args.0, args.1, args.2, args.3, create))
+                    {
                         Ok(session) => {
-                            let version: String = session
-                                .connection
-                                .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-                                .unwrap_or_else(|_| "unknown".to_owned());
-                            if command == "db-create" {
-                                let result = session.connection.execute_batch(
-                                    "CREATE TABLE IF NOT EXISTS firecracker_e2e(
-                                         id INTEGER PRIMARY KEY,
-                                         value INTEGER NOT NULL
-                                     );
-                                     DELETE FROM firecracker_e2e;
-                                     BEGIN IMMEDIATE;
-                                     INSERT INTO firecracker_e2e(value)
-                                     VALUES (101), (202), (303), (404);
-                                     COMMIT;",
-                                );
-                                match result {
-                                    Ok(()) => {
-                                        database = Some(session);
-                                        format!("DBCREATED 4 1010 {version}")
-                                    }
-                                    Err(error) => format!("DBERR {error}"),
+                            match database_reply(&session, create, "DBCREATED", "DBOPEN") {
+                                Ok(reply) => {
+                                    database = Some(session);
+                                    reply
                                 }
-                            } else {
-                                database = Some(session);
-                                format!("DBOPEN {version}")
+                                Err(error) => format!("DBERR {error}"),
                             }
                         }
                         Err(error) => format!("DBERR {error}"),
@@ -474,34 +484,15 @@ mod guest {
                 }
                 Some(command @ ("fs-db-create" | "fs-db-open")) => {
                     let name = parts.next().unwrap_or_default();
-                    match filesystem_database_open(name, command == "fs-db-create") {
+                    let create = command == "fs-db-create";
+                    match filesystem_database_open(name, create) {
                         Ok(session) => {
-                            let version: String = session
-                                .connection
-                                .query_row("SELECT sqlite_version()", [], |row| row.get(0))
-                                .unwrap_or_else(|_| "unknown".to_owned());
-                            if command == "fs-db-create" {
-                                let result = session.connection.execute_batch(
-                                    "CREATE TABLE IF NOT EXISTS firecracker_e2e(
-                                         id INTEGER PRIMARY KEY,
-                                         value INTEGER NOT NULL
-                                     );
-                                     DELETE FROM firecracker_e2e;
-                                     BEGIN IMMEDIATE;
-                                     INSERT INTO firecracker_e2e(value)
-                                     VALUES (101), (202), (303), (404);
-                                     COMMIT;",
-                                );
-                                match result {
-                                    Ok(()) => {
-                                        database = Some(session);
-                                        format!("FSDBCREATED 4 1010 {version}")
-                                    }
-                                    Err(error) => format!("DBERR {error}"),
+                            match database_reply(&session, create, "FSDBCREATED", "FSDBOPEN") {
+                                Ok(reply) => {
+                                    database = Some(session);
+                                    reply
                                 }
-                            } else {
-                                database = Some(session);
-                                format!("FSDBOPEN {version}")
+                                Err(error) => format!("DBERR {error}"),
                             }
                         }
                         Err(error) => format!("DBERR {error}"),
