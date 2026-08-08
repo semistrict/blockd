@@ -9,9 +9,9 @@
 //! the record waits on it exactly as it waits on its segment. Metadata
 //! cost per capture is O(delta), never O(vset).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::{Capture, Daemon, PageMap, Pending, Vset};
+use super::{Capture, Daemon, PageMap, Pending, Rescue, Vset};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_of};
@@ -60,6 +60,7 @@ pub(super) struct Drain {
     capture_seq: u64,
     database: crate::journal::DatabaseMeta,
     database_prune_spans: BTreeSet<u32>,
+    checkpoint: Option<(Epoch, u64, ReqId)>,
     builder: SegmentBatchBuilder,
     /// Armed pages not yet read: drained in key order, or immediately on
     /// a write-protect fault (copy-on-fault, the crux — see `drain_cow`).
@@ -89,6 +90,15 @@ struct Built {
     flushed: Vec<PageId>,
     compact_victims: BTreeSet<(u64, SegId)>,
     compact_pages: u64,
+}
+
+/// One verified victim whose live entries are decompressed in bounded slices.
+#[derive(Debug)]
+pub(super) struct CompactDecode {
+    victim: (u64, SegId),
+    bytes: Vec<u8>,
+    entries: VecDeque<(PageId, Gen, PageLoc)>,
+    rescued: Vec<Rescue>,
 }
 
 impl Daemon {
@@ -271,7 +281,7 @@ impl Daemon {
             || state.outbound.is_some()
             || state.migrate.is_some()
             || !state.pending_leaves.is_empty()
-            || state.compacting.len() >= COMPACT_BATCH
+            || state.compacting.len() + state.compact_decode.len() >= COMPACT_BATCH
         {
             return;
         }
@@ -280,12 +290,19 @@ impl Daemon {
             .iter()
             .filter_map(|&(fence, seg, size)| {
                 let live = state.seg_live.get(&(fence, seg)).copied().unwrap_or(0);
-                (live > 0 && live * 2 <= size && !state.compacting.contains(&(fence, seg)))
+                let decoding = state
+                    .compact_decode
+                    .iter()
+                    .any(|task| task.victim == (fence, seg));
+                (live > 0
+                    && live * 2 <= size
+                    && !state.compacting.contains(&(fence, seg))
+                    && !decoding)
                     .then_some((live * 1_000_000 / size, fence, seg))
             })
             .collect();
         victims.sort_unstable();
-        victims.truncate(COMPACT_BATCH - state.compacting.len());
+        victims.truncate(COMPACT_BATCH - state.compacting.len() - state.compact_decode.len());
         for (_, fence, seg) in victims {
             let state = self.vsets.get_mut(&vset_id).expect("just seen");
             state.compacting.insert((fence, seg));
@@ -317,6 +334,7 @@ impl Daemon {
         fence: u64,
         seg: SegId,
         bytes: Option<Vec<u8>>,
+        out: &mut Vec<Effect>,
     ) {
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
@@ -334,8 +352,41 @@ impl Daemon {
         if (owner, blob_fence, blob_seg) != (vset_id, fence, seg) {
             return;
         }
-        let mut rescued = Vec::new();
-        for (page, generation, loc) in entries {
+        state.compact_decode.push_back(CompactDecode {
+            victim: (fence, seg),
+            bytes,
+            entries: entries.into(),
+            rescued: Vec::new(),
+        });
+        out.push(Effect::SetTimer {
+            timer: TimerId::CompactStep(vset_id),
+            after: 0,
+        });
+    }
+
+    /// Decompress no more than one capture-sized page batch. A damaged entry
+    /// discards the victim's entire partial rescue, matching the old
+    /// all-or-nothing behavior without monopolizing one event.
+    pub(super) fn compact_step(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get_mut(&vset_id) else {
+            return;
+        };
+        let mut budget = DRAIN_PAGES_PER_STEP;
+        let mut damaged = false;
+        while budget > 0 {
+            let Some(task) = state.compact_decode.front_mut() else {
+                break;
+            };
+            let Some((page, generation, loc)) = task.entries.pop_front() else {
+                let complete = state.compact_decode.pop_front().expect("front existed");
+                if !complete.rescued.is_empty() {
+                    state
+                        .compact_stash
+                        .push((complete.victim, complete.rescued));
+                }
+                continue;
+            };
+            budget -= 1;
             let live = state
                 .page_locs
                 .get(&page)
@@ -344,17 +395,26 @@ impl Daemon {
                 continue;
             }
             let start = loc.offset as usize;
-            let Ok((_, _, raw)) =
-                crate::segment::open_entry(vset_id, &bytes[start..start + loc.len as usize])
-            else {
-                return; // damaged mid-blob: rescue nothing, fills decide
+            let end = start.saturating_add(loc.len as usize);
+            let Some(frame) = task.bytes.get(start..end) else {
+                damaged = true;
+                break;
             };
-            rescued.push((page, generation, raw));
+            let Ok((_, _, raw)) = crate::segment::open_entry(vset_id, frame) else {
+                damaged = true;
+                break;
+            };
+            task.rescued.push((page, generation, raw));
         }
-        if rescued.is_empty() {
-            return;
+        if damaged {
+            state.compact_decode.pop_front();
         }
-        state.compact_stash.push(((fence, seg), rescued));
+        if !state.compact_decode.is_empty() {
+            out.push(Effect::SetTimer {
+                timer: TimerId::CompactStep(vset_id),
+                after: 0,
+            });
+        }
     }
 
     pub(super) fn maybe_start_checkpoint(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
@@ -570,11 +630,11 @@ impl Daemon {
         (overlay, leaf_table, rolled_gens, writes)
     }
 
-    /// Begin a capture of the vset's exact current state: re-arm write
-    /// protection on its dirty pages and read their contents straight from
-    /// the shared mapping — in this step when the set is small (and always
-    /// for checkpoints, whose pause is the snapshot), or spread across
-    /// `CaptureStep`s by the incremental drain when it is not.
+    /// Begin a capture of the vset's exact current state. Every non-empty
+    /// mapped-page capture first arms write protection as one effect, then
+    /// reads through bounded `CaptureStep`s. For checkpoints the arm lands
+    /// before `ResumeGuest`, preserving the paused-instant cut without doing
+    /// page copies, compression, or one ioctl per page in the pause event.
     #[allow(clippy::too_many_lines)]
     pub(super) fn start_capture(
         &mut self,
@@ -626,19 +686,17 @@ impl Daemon {
             }
         }
 
-        // 2a-full: a large commit capture must not read and compress its
-        // whole set inside one step. Arm it instead — the cut is fixed at
-        // this instant, behind write protection, with nothing read — and
-        // drain in bounded batches. Checkpoints (and the migration's final
-        // capture) stay synchronous: the guest is paused, and the pause IS
-        // the snapshot.
-        if checkpoint.is_none() && to_flush.len() + compact_pages.len() > DRAIN_PAGES_PER_STEP {
+        // Large captures always drain incrementally, including checkpoints
+        // and migration's final cut. The batched arm effect lands before a
+        // checkpoint resumes, so the paused-instant bytes remain stable.
+        if to_flush.len() + compact_pages.len() > DRAIN_PAGES_PER_STEP {
             self.arm_drain(
                 vset_id,
                 seq,
                 capture_seq,
                 database,
                 database_prune_spans,
+                checkpoint,
                 &to_flush,
                 to_protect,
                 compact_victims,
@@ -668,6 +726,9 @@ impl Daemon {
                 compact_gens.push(Gen(state.next_gen));
                 state.next_gen += 1;
             }
+            // Small captures remain single-step for latency and compatibility,
+            // but arm all dirty pages in contiguous runs before the first copy.
+            mem.arm_write_protect(&to_protect);
             for (page, generation) in &gens {
                 let bytes = mem.read_page(*page);
                 builder.add(*page, *generation, &bytes);
@@ -895,6 +956,7 @@ impl Daemon {
         capture_seq: u64,
         database: crate::journal::DatabaseMeta,
         database_prune_spans: BTreeSet<u32>,
+        checkpoint: Option<(Epoch, u64, ReqId)>,
         to_flush: &[PageId],
         to_protect: Vec<PageId>,
         compact_victims: BTreeSet<(u64, SegId)>,
@@ -925,6 +987,7 @@ impl Daemon {
             capture_seq,
             database,
             database_prune_spans,
+            checkpoint,
             builder: SegmentBatchBuilder::new(vset_id, fence, seg),
             unread,
             armed: to_flush.to_vec(),
@@ -1025,7 +1088,7 @@ impl Daemon {
                 capture_seq: drain.capture_seq,
                 database: drain.database,
                 database_prune_spans: drain.database_prune_spans,
-                checkpoint: None,
+                checkpoint: drain.checkpoint,
                 new_locs,
                 seg_blobs,
                 flushed: drain.armed,
@@ -1466,13 +1529,10 @@ impl Daemon {
         }
 
         let mut keep_segs: BTreeSet<(u64, SegId)> = BTreeSet::new();
-        keep_segs.extend(
-            state
-                .page_locs
-                .values()
-                .map(|(_, loc)| (loc.fence, loc.seg)),
-        );
-        keep_segs.extend(state.overlay.values().map(|(_, loc)| (loc.fence, loc.seg)));
+        // `seg_live` is maintained on every serving-map adoption. Using its
+        // keys avoids rescanning every served page each time a record
+        // finalizes; the remaining scans below are bounded capture metadata.
+        keep_segs.extend(state.seg_live.keys().copied());
         if let Some(best) = &state.best_record {
             keep_segs.extend(best.overlay.values().map(|(_, loc)| (loc.fence, loc.seg)));
         }

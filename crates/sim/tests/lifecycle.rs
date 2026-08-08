@@ -33,11 +33,11 @@ fn quiet_run_serves_and_syncs_without_incident() {
     assert_clean(&report);
     assert_eq!(report.crashes, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(1947, 1970));
+    assert_eq!(report.completed_ops, page_pin(1947, 1945));
     assert_eq!(report.counters.faults_unservable, 0);
     assert_eq!(report.counters.pressure_waits, 0);
     assert_eq!(report.counters.checkpoints_done, 0);
-    assert_eq!(report.counters.syncs_acked, page_pin(274, 281));
+    assert_eq!(report.counters.syncs_acked, page_pin(274, 306));
     assert_eq!(report.counters.guest_rejected, 0);
 }
 
@@ -73,12 +73,12 @@ fn crash_storm_with_checkpoints_resumes() {
     };
     let report = run(3, config);
     assert_clean(&report);
-    assert_eq!(report.crashes, page_pin(10, 9));
-    assert_eq!(report.resumes, page_pin(4, 4));
-    assert_eq!(report.cold_boots, page_pin(26, 23));
+    assert_eq!(report.crashes, page_pin(10, 8));
+    assert_eq!(report.resumes, page_pin(4, 3));
+    assert_eq!(report.cold_boots, page_pin(26, 21));
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(3714, 4085));
+    assert_eq!(report.completed_ops, page_pin(3714, 4168));
 }
 
 #[test]
@@ -96,11 +96,11 @@ fn crash_storm_without_checkpoints_cold_boots_at_sync_consistency() {
     };
     let report = run(4, config);
     assert_clean(&report);
-    assert_eq!(report.crashes, page_pin(9, 8));
+    assert_eq!(report.crashes, page_pin(9, 10));
     assert_eq!(report.resumes, 0);
-    assert_eq!(report.cold_boots, page_pin(27, 24));
+    assert_eq!(report.cold_boots, page_pin(27, 30));
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(2987, 3389));
+    assert_eq!(report.completed_ops, page_pin(2987, 3402));
 }
 
 #[test]
@@ -112,15 +112,15 @@ fn repeated_checkpoints_accrue_no_storage_debt() {
     config.checkpoint_interval = Some(millis(50));
     let report = run(5, config);
     assert_clean(&report);
-    assert_eq!(report.counters.checkpoints_done, page_pin(240, 252));
+    assert_eq!(report.counters.checkpoints_done, page_pin(240, 239));
     // R3.1: the guest-visible pause is the VMM pause round-trip only —
     // capture and persistence never extend it. Far under the 250 ms budget.
-    assert_eq!(report.max_pause_ns, page_pin(199_414, 198_183));
-    assert_eq!(report.counters.records_written, page_pin(1630, 1592));
+    assert_eq!(report.max_pause_ns, page_pin(199_414, 197_701));
+    assert_eq!(report.counters.records_written, page_pin(1630, 1575));
     // Bounded by live data: at worst ~one segment per live page plus two
     // records per vset (48 pages × 3 vsets ⇒ well under 150), an order of
     // magnitude below records_written — not growing with checkpoint count.
-    assert_eq!(report.blob_count, page_pin(57, 67));
+    assert_eq!(report.blob_count, page_pin(57, 62));
 }
 
 #[test]
@@ -134,11 +134,11 @@ fn pressure_slows_guests_but_never_kills() {
     let report = run(6, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.counters.pressure_waits, page_pin(259, 268));
+    assert_eq!(report.counters.pressure_waits, page_pin(259, 276));
     let progressed: Vec<u64> = report.per_guest_completed.values().copied().collect();
     assert_eq!(
         progressed,
-        page_pin([536, 542, 524, 528], [556, 529, 526, 532])
+        page_pin([536, 542, 524, 528], [545, 541, 544, 538])
     );
 }
 
@@ -159,7 +159,7 @@ fn bit_rot_kills_loudly_and_only_where_injected() {
     };
     let report = run(7, config);
     assert_clean(&report);
-    assert_eq!(report.bitflips, page_pin(16, 22));
+    assert_eq!(report.bitflips, page_pin(16, 20));
     assert_eq!(report.guest_deaths, 3);
     assert_eq!(report.counters.faults_unservable, 3);
 }
@@ -186,7 +186,7 @@ fn rot_on_either_record_copy_never_rolls_back_acked_syncs() {
     assert_eq!(report.crashes, 2);
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.cold_boots, 2);
-    assert_eq!(report.completed_ops, page_pin(687, 851));
+    assert_eq!(report.completed_ops, page_pin(687, 783));
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn full_chaos_stays_consistent() {
             report.guest_deaths,
             report.completed_ops,
         ),
-        page_pin((9, 20, 7, 0, 25, 1554), (10, 20, 10, 0, 16, 1966))
+        page_pin((9, 20, 7, 0, 25, 1554), (8, 6, 18, 0, 9, 3751))
     );
 }
 

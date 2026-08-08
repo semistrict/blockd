@@ -4,36 +4,13 @@
 //! or object store (R8.1). Byte layouts are pinned by tests; two encoders of
 //! the same state produce identical bytes.
 
-/// CRC-32C (Castagnoli), reflected, as used by iSCSI/ext4/S3 checksums.
-// The truncating casts are the algorithm's byte indexing.
-#[allow(clippy::cast_possible_truncation)]
+/// Hardware-accelerated CRC-32C (Castagnoli), as used by iSCSI/ext4/S3.
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    const fn table() -> [u32; 256] {
-        let poly: u32 = 0x82F6_3B78;
-        let mut table = [0u32; 256];
-        let mut n = 0;
-        while n < 256 {
-            let mut crc = n as u32;
-            let mut bit = 0;
-            while bit < 8 {
-                crc = if crc & 1 == 1 {
-                    (crc >> 1) ^ poly
-                } else {
-                    crc >> 1
-                };
-                bit += 1;
-            }
-            table[n] = crc;
-            n += 1;
-        }
-        table
-    }
-    const TABLE: [u32; 256] = table();
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc = (crc >> 8) ^ TABLE[usize::from((crc as u8) ^ b)];
-    }
-    !crc
+    u32::try_from(crc_fast::checksum(
+        crc_fast::CrcAlgorithm::Crc32Iscsi,
+        bytes,
+    ))
+    .expect("CRC-32 result fits u32")
 }
 
 /// Append-only little-endian encoder. All widths explicit at call sites.

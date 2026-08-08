@@ -2,8 +2,8 @@
 //! dirtying memory as fast as they can, one probe vset doing paced ops,
 //! REAL uffd + REAL disk blobs (fsync included). The probe's latency as K
 //! grows IS the number the single-loop architecture must answer for; the
-//! loop-stats attribution says which on-loop work (`Fill` copies,
-//! `BlobWrite` fsyncs, capture reads inside decide) is to blame.
+//! loop-stats attribution shows the remaining on-loop dispatch cost after
+//! fill completion and blob I/O move to worker lanes.
 //!
 //! Profiles print to stderr (`--no-capture`); assertions pin the shape
 //! (the traffic actually flowed), not machine-dependent microseconds.
@@ -74,6 +74,7 @@ struct PhaseResult {
     noisy_ops: u64,
     occupancy: f64,
     fills: u64,
+    fill_ns: u64,
     blob_writes: u64,
     report: String,
 }
@@ -155,11 +156,17 @@ fn run_phase(noisy: usize) -> PhaseResult {
             .map_or(0, |(_, count, _)| *count)
     };
     let effects = stats.effect_totals();
+    let total_of = |rows: &[(&'static str, u64, u64)], name: &str| {
+        rows.iter()
+            .find(|(row, _, _)| *row == name)
+            .map_or(0, |(_, _, ns)| *ns)
+    };
     PhaseResult {
         probe_micros,
         noisy_ops: noisy_ops.load(Ordering::Relaxed),
         occupancy: stats.occupancy(),
         fills: count_of(&effects, "Fill"),
+        fill_ns: total_of(&effects, "Fill"),
         blob_writes: count_of(&effects, "BlobWrite"),
         report: stats.report(),
     }
@@ -182,7 +189,7 @@ fn profile_probe_latency_under_noisy_neighbors() {
         );
         eprintln!(
             "  {noisy:>2} noisy: probe {} ops  p50 {}µs  p90 {}µs  p99 {}µs  max {}µs   \
-             noisy {:.0} ops/s  loop occupancy {:.1}%",
+             noisy {:.0} ops/s  loop occupancy {:.1}%  fill dispatch {:.1}µs/op",
             sorted.len(),
             percentile(&sorted, 50),
             percentile(&sorted, 90),
@@ -190,6 +197,7 @@ fn profile_probe_latency_under_noisy_neighbors() {
             percentile(&sorted, 100),
             result.noisy_ops as f64 / PHASE.as_secs_f64(),
             result.occupancy * 100.0,
+            result.fill_ns as f64 / result.fills.max(1) as f64 / 1_000.0,
         );
         eprint!("{}", result.report);
 

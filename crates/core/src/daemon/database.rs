@@ -334,6 +334,11 @@ impl Daemon {
         mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
+        // A request may cover up to 1 MiB. Yield after a small number of
+        // page operations so its copies and temporary page buffers cannot
+        // monopolize the decider loop.
+        const PAGE_OPS_PER_STEP: usize = 16;
+        let mut budget = PAGE_OPS_PER_STEP;
         loop {
             let capture_blocks_mutation = self.vsets.get(&vset).is_some_and(|state| {
                 state.commit_running
@@ -362,6 +367,11 @@ impl Daemon {
                     return;
                 };
                 if self.start_database_request(request, mem, out) {
+                    budget -= 1;
+                    if budget == 0 {
+                        self.continue_database_later(vset, out);
+                        return;
+                    }
                     continue;
                 }
             }
@@ -369,6 +379,22 @@ impl Daemon {
             if !progressed {
                 return;
             }
+            budget -= 1;
+            if budget == 0 {
+                self.continue_database_later(vset, out);
+                return;
+            }
+        }
+    }
+
+    fn continue_database_later(&self, vset: VsetId, out: &mut Vec<Effect>) {
+        if self.vsets.get(&vset).is_some_and(|state| {
+            state.database_runtime.active.is_some() || !state.database_runtime.queue.is_empty()
+        }) {
+            out.push(Effect::SetTimer {
+                timer: TimerId::DatabaseStep(vset),
+                after: 0,
+            });
         }
     }
 

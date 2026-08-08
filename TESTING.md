@@ -12,6 +12,38 @@ binaries on other operating systems. The live GCS round trip is ignored by
 default because it requires a configured bucket; the in-process GCS contract
 tests remain in the normal suite.
 
+## Performance profiles
+
+Performance profiles print measurements rather than pinning machine-specific
+latency thresholds. Run them in release mode with output enabled:
+
+```sh
+# Hardware/SIMD CRC-32C versus the previous bytewise table loop.
+cargo test --release -p blockd-core --test perf_crc -- --ignored --nocapture
+
+# One MiB database request: total work, slice count, and worst loop step.
+cargo test --release -p blockd-core profile_one_mib_database_write_slices -- --ignored --nocapture
+
+# 300k-page capture: total throughput and the worst bounded continuation.
+cargo test --release -p blockd-runtime --test perf_decider profile_huge_vset_capture_stall -- --nocapture
+
+# Replica artifact preparation: old inline-equivalent time versus bounded
+# peer-I/O queue submission and worker completion.
+cargo test --release -p blockd-core --test perf_replica -- --ignored --nocapture
+```
+
+On Linux, the real-userfaultfd noisy-neighbor profile adds end-to-end probe
+latency, event-loop occupancy, and mean on-loop fill dispatch time:
+
+```sh
+cargo test --release -p blockd-runtime --test loop_interference_linux \
+  profile_probe_latency_under_noisy_neighbors -- --nocapture
+```
+
+Keep the same machine, build profile, CPU governor, and background load when
+comparing revisions. The printed shape assertions ensure the intended path ran;
+the measurements themselves are evidence, not portable pass/fail gates.
+
 ## Deterministic simulation ensembles
 
 Three shared presets continuously search beyond the permanent regression seed

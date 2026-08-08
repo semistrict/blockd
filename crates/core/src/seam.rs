@@ -97,14 +97,17 @@ impl fmt::Debug for ReqId {
 /// the shared mapping itself (plain loads); in simulation the harness's
 /// guest-memory model. Only resident pages may be read.
 ///
-/// **Capture contract**: the returned bytes must be *write-stable* — a
-/// concurrent guest write must either be included in the returned bytes or
-/// trap afterwards. A truly concurrent implementation achieves this by
-/// arming write protection on the page *before* reading it (the capture's
-/// later `WriteProtect` effect is then idempotent); the single-threaded
-/// simulation gets it for free because effects apply atomically with the
-/// step.
+/// **Capture contract**: callers arm write protection before scheduling any
+/// read. The returned bytes are then write-stable: a concurrent guest write
+/// either traps before changing them or happens after copy-on-fault has saved
+/// them. The single-threaded simulation gets the same ordering because effects
+/// apply atomically with a step.
 pub trait HostMap {
+    /// Arm dirty pages before a synchronous small capture reads them. The
+    /// production view collapses these into contiguous ranges; modeled views
+    /// may leave this as the default no-op and apply the matching effect.
+    fn arm_write_protect(&self, _pages: &[PageId]) {}
+
     fn read_page(&self, page: PageId) -> Vec<u8>;
 
     /// The accessed-bit harvest behind MGLRU-mirrored aging (R2.6): which
@@ -424,6 +427,10 @@ pub enum TimerId {
     /// with `after: 0`: the next batch runs as soon as the loop has served
     /// whatever else is waiting — that yield is the entire point.
     CaptureStep(VsetId),
+    /// Continue bounded decompression of a verified compaction victim.
+    CompactStep(VsetId),
+    /// Continue a database request after a bounded page-copy slice.
+    DatabaseStep(VsetId),
     /// Post-migration hydration tick (R7.1's tail drain): pull pages whose
     /// locations still reference the source until none remain, then release
     /// the source.
@@ -470,6 +477,18 @@ pub enum Event {
     PeerDelivered {
         from: HostId,
         msg: PeerMsg,
+    },
+    /// Runtime-prepared replica artifact. Expensive frame verification and
+    /// spool sealing happened off the decider; `frame: None` means either
+    /// checksum or artifact validation failed.
+    ReplicaPutPrepared {
+        from: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        artifact: ReplicaArtifact,
+        checksum: u32,
+        bytes: Vec<u8>,
+        frame: Option<Vec<u8>>,
     },
     Admin(AdminCmd),
     /// A blob write became durable.

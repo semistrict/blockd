@@ -98,6 +98,32 @@ pub fn seal_replica_artifact(
     artifact: ReplicaArtifact,
     bytes: &[u8],
 ) -> Result<Vec<u8>, ReplicaSpoolError> {
+    let checksum = crc32c(bytes);
+    seal_verified_replica_artifact(source, vset, assignment_epoch, artifact, checksum, bytes)
+}
+
+/// Verify an immutable artifact without constructing its spool frame. The
+/// source uses this before network transfer so validation does not allocate
+/// and checksum a full frame that will immediately be discarded.
+pub fn verify_replica_artifact(
+    vset: VsetId,
+    artifact: ReplicaArtifact,
+    bytes: &[u8],
+) -> Result<(), ReplicaSpoolError> {
+    verify_artifact(vset, artifact, bytes)
+}
+
+/// Seal an artifact whose transport checksum has already been computed.
+/// Callers must still get full identity/frame validation here; only the
+/// redundant second checksum pass is skipped.
+pub fn seal_verified_replica_artifact(
+    source: HostId,
+    vset: VsetId,
+    assignment_epoch: u64,
+    artifact: ReplicaArtifact,
+    checksum: u32,
+    bytes: &[u8],
+) -> Result<Vec<u8>, ReplicaSpoolError> {
     verify_artifact(vset, artifact, bytes)?;
     let mut e = Enc::new();
     e.u16(1);
@@ -105,7 +131,7 @@ pub fn seal_replica_artifact(
     e.u64(vset.0);
     e.u64(assignment_epoch);
     put_artifact(&mut e, artifact);
-    e.u32(crc32c(bytes));
+    e.u32(checksum);
     e.u32(u32::try_from(bytes.len()).map_err(|_| ReplicaSpoolError)?);
     e.bytes(bytes);
     Ok(seal_frame(MAGIC_REPLICA_ARTIFACT, &e.finish()))

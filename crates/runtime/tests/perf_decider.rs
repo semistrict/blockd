@@ -449,15 +449,17 @@ fn profile_huge_vset_capture_stall() {
         "the capture never flushed the dirty set: {}",
         counters.pages_flushed
     );
-    let (timer_steps, _, worst_timer) = world.times[&Bucket::Timer];
+    let (timer_steps, timer_ns, worst_timer) = world.times[&Bucket::Timer];
     assert!(
         timer_steps > u64::from(HUGE_PAGES) / 64,
         "the capture did not drain in batches: {timer_steps} timer steps"
     );
     eprintln!(
         "── PROFILE: one {HUGE_PAGES}-dirty-page vset ── {timer_steps} drain/tick steps, \
-         worst single step {:.1}ms",
+         mean {:.1}µs, worst single step {:.1}ms, total {:.1}s",
+        timer_ns as f64 / timer_steps as f64 / 1e3,
         worst_timer as f64 / 1e6,
+        timer_ns as f64 / 1e9,
     );
     // Sanity ceiling only (machine-dependent): the pre-drain whole-set
     // read+compress cost seconds; batches plus the seal's metadata step

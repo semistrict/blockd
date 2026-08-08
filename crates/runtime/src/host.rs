@@ -11,20 +11,23 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::{Daemon, DaemonConfig};
 use blockd_core::database::{AttachmentId, DatabaseError, DatabaseReply, DatabaseRequest};
+use blockd_core::format::crc32c;
 use blockd_core::journal::VsetKind;
 use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout;
+use blockd_core::replica_spool::seal_verified_replica_artifact;
 use blockd_core::seam::{
-    AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, TimerId, Verdict,
+    AdminCmd, AdminReply, Effect, Event, HostMap, IoId, PeerMsg, ReplicaArtifact, ReqId, TimerId,
+    Verdict,
 };
-use blockd_core::types::{PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{HostId, PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -325,25 +328,29 @@ struct Shared {
     next_req: AtomicU64,
 }
 
-/// The daemon's synchronous window onto the mappings. Capture contract
-/// (see `HostMap`): arm write protection BEFORE reading, so a concurrent
-/// guest write either lands in the returned bytes or traps after them —
-/// never silently between.
+/// The daemon's synchronous window onto the mappings. Capture arms write
+/// protection in one batched effect before scheduling reads, so this view
+/// only copies bytes and never issues an ioctl per page.
 struct MapView<'a> {
     vsets: &'a BTreeMap<VsetId, Arc<VsetHost>>,
+    fault_work: &'a tokio::sync::mpsc::Sender<FaultWork>,
 }
 
 impl HostMap for MapView<'_> {
+    fn arm_write_protect(&self, pages: &[PageId]) {
+        let (done, armed) = sync_channel(0);
+        self.fault_work
+            .blocking_send(FaultWork::WriteProtect {
+                hosts: writeprotect_jobs(self.vsets, pages),
+                done,
+            })
+            .expect("fault I/O runtime alive");
+        armed.recv().expect("fault I/O runtime alive");
+    }
+
     fn read_page(&self, page: PageId) -> Vec<u8> {
         let host = &self.vsets[&page.volume.vset];
         let index = host.page_index(page);
-        if host.config.kind == VsetKind::Compute {
-            host.uffd
-                .as_ref()
-                .expect("compute vset has userfaultfd")
-                .writeprotect(host.view.addr_of(index), page_size(), true)
-                .expect("capture write-protect");
-        }
         host.region.read_page(index)
     }
 }
@@ -364,12 +371,44 @@ pub struct Runtime {
 
 struct FaultIo {
     handle: tokio::runtime::Handle,
+    work: tokio::sync::mpsc::Sender<FaultWork>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
+enum FaultWork {
+    Fill {
+        shared: Arc<Shared>,
+        host: Arc<VsetHost>,
+        page: PageId,
+        bytes: Vec<u8>,
+        writable: bool,
+        source: FaultSource,
+    },
+    Unprotect {
+        shared: Arc<Shared>,
+        host: Arc<VsetHost>,
+        page: PageId,
+    },
+    Evict {
+        host: Arc<VsetHost>,
+        page: PageId,
+    },
+    WriteProtect {
+        hosts: Vec<(Arc<VsetHost>, Vec<usize>)>,
+        done: std::sync::mpsc::SyncSender<()>,
+    },
+    Barrier {
+        done: std::sync::mpsc::SyncSender<()>,
+    },
+}
+
 impl FaultIo {
     fn shutdown(&mut self) {
+        let (done, drained) = sync_channel(0);
+        if self.work.blocking_send(FaultWork::Barrier { done }).is_ok() {
+            let _ = drained.recv();
+        }
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -382,6 +421,9 @@ impl FaultIo {
 fn spawn_fault_io_runtime() -> FaultIo {
     let (ready_tx, ready_rx) = sync_channel(1);
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    // Bound outstanding completions so a fault storm applies backpressure
+    // instead of turning blocked guest pages into unbounded host memory.
+    let (work, mut work_rx) = tokio::sync::mpsc::channel(1024);
     let thread = thread::Builder::new()
         .name("blockd-fault-io".to_owned())
         .spawn(move || {
@@ -393,15 +435,158 @@ fn spawn_fault_io_runtime() -> FaultIo {
                 .send(runtime.handle().clone())
                 .expect("runtime owner alive");
             runtime.block_on(async {
-                let _ = shutdown_rx.await;
+                tokio::pin!(shutdown_rx);
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        item = work_rx.recv() => {
+                            let Some(item) = item else { break };
+                            execute_fault_work(item);
+                        }
+                    }
+                }
             });
         })
         .expect("spawn fault I/O runtime");
     FaultIo {
         handle: ready_rx.recv().expect("fault I/O runtime started"),
+        work,
         shutdown: Some(shutdown),
         thread: Some(thread),
     }
+}
+
+fn execute_fault_work(work: FaultWork) {
+    match work {
+        FaultWork::Fill {
+            shared,
+            host,
+            page,
+            bytes,
+            writable,
+            source,
+        } => {
+            let index = host.page_index(page);
+            host.region.write_page(index, &bytes);
+            if let Err(error) = host.uffd.as_ref().expect("compute fill").continue_range(
+                host.view.addr_of(index),
+                page_size(),
+                !writable,
+            ) {
+                tracing::error!(?page, %error, "fatal fill completion failure");
+                std::process::abort();
+            }
+            complete_fault(&shared, page, source, "served");
+        }
+        FaultWork::Unprotect { shared, host, page } => {
+            let index = host.page_index(page);
+            if let Err(error) = host.uffd.as_ref().expect("compute unprotect").writeprotect(
+                host.view.addr_of(index),
+                page_size(),
+                false,
+            ) {
+                tracing::error!(?page, %error, "fatal unprotect failure");
+                std::process::abort();
+            }
+            complete_fault(&shared, page, FaultSource::WriteProtect, "served");
+        }
+        FaultWork::Evict { host, page } => {
+            let index = host.page_index(page);
+            host.view.evict(index, 1).expect("evict");
+            host.region.punch_hole(index, 1).expect("punch");
+        }
+        FaultWork::WriteProtect { hosts, done } => {
+            for (host, mut indices) in hosts {
+                let uffd = host.uffd.as_ref().expect("compute write-protect");
+                for_each_contiguous_run(&mut indices, |start, len| {
+                    uffd.writeprotect(host.view.addr_of(start), len * page_size(), true)
+                        .expect("write-protect");
+                });
+            }
+            let _ = done.send(());
+        }
+        FaultWork::Barrier { done } => {
+            let _ = done.send(());
+        }
+    }
+}
+
+struct ReplicaPrepareJob {
+    from: HostId,
+    vset: VsetId,
+    assignment_epoch: u64,
+    artifact: ReplicaArtifact,
+    checksum: u32,
+    bytes: Vec<u8>,
+}
+
+const REPLICA_PREPARE_WORKERS: usize = 2;
+const REPLICA_PREPARE_QUEUE_CAPACITY: usize = 2;
+
+fn prepare_replica_put(job: ReplicaPrepareJob) -> Event {
+    let ReplicaPrepareJob {
+        from,
+        vset,
+        assignment_epoch,
+        artifact,
+        checksum,
+        bytes,
+    } = job;
+    let frame = (crc32c(&bytes) == checksum)
+        .then(|| {
+            seal_verified_replica_artifact(from, vset, assignment_epoch, artifact, checksum, &bytes)
+        })
+        .and_then(Result::ok);
+    Event::ReplicaPutPrepared {
+        from,
+        vset,
+        assignment_epoch,
+        artifact,
+        checksum,
+        bytes,
+        frame,
+    }
+}
+
+fn spawn_replica_prepare_workers(tx: &Arc<LoopQueue>) -> SyncSender<ReplicaPrepareJob> {
+    let (work, rx) = sync_channel::<ReplicaPrepareJob>(REPLICA_PREPARE_QUEUE_CAPACITY);
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..REPLICA_PREPARE_WORKERS {
+        let rx = rx.clone();
+        let tx = tx.clone();
+        thread::Builder::new()
+            .name("blockd-replica-prepare".to_owned())
+            .spawn(move || {
+                loop {
+                    let Ok(job) = rx.lock().expect("lock").recv() else {
+                        return;
+                    };
+                    tx.push(Msg::Ev(prepare_replica_put(job)));
+                }
+            })
+            .expect("spawn replica preparation worker");
+    }
+    work
+}
+
+fn writeprotect_jobs(
+    vsets: &BTreeMap<VsetId, Arc<VsetHost>>,
+    pages: &[PageId],
+) -> Vec<(Arc<VsetHost>, Vec<usize>)> {
+    let mut by_vset: BTreeMap<VsetId, Vec<usize>> = BTreeMap::new();
+    for &page in pages {
+        let host = &vsets[&page.volume.vset];
+        if host.config.kind == VsetKind::Compute {
+            by_vset
+                .entry(page.volume.vset)
+                .or_default()
+                .push(host.page_index(page));
+        }
+    }
+    by_vset
+        .into_iter()
+        .map(|(vset, indices)| (vsets[&vset].clone(), indices))
+        .collect()
 }
 
 #[cfg(test)]
@@ -498,13 +683,43 @@ impl Runtime {
             next_req: AtomicU64::new(1),
         });
 
+        let replica_prepare = spawn_replica_prepare_workers(&tx);
         let peers = config.peer.as_ref().map(|p| {
             let tx = tx.clone();
+            let replica_prepare = replica_prepare.clone();
             PeerNet::start(p, config.daemon.host, move |from, msg| {
-                tx.push(Msg::Ev(Event::PeerDelivered { from, msg }));
+                if let PeerMsg::ReplicaPut {
+                    vset,
+                    assignment_epoch,
+                    artifact,
+                    checksum,
+                    bytes,
+                } = msg
+                {
+                    let job = ReplicaPrepareJob {
+                        from,
+                        vset,
+                        assignment_epoch,
+                        artifact,
+                        checksum,
+                        bytes,
+                    };
+                    if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
+                        replica_prepare.try_send(job)
+                    {
+                        // Replica transfer is retry-driven. Dropping here
+                        // bounds preparation memory without blocking the
+                        // single-threaded peer I/O runtime.
+                        tracing::warn!("replica preparation queue full or stopped");
+                    }
+                } else {
+                    tx.push(Msg::Ev(Event::PeerDelivered { from, msg }));
+                }
             })
         });
         let fault_io = spawn_fault_io_runtime();
+        let fault_effects = fault_io.handle.clone();
+        let fault_work = fault_io.work.clone();
 
         let IoLanes {
             store: store_tx,
@@ -538,6 +753,8 @@ impl Runtime {
                             peers.as_ref(),
                             self_id,
                             source,
+                            &fault_effects,
+                            &fault_work,
                         );
                         shared
                             .stats
@@ -568,7 +785,13 @@ impl Runtime {
                     let started = Instant::now();
                     let effects = {
                         let vsets = shared.vsets.lock().expect("lock");
-                        daemon.step(event, &MapView { vsets: &vsets })
+                        daemon.step(
+                            event,
+                            &MapView {
+                                vsets: &vsets,
+                                fault_work: &fault_work,
+                            },
+                        )
                     };
                     *shared.counters.lock().expect("lock") = daemon.counters;
                     if refresh_observability {
@@ -1360,6 +1583,8 @@ fn apply_effect(
     peers: Option<&Arc<PeerNet>>,
     self_id: blockd_core::types::HostId,
     source: Option<FaultSource>,
+    fault_io: &tokio::runtime::Handle,
+    fault_work: &tokio::sync::mpsc::Sender<FaultWork>,
 ) {
     match effect {
         Effect::Fill {
@@ -1368,18 +1593,18 @@ fn apply_effect(
             writable,
             share,
         } => {
-            complete_fault(shared, page, source.unwrap_or(FaultSource::Zero), "served");
             assert!(share.is_none(), "base sharing is not wired in e2e v1");
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
-            let index = host.page_index(page);
-            host.region.write_page(index, &bytes);
-            // Non-writable fills install write-protected: the next guest
-            // store traps, keeping dirty tracking exact (R2.4).
-            host.uffd
-                .as_ref()
-                .expect("compute fill")
-                .continue_range(host.view.addr_of(index), page_size(), !writable)
-                .expect("continue");
+            fault_work
+                .blocking_send(FaultWork::Fill {
+                    shared: shared.clone(),
+                    host,
+                    page,
+                    bytes,
+                    writable,
+                    source: source.unwrap_or(FaultSource::Zero),
+                })
+                .expect("fault I/O runtime alive");
         }
         Effect::FillShared { .. } => unreachable!("base sharing is not wired in e2e v1"),
         Effect::FillFailed { page } => {
@@ -1390,40 +1615,25 @@ fn apply_effect(
             std::process::abort();
         }
         Effect::Unprotect { page } => {
-            complete_fault(shared, page, FaultSource::WriteProtect, "served");
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
-            let index = host.page_index(page);
-            host.uffd
-                .as_ref()
-                .expect("compute unprotect")
-                .writeprotect(host.view.addr_of(index), page_size(), false)
-                .expect("unprotect");
+            fault_work
+                .blocking_send(FaultWork::Unprotect {
+                    shared: shared.clone(),
+                    host,
+                    page,
+                })
+                .expect("fault I/O runtime alive");
         }
         Effect::WriteProtect { pages } => {
-            let vsets = shared.vsets.lock().expect("lock");
-            let mut by_vset: BTreeMap<VsetId, Vec<usize>> = BTreeMap::new();
-            for page in pages {
-                let host = &vsets[&page.volume.vset];
-                by_vset
-                    .entry(page.volume.vset)
-                    .or_default()
-                    .push(host.page_index(page));
-            }
-            for (vset, mut indices) in by_vset {
-                let host = &vsets[&vset];
-                // Database vsets are storage-only. Their writes enter through
-                // DatabaseOp and the daemon tracks dirty generations itself;
-                // there is no guest mapping whose stores need trapping.
-                if host.config.kind == VsetKind::Database {
-                    debug_assert!(host.uffd.is_none());
-                    continue;
-                }
-                let uffd = host.uffd.as_ref().expect("compute write-protect");
-                for_each_contiguous_run(&mut indices, |start, len| {
-                    uffd.writeprotect(host.view.addr_of(start), len * page_size(), true)
-                        .expect("write-protect");
-                });
-            }
+            let hosts = {
+                let vsets = shared.vsets.lock().expect("lock");
+                writeprotect_jobs(&vsets, &pages)
+            };
+            let (done, armed) = sync_channel(0);
+            fault_work
+                .blocking_send(FaultWork::WriteProtect { hosts, done })
+                .expect("fault I/O runtime alive");
+            armed.recv().expect("fault I/O runtime alive");
         }
         Effect::Evict { page } => {
             // Real reclaim: the daemon only evicts clean pages (their
@@ -1431,9 +1641,18 @@ fn apply_effect(
             // backing genuinely frees RAM; the refault refills from the
             // local segment on disk (R2.4).
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
-            let index = host.page_index(page);
-            host.view.evict(index, 1).expect("evict");
-            host.region.punch_hole(index, 1).expect("punch");
+            if host.config.kind == VsetKind::Compute {
+                // Fill, unprotect, write-protect, and eviction all mutate
+                // the same mapping. One FIFO preserves the daemon's effect
+                // order even while completions run off the event loop.
+                fault_work
+                    .blocking_send(FaultWork::Evict { host, page })
+                    .expect("fault I/O runtime alive");
+            } else {
+                let index = host.page_index(page);
+                host.view.evict(index, 1).expect("evict");
+                host.region.punch_hole(index, 1).expect("punch");
+            }
         }
         Effect::DatabaseInstall { page, bytes } => {
             let host = shared.vsets.lock().expect("lock")[&page.volume.vset].clone();
@@ -1656,7 +1875,8 @@ fn apply_effect(
         }
         Effect::PeerSend { to, msg } => {
             if let Some(net) = peers {
-                net.send(self_id, to, &msg);
+                let net = net.clone();
+                fault_io.spawn_blocking(move || net.send(self_id, to, &msg));
             } else {
                 tracing::warn!(
                     peer_host = to.0,
@@ -2242,6 +2462,7 @@ mod tests {
         let (timer_tx, timer_rx) = channel();
         let (admin_tx, _admin_rx) = channel();
         let tx = LoopQueue::new();
+        let mut fault_io = spawn_fault_io_runtime();
 
         apply_effect(
             Effect::BlobWrite {
@@ -2260,6 +2481,8 @@ mod tests {
             None,
             blockd_core::types::HostId(0),
             None,
+            &fault_io.handle,
+            &fault_io.work,
         );
         apply_effect(
             Effect::SetTimer {
@@ -2277,6 +2500,8 @@ mod tests {
             None,
             blockd_core::types::HostId(0),
             None,
+            &fault_io.handle,
+            &fault_io.work,
         );
 
         assert!(matches!(
@@ -2291,6 +2516,7 @@ mod tests {
             timer_rx.try_recv().expect("follow-up effect ran"),
             (TimerId::Backup(VsetId(9)), 123)
         );
+        fault_io.shutdown();
     }
 
     #[test]

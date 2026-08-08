@@ -33,7 +33,7 @@ pub(crate) fn event_kind(event: &Event) -> usize {
         Event::GuestFault { .. } => 0,
         Event::GuestSync { .. } => 1,
         Event::GuestPaused { .. } => 2,
-        Event::PeerDelivered { .. } => 3,
+        Event::PeerDelivered { .. } | Event::ReplicaPutPrepared { .. } => 3,
         Event::Admin(_) => 4,
         Event::BlobWriteDone { .. } | Event::ReplicaDeleteFailed { .. } => 5,
         Event::BlobReadDone { .. } => 6,

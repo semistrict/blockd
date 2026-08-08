@@ -660,6 +660,8 @@ struct Vset {
     seg_live: BTreeMap<(u64, SegId), u64>,
     /// In-flight compaction reads: mostly-dead segments being read back.
     compacting: BTreeSet<(u64, SegId)>,
+    /// Verified compaction victims awaiting bounded per-entry decompression.
+    compact_decode: VecDeque<capture::CompactDecode>,
     /// Compaction's rescues, riding the next capture into a fresh
     /// segment: per victim, its live entries. Volatile — a crash or
     /// stall just re-runs the compaction.
@@ -832,6 +834,7 @@ impl Vset {
             page_locs: BTreeMap::new(),
             seg_live: BTreeMap::new(),
             compacting: BTreeSet::new(),
+            compact_decode: VecDeque::new(),
             compact_stash: Vec::new(),
             best: None,
             leaf_table: BTreeMap::new(),
@@ -1275,6 +1278,24 @@ impl Daemon {
             Event::Database(request) => self.database_request(request, mem, &mut out),
             Event::GuestPaused { vset, vmstate } => self.paused(vset, vmstate, mem, &mut out),
             Event::PeerDelivered { from, msg } => self.peer(from, msg, mem, &mut out),
+            Event::ReplicaPutPrepared {
+                from,
+                vset,
+                assignment_epoch,
+                artifact,
+                checksum,
+                bytes,
+                frame,
+            } => self.replica_put_prepared(
+                from,
+                vset,
+                assignment_epoch,
+                artifact,
+                checksum,
+                bytes,
+                frame,
+                &mut out,
+            ),
             Event::Admin(cmd) => self.admin(cmd, mem, &mut out),
             Event::BlobWriteDone { io } => self.blob_write_done(io, mem, &mut out),
             Event::ReplicaDeleteFailed { io } => self.replica_delete_failed(io, &mut out),
@@ -1298,6 +1319,10 @@ impl Daemon {
             Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, mem, &mut out),
             Event::Timer(TimerId::FillRetry(vset)) => self.fill_retry_tick(vset, &mut out),
             Event::Timer(TimerId::CaptureStep(vset)) => self.capture_step(vset, mem, &mut out),
+            Event::Timer(TimerId::CompactStep(vset)) => self.compact_step(vset, &mut out),
+            Event::Timer(TimerId::DatabaseStep(vset)) => {
+                self.drive_database(vset, mem, &mut out);
+            }
             Event::Timer(TimerId::Hydrate(vset)) => self.hydrate_tick(vset, &mut out),
             Event::Timer(TimerId::RestoreRetry(vset)) => self.restore_retry(vset, &mut out),
             Event::Timer(TimerId::LeafRetry(vset)) => self.leaf_retry(vset, &mut out),
@@ -1439,7 +1464,7 @@ impl Daemon {
                 loc,
             }) => self.database_fetch_done(vset, page, generation, loc, bytes, mem, out),
             Some(Pending::CompactRead { vset, fence, seg }) => {
-                self.compact_read_done(vset, fence, seg, bytes);
+                self.compact_read_done(vset, fence, seg, bytes, out);
             }
             Some(Pending::PubSegRead { vset, fence, seg }) => {
                 self.pub_seg_read_done(vset, fence, seg, bytes, out);

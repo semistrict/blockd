@@ -59,7 +59,7 @@ fn backup_flows_continuously_and_unbacked_vsets_write_nothing() {
     assert_clean(&report);
     // R4.2: backup flowed continuously without checkpoints (R3.2).
     assert_eq!(report.counters.checkpoints_done, 0);
-    assert_eq!(report.counters.manifests_published, 6);
+    assert_eq!(report.counters.manifests_published, 7);
     assert_eq!(report.counters.fenced, 0);
     // The store holds the backed vset's head + exactly one manifest and the
     // live segments — nothing of the non-backed vset, ever (R4.4).
@@ -79,7 +79,7 @@ fn backup_flows_continuously_and_unbacked_vsets_write_nothing() {
         .filter(|k| k.starts_with(&format!("{backed_prefix}m/")))
         .count();
     assert_eq!(manifests, 1, "superseded manifests are reclaimed (R4.5)");
-    assert_eq!(report.store_keys.len(), page_pin(19, 20));
+    assert_eq!(report.store_keys.len(), page_pin(19, 16));
 }
 
 #[test]
@@ -91,11 +91,11 @@ fn store_outage_queues_backups_and_drains_after() {
     config.faults.store_outage = Some((millis(500), millis(1800)));
     let report = run(12, config);
     assert_clean(&report);
-    assert_eq!(report.counters.store_retries, page_pin(34, 31));
+    assert_eq!(report.counters.store_retries, page_pin(34, 33));
     assert_eq!(report.counters.manifests_published, 6);
     assert_eq!(report.counters.fenced, 0);
     // Local durability was untouched throughout (R8.3): guests progressed.
-    assert_eq!(report.completed_ops, page_pin(1938, 1954));
+    assert_eq!(report.completed_ops, page_pin(1938, 1949));
 }
 
 #[test]
@@ -116,10 +116,10 @@ fn journal_rot_is_survived_via_restore_from_backup() {
     };
     let report = run(13, config);
     assert_clean(&report);
-    assert_eq!(report.crashes, 7);
+    assert_eq!(report.crashes, 8);
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, page_pin(1353, 1179));
+    assert_eq!(report.completed_ops, page_pin(1353, 1360));
 }
 
 #[test]
@@ -154,9 +154,9 @@ fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
     let report = run(14, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.counters.nvme_reclaims, page_pin(36, 26));
-    assert_eq!(report.counters.nvme_stalls, page_pin(50, 74));
-    assert_eq!(report.completed_ops, page_pin(306, 177));
+    assert_eq!(report.counters.nvme_reclaims, page_pin(36, 33));
+    assert_eq!(report.counters.nvme_stalls, page_pin(50, 65));
+    assert_eq!(report.completed_ops, page_pin(306, 206));
 }
 
 #[test]

@@ -39,7 +39,7 @@ fn host_death_restores_orphans_elsewhere_with_racing_claims() {
     // The recovered point was exactly the head's manifest at death (R4.3).
     assert_eq!(report.loss_bound_verified, 1);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(4374, 4253));
+    assert_eq!(report.completed_ops, page_pin(4374, 4214));
 }
 
 #[test]
@@ -383,7 +383,7 @@ fn migration_moves_a_nonbacked_vset_losslessly() {
     // non-backed vset wrote nothing to the store (R4.4), so zero restores.
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.restores, 0);
-    assert_eq!(report.completed_ops, page_pin(1773, 1615));
+    assert_eq!(report.completed_ops, page_pin(1773, 1493));
     // R7.1: the guest-observed pause — source pause through destination
     // resume — stays far inside the 500 ms budget.
     assert!(
@@ -409,7 +409,7 @@ fn source_death_mid_drain_costs_the_nonbacked_vset_loudly() {
     // The destination's guest died at its first peer fetch the dead source
     // could not answer (the sanctioned R7.3 loss).
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, page_pin(581, 617));
+    assert_eq!(report.completed_ops, page_pin(581, 595));
 }
 
 /// R6.2: a restore onto a host with none of the vset's bytes reaches its
@@ -574,7 +574,7 @@ fn hydration_drains_the_tail_and_releases_the_source() {
         report.wedged_guests + report.wedged_hydration + report.wedged_outbound,
         0
     );
-    assert_eq!(report.completed_ops, page_pin(1614, 1549));
+    assert_eq!(report.completed_ops, page_pin(1614, 1669));
 }
 
 /// The recovery side of the two-sided handoff (R7.2): a source that
@@ -596,7 +596,7 @@ fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
     // released and reclaimed.
     assert_eq!(report.releases, 1);
     assert_eq!(report.blobs_per_host[0], 0);
-    assert_eq!(report.completed_ops, page_pin(1348, 1515));
+    assert_eq!(report.completed_ops, page_pin(1348, 1638));
 }
 
 /// A crash that tears the handoff marker means the migration never
@@ -618,7 +618,7 @@ fn torn_handoff_marker_means_the_migration_never_happened() {
     assert_eq!(report.recoveries, 1);
     // The vset still lives on the source: its blobs are there.
     assert!(report.blobs_per_host[0] > 0);
-    assert_eq!(report.completed_ops, page_pin(1460, 1549));
+    assert_eq!(report.completed_ops, page_pin(1460, 1560));
 }
 
 /// R7.3's mirror: the DESTINATION crashes mid-drain. Its durable records
@@ -642,7 +642,7 @@ fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
     // Released and reclaimed: the source holds nothing.
     assert_eq!(report.blobs_per_host[0], 0);
     // Well past the old die-loudly count (592): the guest lived on.
-    assert_eq!(report.completed_ops, page_pin(1508, 1643));
+    assert_eq!(report.completed_ops, page_pin(1508, 1483));
 }
 
 /// R8.3 on the demand-fill path: a store outage while a restored vset is
@@ -776,7 +776,7 @@ fn migration_survives_a_lossy_duplicating_peer_channel() {
         report.peer_drops,
         report.peer_dups
     );
-    assert_eq!(report.completed_ops, page_pin(1463, 1565));
+    assert_eq!(report.completed_ops, page_pin(1463, 1524));
 }
 
 #[test]
@@ -863,7 +863,7 @@ fn restore_waits_out_a_store_outage() {
         "restore finished during the outage: {} ns",
         report.max_restore_ns
     );
-    assert_eq!(report.completed_ops, page_pin(3903, 3978));
+    assert_eq!(report.completed_ops, page_pin(3903, 4029));
 }
 
 /// R6.2's prefetch is a bet, and a rotten resume-set object must cost
@@ -891,7 +891,7 @@ fn a_rotten_resume_set_is_ignored_not_fatal() {
         report.max_restore_ns
     );
     assert_eq!(report.prefetch_fills, 0);
-    assert_eq!(report.completed_ops, page_pin(690, 605));
+    assert_eq!(report.completed_ops, page_pin(690, 677));
 }
 
 /// A vset large enough that its map genuinely shards into leaves. Low
@@ -939,7 +939,7 @@ fn restores_hydrate_multi_leaf_maps_lazily() {
     );
     // The map really was sharded, and really hydrated span by span.
     assert!(report.leaf_fills > 0, "no leaves hydrated");
-    assert_eq!(report.completed_ops, page_pin(24845, 24533));
+    assert_eq!(report.completed_ops, page_pin(24845, 24450));
 }
 
 /// Migration of a multi-leaf vset: the offer stays small, the destination
@@ -963,7 +963,7 @@ fn migration_hydrates_multi_leaf_maps_from_the_source() {
     // throughput concern, not a correctness one, and is asserted by the
     // small-map release tests).
     assert!(report.hydrate_fills > 0);
-    assert_eq!(report.completed_ops, page_pin(29162, 28795));
+    assert_eq!(report.completed_ops, page_pin(29162, 28884));
 }
 
 /// A leaf object rotten in the store makes exactly its span unservable:
@@ -985,5 +985,5 @@ fn a_rotten_leaf_kills_its_span_loudly_and_nothing_else() {
     assert_eq!(report.restores, 1);
     // The reborn guest's verification pass hit the dead span: loud death.
     assert_eq!(report.guest_deaths, 1);
-    assert_eq!(report.completed_ops, page_pin(24315, 24134));
+    assert_eq!(report.completed_ops, page_pin(24315, 24044));
 }

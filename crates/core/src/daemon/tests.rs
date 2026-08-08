@@ -1,5 +1,7 @@
 use super::*;
-use crate::database::{AttachmentId, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest};
+use crate::database::{
+    AttachmentId, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest, MAX_DATABASE_IO,
+};
 use crate::head::HeadRecord;
 use crate::journal::{DurabilityMode, VsetConfig};
 use crate::layout;
@@ -2092,6 +2094,100 @@ fn checkpoint_cost_scales_with_the_delta_not_the_volume() {
     assert_eq!(daemon.counters.pages_flushed, 67);
 }
 
+#[test]
+fn large_checkpoint_resumes_after_batch_arm_before_any_page_copy() {
+    struct CountingMem(std::cell::Cell<usize>);
+    impl HostMap for CountingMem {
+        fn read_page(&self, _page: PageId) -> Vec<u8> {
+            self.0.set(self.0.get() + 1);
+            vec![0; page_size()]
+        }
+    }
+
+    let (mut daemon, _) = Daemon::new(DaemonConfig {
+        host: HostId(0),
+        cache_pages: 80,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: None,
+    });
+    let mem = CountingMem(std::cell::Cell::new(0));
+    let _ = step_settled_with_mem(
+        &mut daemon,
+        Event::Admin(AdminCmd::CreateVset {
+            req: ReqId(800),
+            vset: VSET,
+            config: VsetConfig::compute(1, 80, false),
+            from_base: None,
+        }),
+        &mem,
+    );
+    for n in 0..65 {
+        let _ = daemon.step(
+            Event::GuestFault {
+                page: PageId {
+                    volume: VolumeId {
+                        vset: VSET,
+                        idx: VolumeIdx(1),
+                    },
+                    page: PageNo(n),
+                },
+                write: true,
+            },
+            &mem,
+        );
+    }
+    let _ = daemon.step(
+        Event::Admin(AdminCmd::Checkpoint {
+            req: ReqId(801),
+            vset: VSET,
+        }),
+        &mem,
+    );
+    let paused = daemon.step(
+        Event::GuestPaused {
+            vset: VSET,
+            vmstate: 9,
+        },
+        &mem,
+    );
+    assert_eq!(mem.0.get(), 0, "pause event performs no page copies");
+    assert!(paused.iter().any(|effect| matches!(
+        effect,
+        Effect::WriteProtect { pages } if pages.len() == 65
+    )));
+    assert!(paused.iter().any(|effect| matches!(
+        effect,
+        Effect::SetTimer {
+            timer: TimerId::CaptureStep(VSET),
+            ..
+        }
+    )));
+    assert!(
+        paused
+            .iter()
+            .any(|effect| matches!(effect, Effect::ResumeGuest { vset: VSET }))
+    );
+    assert!(
+        !paused
+            .iter()
+            .any(|effect| matches!(effect, Effect::BlobWrite { .. }))
+    );
+
+    let first = daemon.step(Event::Timer(TimerId::CaptureStep(VSET)), &mem);
+    assert_eq!(mem.0.get(), 64);
+    assert!(first.iter().any(|effect| matches!(
+        effect,
+        Effect::SetTimer {
+            timer: TimerId::CaptureStep(VSET),
+            ..
+        }
+    )));
+}
+
 #[derive(Default)]
 struct DatabaseMem(std::cell::RefCell<BTreeMap<PageId, Vec<u8>>>);
 
@@ -2111,6 +2207,10 @@ fn database_step(daemon: &mut Daemon, mem: &DatabaseMem, event: Event) -> Vec<Ef
                     mem.0.borrow_mut().insert(page, bytes);
                 }
                 Effect::BlobWrite { io, .. } => queue.push_back(Event::BlobWriteDone { io }),
+                Effect::SetTimer {
+                    timer: TimerId::DatabaseStep(vset),
+                    ..
+                } => queue.push_back(Event::Timer(TimerId::DatabaseStep(vset))),
                 other => settled.push(other),
             }
         }
@@ -2190,6 +2290,136 @@ fn database_request(
 }
 
 #[test]
+fn large_database_write_yields_after_a_bounded_page_slice() {
+    let (mut daemon, mem, attachment) = database_daemon_with_capacity(32, 32);
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        810,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+    let effects = daemon.step(
+        Event::Database(DatabaseRequest {
+            req: ReqId(811),
+            vset: VSET,
+            attachment,
+            op: DatabaseOp::Write {
+                handle: 1,
+                offset: 0,
+                bytes: vec![0x5a; page_size() * 17],
+            },
+        }),
+        &mem,
+    );
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::DatabaseInstall { .. }))
+            .count(),
+        16
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SetTimer {
+            timer: TimerId::DatabaseStep(VSET),
+            ..
+        }
+    )));
+    assert!(!effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Database(DatabaseReply::Written {
+            req: ReqId(811),
+            ..
+        })
+    )));
+}
+
+#[test]
+#[ignore = "performance profile; run explicitly in release mode"]
+#[allow(clippy::cast_precision_loss, clippy::disallowed_types)]
+fn profile_one_mib_database_write_slices() {
+    let pages = MAX_DATABASE_IO.div_ceil(page_size());
+    let (mut daemon, mem, attachment) =
+        database_daemon_with_capacity(pages + 1, u32::try_from(pages + 1).expect("fits"));
+    let _ = database_request(
+        &mut daemon,
+        &mem,
+        attachment,
+        820,
+        DatabaseOp::Open {
+            handle: 1,
+            file: DatabaseFile::Main,
+            create: true,
+        },
+    );
+
+    let mut next = Some(Event::Database(DatabaseRequest {
+        req: ReqId(821),
+        vset: VSET,
+        attachment,
+        op: DatabaseOp::Write {
+            handle: 1,
+            offset: 0,
+            bytes: vec![0x5a; MAX_DATABASE_IO],
+        },
+    }));
+    let mut steps = 0u64;
+    let mut installs = 0usize;
+    let mut max_installs = 0usize;
+    let mut total_ns = 0u64;
+    let mut worst_ns = 0u64;
+    let mut completed = false;
+    while let Some(event) = next.take() {
+        let started = std::time::Instant::now();
+        let effects = daemon.step(event, &mem);
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).expect("fits");
+        total_ns += elapsed;
+        worst_ns = worst_ns.max(elapsed);
+        steps += 1;
+
+        let mut step_installs = 0;
+        for effect in effects {
+            match effect {
+                Effect::DatabaseInstall { page, bytes } => {
+                    mem.0.borrow_mut().insert(page, bytes);
+                    installs += 1;
+                    step_installs += 1;
+                }
+                Effect::SetTimer {
+                    timer: TimerId::DatabaseStep(vset),
+                    ..
+                } => {
+                    assert!(next.is_none(), "one continuation per slice");
+                    next = Some(Event::Timer(TimerId::DatabaseStep(vset)));
+                }
+                Effect::Database(DatabaseReply::Written {
+                    req: ReqId(821), ..
+                }) => completed = true,
+                other => panic!("unexpected database profile effect: {other:?}"),
+            }
+        }
+        max_installs = max_installs.max(step_installs);
+    }
+
+    assert!(completed, "write never completed");
+    assert_eq!(installs, pages);
+    assert!(max_installs <= 16, "slice copied {max_installs} pages");
+    eprintln!("── PROFILE: one MiB database write ──");
+    eprintln!(
+        "  {pages} pages in {steps} event-loop slices; at most {max_installs} pages/slice; \
+         mean {:.1}µs, worst {:.1}µs, total {:.1}ms",
+        total_ns as f64 / steps as f64 / 1_000.0,
+        worst_ns as f64 / 1_000.0,
+        total_ns as f64 / 1_000_000.0,
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn database_byte_io_sync_truncate_and_recreate_are_exact() {
     let (mut daemon, mem, attachment) = database_daemon();
@@ -2208,7 +2438,8 @@ fn database_byte_io_sync_truncate_and_recreate_are_exact() {
         [Effect::Database(DatabaseReply::Opened { req: ReqId(102) })]
     );
 
-    let bytes: Vec<u8> = (0..page_size())
+    let io_len = page_size() + 904;
+    let bytes: Vec<u8> = (0..io_len)
         .map(|i| u8::try_from(i % 251).expect("below 251"))
         .collect();
     assert_eq!(
@@ -2237,7 +2468,7 @@ fn database_byte_io_sync_truncate_and_recreate_are_exact() {
             DatabaseOp::Read {
                 handle: 1,
                 offset: 100,
-                len: u32::try_from(bytes.len()).expect("page size fits"),
+                len: u32::try_from(io_len).expect("test I/O fits u32"),
             },
         ),
         [Effect::Database(DatabaseReply::Read {
@@ -3237,7 +3468,12 @@ fn database_cluster_step(
                     },
                 )),
                 Effect::SetTimer { timer, .. }
-                    if matches!(timer, TimerId::DatabaseMigrate(_) | TimerId::CaptureStep(_)) =>
+                    if matches!(
+                        timer,
+                        TimerId::DatabaseMigrate(_)
+                            | TimerId::CaptureStep(_)
+                            | TimerId::DatabaseStep(_)
+                    ) =>
                 {
                     queue.push_back((host, Event::Timer(timer)));
                 }

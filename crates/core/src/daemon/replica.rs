@@ -8,7 +8,9 @@ use crate::format::crc32c;
 use crate::head::{HeadRecord, MAX_RETIRED_STASHES, ManifestPtr, RetiredStash};
 use crate::layout;
 use crate::placement::rank_stash_candidates;
-use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
+use crate::replica_spool::{
+    seal_replica_commit, seal_verified_replica_artifact, verify_replica_artifact,
+};
 use crate::seam::{Effect, IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, StoreFault, TimerId};
 use crate::types::{HostId, VsetId};
 
@@ -116,11 +118,73 @@ impl Daemon {
             self.counters.replica_rejected += 1;
             return;
         }
-        let Ok(frame) = seal_replica_artifact(source, vset, assignment_epoch, artifact, &bytes)
-        else {
+        let Ok(frame) = seal_verified_replica_artifact(
+            source,
+            vset,
+            assignment_epoch,
+            artifact,
+            checksum,
+            &bytes,
+        ) else {
             self.counters.replica_rejected += 1;
             return;
         };
+        self.replica_put_verified(
+            source,
+            vset,
+            assignment_epoch,
+            artifact,
+            checksum,
+            bytes,
+            frame,
+            out,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn replica_put_prepared(
+        &mut self,
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        artifact: ReplicaArtifact,
+        checksum: u32,
+        bytes: Vec<u8>,
+        frame: Option<Vec<u8>>,
+        out: &mut Vec<Effect>,
+    ) {
+        let Some(frame) = frame else {
+            self.counters.replica_rejected += 1;
+            return;
+        };
+        if !self.replica_request_authorized(source, vset, assignment_epoch) {
+            self.counters.replica_rejected += 1;
+            return;
+        }
+        self.replica_put_verified(
+            source,
+            vset,
+            assignment_epoch,
+            artifact,
+            checksum,
+            bytes,
+            frame,
+            out,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replica_put_verified(
+        &mut self,
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        artifact: ReplicaArtifact,
+        checksum: u32,
+        bytes: Vec<u8>,
+        frame: Vec<u8>,
+        out: &mut Vec<Effect>,
+    ) {
         if !self.replica_has_capacity(source, frame.len() as u64) {
             return;
         }
@@ -971,15 +1035,7 @@ impl Daemon {
         };
         // This performs the same identity and checksum verification as the
         // receiver before any damaged local bytes can enter the protocol.
-        if seal_replica_artifact(
-            self.config.host,
-            vset,
-            send.assignment_epoch,
-            artifact,
-            &bytes,
-        )
-        .is_err()
-        {
+        if verify_replica_artifact(vset, artifact, &bytes).is_err() {
             out.push(Effect::Abort {
                 reason: "replica source artifact corrupt",
             });
