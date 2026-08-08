@@ -89,12 +89,11 @@ them; grouped by what would break if they were dropped.
   memory-over-disk affinity of R2.4 and the accounting of its own tiers.
 - **R2.7** NVMe pressure has the same contract as memory pressure, and it
   is the harder case because memory relief drains **into** disk (R2.4).
-  The reclaim ladder has two classes: everything refetchable from backup —
-  hydrated cache and already-backed-up state alike, a class that
-  continuous background backup (R4.2) keeps growing for backed-up vsets —
-  droppable to a floor; and the irreducible residue — live heads plus the
-  sole copies of non-backed-up state — genuine occupancy that only
-  migration or discard can move. The residue must be observable (R9.2)
+  The reclaim ladder has two classes: everything refetchable from the
+  object-store archive — hydrated cache and already-archived state alike —
+  droppable to a floor; and the irreducible residue — live heads plus state
+  not yet archived — genuine occupancy that only archival, migration or
+  discard can move. The residue must be observable (R9.2)
   long before the device fills, with enough configured headroom that
   in-flight writeback completes. At exhaustion the coupled degradation is
   explicit: writeback stalls, therefore memory relief stalls, therefore
@@ -147,43 +146,55 @@ them; grouped by what would break if they were dropped.
   can never observe that disk at a state older than the sync point, and
   every captured disk state is a crash-consistent point of that device's
   write history — nothing written after a sync barrier is present unless
-  everything before it is. In local and ordinary backup mode the durability
-  domain is the host's local disk, exactly as for any checkpoint (R3.6): a
-  partial checkpoint need not survive host loss, but the ordering guarantee
-  holds across daemon crash and restart. Peer-stashed mode strengthens only
-  the durability domain as specified by R4.7; it does not change the device
-  ordering or checkpoint semantics. For a database vset, file existence,
+  everything before it is. The durability domain is the primary host plus
+  its assigned passive peer as specified by R4.1; object-store archival is
+  asynchronous and is not on the acknowledgment path. This does not change
+  device ordering or checkpoint semantics. For a database vset, file existence,
   logical sizes, truncation and deletion are ordered metadata mutations
   covered atomically by the same watermark as page writes.
 
-## R4 — Durability: local first, S3 is backup, one optional peer protects sync
+## R4 — Durability: primary and passive first, object storage is the archive
 
-- **R4.1** One durability knob per vset, at creation, immutable: local only,
-  asynchronously backed up to the object store, or asynchronously backed up
-  with guest syncs additionally protected by one passive peer. All three
-  modes are first-class; placement of that peer is mutable operational state,
-  not another durability mode.
-- **R4.2** The object store is **backup**: an asynchronous background copy
-  of locally durable state, flowing continuously as writeback commits it —
-  not gated on checkpoints. Its one non-backup use is
-  the assignment records of backed-up vsets (R6.3) — small, rare, and
-  never on a guest-visible path. No guest-visible operation and no capture
-  depends on the store; only backup itself, restore on another host, and
-  base publishing do.
-- **R4.3** For a backed-up vset, the loss bound on host death is the backup
-  lag: everything committed locally but not yet copied to the store. The
-  system **measures** the lag — per vset and host-wide — and never bounds
-  it. Checkpoints govern the *kind* of recovery, never its existence: host
-  loss restores the newest backed-up recovery point — resumed if it is a
-  whole checkpoint, cold-booted at sync consistency otherwise (R6.1) — so
-  whoever wants resume rather than reboot after host death drives
-  checkpoints; recovery itself needs none. Database recovery opens the newest
-  backed-up database point detached and may lose locally acknowledged SQLite
-  commits within that lag; local commit acknowledgment is not remote durability.
-- **R4.4** A non-backed-up vset writes **no object of any kind** to the
-  object store, ever — that is the mode's contract, not an optimization. It
-  survives daemon restart only to its last locally committed epoch, and host
-  loss is total. It must still read shared base data from wherever it lives.
+- **R4.1** There is one durability contract. Every guest sync is acknowledged
+  only after its recovery closure is durable on the primary and exactly one
+  assigned passive peer, or after an equal or newer point is already published
+  in the object store. The closure is the compressed immutable artifacts and
+  record needed to cold-boot at the barrier; it is neither guest RAM nor every
+  provisioned page. The peer is recovery storage, not an owner or runner.
+- **R4.2** The object store is an asynchronous archive of peer-committed state.
+  It advances on its own cadence, never gated on sync, capture, or checkpoints.
+  Archive cycles may coalesce any number of intermediate commits and optimize
+  the newest immutable cut before publishing it. Packing is derived wholly
+  inside the passive/archive subsystem from that durable cut: it does not ask
+  the primary to finalize a record, read guest memory, or mutate the live
+  serving timeline. Already archived and base-owned objects may remain
+  referenced; the passive rewrites the selected cut's staged live pages in
+  `(volume, page)` order into bounded archive-only segments and corresponding
+  leaves. Cycles are triggered by a
+  maximum interval, unpublished-byte threshold, passive-spool pressure, or an
+  explicit lifecycle event. Assignment records (R6.3) are its only non-archive
+  use. No guest-visible operation and no ordinary capture waits for the store.
+- **R4.3** Loss of either the primary or the active passive alone loses no
+  acknowledged sync. The passive holds the newest protected closure; loss of
+  that passive pauses new sync acknowledgments only while a replacement is
+  selected, seeded with a complete covering closure, and fenced as active.
+  Repair has no finite retry, candidate-count, retired-peer, or archive-lag
+  budget: repeated passive losses continue through the eligible roster.
+  Simultaneous loss of the primary and every peer holding its newest protected
+  closure is outside the single-node-loss contract. In that event the newest
+  object-store archive may be arbitrarily old; the system neither claims nor
+  configures a time-bounded catastrophic RPO. Checkpoints govern the kind of
+  recovery, never its existence: recovery uses the newest available point —
+  resumed if it is a whole checkpoint, cold-booted at sync consistency
+  otherwise (R6.1). Database recovery opens detached.
+- **R4.4** An object-store outage never limits sync admission by elapsed time
+  or archive lag. A healthy active passive continues accepting protected writes
+  indefinitely while its durable storage has capacity. Archive lag age and
+  bytes remain observable cost and disaster-recovery facts, not correctness
+  thresholds. Only actual passive-capacity exhaustion, including the reserved
+  space needed to finish or compact an in-flight closure, may stall new
+  protected work without acknowledgment. Intermediate cuts may be coalesced,
+  but the latest peer-committed closure must remain complete.
 - **R4.5** Nothing is ever deleted by age. Every durable artifact lives
   until an explicit delete: a vset until its discard, a base until its
   delete. Superseded state is reclaimed only when the same vset's newer
@@ -193,27 +204,32 @@ them; grouped by what would break if they were dropped.
   system requires of it only: strong read-after-write consistency,
   conditional writes (compare-and-swap by version), and objects up to
   64 MiB. Anything speaking that contract (S3, GCS) must work.
-- **R4.7** In peer-stashed mode a guest sync is acknowledged only after its
-  disk recovery closure is durable on the primary and on exactly one passive
-  peer, or after an equal or newer point has already been published by the
-  object store. The closure is the stored, compressed immutable artifacts and
-  record needed to cold-boot at the barrier; it is neither guest RAM nor every
-  provisioned page. The peer is recovery storage, not an owner or runner. Loss
-  of both primary and active stash before the object store catches up is the
-  declared two-machine failure boundary.
-- **R4.8** Peer-stashed data flows primary to one active stash and from that
-  stash to the object store. Candidate peers and virtual-node placement must
-  never cause steady-state fanout. When the active stash is unavailable, new
-  sync acknowledgments stop until one replacement has durably committed a
-  covering baseline and its assignment is published by the same fenced head
-  authority as R6.3. Sequential machine failures before that repair completes
-  are outside R4.7's single-failure guarantee.
-- **R4.9** A passive stash retains committed residue until an object-store head
-  CAS publishes an equal or newer recovery point. Reclamation is explicit,
-  monotone, and implemented by unlinking wholly covered sealed spool files;
-  it never rewrites live residue or deletes it by age. Capacity exhaustion
-  stalls new protected syncs and is observable rather than evicting unbacked
-  data.
+- **R4.7** Protected and archived durability are distinct monotone frontiers.
+  The protected frontier advances on passive commit and authorizes sync ACKs;
+  the archived frontier advances only after the manifest and all referenced
+  objects are durable and a fenced head CAS publishes that cut. Neither may
+  advance from an attempted, partial, or unverifiable write.
+- **R4.8** Data flows primary to one active passive and from that passive to
+  the object store. Candidate peers and virtual-node placement must never
+  cause steady-state fanout. When the active passive is unavailable, new sync
+  acknowledgments stop until one replacement has durably committed a covering
+  baseline. The current holder's existing writer fence authorizes that repair
+  even while the object store is wholly unavailable; head publication retries
+  independently and must not delay activation or later sync acknowledgments.
+  Failed replacements are skipped and replacement repeats automatically;
+  obsolete dead-peer cleanup can never block another failover.
+  Sequential machine failures before a covering replacement commit are outside
+  R4.1's single-failure guarantee, but once repair completes the new passive is
+  the ordinary protected copy and the guarantee is restored.
+- **R4.9** Passive retention is defined by recovery roots, not by archive age:
+  the newest complete protected cut, an immutable archive cut currently being
+  read, and any in-progress replacement cut. Once a newer complete cut is
+  durable, artifacts referenced only by superseded cuts may be compacted into
+  fresh sealed spool generations even while the object store is unavailable.
+  The selected archive cut remains pinned until its attempt finishes or is
+  abandoned for a newer cut. Reclamation is explicit and crash-safe; capacity
+  exhaustion stalls new protected syncs and is observable rather than evicting
+  any recovery root.
 
 ## R5 — Lineage: bases and forks
 
@@ -238,16 +254,18 @@ them; grouped by what would break if they were dropped.
 
 ## R6 — Restore and placement
 
-- **R6.1** Any object-store-backed vset can be brought back on any host of the
-  cluster from the object store alone, at its newest backed-up recovery
+- **R6.1** Any vset can be brought back on any host of the
+  cluster from the object store alone, at its newest archived recovery
   point (R8.2) — restored if that point is a whole checkpoint, cold-booted
   at sync consistency otherwise: no prior local state, no reachable
   previous host, and no requirement that a checkpoint was ever taken. A
-  peer-stashed vset whose newest protected sync is ahead of that point instead
-  requires a complete verified closure from its recorded stash assignment; it
-  must never silently present the older object-store point as satisfying the
-  stronger guarantee. A database vset instead becomes database-ready and
-  detached at its newest backed-up recovery point.
+  vset whose newest protected sync is ahead of that point instead
+  requires a complete verified closure from its recorded stash assignment, or
+  from a higher assignment epoch carrying a commit by the recorded holder's
+  current writer fence (R6.6); it must never silently present the older
+  object-store point as satisfying the stronger guarantee. A database vset
+  instead becomes database-ready and detached at its newest archived recovery
+  point.
 - **R6.2** A compute restore onto a host with none of the vset's bytes reaches the
   guest's first instruction in under 200 ms from a warm object store,
   independent of vset size — by fetching only what the resume touches (a
@@ -257,14 +275,10 @@ them; grouped by what would break if they were dropped.
   attachable after bounded metadata fetches independent of database size; file
   pages follow on demand.
 - **R6.3** The system itself is the authority for which host runs a vset —
-  no consensus service, no trusted control plane. For a backed-up vset the
-  instrument is the object store's conditional writes: two hosts racing to
-  restore one vset resolve to exactly one runner by CAS alone. For a
-  non-backed-up vset — which writes no object ever (R4.4) — at-most-one-
-  runner rests on **state locality**: its state exists on exactly one
-  host, so a second host has nothing to restore, and migration preserves
-  the exclusion by making the handoff durable on both sides before either
-  acts on it (R7.2). The object store plays no part in it.
+  no consensus service, no trusted control plane. The instrument is the
+  object store's conditional head: two hosts racing to restore one vset
+  resolve to exactly one runner by CAS alone. Migration preserves the same
+  exclusion by making the handoff durable on both sides before either acts.
 - **R6.4** Durable state can never fork: a fenced former holder must be
   structurally unable to publish, and its guest must stop within a bounded,
   configured time. Failover after suspected host death must be safe to
@@ -282,9 +296,18 @@ them; grouped by what would break if they were dropped.
   active stash assignment and any in-progress replacement. Health observations
   and deterministic virtual-node rankings are placement inputs, not authority.
   An assignment change is a rare conditional head update and never enters the
-  steady-state guest sync path. During replacement the head names both the old
-  active peer and the single transition peer so recovery can inventory exactly
-  the possible holders without searching the cluster.
+  steady-state guest sync path. During a healthy-store replacement the head
+  names both the old active peer and the single transition peer. During a
+  complete store outage, the existing holder may provisionally advance to a
+  higher assignment epoch, seed exactly one deterministic replacement at a time, and
+  activate it after a complete commit. That residue is authoritative only when
+  its commit and journal carry the holder's current writer fence; recovery may
+  inventory such higher epochs and must reject every stale-fence residue. The
+  provisional assignment is reconciled by head CAS when the store returns.
+  Assignment epochs map cyclically across eligible candidates rather than
+  consuming a finite roster, and a covering activation supersedes obsolete
+  retired-peer authority so an unreachable former peer cannot exhaust future
+  failovers.
 
 ## R7 — Migration
 
@@ -294,12 +317,11 @@ them; grouped by what would break if they were dropped.
   drains its attachment, makes the destination database-ready and detached,
   then serves file reads while the tail drains. It never pauses an unrelated
   VM and attaching at the destination is a separate operation.
-- **R7.2** Migration must work for non-backed-up vsets — served entirely
-  peer-to-peer while the source lives — with the same at-most-one-runner
-  guarantee, transferred explicitly and durably on both sides.
-- **R7.3** Source death mid-migration costs at most the backup lag
-  (backed up) or the vset (non-backed-up, the mode's premise) — never a
-  corrupt or half-migrated survivor.
+- **R7.2** Migration is served peer-to-peer while the source lives, with the
+  same at-most-one-runner guarantee, transferred explicitly and durably on
+  both sides. Its final handoff cut is an explicit archive event.
+- **R7.3** Source death mid-migration recovers from the newest complete
+  protected or archived cut, never a corrupt or half-migrated survivor.
 
 ## R8 — Integrity and failure behavior
 
@@ -327,15 +349,20 @@ them; grouped by what would break if they were dropped.
   local or peer copy — which is fault-path reality, not a durability
   failure; a vset whose working bytes are on its host or a peer runs
   through the outage untouched, and the source-preference order (R2.3)
-  is what keeps that population large. In peer-stashed mode, a healthy stash
-  lets guest syncs continue through the outage while bounded, observable
-  residue grows. Loss of that stash stalls new sync acknowledgments until
-  replacement completes; it never permits an optimistic acknowledgment.
-- **R8.4** Bytes are stored compressed **on local disk and in S3 alike**,
-  and stay compressed in flight between tiers — one scheme end-to-end, so
-  transfers move stored bytes verbatim and the fault path pays at most one
-  decompression of a small block. Compression is part of what makes R1.3's
-  disk overcommit real capacity rather than accounting.
+  is what keeps that population large. A healthy passive
+  lets guest syncs continue through the outage while observable residue is
+  compacted around the live recovery roots. Loss of that passive stalls new
+  sync acknowledgments only until automatic replacement completes; it never
+  permits an optimistic acknowledgment.
+- **R8.4** Bytes are stored compressed **on local disk and in S3 alike**.
+  Primary-to-passive transfer preserves the source segment bytes verbatim;
+  an archive cycle may decode selected live entries and recompress them into
+  fewer bounded packs. The current archive format deliberately keeps the
+  existing LZ4 entry codec. Zstd, zero-page elision, or another format version
+  requires a measured incremental win after temporal packing, plus updated
+  byte-pin and bit-flip suites; it is not implied by this contract. The fault
+  path still decompresses at most one small entry. Compression is part of what
+  makes R1.3's disk overcommit real capacity rather than accounting.
 
 ## R9 — Operability
 
@@ -344,8 +371,8 @@ them; grouped by what would break if they were dropped.
   requires a Linux host with userfaultfd (MINOR + write-protect), the
   patched Firecracker, root, and kernel swap off — nothing else stateful.
 - **R9.2** The operable minimum of observability: per-vset fault latency by
-  source, hydration progress, the backup lag, dirty rate, memory and disk
-  pressure, assignment claims and fences, and for peer-stashed vsets the
+  source, hydration progress, archive lag, dirty rate, memory and disk
+  pressure, assignment claims and fences, and for every vset the
   active/transition peer, assignment epoch, protected-sync lag, spool bytes
   and capacity, stalled syncs, retries, integrity rejects, replacement bytes,
   and cleanup unlinks — as Prometheus series with a fixed, bounded label

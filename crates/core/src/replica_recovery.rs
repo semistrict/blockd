@@ -107,9 +107,22 @@ pub fn prepare_replica_recovery_claim(
     observed_version: u64,
     observed_head: &HeadRecord,
     claimant: HostId,
+    export: &ReplicaExport,
 ) -> ReplicaRecoveryClaim {
     let mut head = observed_head.clone();
     head.holder = claimant;
+    if let Some(observed_assignment) = observed_head.stash {
+        head.stash = Some(crate::head::StashAssignment {
+            assignment_epoch: export.assignment_epoch,
+            active_peer: export.source_peer,
+            active_assignment_epoch: export.assignment_epoch,
+            transition_peer: None,
+            membership_epoch: observed_assignment.membership_epoch,
+        });
+        // The verified export is a complete covering cut, so older stash
+        // copies are no longer recovery roots under the single-loss contract.
+        head.retired_stashes.clear();
+    }
     // Informational until the CAS returns its authoritative fence.
     head.fence = 0;
     ReplicaRecoveryClaim {
@@ -170,6 +183,7 @@ pub fn refence_replica_export(
 pub fn report_replica_recovery(
     source: HostId,
     vset: VsetId,
+    head_version: u64,
     head: &HeadRecord,
     residues: &[ReplicaResidue<'_>],
     store_objects: &BTreeMap<String, Vec<u8>>,
@@ -206,7 +220,7 @@ pub fn report_replica_recovery(
         report.chosen_assignment_epoch = Some(epoch);
         report.covered_sync_through = Some(covered);
     }
-    match export_replica_recovery(source, vset, head, residues, store_objects) {
+    match export_replica_recovery(source, vset, head_version, head, residues, store_objects) {
         Ok(export) => {
             report.status = ReplicaRecoveryStatus::Complete;
             report.chosen_source = Some(export.source_peer);
@@ -244,44 +258,36 @@ pub fn inventory_replica(
     })
 }
 
-/// Verify and export the newest committed residue among only the active and
-/// transition peers named by `head`. Store objects fill the portion of the
-/// closure that the primary had already truthfully marked as S3-durable.
+/// Verify and export the newest committed residue. Normally the source must be
+/// named by `head`; a higher assignment epoch is also accepted when its
+/// complete commit was written by the holder at the head's current fence. That
+/// is the durable proof left by an offline passive replacement whose head CAS
+/// could not complete during an object-store outage.
 pub fn export_replica_recovery(
     source: HostId,
     vset: VsetId,
+    head_version: u64,
     head: &HeadRecord,
     residues: &[ReplicaResidue<'_>],
     store_objects: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ReplicaExport, ReplicaRecoveryError> {
     let assignment = head.stash.ok_or(ReplicaRecoveryError::NoAssignment)?;
-    let mut allowed: BTreeMap<HostId, BTreeSet<u64>> = BTreeMap::new();
-    allowed
-        .entry(assignment.active_peer)
-        .or_default()
-        .insert(assignment.active_assignment_epoch);
-    if let Some(peer) = assignment.transition_peer {
-        allowed
-            .entry(peer)
-            .or_default()
-            .insert(assignment.assignment_epoch);
-    }
-    for retired in &head.retired_stashes {
-        allowed
-            .entry(retired.peer)
-            .or_default()
-            .insert(retired.assignment_epoch);
-    }
+    let allowed = allowed_replica_epochs(head, assignment);
     let mut candidates = Vec::new();
     for &residue in residues {
-        let Some(epochs) = allowed.get(&residue.peer) else {
-            return Err(ReplicaRecoveryError::UnnamedPeer { peer: residue.peer });
-        };
-        if !epochs.contains(&residue.assignment_epoch) {
-            return Err(ReplicaRecoveryError::StaleAssignment {
-                peer: residue.peer,
-                assignment_epoch: residue.assignment_epoch,
-            });
+        let named = allowed
+            .get(&residue.peer)
+            .is_some_and(|epochs| epochs.contains(&residue.assignment_epoch));
+        let possible_offline_replacement = residue.assignment_epoch > assignment.assignment_epoch;
+        if !named && !possible_offline_replacement {
+            return if allowed.contains_key(&residue.peer) {
+                Err(ReplicaRecoveryError::StaleAssignment {
+                    peer: residue.peer,
+                    assignment_epoch: residue.assignment_epoch,
+                })
+            } else {
+                Err(ReplicaRecoveryError::UnnamedPeer { peer: residue.peer })
+            };
         }
         let scan = scan_replica_spool(residue.bytes)
             .map_err(|_| ReplicaRecoveryError::CorruptSpool { peer: residue.peer })?;
@@ -289,6 +295,18 @@ pub fn export_replica_recovery(
         if let Some(commit) = scan.commits.last() {
             let record = JournalRecord::decode(vset, &commit.record)
                 .map_err(|_| ReplicaRecoveryError::CorruptSpool { peer: residue.peer })?;
+            if !named
+                && (head.holder != source
+                    || commit.info.writer_fence != head_version
+                    || record.fence != head_version
+                    || record.seq != commit.info.seq
+                    || record.sync_covered_through != commit.info.sync_covered_through)
+            {
+                return Err(ReplicaRecoveryError::StaleAssignment {
+                    peer: residue.peer,
+                    assignment_epoch: residue.assignment_epoch,
+                });
+            }
             candidates.push((
                 (
                     commit.info.sync_covered_through,
@@ -298,6 +316,11 @@ pub fn export_replica_recovery(
                 residue,
                 scan,
             ));
+        } else if !named {
+            return Err(ReplicaRecoveryError::StaleAssignment {
+                peer: residue.peer,
+                assignment_epoch: residue.assignment_epoch,
+            });
         }
     }
     candidates.sort_by_key(|(rank, _, _)| *rank);
@@ -337,6 +360,30 @@ pub fn export_replica_recovery(
         }
     }
     export_commit(vset, residue, &scan, commit, store_objects)
+}
+
+fn allowed_replica_epochs(
+    head: &HeadRecord,
+    assignment: crate::head::StashAssignment,
+) -> BTreeMap<HostId, BTreeSet<u64>> {
+    let mut allowed: BTreeMap<HostId, BTreeSet<u64>> = BTreeMap::new();
+    allowed
+        .entry(assignment.active_peer)
+        .or_default()
+        .insert(assignment.active_assignment_epoch);
+    if let Some(peer) = assignment.transition_peer {
+        allowed
+            .entry(peer)
+            .or_default()
+            .insert(assignment.assignment_epoch);
+    }
+    for retired in &head.retired_stashes {
+        allowed
+            .entry(retired.peer)
+            .or_default()
+            .insert(retired.assignment_epoch);
+    }
+    allowed
 }
 
 fn verify_scan_identity(
@@ -442,10 +489,60 @@ fn artifact_bytes(
 mod tests {
     use super::*;
     use crate::head::StashAssignment;
-    use crate::journal::{DurabilityMode, RecordKind, VsetConfig};
+    use crate::journal::{DatabaseFileMeta, DatabaseMeta, RecordKind, VsetConfig};
     use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
     use crate::segment::SegmentBuilder;
     use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, page_size};
+
+    fn recovery_spool(
+        source: HostId,
+        vset: VsetId,
+        assignment_epoch: u64,
+        seq: u64,
+        covered: u64,
+        fill: u8,
+    ) -> (Vec<u8>, Vec<u8>, JournalRecord) {
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(2),
+        };
+        let seg = SegId(seq);
+        let mut builder = SegmentBuilder::new(vset, 4, seg);
+        builder.add(page, Gen(seq), &vec![fill; page_size()]);
+        let (segment, locs) = builder.finish();
+        let artifact = ReplicaArtifact::Segment { fence: 4, seg };
+        let info = ReplicaCommitInfo {
+            writer_fence: 4,
+            seq: JournalSeq(seq),
+            sync_covered_through: covered,
+        };
+        let record = JournalRecord {
+            config: VsetConfig::compute(1, 8),
+            seq: info.seq,
+            fence: info.writer_fence,
+            kind: RecordKind::Commit,
+            capture_seq: seq,
+            sync_covered_through: covered,
+            database: crate::journal::DatabaseMeta::default(),
+            overlay: locs
+                .into_iter()
+                .map(|(page, generation, loc)| (page, (generation, loc)))
+                .collect(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let encoded = record.encode(vset);
+        let mut spool = seal_replica_artifact(source, vset, assignment_epoch, artifact, &segment)
+            .expect("artifact");
+        spool.extend(
+            seal_replica_commit(source, vset, assignment_epoch, info, &[artifact], &encoded)
+                .expect("commit"),
+        );
+        (spool, segment, record)
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -477,7 +574,6 @@ mod tests {
                 kind: crate::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
-                durability: DurabilityMode::PeerStashed,
             },
             seq: info.seq,
             fence: info.writer_fence,
@@ -515,6 +611,7 @@ mod tests {
         let export = export_replica_recovery(
             source,
             vset,
+            head.fence,
             &head,
             &[ReplicaResidue {
                 peer,
@@ -529,6 +626,7 @@ mod tests {
         let report = report_replica_recovery(
             source,
             vset,
+            head.fence,
             &head,
             &[ReplicaResidue {
                 peer,
@@ -539,9 +637,10 @@ mod tests {
         );
         assert_eq!(report.status, ReplicaRecoveryStatus::Complete);
         assert!(report.human_summary().starts_with("complete:"));
-        let claim = prepare_replica_recovery_claim(9, &head, HostId(3));
+        let claim = prepare_replica_recovery_claim(9, &head, HostId(3), &export);
         assert_eq!(claim.expected_version, 9);
         assert_eq!(claim.head.holder, HostId(3));
+        assert_eq!(claim.head.stash.expect("verified source").active_peer, peer);
         let refenced = refence_replica_export(vset, &export, 10).expect("fresh writer fence");
         let (_, journal) = refenced
             .blobs
@@ -589,6 +688,7 @@ mod tests {
             export_replica_recovery(
                 HostId(0),
                 vset,
+                head.fence,
                 &head,
                 &[ReplicaResidue {
                     peer: HostId(2),
@@ -602,6 +702,84 @@ mod tests {
     }
 
     #[test]
+    fn recovery_accepts_a_complete_offline_replacement_from_the_current_writer_fence() {
+        let source = HostId(0);
+        let replacement = HostId(2);
+        let vset = VsetId(17);
+        let (spool, _, _) = recovery_spool(source, vset, 2, 8, 12, 0xA5);
+        let head = HeadRecord {
+            vset,
+            holder: source,
+            fence: 4,
+            manifest: None,
+            stash: Some(StashAssignment {
+                assignment_epoch: 1,
+                active_peer: HostId(1),
+                active_assignment_epoch: 1,
+                transition_peer: None,
+                membership_epoch: 6,
+            }),
+            retired_stashes: Vec::new(),
+        };
+        let export = export_replica_recovery(
+            source,
+            vset,
+            head.fence,
+            &head,
+            &[ReplicaResidue {
+                peer: replacement,
+                assignment_epoch: 2,
+                bytes: &spool,
+            }],
+            &BTreeMap::new(),
+        )
+        .expect("the current fenced writer may finish replacement while the store is down");
+        assert_eq!(export.source_peer, replacement);
+        assert_eq!(export.assignment_epoch, 2);
+        assert_eq!(export.sync_covered_through, 12);
+    }
+
+    #[test]
+    fn recovery_rejects_an_offline_replacement_from_a_stale_writer_fence() {
+        let source = HostId(0);
+        let replacement = HostId(2);
+        let vset = VsetId(18);
+        let (spool, _, _) = recovery_spool(source, vset, 2, 8, 12, 0xA5);
+        let head = HeadRecord {
+            vset,
+            holder: source,
+            fence: 5,
+            manifest: None,
+            stash: Some(StashAssignment {
+                assignment_epoch: 1,
+                active_peer: HostId(1),
+                active_assignment_epoch: 1,
+                transition_peer: None,
+                membership_epoch: 6,
+            }),
+            retired_stashes: Vec::new(),
+        };
+        assert_eq!(
+            export_replica_recovery(
+                source,
+                vset,
+                head.fence,
+                &head,
+                &[ReplicaResidue {
+                    peer: replacement,
+                    assignment_epoch: 2,
+                    bytes: &spool,
+                }],
+                &BTreeMap::new(),
+            ),
+            Err(ReplicaRecoveryError::StaleAssignment {
+                peer: replacement,
+                assignment_epoch: 2,
+            })
+        );
+    }
+
+    #[test]
     fn recovery_refuses_peer_residue_older_than_the_store_manifest() {
         let source = HostId(0);
         let peer = HostId(1);
@@ -610,7 +788,6 @@ mod tests {
             kind: crate::journal::VsetKind::Compute,
             disk_volumes: 1,
             pages_per_volume: 8,
-            durability: DurabilityMode::PeerStashed,
         };
         let peer_info = ReplicaCommitInfo {
             writer_fence: 4,
@@ -672,6 +849,7 @@ mod tests {
             export_replica_recovery(
                 source,
                 vset,
+                head.fence,
                 &head,
                 &[ReplicaResidue {
                     peer,
@@ -683,5 +861,253 @@ mod tests {
             .is_err(),
             "recovery must not replace a newer store recovery point with stale peer residue"
         );
+    }
+
+    #[test]
+    fn recovery_after_activation_selects_the_new_active_and_exact_bytes() {
+        let source = HostId(0);
+        let vset = VsetId(19);
+        let (old_spool, old_segment, _) = recovery_spool(source, vset, 8, 80, 80, 0x18);
+        let (active_spool, active_segment, active_record) =
+            recovery_spool(source, vset, 9, 90, 90, 0xA9);
+        assert_ne!(old_segment, active_segment);
+        let head = HeadRecord {
+            vset,
+            holder: source,
+            fence: 4,
+            manifest: None,
+            stash: Some(StashAssignment {
+                assignment_epoch: 9,
+                active_peer: HostId(3),
+                active_assignment_epoch: 9,
+                transition_peer: None,
+                membership_epoch: 6,
+            }),
+            retired_stashes: vec![crate::head::RetiredStash {
+                peer: HostId(2),
+                assignment_epoch: 8,
+                through: ReplicaCommitInfo {
+                    writer_fence: 4,
+                    seq: JournalSeq(80),
+                    sync_covered_through: 80,
+                },
+            }],
+        };
+        let residues = [
+            ReplicaResidue {
+                peer: HostId(2),
+                assignment_epoch: 8,
+                bytes: &old_spool,
+            },
+            ReplicaResidue {
+                peer: HostId(3),
+                assignment_epoch: 9,
+                bytes: &active_spool,
+            },
+        ];
+        let export =
+            export_replica_recovery(source, vset, head.fence, &head, &residues, &BTreeMap::new())
+                .expect("new active is a complete recovery source");
+        assert_eq!(export.source_peer, HostId(3));
+        assert_eq!(export.assignment_epoch, 9);
+        assert_eq!(export.sync_covered_through, 90);
+        assert!(export.blobs.iter().any(|(name, bytes)| {
+            name == &layout::segment_blob(vset, 4, SegId(90)) && bytes == &active_segment
+        }));
+        let (_, bytes) = export
+            .blobs
+            .iter()
+            .find(|(name, _)| name == &layout::journal_blob(vset, 4, JournalSeq(90)))
+            .expect("active journal exported");
+        assert_eq!(
+            JournalRecord::decode(vset, bytes).expect("exported journal"),
+            active_record
+        );
+    }
+
+    #[test]
+    fn recovery_during_transition_uses_only_a_complete_covering_cut() {
+        let source = HostId(0);
+        let vset = VsetId(20);
+        let (active_spool, _, active_record) = recovery_spool(source, vset, 11, 110, 110, 0x11);
+        let (transition_spool, transition_segment, transition_record) =
+            recovery_spool(source, vset, 12, 120, 120, 0x12);
+        let head = HeadRecord {
+            vset,
+            holder: source,
+            fence: 4,
+            manifest: None,
+            stash: Some(StashAssignment {
+                assignment_epoch: 12,
+                active_peer: HostId(1),
+                active_assignment_epoch: 11,
+                transition_peer: Some(HostId(2)),
+                membership_epoch: 6,
+            }),
+            retired_stashes: Vec::new(),
+        };
+
+        let active_only = export_replica_recovery(
+            source,
+            vset,
+            head.fence,
+            &head,
+            &[ReplicaResidue {
+                peer: HostId(1),
+                assignment_epoch: 11,
+                bytes: &active_spool,
+            }],
+            &BTreeMap::new(),
+        )
+        .expect("incomplete replacement leaves old active authoritative");
+        assert_eq!(active_only.source_peer, HostId(1));
+        assert_eq!(active_only.sync_covered_through, 110);
+        let (_, journal) = active_only
+            .blobs
+            .iter()
+            .find(|(name, _)| name == &layout::journal_blob(vset, 4, JournalSeq(110)))
+            .expect("old active journal");
+        assert_eq!(JournalRecord::decode(vset, journal).unwrap(), active_record);
+
+        let transition_complete = export_replica_recovery(
+            source,
+            vset,
+            head.fence,
+            &head,
+            &[
+                ReplicaResidue {
+                    peer: HostId(1),
+                    assignment_epoch: 11,
+                    bytes: &active_spool,
+                },
+                ReplicaResidue {
+                    peer: HostId(2),
+                    assignment_epoch: 12,
+                    bytes: &transition_spool,
+                },
+            ],
+            &BTreeMap::new(),
+        )
+        .expect("complete replacement is the newest protected cut");
+        assert_eq!(transition_complete.source_peer, HostId(2));
+        assert_eq!(transition_complete.sync_covered_through, 120);
+        assert!(transition_complete.blobs.iter().any(|(name, bytes)| {
+            name == &layout::segment_blob(vset, 4, SegId(120)) && bytes == &transition_segment
+        }));
+        let (_, journal) = transition_complete
+            .blobs
+            .iter()
+            .find(|(name, _)| name == &layout::journal_blob(vset, 4, JournalSeq(120)))
+            .expect("transition journal");
+        assert_eq!(
+            JournalRecord::decode(vset, journal).unwrap(),
+            transition_record
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn database_recovery_after_passive_replacement_preserves_metadata_and_bytes() {
+        let source = HostId(0);
+        let peer = HostId(4);
+        let vset = VsetId(21);
+        let main_page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(0),
+            },
+            page: PageNo(0),
+        };
+        let wal_page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(1),
+        };
+        let mut builder = SegmentBuilder::new(vset, 7, SegId(70));
+        builder.add(main_page, Gen(7), &vec![0xDB; page_size()]);
+        builder.add(wal_page, Gen(8), &vec![0xA1; page_size()]);
+        let (segment, locs) = builder.finish();
+        let artifact = ReplicaArtifact::Segment {
+            fence: 7,
+            seg: SegId(70),
+        };
+        let info = ReplicaCommitInfo {
+            writer_fence: 7,
+            seq: JournalSeq(70),
+            sync_covered_through: 700,
+        };
+        let database = DatabaseMeta {
+            main: DatabaseFileMeta {
+                exists: true,
+                size: page_size() as u64 - 17,
+            },
+            wal: DatabaseFileMeta {
+                exists: true,
+                size: page_size() as u64 + 31,
+            },
+            journal: DatabaseFileMeta::default(),
+        };
+        let record = JournalRecord {
+            config: VsetConfig::database(8),
+            seq: info.seq,
+            fence: info.writer_fence,
+            kind: RecordKind::Commit,
+            capture_seq: 70,
+            sync_covered_through: info.sync_covered_through,
+            database,
+            overlay: locs
+                .into_iter()
+                .map(|(page, generation, loc)| (page, (generation, loc)))
+                .collect(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let encoded = record.encode(vset);
+        let mut spool = seal_replica_artifact(source, vset, 20, artifact, &segment).unwrap();
+        spool.extend(seal_replica_commit(source, vset, 20, info, &[artifact], &encoded).unwrap());
+        let head = HeadRecord {
+            vset,
+            holder: source,
+            fence: 7,
+            manifest: None,
+            stash: Some(StashAssignment {
+                assignment_epoch: 20,
+                active_peer: peer,
+                active_assignment_epoch: 20,
+                transition_peer: None,
+                membership_epoch: 6,
+            }),
+            retired_stashes: Vec::new(),
+        };
+        let export = export_replica_recovery(
+            source,
+            vset,
+            head.fence,
+            &head,
+            &[ReplicaResidue {
+                peer,
+                assignment_epoch: 20,
+                bytes: &spool,
+            }],
+            &BTreeMap::new(),
+        )
+        .expect("replacement database closure");
+        assert_eq!(export.source_peer, peer);
+        assert_eq!(export.sync_covered_through, 700);
+        assert!(export.blobs.iter().any(|(name, bytes)| {
+            name == &layout::segment_blob(vset, 7, SegId(70)) && bytes == &segment
+        }));
+        let (_, recovered_record) = export
+            .blobs
+            .iter()
+            .find(|(name, _)| name == &layout::journal_blob(vset, 7, JournalSeq(70)))
+            .expect("database journal");
+        let recovered_record = JournalRecord::decode(vset, recovered_record).unwrap();
+        assert_eq!(recovered_record, record);
+        assert_eq!(recovered_record.database, database);
+        assert_eq!(recovered_record.overlay[&main_page].0, Gen(7));
+        assert_eq!(recovered_record.overlay[&wal_page].0, Gen(8));
     }
 }

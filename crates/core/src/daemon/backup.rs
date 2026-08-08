@@ -1,313 +1,15 @@
-//! Backup (R4.2): an asynchronous background copy of locally durable state,
-//! flowing continuously as records finalize — never on a guest-visible path.
-//! Pipeline per vset, one publish at a time: every segment the newest record
-//! references and the store lacks is copied **verbatim** (R8.4), then the
-//! record's bytes become the manifest, then a head CAS advances the newest
-//! backed-up pointer. A lost head CAS means another host holds the vset:
-//! this one is fenced (R6.4) and structurally cannot publish again.
+//! Object-store head ownership, retry, recovery refresh, and cleanup.
 //!
-//! Store faults never lose queued work (R8.3): the publish is dropped and a
-//! retry timer re-derives it from current local truth.
+//! Recovery data reaches the object store through the passive replica. The
+//! primary performs only fenced head operations and explicit reclamation.
 
-use super::{Daemon, Pending, Publish, StoreCopyArtifact};
-use crate::head::{HeadRecord, ManifestPtr};
-use crate::journal::DurabilityMode;
+use super::{Daemon, Pending};
+use crate::head::HeadRecord;
 use crate::layout;
 use crate::seam::{Effect, HostMap, StoreFault, TimerId};
-use crate::segment::scan_segment;
 use crate::types::{SegId, VsetId};
 
 impl Daemon {
-    /// Start (or continue) publishing if the newest record has not been
-    /// backed up. Called after every finalize and on retry ticks.
-    pub(super) fn maybe_publish(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
-        let Some(state) = self.vsets.get_mut(&vset_id) else {
-            return;
-        };
-        if state.config.durability != DurabilityMode::Backup
-            || state.publish.is_some()
-            || (state.migrated_verdict.is_some() && !state.migration_head_claimed)
-        {
-            return;
-        }
-        let Some(head_version) = state.head_version else {
-            // Head unknown (fresh recovery): learn it first.
-            if !state.head_refreshing {
-                state.head_refreshing = true;
-                let io = self.io();
-                self.pending
-                    .insert(io, Pending::HeadRefresh { vset: vset_id });
-                out.push(Effect::StoreGet {
-                    io,
-                    key: layout::head_key(vset_id),
-                });
-            }
-            return;
-        };
-        let _ = head_version;
-        let Some(record) = self.vsets[&vset_id].best_record.clone() else {
-            return;
-        };
-        let state = self.vsets.get_mut(&vset_id).expect("just seen");
-        let newer = state
-            .backed
-            .is_none_or(|ptr| (record.capture_seq, record.seq) > (ptr.capture_seq, ptr.seq));
-        if !newer {
-            return;
-        }
-        // A pending leaf came from the store, so its segments are already
-        // backed and absent from the locally known closure.
-        let closure = state.own_namespace_closure(&record);
-        let mut segs_todo: Vec<(u64, SegId)> = closure
-            .segments
-            .into_iter()
-            .filter(|key| !state.backed_segs.contains(key))
-            .collect();
-        segs_todo.sort_unstable();
-        segs_todo.dedup();
-        let leaves_todo: Vec<(u64, u64)> = closure
-            .leaves
-            .into_iter()
-            .filter(|key| !state.backed_leaves.contains(key))
-            .collect();
-        state.publish = Some(Publish {
-            record,
-            segs_todo,
-            leaves_todo,
-        });
-        self.publish_step(vset_id, out);
-    }
-
-    /// Drive the publish pipeline one step: next segment, else manifest.
-    pub(super) fn publish_step(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
-        let Some(state) = self.vsets.get_mut(&vset_id) else {
-            return;
-        };
-        let Some(publish) = &mut state.publish else {
-            return;
-        };
-        if let Some(artifact) = StoreCopyArtifact::next(&publish.segs_todo, &publish.leaves_todo) {
-            let io = self.io();
-            let pending = match artifact {
-                StoreCopyArtifact::Segment { fence, seg } => Pending::PubSegRead {
-                    vset: vset_id,
-                    fence,
-                    seg,
-                },
-                StoreCopyArtifact::Leaf { fence, id } => Pending::PubLeafRead {
-                    vset: vset_id,
-                    fence,
-                    id,
-                },
-            };
-            self.pending.insert(io, pending);
-            out.push(Effect::BlobRead {
-                io,
-                name: artifact.blob_name(vset_id),
-            });
-            return;
-        }
-        let record = &publish.record;
-        let ptr = ManifestPtr {
-            fence: record.fence,
-            seq: record.seq,
-            capture_seq: record.capture_seq,
-        };
-        let bytes = record.encode(vset_id);
-        let io = self.io();
-        self.pending
-            .insert(io, Pending::PubManifestPut { vset: vset_id, ptr });
-        out.push(Effect::StorePut {
-            io,
-            key: layout::manifest_key(vset_id, ptr.fence, ptr.seq),
-            bytes,
-        });
-    }
-
-    /// Local read of a segment headed for the store.
-    pub(super) fn pub_seg_read_done(
-        &mut self,
-        vset_id: VsetId,
-        fence: u64,
-        seg: SegId,
-        bytes: Option<Vec<u8>>,
-        out: &mut Vec<Effect>,
-    ) {
-        let Some(state) = self.vsets.get_mut(&vset_id) else {
-            return;
-        };
-        if state.publish.is_none() {
-            return;
-        }
-        // Verify every frame checksum before upload: publishing damaged
-        // bytes would poison the backup tier (R8.1 applies both ways).
-        let intact = bytes.as_ref().is_some_and(|b| {
-            scan_segment(b).is_ok_and(|(v, f, s, _)| v == vset_id && f == fence && s == seg)
-        });
-        let Some(blob) = bytes.filter(|_| intact) else {
-            // Superseded-and-deleted or damaged: abandon; the retry re-derives
-            // from the (by then newer) local truth.
-            state.publish = None;
-            self.backup_backoff(vset_id, out);
-            return;
-        };
-        let io = self.io();
-        self.pending.insert(
-            io,
-            Pending::PubSegPut {
-                vset: vset_id,
-                fence,
-                seg,
-            },
-        );
-        out.push(Effect::StorePut {
-            io,
-            key: layout::segment_key(vset_id, fence, seg),
-            bytes: blob,
-        });
-    }
-
-    /// Local read of a map leaf headed for the store.
-    pub(super) fn pub_leaf_read_done(
-        &mut self,
-        vset_id: VsetId,
-        fence: u64,
-        id: u64,
-        bytes: Option<Vec<u8>>,
-        out: &mut Vec<Effect>,
-    ) {
-        let Some(state) = self.vsets.get_mut(&vset_id) else {
-            return;
-        };
-        if state.publish.is_none() {
-            return;
-        }
-        // Verify before upload (R8.1 in both directions).
-        let intact = bytes
-            .as_deref()
-            .is_some_and(|b| crate::mapleaf::MapLeaf::decode(vset_id, fence, id, b).is_ok());
-        let Some(blob) = bytes.filter(|_| intact) else {
-            state.publish = None;
-            self.backup_backoff(vset_id, out);
-            return;
-        };
-        let io = self.io();
-        self.pending.insert(
-            io,
-            Pending::PubLeafPut {
-                vset: vset_id,
-                fence,
-                id,
-            },
-        );
-        out.push(Effect::StorePut {
-            io,
-            key: layout::leaf_key(vset_id, fence, id),
-            bytes: blob,
-        });
-    }
-
-    /// A store write of the publish pipeline completed.
-    #[allow(clippy::needless_pass_by_value)]
-    pub(super) fn pub_put_done(
-        &mut self,
-        pending: Pending,
-        result: Result<u64, StoreFault>,
-        out: &mut Vec<Effect>,
-    ) {
-        match pending {
-            Pending::PubSegPut { vset, fence, seg } => match result {
-                Ok(_) => {
-                    let Some(state) = self.vsets.get_mut(&vset) else {
-                        return;
-                    };
-                    state.backed_segs.insert((fence, seg));
-                    if let Some(publish) = &mut state.publish {
-                        publish.segs_todo.retain(|&k| k != (fence, seg));
-                    }
-                    self.publish_step(vset, out);
-                }
-                Err(_) => self.backup_fault(vset, out),
-            },
-            Pending::PubLeafPut { vset, fence, id } => match result {
-                Ok(_) => {
-                    let Some(state) = self.vsets.get_mut(&vset) else {
-                        return;
-                    };
-                    state.backed_leaves.insert((fence, id));
-                    if let Some(publish) = &mut state.publish {
-                        publish.leaves_todo.retain(|&k| k != (fence, id));
-                    }
-                    self.publish_step(vset, out);
-                }
-                Err(_) => self.backup_fault(vset, out),
-            },
-            Pending::PubManifestPut { vset, ptr } => match result {
-                Ok(_) => {
-                    let Some(state) = self.vsets.get_mut(&vset) else {
-                        return;
-                    };
-                    state.store_manifests.insert((ptr.fence, ptr.seq));
-                    let head = HeadRecord {
-                        vset,
-                        holder: self.config.host,
-                        fence: state.fence,
-                        manifest: Some(ptr),
-                        stash: state.stash_assignment,
-                        retired_stashes: state.retired_stashes.clone(),
-                    };
-                    let expected = state.head_version;
-                    let io = self.io();
-                    self.pending.insert(io, Pending::PubHeadCas { vset, ptr });
-                    out.push(Effect::StoreCas {
-                        io,
-                        key: layout::head_key(vset),
-                        expected,
-                        bytes: head.encode(),
-                    });
-                }
-                Err(_) => self.backup_fault(vset, out),
-            },
-            Pending::PubHeadCas { vset, ptr } => match result {
-                Ok(version) => {
-                    self.counters.manifests_published += 1;
-                    let Some(state) = self.vsets.get_mut(&vset) else {
-                        return;
-                    };
-                    state.head_version = Some(version);
-                    state.backed = Some(ptr);
-                    let published_sync = state
-                        .publish
-                        .as_ref()
-                        .map_or(0, |publish| publish.record.sync_covered_through);
-                    state.sync_ack_through = state.sync_ack_through.max(published_sync);
-                    state.publish = None;
-                    self.drain_sync_acks(vset, out);
-                    self.store_cleanup(vset, out);
-                    self.maybe_publish(vset, out);
-                    self.maybe_finish_backed_migration(vset, out);
-                }
-                Err(StoreFault::CasConflict { .. }) => {
-                    // Another holder claimed the head: structurally fenced
-                    // (R6.4) — nothing this host writes is reachable now.
-                    self.fence_vset(vset, out);
-                }
-                Err(StoreFault::Unavailable) => self.backup_fault(vset, out),
-            },
-            _ => out.push(Effect::Abort {
-                reason: "store put completion for non-put io",
-            }),
-        }
-    }
-
-    /// A store fault paused this vset's publish (R8.3): drop it and retry.
-    pub(super) fn backup_fault(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
-        if let Some(state) = self.vsets.get_mut(&vset_id) {
-            state.publish = None;
-        }
-        self.backup_backoff(vset_id, out);
-    }
-
     pub(super) fn backup_backoff(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
         self.counters.store_retries += 1;
         out.push(Effect::SetTimer {
@@ -323,30 +25,21 @@ impl Daemon {
         _mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
-        let Some(state) = self.vsets.get_mut(&vset_id) else {
+        let Some(state) = self.vsets.get(&vset_id) else {
             return;
         };
-        if state.config.durability.uses_store() && !state.ready && state.create_req.is_some() {
+        if !state.ready && state.create_req.is_some() {
             // Creation-time head claim still owed.
             self.head_create(vset_id, out);
             return;
         }
-        if state.config.durability.requires_peer_sync() {
-            self.maybe_peer_head_publish(vset_id, out);
-            self.replica_tick(vset_id, out);
-            return;
-        }
-        self.maybe_publish(vset_id, out);
+        self.maybe_peer_head_publish(vset_id, out);
+        self.replica_tick(vset_id, out);
     }
 
     /// Claim a brand-new head at vset creation (create-if-absent CAS).
     pub(super) fn head_create(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
-        let stash = self
-            .vsets
-            .get(&vset_id)
-            .is_some_and(|state| state.config.durability.requires_peer_sync())
-            .then(|| self.initial_stash_assignment(vset_id))
-            .flatten();
+        let stash = self.initial_stash_assignment(vset_id);
         if let Some(state) = self.vsets.get_mut(&vset_id) {
             state.stash_assignment = stash;
         }
@@ -386,7 +79,12 @@ impl Daemon {
                 self.counters.assignment_claims += 1;
                 state.fence = version;
                 state.head_version = Some(version);
-                if state.fork_from.is_some() {
+                let recovering_legacy = state.pending_verdict.is_some();
+                let forked = state.fork_from.is_some();
+                if recovering_legacy {
+                    self.finish_pending_recovery(vset_id, out);
+                }
+                if forked {
                     // Forked creation: materialize the base's map first.
                     self.fork_fetch_base(vset_id, out);
                 } else {
@@ -396,6 +94,20 @@ impl Daemon {
             }
             Err(StoreFault::CasConflict { .. }) => {
                 self.counters.assignment_claim_conflicts += 1;
+                if state.pending_verdict.is_some() && state.create_req.is_none() {
+                    // A legacy local-only vset may race another bootstrap of
+                    // its first durable head. Re-read authority instead of
+                    // deleting recoverable local state.
+                    state.head_refreshing = true;
+                    let io = self.io();
+                    self.pending
+                        .insert(io, super::Pending::HeadRefresh { vset: vset_id });
+                    out.push(Effect::StoreGet {
+                        io,
+                        key: crate::layout::head_key(vset_id),
+                    });
+                    return;
+                }
                 // The id is already claimed: creation fails loudly (ids are
                 // never reused, R6.5 — this is a control-plane defect).
                 let req = state.create_req.take();
@@ -434,9 +146,36 @@ impl Daemon {
                     .replica_placement
                     .as_ref()
                     .map(|placement| placement.membership_epoch);
-                if state.config.durability == DurabilityMode::PeerStashed
-                    && (expected_membership.is_none()
-                        || head.stash.map(|stash| stash.membership_epoch) != expected_membership)
+                if head.stash.is_none() {
+                    // Legacy local/backup heads predate passive assignment.
+                    // The current holder upgrades the head once, then opens
+                    // the recovered vset; all future syncs remain gated on a
+                    // newly seeded passive commit.
+                    if head.holder != self.config.host || expected_membership.is_none() {
+                        self.fence_vset(vset_id, out);
+                        return;
+                    }
+                    let Some(stash) = self.initial_stash_assignment(vset_id) else {
+                        self.fence_vset(vset_id, out);
+                        return;
+                    };
+                    let state = self.vsets.get_mut(&vset_id).expect("known vset");
+                    state.head_version = Some(version);
+                    state.backed = head.manifest;
+                    state.stash_assignment = Some(stash);
+                    state.retired_stashes.clear();
+                    state.replica_assignment_proposal = Some(super::ReplicaAssignmentProposal {
+                        assignment: stash,
+                        activation: None,
+                    });
+                    if let Some(ptr) = head.manifest {
+                        state.store_manifests.insert((ptr.fence, ptr.seq));
+                    }
+                    self.replica_head_write_step(vset_id, out);
+                    return;
+                }
+                if expected_membership.is_none()
+                    || head.stash.map(|stash| stash.membership_epoch) != expected_membership
                 {
                     // Differently configured hosts must not interpret the
                     // same assignment epoch differently.
@@ -454,11 +193,36 @@ impl Daemon {
                         .collect()
                 });
                 if head.holder == self.config.host {
-                    let assignment_changed = state.stash_assignment != head.stash;
+                    let proposal = state.replica_assignment_proposal;
+                    let proposal_published =
+                        proposal.is_some_and(|proposal| head.stash == Some(proposal.assignment));
+                    let provisional = proposal.is_some_and(|proposal| {
+                        state.stash_assignment == Some(proposal.assignment)
+                    });
+                    let head_assignment_epoch = head
+                        .stash
+                        .map_or(0, |assignment| assignment.assignment_epoch);
+                    let preserve_provisional = proposal.is_some_and(|proposal| {
+                        provisional
+                            && !proposal_published
+                            && head.fence == state.fence
+                            && head_assignment_epoch < proposal.assignment.assignment_epoch
+                    });
+                    let assignment_changed =
+                        !preserve_provisional && state.stash_assignment != head.stash;
                     state.head_version = Some(version);
                     state.backed = head.manifest;
-                    state.stash_assignment = head.stash;
-                    state.retired_stashes = head.retired_stashes;
+                    if proposal_published {
+                        state.replica_assignment_proposal = None;
+                    } else if !preserve_provisional {
+                        // A same-or-newer authoritative assignment supersedes
+                        // a proposal that was never installed locally.
+                        state.replica_assignment_proposal = None;
+                    }
+                    if !preserve_provisional {
+                        state.stash_assignment = head.stash;
+                        state.retired_stashes = head.retired_stashes;
+                    }
                     if assignment_changed {
                         // Reads and timers from the losing assignment CAS may
                         // still complete. Cancel their scoped send state so a
@@ -489,7 +253,7 @@ impl Daemon {
                                 .flatten()
                         })
                     });
-                    if let Some(verdict) = state.pending_verdict.take() {
+                    if state.pending_verdict.is_some() {
                         // Serve only if local truth is at least as new as
                         // the backup; journal damage can leave it behind, in
                         // which case the store copy is the truth (R3.8) —
@@ -502,19 +266,9 @@ impl Daemon {
                             self.fence_vset(vset_id, out);
                             return;
                         }
-                        state.ready = true;
-                        let resumed = matches!(verdict, crate::seam::Verdict::Resume { .. });
-                        out.push(Effect::Admin(crate::seam::AdminReply::VsetRecovered {
-                            vset: vset_id,
-                            verdict,
-                        }));
-                        if resumed {
-                            // Record what this resume touches as the next
-                            // restore's resume set (R6.2).
-                            self.start_resume_recording(vset_id, out);
-                        }
+                        self.finish_pending_recovery(vset_id, out);
                     }
-                    self.maybe_publish(vset_id, out);
+                    self.replica_head_write_step(vset_id, out);
                     self.maybe_replicate(vset_id, out);
                     self.maybe_peer_head_publish(vset_id, out);
                     if let Some(release) = releasable_active {
@@ -540,6 +294,26 @@ impl Daemon {
         }
     }
 
+    pub(super) fn finish_pending_recovery(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
+        let Some(state) = self.vsets.get_mut(&vset) else {
+            return;
+        };
+        let Some(verdict) = state.pending_verdict.take() else {
+            return;
+        };
+        state.ready = true;
+        let resumed = matches!(verdict, crate::seam::Verdict::Resume { .. });
+        out.push(Effect::Admin(crate::seam::AdminReply::VsetRecovered {
+            vset,
+            verdict,
+        }));
+        if resumed {
+            // Record what this resume touches as the next restore's resume
+            // set (R6.2).
+            self.start_resume_recording(vset, out);
+        }
+    }
+
     /// After a successful head advance, reclaim superseded store objects
     /// (R4.5: superseded state, explicit deletes, never by age).
     pub(super) fn store_cleanup(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
@@ -554,7 +328,10 @@ impl Daemon {
             .store_manifests
             .iter()
             .copied()
-            .filter(|&key| key != keep_manifest)
+            // A passive peer can finish later uploads before the source's
+            // earlier head CAS completes. Only reclaim manifests that the
+            // authoritative head has actually superseded.
+            .filter(|&key| key < keep_manifest)
             .collect();
         for key in dead_manifests {
             state.store_manifests.remove(&key);

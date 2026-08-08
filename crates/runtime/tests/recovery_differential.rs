@@ -14,11 +14,13 @@
 //! returns files in whatever order `read_dir` feels like, which makes
 //! order-insensitivity part of what a pass proves. Runs on any OS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
 use blockd_core::daemon::Daemon;
+use blockd_core::journal::JournalRecord;
+use blockd_core::layout::{self, BlobName};
 use blockd_core::seam::{Effect, Verdict};
 use blockd_core::types::VsetId;
 use blockd_runtime::scan_blob_dir;
@@ -100,14 +102,29 @@ fn disk_scans_recover_exactly_like_the_simulated_scan() {
             sim_side, rev_side,
             "seed {seed}: recovery depends on scan order"
         );
-        nontrivial += sim_side
-            .0
-            .values()
-            .filter(|v| !matches!(v, Verdict::Unrestorable))
-            .count() as u64;
+        // Backed recovery now defers its verdict until the fenced head read,
+        // which this scan-only differential deliberately does not drive.
+        // Keep the non-vacuity guard on the durable inputs instead: each
+        // counted vset has at least one intact journal candidate that both
+        // scan paths fed into the same deferred recovery state.
+        let recoverable: BTreeSet<_> = blobs
+            .iter()
+            .filter_map(|(name, bytes)| match layout::parse_blob(name) {
+                Some(BlobName::Journal { vset, .. })
+                    if JournalRecord::decode(vset, bytes).is_ok() =>
+                {
+                    Some(vset)
+                }
+                _ => None,
+            })
+            .collect();
+        nontrivial += recoverable.len() as u64;
         fs::remove_dir_all(&root).expect("cleanup");
     }
     // The equality above must have been about something: across the seeds,
     // real vsets recovered to real verdicts.
-    assert!(nontrivial >= 3, "only {nontrivial} restorable vsets seen");
+    assert!(
+        nontrivial >= 3,
+        "only {nontrivial} recoverable journal sets seen"
+    );
 }

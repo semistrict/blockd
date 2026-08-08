@@ -908,6 +908,7 @@ impl Daemon {
         mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
+        let bytes = bytes.or_else(|| self.replica_segment_range(vset, loc));
         if let Some(raw) = Self::verify_entry(page, generation, bytes) {
             self.database_page_fetched(vset, page, raw, mem, out);
             return;
@@ -1002,11 +1003,7 @@ impl Daemon {
         mem: &dyn HostMap,
         out: &mut Vec<Effect>,
     ) {
-        if self
-            .vsets
-            .get(&vset)
-            .is_some_and(|state| state.config.durability.uses_store())
-        {
+        if self.vsets.contains_key(&vset) {
             let io = self.io();
             self.pending.insert(
                 io,

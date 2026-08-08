@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "single-host-base",
-  "description": "One host with local durability and no injected faults.",
+  "description": "One active host with passive-replica durability and no injected faults.",
   "kind": "single-host",
   "daemon": {
     "cache_pages": 256,
@@ -25,11 +25,8 @@
   "topology": {
     "hosts": null,
     "vset_count": 3,
-    "backed_vsets": 0,
-    "nonbacked_vsets": null,
     "disk_volumes": 2,
     "pages_per_volume": 16,
-    "durability": "local",
     "replica_placement": null
   },
   "workload": {

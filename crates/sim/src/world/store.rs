@@ -10,10 +10,15 @@
 //! Operations linearize at submission; the returned time is when the harness
 //! should deliver the outcome.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use blockd_core::head::HeadRecord;
+use blockd_core::journal::JournalRecord;
+use blockd_core::layout;
+use blockd_core::mapleaf::MapLeaf;
 use blockd_core::types::SimTime;
+use blockd_core::types::{Gen, PageId, VolumeId, VsetId, page_size};
 
 use crate::rng::Pcg64;
 
@@ -62,22 +67,72 @@ pub enum StoreError {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PutCounters {
+    pub attempts: u64,
+    pub successes: u64,
+    pub attempted_bytes: u64,
+    pub successful_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum StoreObjectKind {
+    Head = 0,
+    Manifest = 1,
+    Segment = 2,
+    Leaf = 3,
+    ResumeSet = 4,
+    Base = 5,
+    Other = 6,
+}
+
+impl StoreObjectKind {
+    pub const COUNT: usize = 7;
+}
+
+/// Successful object sizes in the upper-bound buckets
+/// 4 KiB, 64 KiB, 1 MiB, 8 MiB, 32 MiB, 64 MiB, and oversized.
+pub const OBJECT_SIZE_BUCKETS: usize = 7;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreCounters {
     pub gets: u64,
+    /// Successful unconditional and conditional writes retained for older
+    /// reports. The detailed attempt/success split below is authoritative.
     pub puts: u64,
     pub deletes: u64,
+    pub put_attempts: u64,
+    pub put_successes: u64,
+    pub cas_attempts: u64,
+    pub cas_successes: u64,
     pub cas_conflicts: u64,
     pub unavailable: u64,
     pub too_large: u64,
     pub bytes_put: u64,
+    /// Bytes belonging to a key+payload combination that succeeded for the
+    /// first time during this store lifetime.
+    pub unique_bytes: u64,
+    /// Bytes in attempts whose exact key+payload combination had already
+    /// succeeded. This includes successful idempotent retries and retries
+    /// that encounter a later outage.
+    pub retry_bytes: u64,
     pub bytes_got: u64,
     pub bitflips: u64,
+    pub puts_by_kind: [PutCounters; StoreObjectKind::COUNT],
+    pub object_size_histogram: [u64; OBJECT_SIZE_BUCKETS],
+    /// Raw logical page bytes whose generation changed between successive
+    /// successfully published archive heads. This is the explicit baseline
+    /// used by hot-working-set amplification tests.
+    pub logical_changed_bytes: u64,
 }
 
 pub struct ObjectStore {
     config: StoreConfig,
     objects: BTreeMap<String, (Version, SimTime, Vec<u8>)>,
     out: bool,
+    attempted_payloads: BTreeSet<(String, usize, u32)>,
+    seen_payloads: BTreeSet<(String, usize, u32)>,
+    archived_generations: BTreeMap<VsetId, BTreeMap<PageId, Gen>>,
     pub counters: StoreCounters,
 }
 
@@ -87,8 +142,144 @@ impl ObjectStore {
             config,
             objects: BTreeMap::new(),
             out: false,
+            attempted_payloads: BTreeSet::new(),
+            seen_payloads: BTreeSet::new(),
+            archived_generations: BTreeMap::new(),
             counters: StoreCounters::default(),
         }
+    }
+
+    fn object_kind(key: &str) -> StoreObjectKind {
+        if key.ends_with("/head") {
+            StoreObjectKind::Head
+        } else if key.contains("/m/") {
+            StoreObjectKind::Manifest
+        } else if key.starts_with("b/") {
+            StoreObjectKind::Base
+        } else if key.ends_with("/rs") {
+            StoreObjectKind::ResumeSet
+        } else if key.contains("/s/") {
+            StoreObjectKind::Segment
+        } else if key.contains("/l/") || key.contains("/lb/") {
+            StoreObjectKind::Leaf
+        } else {
+            StoreObjectKind::Other
+        }
+    }
+
+    fn write_attempt(&mut self, key: &str, bytes: &[u8], cas: bool) -> StoreObjectKind {
+        let kind = Self::object_kind(key);
+        self.counters.put_attempts += 1;
+        self.counters.puts_by_kind[kind as usize].attempts += 1;
+        self.counters.puts_by_kind[kind as usize].attempted_bytes += bytes.len() as u64;
+        if cas {
+            self.counters.cas_attempts += 1;
+        }
+        let identity = (
+            key.to_owned(),
+            bytes.len(),
+            blockd_core::format::crc32c(bytes),
+        );
+        if !self.attempted_payloads.insert(identity) {
+            self.counters.retry_bytes += bytes.len() as u64;
+        }
+        kind
+    }
+
+    fn write_success(&mut self, key: &str, bytes: &[u8], kind: StoreObjectKind, cas: bool) {
+        self.counters.puts += 1;
+        self.counters.put_successes += 1;
+        self.counters.bytes_put += bytes.len() as u64;
+        self.counters.puts_by_kind[kind as usize].successes += 1;
+        self.counters.puts_by_kind[kind as usize].successful_bytes += bytes.len() as u64;
+        if cas {
+            self.counters.cas_successes += 1;
+        }
+        let identity = (
+            key.to_owned(),
+            bytes.len(),
+            blockd_core::format::crc32c(bytes),
+        );
+        if self.seen_payloads.insert(identity) {
+            self.counters.unique_bytes += bytes.len() as u64;
+        }
+        let bucket = match bytes.len() {
+            0..=4096 => 0,
+            4097..=65_536 => 1,
+            65_537..=1_048_576 => 2,
+            1_048_577..=8_388_608 => 3,
+            8_388_609..=33_554_432 => 4,
+            33_554_433..=67_108_864 => 5,
+            _ => 6,
+        };
+        self.counters.object_size_histogram[bucket] += 1;
+    }
+
+    fn observe_archive_head(&mut self, key: &str, bytes: &[u8]) {
+        let Some(encoded_vset) = key
+            .strip_prefix("v/")
+            .and_then(|rest| rest.split('/').next())
+        else {
+            return;
+        };
+        let Ok(raw_vset) = u64::from_str_radix(encoded_vset, 16) else {
+            return;
+        };
+        let vset = VsetId(raw_vset);
+        let Ok(head) = HeadRecord::decode(vset, bytes) else {
+            return;
+        };
+        let Some(ptr) = head.manifest else {
+            return;
+        };
+        let Some((_, _, record_bytes)) = self
+            .objects
+            .get(&layout::manifest_key(vset, ptr.fence, ptr.seq))
+        else {
+            return;
+        };
+        let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
+            return;
+        };
+        let mut current = BTreeMap::new();
+        for leaf_ptr in record.leaves.values() {
+            let (owner, leaf_key) = if leaf_ptr.base == 0 {
+                (vset, layout::leaf_key(vset, leaf_ptr.fence, leaf_ptr.id))
+            } else {
+                (
+                    VsetId(leaf_ptr.base),
+                    layout::base_leaf_key(leaf_ptr.base, leaf_ptr.fence, leaf_ptr.id),
+                )
+            };
+            let Some((_, _, leaf_bytes)) = self.objects.get(&leaf_key) else {
+                continue;
+            };
+            let Ok(leaf) = MapLeaf::decode(owner, leaf_ptr.fence, leaf_ptr.id, leaf_bytes) else {
+                continue;
+            };
+            for (idx, page, generation, _) in leaf.entries {
+                current.insert(
+                    PageId {
+                        volume: VolumeId { vset, idx },
+                        page,
+                    },
+                    generation,
+                );
+            }
+        }
+        current.extend(
+            record
+                .overlay
+                .iter()
+                .map(|(&page, &(generation, _))| (page, generation)),
+        );
+        let previous = self.archived_generations.entry(vset).or_default();
+        let changed = current
+            .iter()
+            .filter(|(page, generation)| previous.get(page) != Some(generation))
+            .count() as u64;
+        self.counters.logical_changed_bytes += changed * page_size() as u64;
+        *previous = current;
     }
 
     fn latency(&self, now: SimTime, rng: &mut Pcg64, bytes: usize) -> SimTime {
@@ -137,6 +328,7 @@ impl ObjectStore {
         bytes: Vec<u8>,
     ) -> (SimTime, Result<Version, StoreError>) {
         let at = self.latency(now, rng, bytes.len());
+        let kind = self.write_attempt(key, &bytes, true);
         if self.out {
             self.counters.unavailable += 1;
             return (at, Err(StoreError::Unavailable));
@@ -151,8 +343,10 @@ impl ObjectStore {
             return (at, Err(StoreError::CasConflict { actual }));
         }
         let next = Version(actual.map_or(1, |v| v.0 + 1));
-        self.counters.puts += 1;
-        self.counters.bytes_put += bytes.len() as u64;
+        self.write_success(key, &bytes, kind, true);
+        if kind == StoreObjectKind::Head {
+            self.observe_archive_head(key, &bytes);
+        }
         self.objects.insert(key.to_owned(), (next, now, bytes));
         (at, Ok(next))
     }
@@ -166,6 +360,7 @@ impl ObjectStore {
         bytes: Vec<u8>,
     ) -> (SimTime, Result<Version, StoreError>) {
         let at = self.latency(now, rng, bytes.len());
+        let kind = self.write_attempt(key, &bytes, false);
         if self.out {
             self.counters.unavailable += 1;
             return (at, Err(StoreError::Unavailable));
@@ -175,8 +370,7 @@ impl ObjectStore {
             return (at, Err(StoreError::TooLarge));
         }
         let next = Version(self.objects.get(key).map_or(1, |(v, _, _)| v.0 + 1));
-        self.counters.puts += 1;
-        self.counters.bytes_put += bytes.len() as u64;
+        self.write_success(key, &bytes, kind, false);
         self.objects.insert(key.to_owned(), (next, now, bytes));
         (at, Ok(next))
     }
@@ -286,6 +480,13 @@ impl ObjectStore {
         self.objects.get(key).map(|(_, _, b)| b.as_slice())
     }
 
+    /// Non-mutating versioned peek for control-plane recovery simulation.
+    pub fn peek_versioned(&self, key: &str) -> Option<(Version, &[u8])> {
+        self.objects
+            .get(key)
+            .map(|(version, _, bytes)| (*version, bytes.as_slice()))
+    }
+
     /// Full listing with last-write times and bytes: the GC process's view
     /// of the bucket (LIST + GET, R9.3).
     pub fn snapshot(&self) -> Vec<(String, SimTime, Vec<u8>)> {
@@ -384,6 +585,43 @@ mod tests {
         assert_eq!(put, Ok(Version(1)));
         let (_, got) = store.get(T0, &mut rng, "v/1/head");
         assert_eq!(got, Ok(Some((Version(1), b"h1".to_vec()))));
+    }
+
+    #[test]
+    fn writes_are_accounted_by_kind_outcome_identity_and_size() {
+        let mut store = ObjectStore::new(StoreConfig::s3());
+        let mut rng = rng();
+        let manifest = "v/0000000000000001/m/0000000000000001-0000000000000001";
+        let bytes = vec![7; 5000];
+
+        store.set_outage(true);
+        let (_, unavailable) = store.put(T0, &mut rng, manifest, bytes.clone());
+        assert_eq!(unavailable, Err(StoreError::Unavailable));
+        store.set_outage(false);
+        let (_, first) = store.put(T0, &mut rng, manifest, bytes.clone());
+        let (_, retry) = store.put(T0, &mut rng, manifest, bytes.clone());
+        assert!(first.is_ok() && retry.is_ok());
+
+        let head = "v/0000000000000001/head";
+        let (_, created) = store.put_cas(T0, &mut rng, head, None, b"head".to_vec());
+        let (_, conflict) = store.put_cas(T0, &mut rng, head, None, b"other".to_vec());
+        assert!(created.is_ok());
+        assert!(matches!(conflict, Err(StoreError::CasConflict { .. })));
+
+        let manifest_counts = store.counters.puts_by_kind[StoreObjectKind::Manifest as usize];
+        assert_eq!(manifest_counts.attempts, 3);
+        assert_eq!(manifest_counts.successes, 2);
+        assert_eq!(manifest_counts.attempted_bytes, 15_000);
+        assert_eq!(manifest_counts.successful_bytes, 10_000);
+        assert_eq!(store.counters.put_attempts, 5);
+        assert_eq!(store.counters.put_successes, 3);
+        assert_eq!(store.counters.cas_attempts, 2);
+        assert_eq!(store.counters.cas_successes, 1);
+        assert_eq!(store.counters.cas_conflicts, 1);
+        assert_eq!(store.counters.unique_bytes, 5004);
+        assert_eq!(store.counters.retry_bytes, 10_000);
+        assert_eq!(store.counters.object_size_histogram[0], 1);
+        assert_eq!(store.counters.object_size_histogram[1], 2);
     }
 
     #[test]

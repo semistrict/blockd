@@ -313,12 +313,8 @@ async fn base(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "baked": true, "sum": sum })))
 }
 
-async fn start_vm(
-    State(state): State<ApiState>,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> ApiResult<Json<Value>> {
-    let backed = arg(&query, "backed", 0) == 1;
-    let id = run_blocking(&state, move |daemon| daemon.start_vm(backed)).await?;
+async fn start_vm(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
+    let id = run_blocking(&state, move |daemon| daemon.start_vm()).await?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -408,7 +404,7 @@ async fn fallback(method: axum::http::Method, uri: Uri) -> ApiError {
 fn metrics_text(state: &Arc<Demod>) -> String {
     let mut vms = BTreeMap::new();
     for vm in state.vms.lock().expect("lock").values() {
-        *vms.entry((vm.state.clone(), vm.backed)).or_insert(0) += 1;
+        *vms.entry(vm.state.clone()).or_insert(0) += 1;
     }
     let store = &state.store.stats;
     let loop_stats = state.rt.loop_stats();
@@ -451,9 +447,9 @@ fn metrics_text(state: &Arc<Demod>) -> String {
         store_latency: store.latency(),
         firecracker_fault_latency: state.firecracker_fault_latency(),
         blob_filesystem_space: state.rt.blob_filesystem_space(),
-        backup_lag_age: state
+        archive_lag_age: state
             .rt
-            .backup_lag_age()
+            .archive_lag_age()
             .into_iter()
             .map(|(vset, age)| (vset.0, age.as_secs_f64()))
             .collect(),
@@ -477,7 +473,6 @@ fn status_value(state: &Arc<Demod>) -> Value {
             json!({
                 "id": id,
                 "state": vm.state,
-                "backed": vm.backed,
                 "prefix": vm.prefix,
             })
         })

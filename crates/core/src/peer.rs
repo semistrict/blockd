@@ -72,6 +72,7 @@ pub fn encode_peer_version(
                     | PeerMsg::ReplicaStatus { .. }
                     | PeerMsg::ReplicaStatusReply { .. }
                     | PeerMsg::ReplicaUploadDone { .. }
+                    | PeerMsg::ReplicaArchive { .. }
                     | PeerMsg::ReplicaRelease { .. }
                     | PeerMsg::ReplicaReleaseAck { .. }
             ))
@@ -223,11 +224,24 @@ pub fn encode_peer_version(
             vset,
             assignment_epoch,
             info,
+            record,
         } => {
             e.u8(14);
             e.u64(vset.0);
             e.u64(*assignment_epoch);
             encode_commit_info(&mut e, *info);
+            e.u32(u32::try_from(record.len()).expect("replica record fits u32"));
+            e.bytes(record);
+        }
+        PeerMsg::ReplicaArchive {
+            vset,
+            assignment_epoch,
+            through,
+        } => {
+            e.u8(17);
+            e.u64(vset.0);
+            e.u64(*assignment_epoch);
+            encode_commit_info(&mut e, *through);
         }
         PeerMsg::ReplicaRelease {
             vset,
@@ -371,6 +385,10 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             info: decode_commit_info(&mut d)?,
+            record: {
+                let len = usize::try_from(d.u32()?).expect("u32 fits usize");
+                d.bytes(len)?.to_vec()
+            },
         },
         15 if version == 2 => PeerMsg::ReplicaRelease {
             vset: VsetId(d.u64()?),
@@ -378,6 +396,11 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             through: decode_commit_info(&mut d)?,
         },
         16 if version == 2 => PeerMsg::ReplicaReleaseAck {
+            vset: VsetId(d.u64()?),
+            assignment_epoch: d.u64()?,
+            through: decode_commit_info(&mut d)?,
+        },
+        17 if version == 2 => PeerMsg::ReplicaArchive {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
@@ -489,6 +512,12 @@ mod tests {
                 vset: VsetId(7),
                 assignment_epoch: 3,
                 info,
+                record: vec![0xD4; 19],
+            },
+            PeerMsg::ReplicaArchive {
+                vset: VsetId(7),
+                assignment_epoch: 3,
+                through: info,
             },
             PeerMsg::ReplicaRelease {
                 vset: VsetId(7),
@@ -540,8 +569,8 @@ mod tests {
             .iter()
             .flat_map(|msg| encode_peer(HostId(2), msg))
             .collect();
-        assert_eq!(bytes.len(), 1745);
-        assert_eq!(crc32c(&bytes), 0x7FE0_7441);
+        assert_eq!(bytes.len(), 1825);
+        assert_eq!(crc32c(&bytes), 0xA252_ACC1);
     }
 
     #[test]

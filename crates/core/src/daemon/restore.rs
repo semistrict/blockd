@@ -120,13 +120,17 @@ impl Daemon {
             fail(out);
             return;
         };
+        let Some(stash) = self.initial_stash_assignment(vset) else {
+            fail(out);
+            return;
+        };
         let claim = HeadRecord {
             vset,
             holder: self.config.host,
             // Informational; the authoritative fence is the CAS version.
             fence: 0,
             manifest: Some(ptr),
-            stash: head.stash,
+            stash: Some(stash),
             retired_stashes: head.retired_stashes,
         };
         let io = self.io();
@@ -277,6 +281,7 @@ impl Daemon {
         state.store_manifests.insert((ptr.fence, ptr.seq));
         state.head_version = Some(fence);
         state.adopt_record(chosen);
+        state.stash_assignment = self.initial_stash_assignment(vset);
         self.vsets.insert(vset, state);
         out.push(Effect::Admin(AdminReply::VsetRestored {
             req,
@@ -448,8 +453,7 @@ impl Daemon {
             .collect();
         // Own-namespace leaves fetched from the store are, by definition,
         // already backed — as are the segments they reference.
-        let backed =
-            state.config.durability.uses_store() && state.peer_source.is_none() && ptr.base == 0;
+        let backed = state.peer_source.is_none() && ptr.base == 0;
         if backed {
             state.backed_leaves.insert((ptr.fence, ptr.id));
             state.backed_segs.extend(segs.iter().copied());
@@ -513,9 +517,8 @@ impl Daemon {
         let Some(pages) = state.resume_recording.take() else {
             return;
         };
-        // R4.4: only backed-up vsets may write objects; and a fenced or
-        // outbound vset has no business publishing anything.
-        if !state.config.durability.uses_store() || !state.ready || state.outbound.is_some() {
+        // A fenced or outbound vset has no business publishing anything.
+        if !state.ready || state.outbound.is_some() {
             return;
         }
         let bytes = encode_resume_set(vset, &pages);

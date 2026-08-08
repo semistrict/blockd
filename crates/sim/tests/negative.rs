@@ -3,7 +3,7 @@
 //! these fail red — an oracle that misses planted misbehavior would pass
 //! every honest run vacuously.
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::daemon::{ArchivePolicy, DaemonConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{HostId, millis, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, Sabotage, run};
@@ -11,9 +11,32 @@ use blockd_sim::world::blobdev::BlobDevConfig;
 use blockd_sim::world::store::StoreConfig;
 
 fn base_config() -> HarnessConfig {
-    let mut config = blockd_sim::presets::single_host_base();
-    config.vset_count = 2;
-    config
+    HarnessConfig {
+        daemon: DaemonConfig {
+            archive: ArchivePolicy::default(),
+            host: HostId(0),
+            cache_pages: 256,
+            writeback_interval: millis(20),
+            backup_retry: millis(200),
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 25,
+            replica_placement: None,
+        },
+        bdev: BlobDevConfig::nvme(),
+        store: StoreConfig::s3(),
+        vset_count: 2,
+        vset_config: VsetConfig::compute(2, 16),
+        horizon: secs(2),
+        think: (millis(1), millis(5)),
+        checkpoint_interval: None,
+        faults: FaultPlan::none(),
+        sabotage: None,
+        guest_sync_share: None,
+        guest_hot_pages: None,
+        rot_records_at: vec![],
+        crash_at: vec![],
+    }
 }
 
 #[test]
@@ -58,19 +81,17 @@ fn oracle_catches_dropped_write_protection() {
     );
 }
 
-/// The two-sided handoff is not vacuous either: a source that ACTS on a
-/// handoff durability it does not have (the marker write acked but never
-/// persisted) recovers its vset RUNNABLE after a crash — while the
-/// destination is already running it. The harness's ground-truth
-/// two-runners check must catch the double-run R7.2 forbids.
+/// The fenced head is an independent exclusion boundary: even if the local
+/// handoff marker lies about durability, a crashed source may not recover as
+/// a second runner after the destination claims ownership.
 #[test]
-fn oracle_catches_a_source_that_skips_the_durable_handoff() {
+fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
     let config = blockd_sim::cluster::ClusterConfig {
         hosts: 2,
         vset_count: 1,
-        vset_config: VsetConfig::compute(2, 16, false),
-        nonbacked_vsets: 0,
+        vset_config: VsetConfig::compute(2, 16),
         daemon: DaemonConfig {
+            archive: ArchivePolicy::default(),
             host: HostId(0),
             cache_pages: 128,
             writeback_interval: millis(20),
@@ -86,7 +107,7 @@ fn oracle_catches_a_source_that_skips_the_durable_handoff() {
         think: (millis(1), millis(5)),
         checkpoint_interval: Some(millis(300)),
         kill_hosts_at: vec![],
-        crash_hosts_at: vec![(millis(1510), 0)],
+        crash_hosts_at: vec![(millis(1575), 0)],
         restart_delay: (millis(50), millis(200)),
         crash_mean_interval: 0,
         migrate_mean_interval: 0,
@@ -104,12 +125,9 @@ fn oracle_catches_a_source_that_skips_the_durable_handoff() {
         guest_sync_share: None,
     };
     let report = blockd_sim::cluster::run(7, config);
-    // The migration itself completed — that is what makes the sabotage
-    // dangerous rather than merely broken.
+    // The migration completed and the source crashed in the old danger
+    // window, but the head fence still excludes its stale local recovery.
     assert_eq!(report.migrations, 1);
-    assert!(
-        report.violations.iter().any(|v| v.contains("two runners")),
-        "the double-run went uncaught: {:?}",
-        report.violations
-    );
+    assert_eq!(report.violations, Vec::<String>::new());
+    assert_eq!(report.guest_deaths, 0);
 }

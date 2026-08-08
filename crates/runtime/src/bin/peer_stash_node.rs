@@ -21,7 +21,7 @@ mod linux {
 
     use base64::Engine;
     use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
-    use blockd_core::journal::{DurabilityMode, VsetConfig};
+    use blockd_core::journal::VsetConfig;
     use blockd_core::placement::PeerCandidate;
     use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
     use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, PeerTlsConfig, Runtime, RuntimeConfig};
@@ -33,7 +33,6 @@ mod linux {
         kind: blockd_core::journal::VsetKind::Compute,
         disk_volumes: 1,
         pages_per_volume: 64,
-        durability: DurabilityMode::PeerStashed,
     };
 
     #[derive(Clone)]
@@ -158,6 +157,7 @@ mod linux {
             .collect();
         RuntimeConfig {
             daemon: DaemonConfig {
+                archive: Default::default(),
                 host: config.host,
                 cache_pages: 256,
                 writeback_interval: millis(5),

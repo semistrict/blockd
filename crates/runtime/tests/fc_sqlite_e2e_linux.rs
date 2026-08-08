@@ -79,6 +79,7 @@ fn artifacts() -> Artifacts {
 fn runtime_config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
         daemon: DaemonConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 64,
             writeback_interval: millis(5),
@@ -130,7 +131,7 @@ fn sqlite_inside_firecracker_survives_detach_daemon_restart_and_new_vm() {
     let config = runtime_config(&artifacts.scratch);
     let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
     let vset = VsetId(51);
-    let database_config = VsetConfig::database(512, false);
+    let database_config = VsetConfig::database(512);
 
     let runtime = Arc::new(Runtime::new(&config, store.clone()));
     runtime.create_vset(vset, database_config);

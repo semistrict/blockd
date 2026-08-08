@@ -50,7 +50,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 fn vset_config() -> VsetConfig {
-    VsetConfig::compute(1, PAGES_PER_VOLUME, false)
+    VsetConfig::compute(1, PAGES_PER_VOLUME)
 }
 
 struct Lcg(u64);
@@ -82,6 +82,7 @@ struct PhaseResult {
 fn run_phase(noisy: usize) -> PhaseResult {
     let config = RuntimeConfig {
         daemon: DaemonConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 1 << 20, // no eviction pressure: isolate loop contention
             writeback_interval: millis(5),

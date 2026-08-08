@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::cache::Cache;
 use crate::head::ManifestPtr;
-use crate::journal::{DatabaseMeta, DurabilityMode, JournalRecord, VsetConfig};
+use crate::journal::{DatabaseMeta, JournalRecord, VsetConfig};
 use crate::layout;
 use crate::mapleaf::LeafPtr;
 use crate::placement::{PeerCandidate, rank_stash_candidates};
@@ -55,6 +55,11 @@ use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
+    /// Cadence, batching, and capacity reserve for moving peer-committed
+    /// history into the catastrophic-failure archive. Archive age is
+    /// unbounded and never changes the fsync frontier: that is always the
+    /// passive peer commit.
+    pub archive: ArchivePolicy,
     /// This daemon's host identity (from the control plane roster, R6.5).
     pub host: HostId,
     /// Host cache capacity in pages (memory overcommit is real: the sum of
@@ -77,8 +82,33 @@ pub struct DaemonConfig {
     /// 0 disables the watch.
     pub wedge_ticks: u64,
     /// Versioned authenticated roster used only to choose one passive stash.
-    /// `None` keeps peer-stashed creation disabled on this host.
+    /// `None` means this host cannot create vsets because no passive can be placed.
     pub replica_placement: Option<ReplicaPlacementConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchivePolicy {
+    /// Healthy-store delay before the passive starts an archive cycle.
+    pub interval: u64,
+    /// Start early once unpublished recovery material reaches this size.
+    pub max_unpublished_bytes: u64,
+    /// Host-wide passive-spool capacity and the soft reserve at which archival
+    /// becomes urgent. Writes beyond capacity are rejected rather than
+    /// acknowledged under a weaker contract; an in-flight closure may consume
+    /// the reserve until the hard capacity is actually exhausted.
+    pub spool_capacity_bytes: u64,
+    pub spool_headroom_bytes: u64,
+}
+
+impl Default for ArchivePolicy {
+    fn default() -> Self {
+        Self {
+            interval: crate::types::secs(10),
+            max_unpublished_bytes: 32 * 1024 * 1024,
+            spool_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            spool_headroom_bytes: 256 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +221,16 @@ pub struct Counters {
     /// New spool generations opened because the prior generation reached
     /// its size bound.
     pub replica_rotations: u64,
+    /// Archive cycles begun by cadence/threshold/pressure after coalescing
+    /// peer commits to one immutable cut.
+    pub archive_cycles: u64,
+    /// Intermediate committed cuts replaced before an archive cycle began.
+    pub archive_commits_coalesced: u64,
+    /// New replica work withheld because host-wide passive-spool hard capacity
+    /// was exhausted. Soft headroom triggers urgent archival but remains
+    /// available to finish in-flight closures. Archive age is never an
+    /// admission limit. No withheld operation is acknowledged.
+    pub replica_capacity_backpressure: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,10 +255,11 @@ pub struct ReplicaSpoolMetrics {
     pub vset: VsetId,
     pub assignment_epoch: u64,
     pub stored_bytes: u64,
-    pub source_capacity_bytes: u64,
+    pub host_capacity_bytes: u64,
     pub current_generation: u64,
     pub committed_through: u64,
     pub uploaded_through: u64,
+    pub unarchived_age_ns: u64,
 }
 
 /// One live vset's current operational state. This is deliberately a
@@ -227,7 +268,6 @@ pub struct ReplicaSpoolMetrics {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VsetStats {
     pub vset: VsetId,
-    pub backed_up: bool,
     pub role: VsetRole,
     pub fence: u64,
     pub dirty_pages: usize,
@@ -236,8 +276,8 @@ pub struct VsetStats {
     pub pending_syncs: usize,
     pub pending_leaf_spans: usize,
     pub hydration_remaining_pages: usize,
-    pub backup_lag_captures: Option<u64>,
-    pub backup_lag_bytes: Option<u64>,
+    pub archive_lag_captures: Option<u64>,
+    pub archive_lag_bytes: Option<u64>,
     pub operations: VsetOperations,
     pub live_segment_bytes: u64,
     pub local_segment_bytes: u64,
@@ -316,8 +356,8 @@ struct Capture {
     /// The watermark this capture's record carries; fixed when the record
     /// write is issued.
     sync_covered_through: u64,
-    /// The exact record written for this capture (kept for backup: the
-    /// manifest is these bytes, verbatim).
+    /// The exact record written for this capture and committed to the
+    /// passive. The archive may derive a location-rewritten manifest from it.
     record: Option<JournalRecord>,
 }
 
@@ -359,6 +399,20 @@ enum Pending {
         info: crate::seam::ReplicaCommitInfo,
         record_checksum: u32,
         frame_len: u64,
+    },
+    ReplicaCompactAppend {
+        key: ReplicaKey,
+        old_through_generation: u64,
+        new_generation: u64,
+        reclaim_bytes: u64,
+        rewritten_bytes: u64,
+        retained: BTreeSet<crate::seam::ReplicaArtifact>,
+    },
+    ReplicaCompactDelete {
+        key: ReplicaKey,
+    },
+    ReplicaSupersededDelete {
+        key: ReplicaKey,
     },
     ReplicaUploadArtifact {
         key: ReplicaKey,
@@ -458,44 +512,10 @@ enum Pending {
         generation: Gen,
         loc: PageLoc,
     },
-    /// Backup pipeline: local read of a segment on its way to the store.
-    PubSegRead {
-        vset: VsetId,
-        fence: u64,
-        seg: SegId,
-    },
-    /// Backup pipeline: segment object write.
-    PubSegPut {
-        vset: VsetId,
-        fence: u64,
-        seg: SegId,
-    },
-    /// Backup pipeline: local read of a map leaf on its way to the store.
-    PubLeafRead {
-        vset: VsetId,
-        fence: u64,
-        id: u64,
-    },
-    /// Backup pipeline: leaf object write.
-    PubLeafPut {
-        vset: VsetId,
-        fence: u64,
-        id: u64,
-    },
     /// Passive-replica sender: local immutable artifact read.
     ReplicaSourceRead {
         vset: VsetId,
         artifact: crate::seam::ReplicaArtifact,
-    },
-    /// Backup pipeline: manifest object write.
-    PubManifestPut {
-        vset: VsetId,
-        ptr: ManifestPtr,
-    },
-    /// Backup pipeline: head CAS advancing the manifest pointer.
-    PubHeadCas {
-        vset: VsetId,
-        ptr: ManifestPtr,
     },
     /// Head creation CAS at vset creation (backed-up vsets).
     HeadCreate {
@@ -716,9 +736,8 @@ struct Vset {
     store_fill_retry: Vec<(PageId, bool, Gen, crate::segment::PageLoc)>,
     /// Highest sync barrier covered by a durable record's watermark (R3.8).
     local_covered_through: u64,
-    /// Highest barrier whose configured durability domain is proven. For
-    /// ordinary modes this follows local coverage; peer-stashed mode advances
-    /// only from a peer commit or a covering S3 publication.
+    /// Highest barrier whose protected durability domain is proven. It
+    /// advances only from a passive commit or a covering archive publication.
     sync_ack_through: u64,
     next_gen: u64,
     next_seq: u64,
@@ -742,20 +761,16 @@ struct Vset {
     backed: Option<ManifestPtr>,
     backed_segs: BTreeSet<(u64, SegId)>,
     store_manifests: BTreeSet<(u64, JournalSeq)>,
-    publish: Option<Publish>,
     /// Artifacts already acknowledged by the current passive peer. Volatile:
     /// after restart, identical puts are safely re-acknowledged by the peer.
     peer_artifacts: BTreeSet<crate::seam::ReplicaArtifact>,
     peer_committed: Option<crate::seam::ReplicaCommitInfo>,
     peer_committed_record: Option<JournalRecord>,
     store_published_through: u64,
-    peer_upload_done: Option<(u64, crate::seam::ReplicaCommitInfo)>,
+    peer_upload_done: Option<(u64, crate::seam::ReplicaCommitInfo, JournalRecord)>,
     replica_head_inflight: bool,
     replica_assignment_inflight: bool,
-    replica_assignment_proposal: Option<(
-        crate::head::StashAssignment,
-        Option<crate::seam::ReplicaCommitInfo>,
-    )>,
+    replica_assignment_proposal: Option<ReplicaAssignmentProposal>,
     replica_send: Option<ReplicaSend>,
     replica_release: Option<(HostId, u64, crate::seam::ReplicaCommitInfo)>,
     replica_release_queue: VecDeque<(HostId, u64, crate::seam::ReplicaCommitInfo)>,
@@ -799,14 +814,18 @@ struct Vset {
     migration_head_claimed: bool,
 }
 
-/// One in-flight backup publish (R4.2): segments verbatim, then the
-/// manifest, then the head CAS.
+/// One sequential passive-replica transfer. At most one message is awaiting
+/// an ACK, which bounds memory and makes retry identity explicit.
 #[derive(Debug)]
-struct Publish {
+struct ReplicaSend {
+    target: HostId,
+    assignment_epoch: u64,
     record: JournalRecord,
-    segs_todo: Vec<(u64, SegId)>,
-    /// Own-namespace leaves the record references and the store lacks.
-    leaves_todo: Vec<(u64, u64)>,
+    required: Vec<crate::seam::ReplicaArtifact>,
+    todo: Vec<crate::seam::ReplicaArtifact>,
+    awaiting: Option<crate::seam::PeerMsg>,
+    retries: u8,
+    timer_generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -834,23 +853,24 @@ impl StoreCopyArtifact {
     }
 }
 
-/// One sequential passive-replica transfer. At most one message is awaiting
-/// an ACK, which bounds memory and makes retry identity explicit.
-#[derive(Debug)]
-struct ReplicaSend {
-    target: HostId,
-    assignment_epoch: u64,
-    record: JournalRecord,
-    required: Vec<crate::seam::ReplicaArtifact>,
-    todo: Vec<crate::seam::ReplicaArtifact>,
-    awaiting: Option<crate::seam::PeerMsg>,
-    retries: u8,
-    timer_generation: u64,
-}
-
 struct OwnNamespaceClosure {
     segments: Vec<(u64, SegId)>,
     leaves: Vec<(u64, u64)>,
+}
+
+/// A head mutation that may be installed provisionally while the object store
+/// is unavailable. The existing writer fence authorizes the replacement; the
+/// proposal remains queued until the head catches up.
+#[derive(Clone, Copy, Debug)]
+struct ReplicaAssignmentProposal {
+    assignment: crate::head::StashAssignment,
+    activation: Option<ReplicaActivation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplicaActivation {
+    retired: crate::head::RetiredStash,
+    info: crate::seam::ReplicaCommitInfo,
 }
 
 impl Vset {
@@ -907,7 +927,6 @@ impl Vset {
             backed: None,
             backed_segs: BTreeSet::new(),
             store_manifests: BTreeSet::new(),
-            publish: None,
             peer_artifacts: BTreeSet::new(),
             peer_committed: None,
             peer_committed_record: None,
@@ -935,12 +954,6 @@ impl Vset {
             migrated_verdict: None,
             wedge: Wedge::default(),
             migration_head_claimed: false,
-        }
-    }
-
-    fn adopt_local_ack_if_allowed(&mut self) {
-        if !self.config.durability.requires_peer_sync() {
-            self.sync_ack_through = self.sync_ack_through.max(self.local_covered_through);
         }
     }
 
@@ -1072,15 +1085,31 @@ struct PassiveReplica {
     artifacts: BTreeMap<crate::seam::ReplicaArtifact, (u32, Vec<u8>)>,
     uncommitted_artifacts: BTreeSet<crate::seam::ReplicaArtifact>,
     committed: Option<(crate::seam::ReplicaCommitInfo, u32)>,
+    committed_required: Vec<crate::seam::ReplicaArtifact>,
+    committed_record: Vec<u8>,
     pending_commit: Option<ReplicaPendingCommit>,
     upload: Option<ReplicaUpload>,
     upload_queue: VecDeque<ReplicaUpload>,
     uploaded_artifacts: BTreeSet<crate::seam::ReplicaArtifact>,
     upload_done: Option<crate::seam::ReplicaCommitInfo>,
+    upload_done_record: Option<Vec<u8>>,
+    archive_timer_armed: bool,
+    archive_urgent: bool,
+    archive_timer_generation: u64,
+    unarchived_age: u64,
+    compaction: Option<ReplicaCompaction>,
     append_inflight: bool,
     stored_bytes: u64,
     current_generation: u64,
     current_file_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ReplicaCompaction {
+    through_generation: u64,
+    reclaim_bytes: u64,
+    rewritten_bytes: u64,
+    retained: BTreeSet<crate::seam::ReplicaArtifact>,
 }
 
 #[derive(Debug)]
@@ -1095,6 +1124,10 @@ struct ReplicaUpload {
     info: crate::seam::ReplicaCommitInfo,
     todo: Vec<crate::seam::ReplicaArtifact>,
     record: Vec<u8>,
+    /// Archive-only objects derived from the exact durable spool cut. These
+    /// need not be appended back into the recovery spool: a restart derives
+    /// them again from the retained source artifacts.
+    derived: BTreeMap<crate::seam::ReplicaArtifact, Vec<u8>>,
     inflight: bool,
 }
 
@@ -1130,6 +1163,7 @@ pub struct Daemon {
     fence_floors: BTreeMap<VsetId, u64>,
     replicas: BTreeMap<ReplicaKey, PassiveReplica>,
     replica_latest_epoch: BTreeMap<(HostId, VsetId), u64>,
+    replica_timer_generations: BTreeMap<ReplicaKey, u64>,
     /// Local bytes written and not yet deleted (the daemon wrote every byte,
     /// so it does its own accounting; R2.7).
     local_bytes: u64,
@@ -1167,15 +1201,20 @@ impl Daemon {
                 let local_segment_bytes = state.seg_blobs.iter().map(|&(_, _, bytes)| bytes).sum();
                 let best = state.best.map_or(0, |(capture, _)| capture);
                 let backed = state.backed.map_or(0, |ptr| ptr.capture_seq);
-                let backed_up = state.config.durability == DurabilityMode::Backup;
-                let backup_lag_bytes = backed_up.then(|| {
-                    let Some(record) = state.best_record.as_ref() else {
-                        return 0;
-                    };
-                    let closure = state.own_namespace_closure(record);
-                    let pending_segments: BTreeSet<(u64, SegId)> = closure
-                        .segments
-                        .into_iter()
+                let archive_lag_bytes = state.best_record.as_ref().map_or(0, |record| {
+                    let pending_segments: BTreeSet<(u64, SegId)> = record
+                        .overlay
+                        .values()
+                        .filter(|(_, loc)| loc.base == 0)
+                        .map(|(_, loc)| (loc.fence, loc.seg))
+                        .chain(
+                            record
+                                .leaves
+                                .values()
+                                .filter(|ptr| ptr.base == 0)
+                                .filter_map(|ptr| state.leaf_blobs.get(ptr))
+                                .flat_map(|(_, segments)| segments.iter().copied()),
+                        )
                         .filter(|segment| !state.backed_segs.contains(segment))
                         .collect();
                     state
@@ -1202,7 +1241,7 @@ impl Daemon {
                 if state.ckpt_running {
                     operations |= VsetOperations::CHECKPOINT;
                 }
-                if state.publish.is_some() {
+                if state.replica_send.is_some() || state.replica_head_inflight {
                     operations |= VsetOperations::BACKUP;
                 }
                 if hydrating {
@@ -1210,7 +1249,6 @@ impl Daemon {
                 }
                 VsetStats {
                     vset,
-                    backed_up,
                     role,
                     fence: state.fence,
                     dirty_pages,
@@ -1219,8 +1257,8 @@ impl Daemon {
                     pending_syncs: state.pending_syncs.len(),
                     pending_leaf_spans: state.pending_leaves.len(),
                     hydration_remaining_pages,
-                    backup_lag_captures: backed_up.then_some(best.saturating_sub(backed)),
-                    backup_lag_bytes,
+                    archive_lag_captures: Some(best.saturating_sub(backed)),
+                    archive_lag_bytes: Some(archive_lag_bytes),
                     operations: VsetOperations(operations),
                     live_segment_bytes,
                     local_segment_bytes,
@@ -1247,6 +1285,14 @@ impl Daemon {
     }
 
     pub fn new(config: DaemonConfig) -> (Daemon, Vec<Effect>) {
+        assert!(
+            config.archive.interval > 0,
+            "archive interval must be positive"
+        );
+        assert!(
+            config.archive.spool_headroom_bytes < config.archive.spool_capacity_bytes,
+            "archive spool headroom must be smaller than capacity"
+        );
         let cache = Cache::new(config.cache_pages);
         let daemon = Daemon {
             config,
@@ -1262,6 +1308,7 @@ impl Daemon {
             fence_floors: BTreeMap::new(),
             replicas: BTreeMap::new(),
             replica_latest_epoch: BTreeMap::new(),
+            replica_timer_generations: BTreeMap::new(),
             local_bytes: 0,
             counters: Counters::default(),
         };
@@ -1284,7 +1331,6 @@ impl Daemon {
     pub fn replica_metrics(&self) -> Vec<ReplicaVsetMetrics> {
         self.vsets
             .iter()
-            .filter(|(_, state)| state.config.durability.requires_peer_sync())
             .map(|(&vset, state)| ReplicaVsetMetrics {
                 vset,
                 active_peer: state
@@ -1322,7 +1368,7 @@ impl Daemon {
                 vset: key.vset,
                 assignment_epoch: key.assignment_epoch,
                 stored_bytes: replica.stored_bytes,
-                source_capacity_bytes: replica::MAX_REPLICA_SOURCE_BYTES,
+                host_capacity_bytes: self.config.archive.spool_capacity_bytes,
                 current_generation: replica.current_generation,
                 committed_through: replica
                     .committed
@@ -1330,6 +1376,7 @@ impl Daemon {
                 uploaded_through: replica
                     .upload_done
                     .map_or(0, |info| info.sync_covered_through),
+                unarchived_age_ns: replica.unarchived_age,
             })
             .collect()
     }
@@ -1400,7 +1447,8 @@ impl Daemon {
                 source,
                 vset,
                 assignment_epoch,
-            }) => self.replica_upload_retry(source, vset, assignment_epoch, &mut out),
+                generation,
+            }) => self.replica_upload_retry(source, vset, assignment_epoch, generation, &mut out),
             Event::Timer(TimerId::ResumeSet(vset)) => self.resume_set_flush(vset, &mut out),
             Event::Timer(TimerId::MigrateOffer(vset)) => self.migrate_offer_tick(vset, &mut out),
             Event::Timer(TimerId::PeerRetry(io)) => self.peer_retry(io, mem, &mut out),
@@ -1442,12 +1490,6 @@ impl Daemon {
         out: &mut Vec<Effect>,
     ) {
         match self.pending.remove(&io) {
-            Some(
-                p @ (Pending::PubSegPut { .. }
-                | Pending::PubLeafPut { .. }
-                | Pending::PubManifestPut { .. }
-                | Pending::PubHeadCas { .. }),
-            ) => self.pub_put_done(p, result, out),
             Some(
                 p @ (Pending::ReplicaUploadArtifact { .. }
                 | Pending::ReplicaUploadManifest { .. }
@@ -1553,9 +1595,6 @@ impl Daemon {
             Some(Pending::CompactRead { vset, fence, seg }) => {
                 self.compact_read_done(vset, fence, seg, bytes, out);
             }
-            Some(Pending::PubSegRead { vset, fence, seg }) => {
-                self.pub_seg_read_done(vset, fence, seg, bytes, out);
-            }
             Some(Pending::ReplicaSourceRead { vset, artifact }) => {
                 self.replica_source_read_done(vset, artifact, bytes, out);
             }
@@ -1567,9 +1606,6 @@ impl Daemon {
             }
             Some(Pending::PeerRead { requester, peer_io }) => {
                 Self::peer_read_done(requester, peer_io, bytes, out);
-            }
-            Some(Pending::PubLeafRead { vset, fence, id }) => {
-                self.pub_leaf_read_done(vset, fence, id, bytes, out);
             }
             Some(Pending::PeerLeafRead { requester, peer_io }) => {
                 out.push(Effect::PeerSend {
@@ -1618,9 +1654,9 @@ impl Daemon {
     }
 
     /// R2.7 reclaim ladder, first class: local segments whose bytes the
-    /// backup tier already holds are droppable — refaults refetch from the
-    /// store (source order R2.3). The irreducible residue (non-backed-up
-    /// state and sole copies) is what remains, and it is observable.
+    /// archive tier already holds are droppable — refaults refetch from the
+    /// store (source order R2.3). Unarchived sole copies are irreducible and
+    /// observable.
     pub(super) fn nvme_reclaim(&mut self, out: &mut Vec<Effect>) {
         if !self.over_soft_limit() {
             return;
@@ -1631,9 +1667,6 @@ impl Daemon {
                 return;
             }
             let state = &self.vsets[&vset_id];
-            if !state.config.durability.uses_store() {
-                continue;
-            }
             // Droppable: fully backed and not pinned by in-flight work.
             let mut pinned: std::collections::BTreeSet<(u64, SegId)> =
                 std::collections::BTreeSet::new();
@@ -1644,16 +1677,6 @@ impl Daemon {
                         pinned.extend(segs.iter().copied());
                     }
                 }
-            }
-            if let Some(publish) = &state.publish {
-                pinned.extend(
-                    publish
-                        .record
-                        .overlay
-                        .values()
-                        .map(|(_, l)| (l.fence, l.seg)),
-                );
-                pinned.extend(publish.segs_todo.iter().copied());
             }
             for p in self.pending.values() {
                 if let Pending::Fetch { page, loc, .. } = p
@@ -1689,11 +1712,8 @@ impl Daemon {
     }
 
     /// Backup lag in capture units (R4.3: measured, never bounded).
-    pub fn backup_lag(&self, vset: VsetId) -> Option<u64> {
+    pub fn archive_lag(&self, vset: VsetId) -> Option<u64> {
         let state = self.vsets.get(&vset)?;
-        if !state.config.durability.uses_store() {
-            return None;
-        }
         let best = state.best.map_or(0, |(capture, _)| capture);
         let backed = state.backed.map_or(0, |ptr| ptr.capture_seq);
         Some(best.saturating_sub(backed))

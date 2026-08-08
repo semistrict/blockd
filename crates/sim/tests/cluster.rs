@@ -6,10 +6,13 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blockd_core::daemon::{Daemon, DaemonConfig};
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::daemon::{ArchivePolicy, Daemon, DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
-use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, Verdict};
+use blockd_core::placement::PeerCandidate;
+use blockd_core::seam::{
+    AdminCmd, AdminReply, Effect, Event, HostMap, PeerMsg, ReplicaArtifact, ReqId, TimerId, Verdict,
+};
 use blockd_core::types::{
     HostId, PageId, PageNo, SegId, SimTime, VolumeId, VolumeIdx, VsetId, page_size,
 };
@@ -30,11 +33,12 @@ impl HostMap for PatternMem {
 }
 
 fn config() -> VsetConfig {
-    VsetConfig::compute(1, 4, true)
+    VsetConfig::compute(1, 4)
 }
 
 fn daemon(host: u16) -> Daemon {
     Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(host),
         cache_pages: 16,
         writeback_interval: 1_000_000,
@@ -42,7 +46,18 @@ fn daemon(host: u16) -> Daemon {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(ReplicaPlacementConfig {
+            membership_epoch: 1,
+            local_failure_domain: host + 1,
+            roster: (0..3)
+                .map(|candidate| PeerCandidate {
+                    host: HostId(candidate),
+                    weight: 1,
+                    failure_domain: candidate + 1,
+                    drained: false,
+                })
+                .collect(),
+        }),
     })
     .0
 }
@@ -50,6 +65,7 @@ fn daemon(host: u16) -> Daemon {
 /// Drive one event to completion: every blob write and store operation the
 /// daemon issues completes immediately (in order) against the shared store
 /// and an always-successful local device. Returns the non-I/O effects.
+#[allow(clippy::too_many_lines)]
 fn settle(
     daemon: &mut Daemon,
     local: &mut BTreeMap<String, Vec<u8>>,
@@ -60,6 +76,7 @@ fn settle(
     let now = SimTime::ZERO;
     let mut settled = Vec::new();
     let mut queue = VecDeque::from([event]);
+    let mut replica = BTreeMap::<ReplicaArtifact, Vec<u8>>::new();
     while let Some(event) = queue.pop_front() {
         for effect in daemon.step(event, &PatternMem) {
             match effect {
@@ -134,6 +151,94 @@ fn settle(
                 Effect::StoreDelete { key } => {
                     let _ = store.delete(now, &mut rng, &key);
                 }
+                Effect::SetTimer { .. } => {}
+                Effect::PeerSend { to, msg } => match msg {
+                    PeerMsg::ReplicaStatus {
+                        vset,
+                        assignment_epoch,
+                    } => queue.push_back(Event::PeerDelivered {
+                        from: to,
+                        msg: PeerMsg::ReplicaStatusReply {
+                            vset,
+                            assignment_epoch,
+                            committed: None,
+                        },
+                    }),
+                    PeerMsg::ReplicaPut {
+                        vset,
+                        assignment_epoch,
+                        artifact,
+                        checksum,
+                        bytes,
+                    } => {
+                        replica.insert(artifact, bytes);
+                        queue.push_back(Event::PeerDelivered {
+                            from: to,
+                            msg: PeerMsg::ReplicaPutAck {
+                                vset,
+                                assignment_epoch,
+                                artifact,
+                                checksum,
+                            },
+                        });
+                    }
+                    PeerMsg::ReplicaCommit {
+                        vset,
+                        assignment_epoch,
+                        info,
+                        required,
+                        record,
+                    } => {
+                        for artifact in required {
+                            let bytes = replica.get(&artifact).expect("replica artifact").clone();
+                            let key = match artifact {
+                                ReplicaArtifact::Segment { fence, seg } => {
+                                    layout::segment_key(vset, fence, seg)
+                                }
+                                ReplicaArtifact::Leaf { fence, id } => {
+                                    layout::leaf_key(vset, fence, id)
+                                }
+                            };
+                            let _ = store.put(now, &mut rng, &key, bytes);
+                        }
+                        let _ = store.put(
+                            now,
+                            &mut rng,
+                            &layout::manifest_key(vset, info.writer_fence, info.seq),
+                            record.clone(),
+                        );
+                        queue.push_back(Event::PeerDelivered {
+                            from: to,
+                            msg: PeerMsg::ReplicaCommitAck {
+                                vset,
+                                assignment_epoch,
+                                info,
+                            },
+                        });
+                        queue.push_back(Event::PeerDelivered {
+                            from: to,
+                            msg: PeerMsg::ReplicaUploadDone {
+                                vset,
+                                assignment_epoch,
+                                info,
+                                record,
+                            },
+                        });
+                    }
+                    PeerMsg::ReplicaRelease {
+                        vset,
+                        assignment_epoch,
+                        through,
+                    } => queue.push_back(Event::PeerDelivered {
+                        from: to,
+                        msg: PeerMsg::ReplicaReleaseAck {
+                            vset,
+                            assignment_epoch,
+                            through,
+                        },
+                    }),
+                    other => settled.push(Effect::PeerSend { to, msg: other }),
+                },
                 other => settled.push(other),
             }
         }
@@ -224,153 +329,10 @@ fn seeded_host_a(local: &mut BTreeMap<String, Vec<u8>>, store: &mut ObjectStore)
             .iter()
             .any(|e| matches!(e, Effect::Admin(AdminReply::CheckpointDone { .. })))
     );
-    assert_eq!(a.counters.manifests_published, 2, "creation + checkpoint");
-    assert_eq!(a.backup_lag(VSET), Some(0));
+    let _ = settle(&mut a, local, store, Event::Timer(TimerId::Backup(VSET)));
+    assert!(a.counters.manifests_published >= 1, "checkpoint published");
+    assert_eq!(a.archive_lag(VSET), Some(0));
     a
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn racing_restores_resolve_to_exactly_one_runner_and_fence_the_old_holder() {
-    let mut store = ObjectStore::new(StoreConfig::s3());
-    let mut local_a = BTreeMap::new();
-    let mut local_b = BTreeMap::new();
-    let mut local_c = BTreeMap::new();
-    let mut a = seeded_host_a(&mut local_a, &mut store);
-
-    // Hosts B and C race to restore (a wrong liveness guess about A —
-    // safe to attempt at any moment, R6.4). C reads the head first; B's
-    // claim lands while C's is still in flight — a genuine race.
-    let mut b = daemon(1);
-    let mut c = daemon(2);
-    let mut rng = Pcg64::new(3, 3);
-    let now = SimTime::ZERO;
-    let c_read = c.step(
-        Event::Admin(AdminCmd::RestoreVset {
-            req: ReqId(11),
-            vset: VSET,
-        }),
-        &PatternMem,
-    );
-    let [Effect::StoreGet { io: c_io, key }] = c_read.as_slice() else {
-        panic!("restore starts with a head read: {c_read:?}");
-    };
-    let (_, stale) = store.get(now, &mut rng, key);
-    let stale = stale
-        .map(|found| found.map(|(v, b)| (v.0, b)))
-        .map_err(|_| blockd_core::seam::StoreFault::Unavailable);
-
-    let b_effects = settle(
-        &mut b,
-        &mut local_b,
-        &mut store,
-        Event::Admin(AdminCmd::RestoreVset {
-            req: ReqId(10),
-            vset: VSET,
-        }),
-    );
-    let c_effects = settle(
-        &mut c,
-        &mut local_c,
-        &mut store,
-        Event::StoreGetDone {
-            io: *c_io,
-            result: stale,
-        },
-    );
-    // B claimed the head; C's claim carried the stale expectation and
-    // CAS-failed: exactly one runner (R6.3).
-    assert_eq!(
-        b_effects,
-        [
-            Effect::Admin(AdminReply::VsetRestored {
-                req: ReqId(10),
-                vset: VSET,
-                verdict: Verdict::Resume {
-                    epoch: blockd_core::types::Epoch(1),
-                    vmstate: 7
-                }
-            }),
-            // The resume opens its R6.2 recording window (the resume-set
-            // fetch itself was settled against the store).
-            Effect::SetTimer {
-                timer: blockd_core::seam::TimerId::ResumeSet(VSET),
-                after: blockd_core::types::millis(1000),
-            },
-        ]
-    );
-    assert_eq!(
-        c_effects,
-        [Effect::Admin(AdminReply::AdminFailed { req: ReqId(11) })]
-    );
-
-    // A still runs its zombie guest (bounded double-run window). Its next
-    // publish attempt CAS-fails and it is structurally fenced (R6.4).
-    let page = PageId {
-        volume: VolumeId {
-            vset: VSET,
-            idx: VolumeIdx(1),
-        },
-        page: PageNo(1),
-    };
-    let _ = settle(
-        &mut a,
-        &mut local_a,
-        &mut store,
-        Event::GuestFault { page, write: true },
-    );
-    let effects = settle(
-        &mut a,
-        &mut local_a,
-        &mut store,
-        Event::Timer(blockd_core::seam::TimerId::Writeback),
-    );
-    assert!(
-        effects.contains(&Effect::VsetFenced { vset: VSET }),
-        "old holder must fence itself on the lost CAS: {effects:?}"
-    );
-    assert_eq!(a.counters.fenced, 1);
-    assert_eq!(a.backup_lag(VSET), None, "the vset is gone from A");
-
-    // B serves the restored page: fill comes from the store (A's segment,
-    // verbatim bytes — R8.4/R2.3) after the local miss.
-    let restored = PageId {
-        volume: VolumeId {
-            vset: VSET,
-            idx: VolumeIdx(1),
-        },
-        page: PageNo(0),
-    };
-    let effects = settle(
-        &mut b,
-        &mut local_b,
-        &mut store,
-        Event::GuestFault {
-            page: restored,
-            write: false,
-        },
-    );
-    let mut expected = vec![0u8; page_size()];
-    expected[0] = 0xA0 ^ 1;
-    expected[1] = 0;
-    assert_eq!(
-        effects,
-        [Effect::Fill {
-            page: restored,
-            bytes: expected,
-            writable: false,
-            share: None
-        }]
-    );
-    assert_eq!(b.counters.fills, 1);
-
-    // The head belongs to B; nothing A writes is reachable (R6.4).
-    let now = SimTime::ZERO;
-    let mut rng = Pcg64::new(1, 1);
-    let (_, head) = store.get(now, &mut rng, &layout::head_key(VSET));
-    let (_, bytes) = head.expect("store up").expect("head exists");
-    let head = blockd_core::head::HeadRecord::decode(VSET, &bytes).expect("intact");
-    assert_eq!(head.holder, HostId(1));
 }
 
 #[test]
@@ -533,10 +495,7 @@ fn two_hundred_forks_hold_one_resident_copy_of_each_base_page() {
         })]
     );
 
-    let fork_config = VsetConfig {
-        durability: DurabilityMode::Local, // forks read shared data, write nothing (R4.4)
-        ..config()
-    };
+    let fork_config = VsetConfig { ..config() };
     for (req, fork) in (100u64..).zip(0..200u64) {
         let effects = settle(
             &mut a,

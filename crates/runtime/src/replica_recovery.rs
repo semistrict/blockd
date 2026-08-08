@@ -60,7 +60,7 @@ pub async fn install_replica_recovery(
     if observed_version != verified_head_version {
         return Err(InstallReplicaRecoveryError::ClaimConflict);
     }
-    let claim = prepare_replica_recovery_claim(observed_version, &observed, claimant);
+    let claim = prepare_replica_recovery_claim(observed_version, &observed, claimant, export);
     let writer_fence = store
         .clone()
         .put_cas(
@@ -193,7 +193,7 @@ mod tests {
     use std::sync::Mutex;
 
     use blockd_core::head::StashAssignment;
-    use blockd_core::journal::{DurabilityMode, RecordKind, VsetConfig};
+    use blockd_core::journal::{RecordKind, VsetConfig};
     use blockd_core::seam::{ReplicaCommitInfo, StoreFault};
     use blockd_core::types::JournalSeq;
 
@@ -273,7 +273,6 @@ mod tests {
                 kind: blockd_core::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
-                durability: DurabilityMode::PeerStashed,
             },
             seq: JournalSeq(3),
             fence: 1,
@@ -358,7 +357,6 @@ mod tests {
                 kind: blockd_core::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
-                durability: DurabilityMode::PeerStashed,
             },
             seq: JournalSeq(3),
             fence: 1,

@@ -1,7 +1,7 @@
 //! Recovery (R8.2): rebuild a daemon from durable state alone, with an
 //! explicit per-vset verdict.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Daemon, DaemonConfig, PassiveReplica, ReplicaKey, Vset};
 use crate::format::crc32c;
@@ -10,7 +10,7 @@ use crate::layout::{self, BlobName};
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
 use crate::replica_spool::scan_replica_spool;
 use crate::seam::{Effect, Verdict};
-use crate::types::{JournalSeq, PageId, SegId, VolumeId, VsetId};
+use crate::types::{HostId, JournalSeq, PageId, SegId, VolumeId, VsetId};
 
 /// One local recovery entry. Segment contents are verified lazily on first
 /// read, so callers may omit their bytes while still reporting the on-disk
@@ -179,8 +179,10 @@ impl Daemon {
             let Some((&current_generation, current_bytes)) = generations.last_key_value() else {
                 continue;
             };
-            // A generation boundary is only a filename boundary; frames form
-            // one ordered log so later commits may reference earlier data.
+            // Ordinary generations form one ordered log, but a compaction
+            // generation is also a self-contained checkpoint. Trying every
+            // generation suffix lets recovery survive an interrupted durable
+            // unlink that left arbitrary obsolete files beside that checkpoint.
             let mut combined = Vec::new();
             let mut boundaries = Vec::new();
             for (&generation, bytes) in &generations {
@@ -188,13 +190,32 @@ impl Daemon {
                 combined.extend_from_slice(bytes);
                 boundaries.push((generation, start, bytes.len()));
             }
-            let Ok(scan) = scan_replica_spool(&combined) else {
+            let Some((scan_start, scan)) = boundaries
+                .iter()
+                .filter_map(|(_, start, _)| {
+                    scan_replica_spool(&combined[*start..])
+                        .ok()
+                        .filter(|scan| scan.valid_len > 0)
+                        .map(|scan| (*start, scan))
+                })
+                .max_by_key(|(start, scan)| {
+                    let newest = scan.commits.last().map(|commit| {
+                        (
+                            commit.info.sync_covered_through,
+                            commit.info.writer_fence,
+                            commit.info.seq.0,
+                        )
+                    });
+                    (newest.is_some(), newest.unwrap_or_default(), *start)
+                })
+            else {
                 continue;
             };
+            let valid_end = scan_start.saturating_add(scan.valid_len);
             let current_file_bytes = if scan.truncated_tail {
                 let Some(&(generation, start, _)) = boundaries
                     .iter()
-                    .find(|(_, start, len)| scan.valid_len < start.saturating_add(*len))
+                    .find(|(_, start, len)| valid_end < start.saturating_add(*len))
                 else {
                     continue;
                 };
@@ -203,12 +224,13 @@ impl Daemon {
                 if generation != current_generation {
                     continue;
                 }
-                let valid_in_generation = scan.valid_len.saturating_sub(start) as u64;
+                let valid_in_generation = valid_end.saturating_sub(start) as u64;
                 replica_truncations.insert(key, (generation, valid_in_generation));
                 valid_in_generation
             } else {
                 current_bytes.len() as u64
             };
+            let stored_bytes = (combined.len() - current_bytes.len()) as u64 + current_file_bytes;
             let artifacts = scan
                 .artifacts
                 .into_iter()
@@ -217,13 +239,18 @@ impl Daemon {
             let uncommitted_artifacts = scan.uncommitted_artifacts;
             let last_commit = scan.commits.last();
             let committed = last_commit.map(|commit| (commit.info, crc32c(&commit.record)));
+            let committed_required =
+                last_commit.map_or_else(Vec::new, |commit| commit.required.clone());
+            let committed_record =
+                last_commit.map_or_else(Vec::new, |commit| commit.record.clone());
             let upload = last_commit.map(|commit| super::ReplicaUpload {
                 info: commit.info,
                 todo: commit.required.clone(),
                 record: commit.record.clone(),
+                derived: BTreeMap::new(),
                 inflight: false,
             });
-            replica_bytes = replica_bytes.saturating_add(scan.valid_len as u64);
+            replica_bytes = replica_bytes.saturating_add(stored_bytes);
             recovered_rotations = recovered_rotations.saturating_add(current_generation);
             recovered_replicas.insert(
                 key,
@@ -231,22 +258,41 @@ impl Daemon {
                     artifacts,
                     uncommitted_artifacts,
                     committed,
+                    committed_required,
+                    committed_record,
                     pending_commit: None,
-                    upload,
-                    upload_queue: VecDeque::new(),
+                    upload: None,
+                    upload_queue: upload.into_iter().collect(),
                     uploaded_artifacts: BTreeSet::new(),
                     upload_done: None,
+                    upload_done_record: None,
+                    archive_timer_armed: false,
+                    archive_urgent: false,
+                    archive_timer_generation: 0,
+                    unarchived_age: 0,
+                    compaction: None,
                     append_inflight: false,
-                    stored_bytes: scan.valid_len as u64,
+                    stored_bytes,
                     current_generation,
                     current_file_bytes,
                 },
             );
         }
 
+        let replica_latest_epoch = recovered_replicas.keys().fold(
+            BTreeMap::<(HostId, VsetId), u64>::new(),
+            |mut latest, key| {
+                latest
+                    .entry((key.source, key.vset))
+                    .and_modify(|epoch| *epoch = (*epoch).max(key.assignment_epoch))
+                    .or_insert(key.assignment_epoch);
+                latest
+            },
+        );
         let (mut daemon, mut effects) = Daemon::new(config);
         daemon.fence_floors = fence_floors;
         daemon.replicas = recovered_replicas;
+        daemon.replica_latest_epoch = replica_latest_epoch;
         daemon.counters.replica_bytes = replica_bytes;
         daemon.counters.replica_rotations = recovered_rotations;
         let mut verdicts = BTreeMap::new();
@@ -311,7 +357,6 @@ impl Daemon {
             state.next_seg = f.max_seg;
             state.next_leaf = f.max_leaf;
             state.local_covered_through = watermark;
-            state.adopt_local_ack_if_allowed();
 
             let (verdict, chosen) = if cold.config.kind == VsetKind::Database {
                 (
@@ -382,7 +427,6 @@ impl Daemon {
                 .collect();
             state.best = Some((chosen.capture_seq, chosen.seq));
             state.local_covered_through = watermark.max(chosen.sync_covered_through);
-            state.adopt_local_ack_if_allowed();
             // Every on-disk record name, with its watermark where intact
             // (corrupt records contribute nothing and are reclaimable).
             state.record_ws = f
@@ -438,33 +482,24 @@ impl Daemon {
                 daemon.vsets.insert(vset_id, state);
                 continue;
             }
-            let backed = state.config.durability.uses_store();
-            if backed {
-                // A backed-up vset may not serve yet: journal damage can
-                // leave local state BEHIND the backup, and serving it would
-                // roll back acknowledged syncs (R3.8). The head refresh
-                // resolves the verdict — or fences us (R6.4).
-                state.ready = false;
-                state.head_refreshing = true;
-                state.pending_verdict = Some(verdict);
-            }
+            // Local state may be behind the published head. Refresh
+            // assignment and backup truth before opening the guest gate.
+            state.ready = false;
+            state.head_refreshing = true;
+            state.pending_verdict = Some(verdict);
             daemon.vsets.insert(vset_id, state);
             if hydrating {
                 daemon.request_pending_leaves(vset_id, &mut effects);
             }
             daemon.cleanup(vset_id, &mut effects);
-            if backed {
-                let io = daemon.io();
-                daemon
-                    .pending
-                    .insert(io, super::Pending::HeadRefresh { vset: vset_id });
-                effects.push(Effect::StoreGet {
-                    io,
-                    key: crate::layout::head_key(vset_id),
-                });
-            } else {
-                verdicts.insert(vset_id, verdict);
-            }
+            let io = daemon.io();
+            daemon
+                .pending
+                .insert(io, super::Pending::HeadRefresh { vset: vset_id });
+            effects.push(Effect::StoreGet {
+                io,
+                key: crate::layout::head_key(vset_id),
+            });
         }
         daemon.local_bytes = recovered_bytes;
         let replica_keys: Vec<_> = daemon.replicas.keys().copied().collect();
@@ -488,8 +523,9 @@ impl Daemon {
                         generation,
                         len,
                     });
+                } else {
+                    daemon.replica_archive_schedule(key, &mut effects);
                 }
-                daemon.replica_upload_step(key, &mut effects);
             } else {
                 daemon.replicas.remove(&key);
             }

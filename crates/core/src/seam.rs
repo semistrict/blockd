@@ -253,6 +253,14 @@ pub enum PeerMsg {
         vset: VsetId,
         assignment_epoch: u64,
         info: ReplicaCommitInfo,
+        record: Vec<u8>,
+    },
+    /// The primary needs the covering committed cut archived before an
+    /// explicit lifecycle transition (for example migration) can finish.
+    ReplicaArchive {
+        vset: VsetId,
+        assignment_epoch: u64,
+        through: ReplicaCommitInfo,
     },
     ReplicaRelease {
         vset: VsetId,
@@ -413,6 +421,7 @@ pub enum TimerId {
         source: HostId,
         vset: VsetId,
         assignment_epoch: u64,
+        generation: u64,
     },
     /// End of the post-resume recording window (R6.2): the pages faulted
     /// so far become the vset's recorded resume set.
@@ -684,6 +693,11 @@ pub enum Effect {
     /// guests hang and are killed by the node manager.
     VsetFenced {
         vset: VsetId,
+    },
+    /// One vset's recovery material is locally unservable. The node manager
+    /// kills only that guest; other vsets on the daemon remain available.
+    VsetUnservable {
+        page: PageId,
     },
     /// Send a message to a cluster peer (R11.1).
     PeerSend {

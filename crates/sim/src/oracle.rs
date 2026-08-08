@@ -54,7 +54,7 @@ struct VsetGhost {
     /// verification pass in inference mode while this is set.
     disk_unresolved: bool,
     /// The next recovery may legitimately roll back acknowledged syncs:
-    /// restore after host loss is bounded by the backup lag (R4.3), not by
+    /// restore after dual-host loss is bounded by the archive horizon (R4.3), not by
     /// local sync durability.
     sync_loss_ok: bool,
 }
@@ -309,7 +309,7 @@ impl Oracle {
     }
 
     /// The next recovery of this vset is a restore from backup: sync
-    /// rollback up to the backup lag is sanctioned (R4.3).
+    /// rollback up to the archive horizon is sanctioned (R4.3).
     pub fn allow_sync_loss(&mut self, vset: VsetId) {
         self.vsets.get_mut(&vset).expect("registered").sync_loss_ok = true;
     }
@@ -348,7 +348,7 @@ mod tests {
     const VSET: VsetId = VsetId(9);
 
     fn config() -> VsetConfig {
-        VsetConfig::compute(1, 2, false)
+        VsetConfig::compute(1, 2)
     }
 
     fn page(volume: u8, n: u32) -> PageId {

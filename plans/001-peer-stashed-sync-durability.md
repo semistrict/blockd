@@ -1,5 +1,14 @@
 # Plan 001: Add peer-stashed sync durability without putting S3 on the guest sync path
 
+> Superseded by the consolidated durability architecture: every vset now
+> acknowledges sync only after passive-node persistence, and S3 advances on
+> an independent archive cadence. **Do not execute this plan.** Its mode
+> matrix, archive-gated spool reclamation, recoverability-only promise, and
+> deferred passive replacement are all obsolete. The current contract permits
+> crash-safe compaction around live recovery roots during an indefinite S3
+> outage and automatically fences and seeds another passive after failure.
+> The remainder is retained only as design history.
+
 > **Executor instructions**: Follow this plan step by step. Run every
 > verification command and confirm the expected result before moving to the
 > next step. If anything in the "STOP conditions" section occurs, stop and

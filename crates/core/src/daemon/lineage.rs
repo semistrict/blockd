@@ -52,10 +52,8 @@ impl Daemon {
             out.push(Effect::Admin(AdminReply::AdminFailed { req }));
             return;
         };
-        // Bases are store objects: only the backed-up mode may write them
-        // (R4.4 is absolute for the other mode), and only a pinned whole
-        // checkpoint (or disk-only point) can be kept.
-        if !state.ready || !state.config.durability.uses_store() || state.keep.is_some() {
+        // Only a pinned whole checkpoint (or disk-only point) can be kept.
+        if !state.ready || state.keep.is_some() {
             out.push(Effect::Admin(AdminReply::AdminFailed { req }));
             return;
         }
@@ -261,7 +259,7 @@ impl Daemon {
     // ── forks ───────────────────────────────────────────────────────────
 
     /// Fetch the base record for a forked creation (after the head claim,
-    /// for backed forks; directly, for non-backed ones).
+    /// before adopting the protected fork).
     pub(super) fn fork_fetch_base(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
         let Some(state) = self.vsets.get(&vset) else {
             return;
@@ -305,7 +303,7 @@ impl Daemon {
         // O(1) fork (R5.1): re-key the base's overlay under the new vset
         // and REFERENCE the base's leaf blobs in place — no map copy of
         // any size (R5.3). The leaves hydrate lazily from the store
-        // (reads only: R4.4-safe for non-backed forks); divergence goes to
+        // (reads only); divergence goes to
         // the overlay and rolls into the fork's own leaves.
         let mut overlay: BTreeMap<PageId, _> = BTreeMap::new();
         let whole = matches!(record.kind, RecordKind::Checkpoint { .. });

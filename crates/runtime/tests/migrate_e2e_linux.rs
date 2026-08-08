@@ -13,12 +13,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
+use blockd_core::placement::PeerCandidate;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig, S3Store};
 use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};
+
+mod support;
 
 const VSET: VsetId = VsetId(1);
 
@@ -48,6 +51,7 @@ fn free_addr() -> SocketAddr {
 fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
     RuntimeConfig {
         daemon: DaemonConfig {
+            archive: Default::default(),
             host: HostId(host),
             cache_pages: 256,
             writeback_interval: millis(5),
@@ -55,7 +59,18 @@ fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 500,
-            replica_placement: None,
+            replica_placement: Some(ReplicaPlacementConfig {
+                membership_epoch: 1,
+                local_failure_domain: host + 1,
+                roster: (0..2)
+                    .map(|candidate| PeerCandidate {
+                        host: HostId(candidate),
+                        weight: 1,
+                        failure_domain: candidate + 1,
+                        drained: false,
+                    })
+                    .collect(),
+            }),
         },
         blob_dir: temp_dir(tag),
         peer: Some(peer),
@@ -181,7 +196,7 @@ fn files_under(dir: &std::path::Path) -> usize {
         .sum()
 }
 
-/// A worked non-backed vset moves from host A to host B over TCP: verdict
+/// A worked vset moves from host A to host B over TCP: verdict
 /// resumes on B, the same workload continues there, EVERY disk byte
 /// verifies on B (demand fetches over the wire), hydration drains the
 /// tail, the source releases and reclaims to zero blobs.
@@ -196,24 +211,20 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
         listen: addr_a,
         peers: roster.clone(),
         outbound_protocol_versions: BTreeMap::new(),
-        tls: None,
+        tls: Some(support::peer_tls(0, 2)),
     };
     let peer_b = PeerConfig {
         listen: addr_b,
         peers: roster,
         outbound_protocol_versions: BTreeMap::new(),
-        tls: None,
+        tls: Some(support::peer_tls(1, 2)),
     };
     let store = Arc::new(S3Store::new());
     let a = Runtime::new(&runtime_config("host-a", 0, peer_a), store.clone());
     let b = Runtime::new(&runtime_config("host-b", 1, peer_b), store.clone());
 
     let spec = blockd_workload::load("migration").expect("migration workload");
-    let vc = VsetConfig::compute(
-        spec.shape.disk_volumes,
-        spec.shape.pages_per_volume,
-        spec.shape.backed_up,
-    );
+    let vc = VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
     let mut backend = MigrationBackend::new(&a, &b, vc);
     let outcome = blockd_workload::run(&spec, &mut backend).expect("migration workload");
 
@@ -257,7 +268,8 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
         b.counters().hydrate_fills > 0,
         "no hydration happened over the wire"
     );
-    // A non-backed vset never touched the store (R4.4).
-    let (_, keys) = (0, store.s3.stats.total_requests());
-    assert_eq!(keys, 0, "non-backed migration must not touch the store");
+    assert!(
+        store.s3.stats.total_requests() > 0,
+        "migration must retain the store recovery path"
+    );
 }

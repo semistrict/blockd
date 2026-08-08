@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blockd_core::daemon::{Daemon, DaemonConfig, ReplicaPlacementConfig};
-use blockd_core::journal::{DurabilityMode, JournalRecord, RecordKind, VsetConfig};
+use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
 use blockd_core::layout;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
 use blockd_core::replica_spool::{seal_replica_artifact, seal_replica_commit};
@@ -49,7 +49,6 @@ fn fixture() -> (Vec<u8>, Vec<u8>) {
             kind: blockd_core::journal::VsetKind::Compute,
             disk_volumes: 1,
             pages_per_volume: 8,
-            durability: DurabilityMode::PeerStashed,
         },
         seq: info.seq,
         fence: info.writer_fence,
@@ -165,6 +164,7 @@ fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
         .expect("target")
         .failure_domain;
     let daemon_config = DaemonConfig {
+        archive: Default::default(),
         host: target,
         cache_pages: 8,
         writeback_interval: 1_000_000,

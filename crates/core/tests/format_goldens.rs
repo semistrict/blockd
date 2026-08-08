@@ -8,10 +8,9 @@
 
 use std::collections::BTreeMap;
 
+use blockd_core::format::{FRAME_HEADER, crc32c};
 use blockd_core::head::{HeadRecord, ManifestPtr};
-use blockd_core::journal::{
-    DatabaseMeta, DurabilityMode, JournalRecord, RecordKind, VsetConfig, VsetKind,
-};
+use blockd_core::journal::{DatabaseMeta, JournalRecord, RecordKind, VsetConfig, VsetKind};
 use blockd_core::mapleaf::{LeafPtr, MapLeaf};
 use blockd_core::segment::PageLoc;
 use blockd_core::types::{
@@ -47,7 +46,6 @@ fn golden_journal_record() -> (VsetId, JournalRecord) {
             kind: VsetKind::Compute,
             disk_volumes: 2,
             pages_per_volume: 16,
-            durability: DurabilityMode::Backup,
         },
         seq: JournalSeq(5),
         fence: 6,
@@ -142,23 +140,7 @@ const JOURNAL_V4_16K: &str = "424a5231990000003f5a3b5d040000400000a1000000000000
 const JOURNAL_V5_4K: &str = "424a523199000000217b6b6f050000100000a10000000000000005000000000000000600000000000000010300000000000000290000000000000063000000000000005a00000000000000010200021000000001010000000107000000090000000000000000000000000000000600000000000000020000000000000075000000580000000100000000010000000000000000000004000000000000000b00000000000000";
 const JOURNAL_V5_16K: &str = "424a523199000000e0013d2b050000400000a10000000000000005000000000000000600000000000000010300000000000000290000000000000063000000000000005a00000000000000010200021000000001010000000107000000090000000000000000000000000000000600000000000000020000000000000075000000580000000100000000010000000000000000000004000000000000000b00000000000000";
 const JOURNAL_V6_4K: &str = "424a52319a0000000fc0a899060000100000a10000000000000005000000000000000600000000000000010300000000000000290000000000000063000000000000005a0000000000000001020000021000000001010000000107000000090000000000000000000000000000000600000000000000020000000000000075000000580000000100000000010000000000000000000004000000000000000b00000000000000";
-const JOURNAL_V6_16K: &str = "424a52319a000000b2330aa8060000400000a10000000000000005000000000000000600000000000000010300000000000000290000000000000063000000000000005a0000000000000001020000021000000001010000000107000000090000000000000000000000000000000600000000000000020000000000000075000000580000000100000000010000000000000000000004000000000000000b00000000000000";
-
-fn journal_v4_golden() -> &'static str {
-    match page_size() {
-        4096 => JOURNAL_V4_4K,
-        16_384 => JOURNAL_V4_16K,
-        size => panic!("journal golden missing for {size}-byte pages"),
-    }
-}
-
-fn journal_v5_golden() -> &'static str {
-    match page_size() {
-        4096 => JOURNAL_V5_4K,
-        16_384 => JOURNAL_V5_16K,
-        size => panic!("journal golden missing for {size}-byte pages"),
-    }
-}
+const JOURNAL_V6_16K: &str = "424a52319a0000009ed98b07060000400000a10000000000000005000000000000000600000000000000010300000000000000290000000000000063000000000000005a0000000000000001020000021000000002010000000107000000090000000000000000000000000000000600000000000000020000000000000075000000580000000100000000010000000000000000000004000000000000000b00000000000000";
 
 fn journal_v6_golden() -> &'static str {
     match page_size() {
@@ -172,23 +154,55 @@ const HEAD_V2: &str = "424844312e000000d20c2e6f0200b2000000000000000300110000000
 const LEAF_V1: &str = "424d4c317c000000936201c70100c30000000000000004000000000000000b00000000000000000010000200000001000000000400000000000000000000000000000003000000000000000100000000000000000000004000000001030000000700000000000000090000000000000002000000000000000500000000000000800000005a000000";
 
 #[test]
-fn journal_v4_and_v5_golden_bytes_still_decode_and_v6_is_pinned() {
+fn peer_first_v6_is_pinned_and_legacy_records_remain_recoverable() {
     let (vset, record) = golden_journal_record();
     assert_eq!(
         hex(&record.encode(vset)),
         journal_v6_golden(),
         "v6 encoder drifted"
     );
+    let legacy_v4 = match page_size() {
+        4096 => JOURNAL_V4_4K,
+        16_384 => JOURNAL_V4_16K,
+        size => panic!("journal golden missing for {size}-byte pages"),
+    };
+    let legacy_v5 = match page_size() {
+        4096 => JOURNAL_V5_4K,
+        16_384 => JOURNAL_V5_16K,
+        size => panic!("journal golden missing for {size}-byte pages"),
+    };
     assert_eq!(
-        JournalRecord::decode(vset, &unhex(journal_v4_golden())),
-        Ok(record.clone()),
-        "decoder no longer reads the frozen v4 bytes"
+        JournalRecord::decode(vset, &unhex(legacy_v4)),
+        Ok(record.clone())
     );
     assert_eq!(
-        JournalRecord::decode(vset, &unhex(journal_v5_golden())),
-        Ok(record),
-        "decoder no longer reads the frozen v5 bytes"
+        JournalRecord::decode(vset, &unhex(legacy_v5)),
+        Ok(record.clone())
     );
+    assert_eq!(
+        JournalRecord::decode(vset, &record.encode(vset)),
+        Ok(record)
+    );
+}
+
+#[test]
+fn peer_first_v5_journal_bytes_remain_recoverable() {
+    let (vset, record) = golden_journal_record();
+    let frozen = match page_size() {
+        4096 => JOURNAL_V5_4K,
+        16_384 => JOURNAL_V5_16K,
+        size => panic!("journal golden missing for {size}-byte pages"),
+    };
+    let mut bytes = unhex(frozen);
+    let checksum = {
+        let payload = &mut bytes[FRAME_HEADER..];
+        // V5's last config byte was the durability tag. Convert the frozen
+        // backup record to the already-supported peer-first tag and reseal it.
+        payload[71] = 2;
+        crc32c(payload)
+    };
+    bytes[8..12].copy_from_slice(&checksum.to_le_bytes());
+    assert_eq!(JournalRecord::decode(vset, &bytes), Ok(record));
 }
 
 #[test]

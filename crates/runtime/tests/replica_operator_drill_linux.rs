@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blockd_core::head::HeadRecord;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_runtime::fakegcs::{FakeGcs, Fault};
@@ -58,7 +58,6 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
             kind: blockd_core::journal::VsetKind::Compute,
             disk_volumes: 1,
             pages_per_volume: 8,
-            durability: DurabilityMode::PeerStashed,
         };
         a.create_vset(VSET, vset_config);
         let (_, head_bytes) = store(&endpoint, &prefix)

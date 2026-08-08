@@ -9,7 +9,6 @@
   },
   "topology": {
     "vset_count": 1,
-    "backed_vsets": 0,
     "pages_per_volume": 4096
   },
   "workload": {

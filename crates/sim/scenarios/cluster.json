@@ -25,11 +25,8 @@
   "topology": {
     "hosts": 3,
     "vset_count": 3,
-    "backed_vsets": null,
-    "nonbacked_vsets": 0,
     "disk_volumes": 2,
     "pages_per_volume": 16,
-    "durability": "backup",
     "replica_placement": null
   },
   "workload": {

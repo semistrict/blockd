@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use blockd_core::daemon::{Daemon, DaemonConfig};
 use blockd_core::database::{AttachmentId, DatabaseError, DatabaseReply, DatabaseRequest};
 use blockd_core::format::crc32c;
+use blockd_core::journal::VsetConfig;
 use blockd_core::journal::VsetKind;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
 use blockd_core::layout;
 use blockd_core::replica_spool::seal_verified_replica_artifact;
 use blockd_core::seam::{
@@ -47,9 +47,10 @@ pub struct RuntimeConfig {
 }
 
 fn assert_peer_stash_transport(config: VsetConfig, authenticated: bool) {
+    let _ = config;
     assert!(
-        config.durability != DurabilityMode::PeerStashed || authenticated,
-        "peer-stashed durability requires mutually authenticated TLS"
+        authenticated,
+        "passive durability requires mutually authenticated TLS"
     );
 }
 
@@ -302,7 +303,7 @@ struct Shared {
     pause_expected: Mutex<BTreeMap<VsetId, VecDeque<usize>>>,
     pause_in_flight: Mutex<BTreeMap<VsetId, (usize, Instant)>>,
     pause_latency: [AtomicHistogram; PAUSE_NAMES.len()],
-    backup_lag_started: Mutex<BTreeMap<VsetId, Instant>>,
+    archive_lag_started: Mutex<BTreeMap<VsetId, Instant>>,
     operation_started: Mutex<BTreeMap<(VsetId, u8), Instant>>,
     next_req: AtomicU64,
 }
@@ -336,7 +337,7 @@ impl Shared {
             pause_expected: Mutex::new(BTreeMap::new()),
             pause_in_flight: Mutex::new(BTreeMap::new()),
             pause_latency: std::array::from_fn(|_| AtomicHistogram::default()),
-            backup_lag_started: Mutex::new(BTreeMap::new()),
+            archive_lag_started: Mutex::new(BTreeMap::new()),
             operation_started: Mutex::new(BTreeMap::new()),
             next_req: AtomicU64::new(1),
         }
@@ -421,7 +422,18 @@ enum FaultWork {
 impl FaultIo {
     fn shutdown(&mut self) {
         let (done, drained) = sync_channel(0);
-        if self.work.blocking_send(FaultWork::Barrier { done }).is_ok() {
+        let mut barrier = FaultWork::Barrier { done };
+        let queued = loop {
+            match self.work.try_send(barrier) {
+                Ok(()) => break true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(work)) => {
+                    barrier = work;
+                    thread::yield_now();
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break false,
+            }
+        };
+        if queued {
             let _ = drained.recv();
         }
         if let Some(shutdown) = self.shutdown.take() {
@@ -632,9 +644,8 @@ impl Runtime {
     /// Recover a daemon from the blobs actually on disk (R8.2). The caller
     /// supplies the vset configs so guest memory can be rebuilt (in
     /// production the control plane knows them; the records carry them
-    /// too). Returns the per-vset verdicts for non-backed vsets; backed
-    /// vsets report `VsetRecovered` through admin replies after their head
-    /// refresh.
+    /// too). Store claims and passive inventory complete asynchronously;
+    /// recovered vsets report through admin replies after head refresh.
     #[allow(clippy::needless_pass_by_value)]
     pub fn recover(
         config: &RuntimeConfig,
@@ -785,7 +796,7 @@ impl Runtime {
                     *shared.counters.lock().expect("lock") = daemon.counters;
                     if refresh_observability {
                         let daemon_stats = daemon.stats();
-                        update_backup_lag(&shared, &daemon_stats);
+                        update_archive_lag(&shared, &daemon_stats);
                         update_active_operations(&shared, &daemon_stats);
                         *shared.daemon_stats.lock().expect("lock") = daemon_stats;
                         *shared.replica_metrics.lock().expect("lock") = daemon.replica_metrics();
@@ -836,9 +847,9 @@ impl Runtime {
         self.shared.capacity.lock().expect("lock").signal()
     }
 
-    pub fn backup_lag_age(&self) -> Vec<(VsetId, Duration)> {
+    pub fn archive_lag_age(&self) -> Vec<(VsetId, Duration)> {
         self.shared
-            .backup_lag_started
+            .archive_lag_started
             .lock()
             .expect("lock")
             .iter()
@@ -1033,7 +1044,7 @@ impl Runtime {
 
     #[tracing::instrument(
         skip(self, config),
-        fields(vset_id = vset.0, backed = config.durability == DurabilityMode::Backup)
+        fields(vset_id = vset.0)
     )]
     pub fn create_vset(&self, vset: VsetId, config: VsetConfig) {
         let started = Instant::now();
@@ -1174,7 +1185,7 @@ impl Runtime {
     /// Restore a backed-up vset from the store onto this host (R6.1).
     #[tracing::instrument(
         skip(self, config),
-        fields(vset_id = vset.0, backed = config.durability == DurabilityMode::Backup)
+        fields(vset_id = vset.0)
     )]
     pub fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
         let started = Instant::now();
@@ -1222,7 +1233,7 @@ impl Runtime {
         }
     }
 
-    /// Hand a non-backed vset off to `to` (R7.2): pauses, captures, makes
+    /// Hand a protected vset off to `to` (R7.2): prepares, pauses, captures, makes
     /// the handoff durable on both sides, then serves the post-copy drain.
     /// Returns once this side's `MigratedOut` lands.
     #[tracing::instrument(skip(self), fields(vset_id = vset.0, destination_host = to.0))]
@@ -1502,15 +1513,15 @@ fn complete_pause(shared: &Shared, vset: VsetId) {
     }
 }
 
-fn update_backup_lag(shared: &Shared, stats: &blockd_core::daemon::DaemonStats) {
+fn update_archive_lag(shared: &Shared, stats: &blockd_core::daemon::DaemonStats) {
     let now = Instant::now();
     let lagging: std::collections::BTreeSet<VsetId> = stats
         .vsets
         .iter()
-        .filter(|vset| vset.backup_lag_captures.is_some_and(|lag| lag > 0))
+        .filter(|vset| vset.archive_lag_captures.is_some_and(|lag| lag > 0))
         .map(|vset| vset.vset)
         .collect();
-    let mut started = shared.backup_lag_started.lock().expect("lock");
+    let mut started = shared.archive_lag_started.lock().expect("lock");
     started.retain(|vset, _| lagging.contains(vset));
     for vset in lagging {
         started.entry(vset).or_insert(now);
@@ -1543,7 +1554,7 @@ fn update_capacity_signal(shared: &Shared, queue: &LoopQueue) {
         .map(|value| value.load(Ordering::Relaxed))
         .sum();
     let oldest_backup_lag = shared
-        .backup_lag_started
+        .archive_lag_started
         .lock()
         .expect("lock")
         .values()
@@ -1563,13 +1574,13 @@ fn update_capacity_signal(shared: &Shared, queue: &LoopQueue) {
     let spool_metrics = shared.replica_spool_metrics.lock().expect("lock");
     let (peer_spool_used_bytes, peer_spool_capacity_bytes) = spool_metrics
         .iter()
-        .filter(|metric| metric.source_capacity_bytes > 0)
+        .filter(|metric| metric.host_capacity_bytes > 0)
         .max_by(|left, right| {
-            (u128::from(left.stored_bytes) * u128::from(right.source_capacity_bytes))
-                .cmp(&(u128::from(right.stored_bytes) * u128::from(left.source_capacity_bytes)))
+            (u128::from(left.stored_bytes) * u128::from(right.host_capacity_bytes))
+                .cmp(&(u128::from(right.stored_bytes) * u128::from(left.host_capacity_bytes)))
         })
         .map_or((0, 0), |metric| {
-            (metric.stored_bytes, metric.source_capacity_bytes)
+            (metric.stored_bytes, metric.host_capacity_bytes)
         });
     drop(spool_metrics);
 
@@ -1908,6 +1919,14 @@ fn apply_effect(effect: Effect, context: &EffectContext, source: Option<FaultSou
                 .lock()
                 .expect("lock")
                 .push(format!("fenced: {vset:?}"));
+        }
+        Effect::VsetUnservable { page } => {
+            tracing::error!(?page, "vset recovery material is unservable");
+            shared
+                .incidents
+                .lock()
+                .expect("lock")
+                .push(format!("unservable: {:?}", page.volume.vset));
         }
         Effect::Admin(reply) => {
             if let AdminReply::MigratedOut { vset, .. } = reply {
@@ -2473,6 +2492,7 @@ mod tests {
         let runtime = Runtime::new(
             &RuntimeConfig {
                 daemon: DaemonConfig {
+                    archive: Default::default(),
                     host: blockd_core::types::HostId(0),
                     cache_pages: 8,
                     writeback_interval: blockd_core::types::millis(5),
@@ -2488,7 +2508,7 @@ mod tests {
             Arc::new(crate::s3::S3Store::new()),
         );
         let fault_reader_count = runtime.fault_reader_count.clone();
-        runtime.create_vset(VsetId(99), VsetConfig::compute(1, 1, false));
+        runtime.create_vset(VsetId(99), VsetConfig::compute(1, 1));
         let deadline = Instant::now() + Duration::from_secs(1);
         while fault_reader_count.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             thread::yield_now();
@@ -2515,6 +2535,7 @@ mod tests {
         let runtime = Runtime::new(
             &RuntimeConfig {
                 daemon: DaemonConfig {
+                    archive: Default::default(),
                     host: blockd_core::types::HostId(0),
                     cache_pages: 8,
                     writeback_interval: blockd_core::types::secs(60),
@@ -2531,11 +2552,11 @@ mod tests {
         );
 
         let first = VsetId(1);
-        runtime.create_vset(first, VsetConfig::database(1, false));
+        runtime.create_vset(first, VsetConfig::database(1));
         assert!(runtime.daemon_stats().vsets.is_empty());
 
         runtime.tx.push(Msg::Ev(Event::Timer(TimerId::Writeback)));
-        runtime.create_vset(VsetId(2), VsetConfig::database(1, false));
+        runtime.create_vset(VsetId(2), VsetConfig::database(1));
         let published = runtime.daemon_stats();
         assert_eq!(
             published

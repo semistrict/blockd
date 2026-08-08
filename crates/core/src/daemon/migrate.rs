@@ -1,7 +1,7 @@
 //! Live migration (R7): post-copy — cut over first, fault the remainder.
 //!
-//! The at-most-one-runner exclusion for non-backed-up vsets rests on state
-//! locality plus a **two-sided durable handoff** (R6.3/R7.2):
+//! The at-most-one-runner exclusion rests on the fenced head plus a
+//! **two-sided durable handoff** (R6.3/R7.2):
 //!
 //! 1. The source pauses the guest, captures a final whole record, and
 //!    durably writes a local *handoff marker* before offering anything. A
@@ -13,8 +13,8 @@
 //!
 //! The destination resumes immediately (pause = capture + one message,
 //! R7.1) and demand-faults the tail from the source — the peer tier of
-//! R2.3. Source death mid-drain costs the vset (non-backed mode's premise,
-//! R7.3) — loudly, at the destination's first unservable fetch.
+//! R2.3. Source death mid-drain falls back to the protected closure retained
+//! on the destination's passive spool (R7.3).
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::head::HeadRecord;
@@ -78,6 +78,7 @@ impl Handoff {
 pub(super) struct MigrateOut {
     pub req: ReqId,
     pub to: HostId,
+    pub handoff_started: bool,
     /// The final captured record, offered once the handoff is durable.
     pub record: Option<JournalRecord>,
 }
@@ -94,13 +95,11 @@ impl Daemon {
             out.push(Effect::Admin(AdminReply::AdminFailed { req }));
             return;
         };
-        // V1 migrates the mode that has no other way to move (R7.2);
-        // backed-up vsets relocate via restore. One migration at a time;
-        // outbound vsets are already gone; a vset still draining its OWN
+        // One migration at a time; outbound vsets are already gone; a vset
+        // still draining its OWN
         // tail off a source may not chain-migrate — its record would point
         // the new destination at segments the middle host never had.
         if !state.ready
-            || (state.config.durability.uses_store() && state.config.kind != VsetKind::Database)
             || state.outbound.is_some()
             || state.migrate.is_some()
             || state.peer_source.is_some()
@@ -114,6 +113,7 @@ impl Daemon {
         state.migrate = Some(MigrateOut {
             req,
             to,
+            handoff_started: false,
             record: None,
         });
         if state.config.kind == VsetKind::Database {
@@ -125,8 +125,10 @@ impl Daemon {
                 after: 0,
             });
         } else {
-            // Cut over: pause, capture, hand off (R7.1's guest-observed pause
-            // is this pause plus one network hop).
+            // Replication, not object-store publication, is the migration
+            // durability boundary. Pause immediately; the final cut is
+            // committed to the passive before the handoff marker, and the
+            // archive pipeline packs it later on its own cadence.
             out.push(Effect::PauseGuest { vset });
         }
     }
@@ -165,11 +167,8 @@ impl Daemon {
             return;
         };
         migrate.record = Some(record);
-        if state.config.durability.uses_store() {
-            self.maybe_finish_backed_migration(vset, out);
-            return;
-        }
-        self.write_migration_handoff(vset, out);
+        self.maybe_replicate(vset, out);
+        self.maybe_finish_backed_migration(vset, out);
     }
 
     fn write_migration_handoff(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
@@ -185,6 +184,13 @@ impl Daemon {
         };
         let io = self.io();
         self.pending.insert(io, Pending::HandoffWrite { vset });
+        self.vsets
+            .get_mut(&vset)
+            .expect("known")
+            .migrate
+            .as_mut()
+            .expect("migrating")
+            .handoff_started = true;
         out.push(Effect::BlobWrite {
             io,
             name: layout::handoff_blob(vset),
@@ -192,9 +198,11 @@ impl Daemon {
         });
     }
 
-    /// A backed database transfers only after its final record is the store
-    /// head. This prevents a late source publish from racing the destination's
-    /// assignment claim and fencing the peer that still serves the tail.
+    /// Compute handoff needs the final record on the passive, not in the
+    /// archive: S3 publication remains asynchronous to the guest-visible
+    /// pause. A database still waits for the store head because its
+    /// destination must claim that assignment without racing a late source
+    /// publication.
     pub(super) fn maybe_finish_backed_migration(&mut self, vset: VsetId, out: &mut Vec<Effect>) {
         let ready = self.vsets.get(&vset).is_some_and(|state| {
             let Some(migrate) = &state.migrate else {
@@ -203,12 +211,18 @@ impl Daemon {
             let Some(record) = &migrate.record else {
                 return false;
             };
-            state.config.durability.uses_store()
-                && state.publish.is_none()
-                && state.outbound.is_none()
-                && state.backed.is_some_and(|ptr| {
-                    (ptr.capture_seq, ptr.seq) == (record.capture_seq, record.seq)
-                })
+            state.outbound.is_none()
+                && !migrate.handoff_started
+                && match state.config.kind {
+                    VsetKind::Compute => {
+                        state.peer_committed_record.as_ref().is_some_and(|known| {
+                            (known.fence, known.seq) == (record.fence, record.seq)
+                        })
+                    }
+                    VsetKind::Database => state.backed.is_some_and(|ptr| {
+                        (ptr.capture_seq, ptr.seq) == (record.capture_seq, record.seq)
+                    }),
+                }
         });
         if ready {
             self.write_migration_handoff(vset, out);
@@ -281,6 +295,7 @@ impl Daemon {
         state.migrate = Some(MigrateOut {
             req: RECOVERED_REQ,
             to,
+            handoff_started: true,
             record: None,
         });
         let record = state
@@ -420,6 +435,7 @@ impl Daemon {
             | PeerMsg::ReplicaPutAck { .. }
             | PeerMsg::ReplicaCommit { .. }
             | PeerMsg::ReplicaCommitAck { .. }
+            | PeerMsg::ReplicaArchive { .. }
             | PeerMsg::ReplicaStatus { .. }
             | PeerMsg::ReplicaStatusReply { .. }
             | PeerMsg::ReplicaUploadDone { .. }
@@ -549,7 +565,6 @@ impl Daemon {
         // every leaf span parks its faults until fetched (post-copy is
         // already the contract — a parked fault is just a further page).
         state.adopt_record(record);
-        state.adopt_local_ack_if_allowed();
         state.peer_source = Some(from);
         state.hydration_remaining_pages = state
             .page_locs
@@ -571,10 +586,7 @@ impl Daemon {
         let Some(state) = self.vsets.get(&vset) else {
             return;
         };
-        if !state.config.durability.uses_store()
-            || state.migrated_verdict.is_none()
-            || state.migration_head_claimed
-        {
+        if state.migrated_verdict.is_none() || state.migration_head_claimed {
             return;
         }
         let Some(source) = state.peer_source else {

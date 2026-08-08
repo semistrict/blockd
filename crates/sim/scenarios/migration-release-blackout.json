@@ -6,8 +6,7 @@
   "kind": "cluster",
   "topology": {
     "hosts": 2,
-    "vset_count": 1,
-    "nonbacked_vsets": 1
+    "vset_count": 1
   },
   "nemeses": {
     "kill_hosts": [],

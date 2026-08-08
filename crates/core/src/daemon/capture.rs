@@ -116,9 +116,7 @@ impl Daemon {
                     out.push(Effect::Admin(AdminReply::AdminFailed { req }));
                     return;
                 }
-                if config.durability.requires_peer_sync()
-                    && self.initial_stash_assignment(vset).is_none()
-                {
+                if self.initial_stash_assignment(vset).is_none() {
                     out.push(Effect::Admin(AdminReply::AdminFailed { req }));
                     return;
                 }
@@ -126,19 +124,9 @@ impl Daemon {
                 state.create_req = Some(req);
                 state.fork_from = from_base;
                 self.vsets.insert(vset, state);
-                if config.durability.uses_store() {
-                    // Backed-up vsets claim their head first (R6.3): the
-                    // returned CAS version is this incarnation's fence.
-                    self.head_create(vset, out);
-                } else if from_base.is_some() {
-                    // Non-backed forks still read shared base data (R4.4
-                    // allows reads; writes stay forbidden).
-                    self.fork_fetch_base(vset, out);
-                } else {
-                    // The creation record: seq 0, empty map, durable before
-                    // the vset is usable (R4.4: the store is never touched).
-                    self.start_record_only_capture(vset, out);
-                }
+                // Every vset claims its fenced head and stash assignment
+                // before writing its first local record.
+                self.head_create(vset, out);
             }
             AdminCmd::KeepBase { req, vset, base } => self.keep_base(req, vset, base, out),
             AdminCmd::Checkpoint { req, vset } => {
@@ -672,7 +660,8 @@ impl Daemon {
         let flush_set: BTreeSet<PageId> = to_flush.iter().copied().collect();
         let mut compact_victims: BTreeSet<(u64, SegId)> = BTreeSet::new();
         let mut compact_pages: Vec<(PageId, Gen, Vec<u8>)> = Vec::new();
-        for (victim, entries) in std::mem::take(&mut state.compact_stash) {
+        let compact_stash = std::mem::take(&mut state.compact_stash);
+        for (victim, entries) in compact_stash {
             let before = compact_pages.len();
             compact_pages.extend(entries.into_iter().filter(|(page, generation, _)| {
                 !flush_set.contains(page)
@@ -1272,6 +1261,9 @@ impl Daemon {
             Some(
                 pending @ (Pending::ReplicaArtifactAppend { .. }
                 | Pending::ReplicaCommitAppend { .. }
+                | Pending::ReplicaCompactAppend { .. }
+                | Pending::ReplicaCompactDelete { .. }
+                | Pending::ReplicaSupersededDelete { .. }
                 | Pending::ReplicaReleaseDelete { .. }
                 | Pending::ReplicaTailTruncate { .. }),
             ) => self.replica_append_done(pending, out),
@@ -1321,10 +1313,7 @@ impl Daemon {
         let mut claim_migration_head = false;
         if !state.ready {
             state.ready = true;
-            if state.migrated_verdict.is_some()
-                && state.config.durability.uses_store()
-                && !state.migration_head_claimed
-            {
+            if state.migrated_verdict.is_some() && !state.migration_head_claimed {
                 // The first local record is the backed destination's
                 // provisional side. Claim the assignment head next, then
                 // write once more in the returned fence before accepting.
@@ -1400,7 +1389,6 @@ impl Daemon {
         state.local_covered_through = state
             .local_covered_through
             .max(capture.sync_covered_through);
-        state.adopt_local_ack_if_allowed();
         self.drain_sync_acks(vset_id, out);
 
         self.maybe_replicate(vset_id, out);
@@ -1426,15 +1414,6 @@ impl Daemon {
             self.maybe_start_commit(vset_id, mem, out);
         }
         self.maybe_start_checkpoint(vset_id, out);
-        // Backup flows continuously as records finalize (R4.2), never gated
-        // on checkpoints (R3.2).
-        if self
-            .vsets
-            .get(&vset_id)
-            .is_some_and(|s| s.config.durability.uses_store())
-        {
-            self.maybe_publish(vset_id, out);
-        }
     }
 
     pub(super) fn drain_sync_acks(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
@@ -1472,6 +1451,16 @@ impl Daemon {
     // One keep-set per artifact class; splitting would scatter the rule.
     #[allow(clippy::too_many_lines)]
     pub(super) fn cleanup(&mut self, vset_id: VsetId, out: &mut Vec<Effect>) {
+        let pending_replica_reads: Vec<_> = self
+            .pending
+            .values()
+            .filter_map(|pending| match pending {
+                super::Pending::ReplicaSourceRead { vset, artifact } if *vset == vset_id => {
+                    Some(*artifact)
+                }
+                _ => None,
+            })
+            .collect();
         let Some(state) = self.vsets.get_mut(&vset_id) else {
             return;
         };
@@ -1483,12 +1472,6 @@ impl Daemon {
             keep_records.insert(pinned.seq);
         }
         keep_records.extend(state.captures.keys().copied());
-        // An in-flight backup publish pins its record and segments: the
-        // store copy reads them from local disk (R4.2), and writeback must
-        // not race them away.
-        if let Some(publish) = &state.publish {
-            keep_records.insert(publish.record.seq);
-        }
         if let Some(send) = &state.replica_send {
             keep_records.insert(send.record.seq);
         }
@@ -1509,8 +1492,8 @@ impl Daemon {
             keep_records.insert(anchor);
         }
 
-        // Leaves stay while any kept record (or the serving table, or an
-        // in-flight capture/publish) references them.
+        // Leaves stay while any kept record (or the serving table or an
+        // in-flight replica send) references them.
         let mut keep_leaves: BTreeSet<LeafPtr> = state.leaf_table.values().copied().collect();
         if let Some(best) = &state.best_record {
             keep_leaves.extend(best.leaves.values());
@@ -1521,12 +1504,21 @@ impl Daemon {
         for capture in state.captures.values() {
             keep_leaves.extend(capture.leaf_table.values());
         }
-        if let Some(publish) = &state.publish {
-            keep_leaves.extend(publish.record.leaves.values());
-        }
         if let Some(send) = &state.replica_send {
             keep_leaves.extend(send.record.leaves.values());
         }
+        keep_leaves.extend(
+            pending_replica_reads
+                .iter()
+                .filter_map(|artifact| match artifact {
+                    crate::seam::ReplicaArtifact::Leaf { fence, id } => Some(LeafPtr {
+                        base: 0,
+                        fence: *fence,
+                        id: *id,
+                    }),
+                    crate::seam::ReplicaArtifact::Segment { .. } => None,
+                }),
+        );
 
         let mut keep_segs: BTreeSet<(u64, SegId)> = BTreeSet::new();
         // `seg_live` is maintained on every serving-map adoption. Using its
@@ -1547,15 +1539,6 @@ impl Daemon {
                     .map(|(_, loc)| (loc.fence, loc.seg)),
             );
         }
-        if let Some(publish) = &state.publish {
-            keep_segs.extend(
-                publish
-                    .record
-                    .overlay
-                    .values()
-                    .map(|(_, loc)| (loc.fence, loc.seg)),
-            );
-        }
         if let Some(send) = &state.replica_send {
             keep_segs.extend(
                 send.record
@@ -1564,6 +1547,14 @@ impl Daemon {
                     .map(|(_, loc)| (loc.fence, loc.seg)),
             );
         }
+        keep_segs.extend(
+            pending_replica_reads
+                .iter()
+                .filter_map(|artifact| match artifact {
+                    crate::seam::ReplicaArtifact::Segment { fence, seg } => Some((*fence, *seg)),
+                    crate::seam::ReplicaArtifact::Leaf { .. } => None,
+                }),
+        );
         // Every kept leaf pins the segments its entries reference.
         for ptr in &keep_leaves {
             if let Some((_, segs)) = state.leaf_blobs.get(ptr) {

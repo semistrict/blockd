@@ -20,10 +20,10 @@
 //! Object store keys (relative to the cluster's bucket + prefix, R9.1):
 //! - `v/<vset:016x>/head`  — head record: CAS assignment authority (R6.3)
 //!   and pointer to the newest backed-up manifest
-//! - `v/<vset:016x>/m/<fence:016x>-<seq:016x>` — manifest: the journal
-//!   record's bytes, verbatim
-//! - `v/<vset:016x>/s/<fence:016x>-<seg:016x>` — segment: the local blob's
-//!   bytes, verbatim (R8.4: transfers move stored bytes unchanged)
+//! - `v/<vset:016x>/m/<fence:016x>-<seq:016x>` — manifest: the selected
+//!   journal cut, optionally rewritten to archive-only page locations
+//! - `v/<vset:016x>/s/<fence:016x>-<seg:016x>` — source segment bytes or a
+//!   passive-derived archive pack, both in the same verified format
 //! - `b/<base:016x>/…` — bases (lineage milestone)
 
 use crate::types::{HostId, JournalSeq, SegId, VsetId};
@@ -75,7 +75,7 @@ pub fn segment_key(vset: VsetId, fence: u64, seg: SegId) -> String {
     format!("v/{:016x}/s/{fence:016x}-{:016x}", vset.0, seg.0)
 }
 
-/// A map leaf in the store, the local blob's bytes verbatim (R8.4).
+/// A source map leaf or a passive-derived archive leaf in the store.
 pub fn leaf_key(vset: VsetId, fence: u64, id: u64) -> String {
     format!("v/{:016x}/l/{fence:016x}-{id:016x}", vset.0)
 }

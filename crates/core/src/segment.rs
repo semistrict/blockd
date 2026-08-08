@@ -1,8 +1,9 @@
 //! Segments: the unit of page storage and transfer. A segment is one
 //! write-once blob holding lz4-compressed page entries, each individually
-//! framed and checksummed. The same bytes live on local disk and in the
-//! object store, and move between tiers verbatim (R8.4); the fault path pays
-//! exactly one decompression of one entry.
+//! framed and checksummed. Primary-to-passive transfer moves source segments
+//! verbatim; the passive may decode live entries into archive-only packs in
+//! the same format (R8.4). The fault path pays exactly one decompression of
+//! one entry.
 //!
 //! Layout: `header frame | entry frame | entry frame | …`. Every frame is
 //! `format::seal_frame`; a torn tail fails a frame check and is detected as

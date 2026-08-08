@@ -9,7 +9,6 @@
     "disk_headroom_bytes": { "uniform": { "min": 12288, "max": 24576 } }
   },
   "topology": {
-    "backed_vsets": 0
   },
   "coverage": [
     { "metric": "nvme-stall", "label": "irreducible NVMe stall" }

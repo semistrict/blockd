@@ -44,7 +44,7 @@ pub(crate) fn event_kind(event: &Event) -> usize {
     }
 }
 
-pub(crate) const EFFECT_KINDS: [&str; 29] = [
+pub(crate) const EFFECT_KINDS: [&str; 30] = [
     "Fill",
     "FillShared",
     "FillFailed",
@@ -74,6 +74,7 @@ pub(crate) const EFFECT_KINDS: [&str; 29] = [
     "Abort",
     "DatabaseInstall",
     "Database",
+    "VsetUnservable",
 ];
 
 pub(crate) fn effect_kind(effect: &Effect) -> usize {
@@ -107,6 +108,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> usize {
         Effect::Abort { .. } => 26,
         Effect::DatabaseInstall { .. } => 27,
         Effect::Database(_) => 28,
+        Effect::VsetUnservable { .. } => 29,
     }
 }
 

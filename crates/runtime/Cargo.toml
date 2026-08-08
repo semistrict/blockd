@@ -46,8 +46,3 @@ tempfile = "3.23.0"
 [target.'cfg(target_os = "linux")'.dependencies]
 blockd-vsetfs = { path = "../vsetfs" }
 libc.workspace = true
-
-[[bin]]
-name = "blockd-vsetfs"
-path = "src/bin/blockd-vsetfs.rs"
-required-features = []

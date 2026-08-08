@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
-use crate::journal::{DurabilityMode, JournalRecord};
+use crate::journal::JournalRecord;
 use crate::mapleaf::MapLeaf;
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
@@ -317,8 +317,7 @@ fn verify_record(
     bytes: &[u8],
 ) -> Result<(), ReplicaSpoolError> {
     let record = JournalRecord::decode(vset, bytes)?;
-    if record.config.durability != DurabilityMode::PeerStashed
-        || record.fence != info.writer_fence
+    if record.fence != info.writer_fence
         || record.seq != info.seq
         || record.sync_covered_through != info.sync_covered_through
     {
@@ -362,7 +361,6 @@ mod tests {
                 kind: crate::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 16,
-                durability: DurabilityMode::PeerStashed,
             },
             seq: info.seq,
             fence: info.writer_fence,
@@ -412,7 +410,6 @@ mod tests {
                 kind: crate::journal::VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 16,
-                durability: DurabilityMode::PeerStashed,
             },
             seq: info.seq,
             fence: info.writer_fence,

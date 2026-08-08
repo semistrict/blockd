@@ -205,6 +205,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "blockd-core",
  "blockd-runtime",
  "opentelemetry",
@@ -213,6 +214,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus",
  "reqwest",
+ "rustls",
  "serde_json",
  "tokio",
  "tower-http 0.7.0",

@@ -4,25 +4,29 @@
 //! control plane deliberately racing two claimants to keep the
 //! exactly-one-runner property under fire. Loss on host death is checked
 //! against the head's manifest pointer at the instant of death (R4.3: the
-//! backup lag, nothing more).
+//! archive horizon, nothing more).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use blockd_core::daemon::{Daemon, DaemonConfig};
+use blockd_core::daemon::{Daemon, DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::head::{HeadRecord, ManifestPtr};
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
+use blockd_core::placement::PeerCandidate;
+use blockd_core::replica_recovery::{
+    ReplicaResidue, export_replica_recovery, refence_replica_export,
+};
 use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, Verdict};
 use blockd_core::types::{HostId, PageId, SimTime, VsetId, micros, millis};
 
 use crate::guest::{
     AttemptResult, FillResult, Guest, GuestState, PendingOp, UnparkResult, VsetMem,
 };
-use crate::harness::Sabotage;
+use crate::harness::{Sabotage, archive_segment_efficiency};
 use crate::kernel::Kernel;
 use crate::oracle::Oracle;
 use crate::world::blobdev::{BdevIo, BlobDev, BlobDevConfig};
-use crate::world::store::{ObjectStore, StoreConfig, Version};
+use crate::world::store::{ObjectStore, StoreConfig, StoreCounters, Version};
 
 /// One peer message kind, as the wedge nemesis targets them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,6 +43,7 @@ pub enum PeerKind {
     ReplicaPutAck,
     ReplicaCommit,
     ReplicaCommitAck,
+    ReplicaArchive,
     ReplicaStatus,
     ReplicaStatusReply,
     ReplicaUploadDone,
@@ -62,6 +67,7 @@ impl PeerKind {
             PeerMsg::ReplicaPutAck { .. } => PeerKind::ReplicaPutAck,
             PeerMsg::ReplicaCommit { .. } => PeerKind::ReplicaCommit,
             PeerMsg::ReplicaCommitAck { .. } => PeerKind::ReplicaCommitAck,
+            PeerMsg::ReplicaArchive { .. } => PeerKind::ReplicaArchive,
             PeerMsg::ReplicaStatus { .. } => PeerKind::ReplicaStatus,
             PeerMsg::ReplicaStatusReply { .. } => PeerKind::ReplicaStatusReply,
             PeerMsg::ReplicaUploadDone { .. } => PeerKind::ReplicaUploadDone,
@@ -78,12 +84,7 @@ pub struct ClusterConfig {
     pub bdev: BlobDevConfig,
     pub store: StoreConfig,
     pub vset_count: u16,
-    /// Per-vset shape; `backed_up` here applies to every vset past the
-    /// first `nonbacked_vsets`.
     pub vset_config: VsetConfig,
-    /// The first N vsets are created non-backed (R4.4's other mode — the
-    /// one that must migrate to move, R7.2).
-    pub nonbacked_vsets: u16,
     pub horizon: u64,
     pub think: (u64, u64),
     pub checkpoint_interval: Option<u64>,
@@ -96,8 +97,7 @@ pub struct ClusterConfig {
     pub restart_delay: (u64, u64),
     /// Nemesis: mean interval between random host crashes (0 disables).
     pub crash_mean_interval: u64,
-    /// Nemesis: mean interval between random migrations of non-backed
-    /// vsets to random destinations (0 disables).
+    /// Nemesis: mean interval between random migrations (0 disables).
     pub migrate_mean_interval: u64,
     /// Peer-message loss odds as (numerator, denominator); (0, 1) is a
     /// reliable channel. Draws happen only when the numerator is nonzero,
@@ -237,21 +237,56 @@ pub struct ClusterReport {
     pub replica_artifact_flushes: u64,
     pub replica_commit_flushes: u64,
     pub replica_rotations: u64,
+    pub archive_cycles: u64,
+    pub archive_commits_coalesced: u64,
+    pub replica_capacity_backpressure: u64,
+    pub published_segment_bytes: u64,
+    pub published_live_entry_bytes: u64,
+    pub published_dead_entry_bytes: u64,
+    pub published_segment_overhead_bytes: u64,
+    pub replica_spool_bytes: u64,
+    pub peer_committed_through: u64,
+    pub archived_through: u64,
+    pub archive_lag_bytes: u64,
+    pub max_archive_lag_age_ns: u64,
+    pub segs_compacted: u64,
+    pub pages_compacted: u64,
+    pub store: StoreCounters,
     /// Blobs left on each host's device at the end of the run.
     pub blobs_per_host: Vec<usize>,
+    /// Primary journal/segment/leaf blobs, excluding passive replica spools.
+    pub primary_blobs_per_host: Vec<usize>,
 }
 
-struct MemView<'a>(&'a BTreeMap<VsetId, VsetMem>);
+struct MemView<'a> {
+    host: u16,
+    now: SimTime,
+    mems: &'a BTreeMap<VsetId, VsetMem>,
+}
 
 impl HostMap for MemView<'_> {
     fn read_page(&self, page: PageId) -> Vec<u8> {
-        self.0[&page.volume.vset].pages[&page].clone()
+        let mem = self.mems.get(&page.volume.vset).unwrap_or_else(|| {
+            panic!(
+                "capture read for unmapped vset: {page:?} on host {} at {:?}",
+                self.host, self.now
+            )
+        });
+        mem.pages
+            .get(&page)
+            .unwrap_or_else(|| {
+                panic!(
+                    "capture read for nonresident page: {page:?} on host {} at {:?}",
+                    self.host, self.now
+                )
+            })
+            .clone()
     }
 
     fn harvest_accessed(&self) -> Vec<PageId> {
         // One-shot: drain every guest's touch record. `mems` is a BTreeMap
         // and each set is ordered, so the result is deterministic.
-        self.0
+        self.mems
             .values()
             .flat_map(|mem| mem.accessed.take())
             .collect()
@@ -295,6 +330,11 @@ enum Ev {
     KillHost(u16),
     CrashHost(u16),
     RestartHost(u16),
+    PromoteOrphan {
+        source: u16,
+        vset: VsetId,
+        claimants: Vec<u16>,
+    },
     StoreOutage(bool),
     RotResumeSets,
     RotLeaves,
@@ -329,6 +369,7 @@ struct Cluster {
     expected_ptr: BTreeMap<VsetId, Option<ManifestPtr>>,
     /// `RestoreVset` send instants, for the R6.2 latency measurement.
     restore_sent: BTreeMap<ReqId, SimTime>,
+    orphan_started: BTreeMap<VsetId, SimTime>,
     /// Last `PauseGuest` instant per vset (the R7.1 pause measurement).
     paused_at: BTreeMap<VsetId, SimTime>,
     /// Migrated-in vsets and the source host still serving their tail.
@@ -356,7 +397,21 @@ struct Cluster {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
+pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
+    if config.daemon.replica_placement.is_none() {
+        config.daemon.replica_placement = Some(ReplicaPlacementConfig {
+            membership_epoch: 1,
+            local_failure_domain: 1,
+            roster: (0..config.hosts)
+                .map(|host| PeerCandidate {
+                    host: HostId(host),
+                    weight: 1,
+                    failure_domain: host + 1,
+                    drained: false,
+                })
+                .collect(),
+        });
+    }
     let kernel = Kernel::new(seed);
     let store = ObjectStore::new(config.store.clone());
     let mut hosts = Vec::new();
@@ -399,6 +454,7 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
         pending_offers: BTreeMap::new(),
         expected_ptr: BTreeMap::new(),
         restore_sent: BTreeMap::new(),
+        orphan_started: BTreeMap::new(),
         paused_at: BTreeMap::new(),
         migrated_from: BTreeMap::new(),
         doomed: BTreeSet::new(),
@@ -488,6 +544,38 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
     c.report.replica_artifact_flushes = sum(|k| k.replica_artifact_flushes);
     c.report.replica_commit_flushes = sum(|k| k.replica_commit_flushes);
     c.report.replica_rotations = sum(|k| k.replica_rotations);
+    c.report.archive_cycles = sum(|k| k.archive_cycles);
+    c.report.archive_commits_coalesced = sum(|k| k.archive_commits_coalesced);
+    c.report.replica_capacity_backpressure = sum(|k| k.replica_capacity_backpressure);
+    let vsets: Vec<_> = c.guests.keys().copied().collect();
+    let (physical, archive_live, dead, overhead) = archive_segment_efficiency(&c.store, &vsets);
+    c.report.published_segment_bytes = physical;
+    c.report.published_live_entry_bytes = archive_live;
+    c.report.published_dead_entry_bytes = dead;
+    c.report.published_segment_overhead_bytes = overhead;
+    c.report.replica_spool_bytes = live()
+        .flat_map(blockd_core::daemon::Daemon::replica_spool_metrics)
+        .map(|metrics| metrics.stored_bytes)
+        .sum();
+    c.report.max_archive_lag_age_ns = live()
+        .flat_map(blockd_core::daemon::Daemon::replica_spool_metrics)
+        .map(|metrics| metrics.unarchived_age_ns)
+        .max()
+        .unwrap_or(0);
+    c.report.peer_committed_through = live()
+        .flat_map(blockd_core::daemon::Daemon::replica_metrics)
+        .map(|metrics| metrics.peer_committed_through)
+        .sum();
+    c.report.archived_through = live()
+        .flat_map(blockd_core::daemon::Daemon::replica_metrics)
+        .map(|metrics| metrics.store_published_through)
+        .sum();
+    c.report.archive_lag_bytes = live()
+        .flat_map(|daemon| daemon.stats().vsets)
+        .filter_map(|metrics| metrics.archive_lag_bytes)
+        .sum();
+    c.report.segs_compacted = sum(|k| k.segs_compacted);
+    c.report.pages_compacted = sum(|k| k.pages_compacted);
     c.report.disk_crash_applied = c
         .hosts
         .iter()
@@ -506,7 +594,23 @@ pub fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
     c.report.disk_bitflips = c.hosts.iter().map(|host| host.bdev.counters.bitflips).sum();
     c.report.store_unavailable = c.store.counters.unavailable;
     c.report.store_cas_conflicts = c.store.counters.cas_conflicts;
+    c.report.store = c.store.counters;
     c.report.blobs_per_host = c.hosts.iter().map(|h| h.bdev.blob_count()).collect();
+    c.report.primary_blobs_per_host = c
+        .hosts
+        .iter()
+        .map(|host| {
+            host.bdev
+                .scan()
+                .filter(|(name, _)| {
+                    !matches!(
+                        layout::parse_blob(name),
+                        Some(layout::BlobName::ReplicaSpool { .. })
+                    )
+                })
+                .count()
+        })
+        .collect();
     c.report
 }
 
@@ -571,14 +675,9 @@ impl Cluster {
         }
     }
 
-    /// The shape a vset was created with (the first `nonbacked_vsets` run
-    /// in the non-backed mode).
     fn vset_config_for(&self, vset: VsetId) -> VsetConfig {
-        let mut config = self.config.vset_config;
-        if vset.0 <= u64::from(self.config.nonbacked_vsets) {
-            config.durability = DurabilityMode::Local;
-        }
-        config
+        let _ = vset;
+        self.config.vset_config
     }
 
     fn step_daemon(&mut self, host: u16, event: Event) {
@@ -586,7 +685,14 @@ impl Cluster {
         let Some(daemon) = &mut state.daemon else {
             return;
         };
-        let effects = daemon.step(event, &MemView(&state.mems));
+        let effects = daemon.step(
+            event,
+            &MemView {
+                host,
+                now: self.kernel.now(),
+                mems: &state.mems,
+            },
+        );
         self.apply_effects(host, effects);
         // Retried writes trap again after the batch (see `refaults`).
         while let Some((host, page)) = self.refaults.pop() {
@@ -1037,6 +1143,12 @@ impl Cluster {
                         guest.state = GuestState::Dead;
                     }
                 }
+                Effect::VsetUnservable { page } => {
+                    if let Some(guest) = self.guests.get_mut(&page.volume.vset) {
+                        guest.state = GuestState::Dead;
+                    }
+                    self.report.guest_deaths += 1;
+                }
                 Effect::Admin(reply) => self.admin_reply(host, reply),
                 Effect::PeerSend { to, msg } => {
                     // The wedge nemesis: a total, targeted outage of one
@@ -1236,6 +1348,11 @@ impl Cluster {
             Ev::KillHost(host) => self.kill_host(host),
             Ev::CrashHost(host) => self.crash_host(host),
             Ev::RestartHost(host) => self.restart_host(host),
+            Ev::PromoteOrphan {
+                source,
+                vset,
+                claimants,
+            } => self.promote_orphan(source, vset, claimants),
             Ev::StoreOutage(out) => self.store.set_outage(out),
             Ev::RotResumeSets => self.rot_resume_sets(),
             Ev::RotLeaves => self.rot_leaves(),
@@ -1377,14 +1494,13 @@ impl Cluster {
         }
     }
 
-    /// Nemesis: migrate a random non-backed vset to a random live peer.
+    /// Nemesis: migrate a random vset to a live peer.
     fn random_migration(&mut self) {
         let candidates: Vec<(VsetId, u16)> = self
             .placement
             .iter()
             .filter(|&(&vset, &host)| {
-                vset.0 <= u64::from(self.config.nonbacked_vsets)
-                    && self.hosts[usize::from(host)].daemon.is_some()
+                self.hosts[usize::from(host)].daemon.is_some()
                     && !self.migrated_from.contains_key(&vset)
                     && !self.doomed.contains(&vset)
             })
@@ -1428,13 +1544,8 @@ impl Cluster {
         state.inc += 1;
         state.mems.clear();
         state.shared_base.clear();
-        // Migrated-in vsets whose source this was lose their tail: their
-        // guests' next unservable fault is the sanctioned R7.3 cost.
-        for (&vset, &source) in &self.migrated_from {
-            if source == host {
-                self.doomed.insert(vset);
-            }
-        }
+        // Migrated-in vsets whose source this was retain the final handoff
+        // closure on the destination's durable passive spool (R7.3).
         let orphans: Vec<VsetId> = self
             .placement
             .iter()
@@ -1442,35 +1553,258 @@ impl Cluster {
             .map(|(v, _)| *v)
             .collect();
         for vset in orphans {
+            self.orphan_started.insert(vset, self.kernel.now());
             if let Some(guest) = self.guests.get_mut(&vset) {
                 guest.state = GuestState::Dead;
             }
-            if vset.0 <= u64::from(self.config.nonbacked_vsets) {
-                // Non-backed mode: host death costs the vset (its premise);
-                // there is nothing to restore from (R4.4).
+            let claimants: Vec<u16> = (1..self.config.hosts)
+                .map(|offset| (host + offset) % self.config.hosts)
+                .filter(|candidate| {
+                    !self.dead.contains(candidate)
+                        && self.hosts[usize::from(*candidate)].daemon.is_some()
+                })
+                .take(if self.config.race_restore { 2 } else { 1 })
+                .collect();
+            if claimants.is_empty() {
+                self.report
+                    .violations
+                    .push(format!("orphan {vset:?} has no live restore claimant"));
                 continue;
             }
-            // The R4.3 bound: whatever the head points at right now is the
-            // most anyone may recover.
-            let ptr = self
-                .store
-                .peek(&layout::head_key(vset))
-                .and_then(|bytes| HeadRecord::decode(vset, bytes).ok())
-                .and_then(|head| head.manifest);
-            self.expected_ptr.insert(vset, ptr);
+            self.kernel.schedule_at(
+                self.kernel.now(),
+                Ev::PromoteOrphan {
+                    source: host,
+                    vset,
+                    claimants,
+                },
+            );
+        }
+    }
 
-            let first = (host + 1) % self.config.hosts;
+    /// Inventory the fenced passive, publish its exact committed closure,
+    /// retire the dead assignment, then let ordinary restore race onto a
+    /// freshly placed passive. Partial object puts are harmless; the head CAS
+    /// is the single publication point, so an outage simply retries.
+    #[allow(clippy::too_many_lines)]
+    fn promote_orphan(&mut self, source: u16, vset: VsetId, claimants: Vec<u16>) {
+        let key = layout::head_key(vset);
+        let Some((observed_version, head_bytes)) = self.store.peek_versioned(&key) else {
+            self.kernel.schedule_after(
+                self.config.daemon.backup_retry,
+                Ev::PromoteOrphan {
+                    source,
+                    vset,
+                    claimants,
+                },
+            );
+            return;
+        };
+        let Ok(head) = HeadRecord::decode(vset, head_bytes) else {
+            self.report
+                .violations
+                .push(format!("corrupt orphan head for {vset:?}"));
+            return;
+        };
+        if head.holder != HostId(source) {
+            return;
+        }
+
+        let mut allowed = BTreeSet::new();
+        if let Some(stash) = head.stash {
+            allowed.insert((stash.active_peer, stash.active_assignment_epoch));
+            if let Some(peer) = stash.transition_peer {
+                allowed.insert((peer, stash.assignment_epoch));
+            }
+        }
+        allowed.extend(
+            head.retired_stashes
+                .iter()
+                .map(|retired| (retired.peer, retired.assignment_epoch)),
+        );
+        let mut owned: Vec<(HostId, u64, Vec<u8>)> = Vec::new();
+        for peer in 0..self.config.hosts {
+            if self.dead.contains(&peer) {
+                continue;
+            }
+            let peer_id = HostId(peer);
+            let mut generations: BTreeMap<u64, BTreeMap<u64, Vec<u8>>> = BTreeMap::new();
+            for (name, bytes) in self.hosts[usize::from(peer)].bdev.scan() {
+                if let Some(layout::BlobName::ReplicaSpool {
+                    source: got_source,
+                    vset: got_vset,
+                    assignment_epoch,
+                    generation,
+                }) = layout::parse_blob(name)
+                    && (got_source, got_vset) == (HostId(source), vset)
+                    && (allowed.contains(&(peer_id, assignment_epoch))
+                        || head
+                            .stash
+                            .is_some_and(|stash| assignment_epoch > stash.assignment_epoch))
+                {
+                    generations
+                        .entry(assignment_epoch)
+                        .or_default()
+                        .insert(generation, bytes.clone());
+                }
+            }
+            for (assignment_epoch, generations) in generations {
+                let bytes: Vec<u8> = generations.into_values().flatten().collect();
+                owned.push((peer_id, assignment_epoch, bytes));
+            }
+        }
+        let residues: Vec<_> = owned
+            .iter()
+            .map(|(peer, assignment_epoch, bytes)| ReplicaResidue {
+                peer: *peer,
+                assignment_epoch: *assignment_epoch,
+                bytes,
+            })
+            .collect();
+        let store_objects: BTreeMap<_, _> = self
+            .store
+            .snapshot()
+            .into_iter()
+            .map(|(key, _, bytes)| (key, bytes))
+            .collect();
+        let export = if residues.is_empty() {
+            None
+        } else {
+            match export_replica_recovery(
+                HostId(source),
+                vset,
+                observed_version.0,
+                &head,
+                &residues,
+                &store_objects,
+            ) {
+                Ok(export) => Some(export),
+                Err(error) => {
+                    self.report
+                        .violations
+                        .push(format!("passive promotion failed for {vset:?}: {error:?}"));
+                    return;
+                }
+            }
+        };
+        if export.is_none() && head.manifest.is_none() {
+            self.report
+                .violations
+                .push(format!("orphan {vset:?} has neither passive nor archive"));
+            return;
+        }
+
+        let new_fence = observed_version.0.saturating_add(1);
+        let mut manifest = head.manifest;
+        if let Some(export) = export {
+            let Ok(export) = refence_replica_export(vset, &export, new_fence) else {
+                self.report
+                    .violations
+                    .push(format!("passive refence failed for {vset:?}"));
+                return;
+            };
+            let record = export
+                .blobs
+                .iter()
+                .find_map(|(name, bytes)| {
+                    matches!(
+                        layout::parse_blob(name),
+                        Some(layout::BlobName::Journal { fence, .. }) if fence == new_fence
+                    )
+                    .then_some(bytes)
+                })
+                .and_then(|bytes| blockd_core::journal::JournalRecord::decode(vset, bytes).ok())
+                .expect("verified export has its refenced record");
+            for (name, bytes) in &export.blobs {
+                let object_key = match layout::parse_blob(name) {
+                    Some(layout::BlobName::Segment { fence, seg, .. }) => {
+                        Some(layout::segment_key(vset, fence, seg))
+                    }
+                    Some(layout::BlobName::Leaf { fence, id, .. }) => {
+                        Some(layout::leaf_key(vset, fence, id))
+                    }
+                    _ => None,
+                };
+                if let Some(object_key) = object_key {
+                    let (_, result) = self.store.put(
+                        self.kernel.now(),
+                        self.kernel.rng(),
+                        &object_key,
+                        bytes.clone(),
+                    );
+                    if result.is_err() {
+                        self.kernel.schedule_after(
+                            self.config.daemon.backup_retry,
+                            Ev::PromoteOrphan {
+                                source,
+                                vset,
+                                claimants,
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+            let record_bytes = record.encode(vset);
+            let (_, result) = self.store.put(
+                self.kernel.now(),
+                self.kernel.rng(),
+                &layout::manifest_key(vset, new_fence, record.seq),
+                record_bytes,
+            );
+            if result.is_err() {
+                self.kernel.schedule_after(
+                    self.config.daemon.backup_retry,
+                    Ev::PromoteOrphan {
+                        source,
+                        vset,
+                        claimants,
+                    },
+                );
+                return;
+            }
+            manifest = Some(ManifestPtr {
+                fence: new_fence,
+                seq: record.seq,
+                capture_seq: record.capture_seq,
+            });
+        }
+        let promoted = HeadRecord {
+            vset,
+            holder: HostId(source),
+            fence: new_fence,
+            manifest,
+            stash: None,
+            retired_stashes: Vec::new(),
+        };
+        let (_, result) = self.store.put_cas(
+            self.kernel.now(),
+            self.kernel.rng(),
+            &key,
+            Some(observed_version),
+            promoted.encode(),
+        );
+        if result.is_err() {
+            self.kernel.schedule_after(
+                self.config.daemon.backup_retry,
+                Ev::PromoteOrphan {
+                    source,
+                    vset,
+                    claimants,
+                },
+            );
+            return;
+        }
+        self.expected_ptr.insert(vset, manifest);
+        let started = self
+            .orphan_started
+            .remove(&vset)
+            .unwrap_or_else(|| self.kernel.now());
+        for claimant in claimants {
             let req = self.req();
             self.admin_reqs.insert(req, vset);
-            self.restore_sent.insert(req, self.kernel.now());
-            self.step_daemon(first, Event::Admin(AdminCmd::RestoreVset { req, vset }));
-            if self.config.race_restore && self.config.hosts > 2 {
-                let second = (host + 2) % self.config.hosts;
-                let req = self.req();
-                self.admin_reqs.insert(req, vset);
-                self.restore_sent.insert(req, self.kernel.now());
-                self.step_daemon(second, Event::Admin(AdminCmd::RestoreVset { req, vset }));
-            }
+            self.restore_sent.insert(req, started);
+            self.step_daemon(claimant, Event::Admin(AdminCmd::RestoreVset { req, vset }));
         }
     }
 
@@ -1487,14 +1821,8 @@ impl Cluster {
         state.bdev.crash(self.kernel.rng());
         state.mems.clear();
         state.shared_base.clear();
-        // A destination crashing mid-drain loses its volatile peer link:
-        // the tail it had not pulled is unreachable after restart — the
-        // sanctioned host-death cost of the non-backed mode.
-        for &vset in self.migrated_from.keys() {
-            if self.placement.get(&vset) == Some(&host) {
-                self.doomed.insert(vset);
-            }
-        }
+        // A destination crashing mid-drain recovers the protected closure
+        // from its durable passive spool along with ordinary local state.
         let (lo, hi) = self.config.restart_delay;
         let delay = self.kernel.rng().range(lo, hi);
         self.kernel.schedule_after(delay, Ev::RestartHost(host));
@@ -1570,9 +1898,7 @@ impl Cluster {
             let source = self.placement.insert(vset, host).expect("was placed");
             self.migrated_from.insert(vset, source);
         }
-        self.hosts[usize::from(host)]
-            .mems
-            .insert(vset, VsetMem::default());
+        self.hosts[usize::from(host)].mems.entry(vset).or_default();
         match verdict {
             Verdict::Resume { vmstate, .. } => {
                 self.oracle.on_resume(vset, vmstate);
@@ -1650,7 +1976,18 @@ impl Cluster {
             AttemptResult::Fault { page, write } => {
                 self.step_daemon(host, Event::GuestFault { page, write });
             }
-            AttemptResult::Complete => self.complete_op(host, vset, op),
+            AttemptResult::Complete => {
+                // Deferred recovery can warm disk pages before the cold-boot
+                // verdict reaches the harness. A resident fsck read must
+                // still validate and claim those bytes.
+                if let PendingOp::Fsck { page } = op
+                    && self.guests[&vset].cold_booting
+                {
+                    let bytes = self.hosts[usize::from(host)].mems[&vset].pages[&page].clone();
+                    self.oracle.check_fill(page, &bytes, true);
+                }
+                self.complete_op(host, vset, op);
+            }
         }
     }
 
@@ -1670,7 +2007,15 @@ impl Cluster {
 
     fn fill(&mut self, host: u16, page: PageId, bytes: Vec<u8>, writable: bool) {
         let vset = page.volume.vset;
-        if self.placement.get(&vset) != Some(&host) {
+        // A migration destination may hydrate its protected tail after its
+        // durable accept but before the harness observes VsetMigratedIn and
+        // moves the control-plane placement. Those fills belong to the
+        // accepted incarnation; only a host outside both roles is stale.
+        let accepted_destination = self
+            .pending_offers
+            .get(&vset)
+            .is_some_and(|&(_, destination)| destination == host);
+        if self.placement.get(&vset) != Some(&host) && !accepted_destination {
             if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
                 eprintln!(
                     "[{:>12}] DROPPED fill host {host} {page:?} (placed {:?})",
@@ -1714,8 +2059,7 @@ impl Cluster {
             return;
         };
         // No damage is injected in cluster runs: an unservable page is a
-        // real violation — unless the vset's migration source died with the
-        // post-copy drain incomplete, the sanctioned R7.3 loss.
+        // real violation unless an explicit damage nemesis marked the vset.
         self.oracle
             .on_fill_failed(page, self.doomed.contains(&vset));
         if matches!(op, PendingOp::Fsck { .. }) && guest.cold_booting {
@@ -1784,9 +2128,7 @@ impl Cluster {
             self.report.max_restore_ns = self.report.max_restore_ns.max(latency);
         }
         self.placement.insert(vset, host);
-        self.hosts[usize::from(host)]
-            .mems
-            .insert(vset, VsetMem::default());
+        self.hosts[usize::from(host)].mems.entry(vset).or_default();
         let restored = self
             .store
             .peek(&layout::head_key(vset))
@@ -1800,9 +2142,6 @@ impl Cluster {
             (Some(expected), got) => self.report.violations.push(format!(
                 "R4.3: {vset:?} restored to {got:?}, head at death said {expected:?}"
             )),
-        }
-        if self.vset_config_for(vset).durability == DurabilityMode::Backup {
-            self.oracle.allow_sync_loss(vset);
         }
         match verdict {
             Verdict::Resume { vmstate, .. } => {
@@ -1832,9 +2171,7 @@ impl Cluster {
                 self.admin_reqs.remove(&req);
                 let config = self.vset_config_for(vset);
                 self.oracle.register(vset, config);
-                self.hosts[usize::from(host)]
-                    .mems
-                    .insert(vset, VsetMem::default());
+                self.hosts[usize::from(host)].mems.entry(vset).or_default();
                 let mut guest = Guest::new(vset, config);
                 guest.sync_share = self.config.guest_sync_share;
                 self.guests.insert(vset, guest);
@@ -1900,9 +2237,7 @@ impl Cluster {
                         },
                     );
                 }
-                self.hosts[usize::from(host)]
-                    .mems
-                    .insert(vset, VsetMem::default());
+                self.hosts[usize::from(host)].mems.entry(vset).or_default();
                 let Verdict::Resume { vmstate, .. } = verdict else {
                     self.report
                         .violations

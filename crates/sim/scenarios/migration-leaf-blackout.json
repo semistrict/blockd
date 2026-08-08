@@ -10,7 +10,6 @@
   "topology": {
     "hosts": 2,
     "vset_count": 1,
-    "nonbacked_vsets": 1,
     "pages_per_volume": 5000
   },
   "workload": {

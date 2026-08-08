@@ -3,13 +3,13 @@ use crate::database::{
     AttachmentId, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest, MAX_DATABASE_IO,
 };
 use crate::head::HeadRecord;
-use crate::journal::{DurabilityMode, VsetConfig};
+use crate::journal::VsetConfig;
 use crate::layout;
 use crate::mapleaf::{LeafPtr, span_of};
 use crate::placement::{PeerCandidate, rank_stash_candidates};
 use crate::seam::{
     AdminCmd, AdminReply, DetachMode, Effect, Event, HostMap, PeerMsg, ReplicaArtifact,
-    ReplicaCommitInfo, ReqId, Verdict,
+    ReplicaCommitInfo, ReqId, StoreFault, Verdict,
 };
 use crate::segment::SegmentBuilder;
 use crate::types::{HostId, PageNo, VmId, VolumeId, VolumeIdx, page_size};
@@ -25,7 +25,28 @@ impl HostMap for NoMem {
 const VSET: VsetId = VsetId(7);
 
 fn config() -> VsetConfig {
-    VsetConfig::compute(1, 4, false)
+    VsetConfig::compute(1, 4)
+}
+
+fn test_replica_placement() -> ReplicaPlacementConfig {
+    ReplicaPlacementConfig {
+        membership_epoch: 1,
+        local_failure_domain: 1,
+        roster: vec![
+            PeerCandidate {
+                host: HostId(0),
+                weight: 1,
+                failure_domain: 1,
+                drained: false,
+            },
+            PeerCandidate {
+                host: HostId(1),
+                weight: 1,
+                failure_domain: 2,
+                drained: false,
+            },
+        ],
+    }
 }
 
 /// Drive one event and complete every blob write it (transitively)
@@ -41,6 +62,67 @@ fn step_settled_with_mem(daemon: &mut Daemon, event: Event, mem: &dyn HostMap) -
         for effect in daemon.step(event, mem) {
             match effect {
                 Effect::BlobWrite { io, .. } => queue.push(Event::BlobWriteDone { io }),
+                Effect::StoreCas {
+                    io, expected: None, ..
+                } => queue.push(Event::StorePutDone { io, result: Ok(1) }),
+                Effect::PeerSend {
+                    to: HostId(1),
+                    msg:
+                        PeerMsg::ReplicaStatus {
+                            vset,
+                            assignment_epoch,
+                        },
+                } => queue.push(Event::PeerDelivered {
+                    from: HostId(1),
+                    msg: PeerMsg::ReplicaStatusReply {
+                        vset,
+                        assignment_epoch,
+                        committed: None,
+                    },
+                }),
+                Effect::PeerSend {
+                    to: HostId(1),
+                    msg:
+                        PeerMsg::ReplicaPut {
+                            vset,
+                            assignment_epoch,
+                            artifact,
+                            checksum,
+                            ..
+                        },
+                } => queue.push(Event::PeerDelivered {
+                    from: HostId(1),
+                    msg: PeerMsg::ReplicaPutAck {
+                        vset,
+                        assignment_epoch,
+                        artifact,
+                        checksum,
+                    },
+                }),
+                Effect::PeerSend {
+                    to: HostId(1),
+                    msg:
+                        PeerMsg::ReplicaCommit {
+                            vset,
+                            assignment_epoch,
+                            info,
+                            ..
+                        },
+                } => queue.push(Event::PeerDelivered {
+                    from: HostId(1),
+                    msg: PeerMsg::ReplicaCommitAck {
+                        vset,
+                        assignment_epoch,
+                        info,
+                    },
+                }),
+                Effect::SetTimer {
+                    timer:
+                        TimerId::Replica { .. }
+                        | TimerId::ReplicaUpload { .. }
+                        | TimerId::ReplicaRelease(_),
+                    ..
+                } => {}
                 other => settled.push(other),
             }
         }
@@ -50,6 +132,7 @@ fn step_settled_with_mem(daemon: &mut Daemon, event: Event, mem: &dyn HostMap) -
 
 fn created_daemon() -> Daemon {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: crate::types::HostId(0),
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -57,7 +140,7 @@ fn created_daemon() -> Daemon {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
     let effects = step_settled(
         &mut daemon,
@@ -101,13 +184,14 @@ fn operational_snapshot_tracks_dirty_and_parked_state() {
     let vset = &stats.vsets[0];
     assert_eq!(vset.role, VsetRole::Serving);
     assert_eq!((vset.dirty_pages, vset.unstable_pages), (1, 1));
-    assert_eq!(vset.backup_lag_bytes, None);
+    assert_eq!(vset.archive_lag_bytes, Some(0));
     assert_eq!(daemon.counters.guest_pages_dirtied, 1);
 }
 
 #[test]
 fn hydration_tick_scans_and_issues_bounded_batches() {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(0),
         cache_pages: 128,
         writeback_interval: 1_000_000,
@@ -115,9 +199,9 @@ fn hydration_tick_scans_and_issues_bounded_batches() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
-    let mut state = Vset::new(VsetConfig::compute(1, 1024, false));
+    let mut state = Vset::new(VsetConfig::compute(1, 1024));
     state.ready = true;
     state.fence = 2;
     state.peer_source = Some(HostId(1));
@@ -171,6 +255,7 @@ fn hydration_tick_scans_and_issues_bounded_batches() {
 #[test]
 fn peer_retry_preserves_the_original_request_for_a_late_reply() {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(0),
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -178,7 +263,7 @@ fn peer_retry_preserves_the_original_request_for_a_late_reply() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
     let mut state = Vset::new(config());
     state.ready = true;
@@ -237,6 +322,7 @@ fn peer_retry_preserves_the_original_request_for_a_late_reply() {
 #[allow(clippy::disallowed_types)]
 fn profile_300k_page_hydration_tick() {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(0),
         cache_pages: 128,
         writeback_interval: 1_000_000,
@@ -244,9 +330,9 @@ fn profile_300k_page_hydration_tick() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
-    let mut state = Vset::new(VsetConfig::compute(1, 300_000, false));
+    let mut state = Vset::new(VsetConfig::compute(1, 300_000));
     state.ready = true;
     state.fence = 2;
     state.peer_source = Some(HostId(1));
@@ -537,12 +623,6 @@ impl HostMap for ZeroMem {
 #[test]
 fn peer_stashed_sync_never_acks_from_local_record_durability() {
     let mut daemon = created_daemon();
-    daemon
-        .vsets
-        .get_mut(&VSET)
-        .expect("created vset")
-        .config
-        .durability = DurabilityMode::PeerStashed;
     let page = PageId {
         volume: VolumeId {
             vset: VSET,
@@ -580,7 +660,6 @@ fn peer_stashed_sync_never_acks_from_local_record_durability() {
 fn peer_stashed_sync_acks_only_after_exact_peer_commit_and_retries() {
     let mut daemon = created_daemon();
     let state = daemon.vsets.get_mut(&VSET).expect("created vset");
-    state.config.durability = DurabilityMode::PeerStashed;
     state.stash_assignment = Some(crate::head::StashAssignment {
         assignment_epoch: 1,
         active_peer: HostId(1),
@@ -741,6 +820,11 @@ fn peer_stashed_sync_acks_only_after_exact_peer_commit_and_retries() {
             .count(),
         1
     );
+    let archived_record = daemon.vsets[&VSET]
+        .peer_committed_record
+        .as_ref()
+        .expect("committed record")
+        .encode(VSET);
 
     let effects = daemon.step(
         Event::PeerDelivered {
@@ -749,6 +833,7 @@ fn peer_stashed_sync_acks_only_after_exact_peer_commit_and_retries() {
                 vset: VSET,
                 assignment_epoch: 1,
                 info,
+                record: archived_record,
             },
         },
         &NoMem,
@@ -795,10 +880,7 @@ fn completing_older_head_cas_preserves_newer_upload_notice() {
         membership_epoch: 6,
     };
     let record = |seq: u64, capture_seq: u64| JournalRecord {
-        config: VsetConfig {
-            durability: DurabilityMode::PeerStashed,
-            ..config()
-        },
+        config: VsetConfig { ..config() },
         seq: JournalSeq(seq),
         fence: 1,
         kind: crate::journal::RecordKind::Commit,
@@ -823,7 +905,6 @@ fn completing_older_head_cas_preserves_newer_upload_notice() {
     };
     {
         let state = daemon.vsets.get_mut(&VSET).expect("created vset");
-        state.config.durability = DurabilityMode::PeerStashed;
         state.stash_assignment = Some(assignment);
         state.head_version = Some(1);
         state.peer_committed = Some(older_info);
@@ -837,6 +918,7 @@ fn completing_older_head_cas_preserves_newer_upload_notice() {
                 vset: VSET,
                 assignment_epoch: assignment.assignment_epoch,
                 info: older_info,
+                record: older.encode(VSET),
             },
         },
         &NoMem,
@@ -852,7 +934,7 @@ fn completing_older_head_cas_preserves_newer_upload_notice() {
     {
         let state = daemon.vsets.get_mut(&VSET).expect("created vset");
         state.peer_committed = Some(newer_info);
-        state.peer_committed_record = Some(newer);
+        state.peer_committed_record = Some(newer.clone());
     }
     assert!(
         daemon
@@ -863,6 +945,7 @@ fn completing_older_head_cas_preserves_newer_upload_notice() {
                         vset: VSET,
                         assignment_epoch: assignment.assignment_epoch,
                         info: newer_info,
+                        record: newer.encode(VSET),
                     },
                 },
                 &NoMem,
@@ -909,10 +992,7 @@ fn head_mutations_are_serialized_per_vset() {
         ..current
     };
     let record = JournalRecord {
-        config: VsetConfig {
-            durability: DurabilityMode::PeerStashed,
-            ..config()
-        },
+        config: VsetConfig { ..config() },
         seq: JournalSeq(2),
         fence: 1,
         kind: crate::journal::RecordKind::Commit,
@@ -926,12 +1006,14 @@ fn head_mutations_are_serialized_per_vset() {
     let info = Daemon::commit_info(&record);
     {
         let state = daemon.vsets.get_mut(&VSET).expect("created vset");
-        state.config.durability = DurabilityMode::PeerStashed;
         state.head_version = Some(1);
         state.stash_assignment = Some(current);
-        state.peer_upload_done = Some((current.assignment_epoch, info));
+        state.peer_upload_done = Some((current.assignment_epoch, info, record.clone()));
         state.peer_committed_record = Some(record);
-        state.replica_assignment_proposal = Some((transition, None));
+        state.replica_assignment_proposal = Some(ReplicaAssignmentProposal {
+            assignment: transition,
+            activation: None,
+        });
     }
 
     let effects = daemon.step(Event::Timer(TimerId::Backup(VSET)), &NoMem);
@@ -1010,6 +1092,7 @@ fn head_mutations_are_serialized_per_vset() {
 #[test]
 fn store_only_restore_refuses_a_head_with_peer_residue() {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(2),
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -1017,7 +1100,7 @@ fn store_only_restore_refuses_a_head_with_peer_residue() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
     let effects = daemon.step(
         Event::Admin(AdminCmd::RestoreVset {
@@ -1068,6 +1151,7 @@ fn store_only_restore_refuses_a_head_with_peer_residue() {
 #[test]
 fn peer_stashed_creation_publishes_exactly_one_deterministic_stash() {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(0),
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -1098,10 +1182,7 @@ fn peer_stashed_creation_publishes_exactly_one_deterministic_stash() {
         Event::Admin(AdminCmd::CreateVset {
             req: ReqId(20),
             vset: VSET,
-            config: VsetConfig {
-                durability: DurabilityMode::PeerStashed,
-                ..config()
-            },
+            config: VsetConfig { ..config() },
             from_base: None,
         }),
         &NoMem,
@@ -1115,45 +1196,6 @@ fn peer_stashed_creation_publishes_exactly_one_deterministic_stash() {
     assert_eq!(stash.transition_peer, None);
     assert_eq!(stash.membership_epoch, 6);
     assert_eq!(stash.assignment_epoch, 1);
-}
-
-#[test]
-fn backup_creation_never_publishes_a_peer_stash() {
-    let (mut daemon, _) = Daemon::new(DaemonConfig {
-        host: HostId(0),
-        cache_pages: 8,
-        writeback_interval: 1_000_000,
-        backup_retry: 200_000_000,
-        disk_capacity: None,
-        disk_headroom: 0,
-        wedge_ticks: 25,
-        replica_placement: Some(ReplicaPlacementConfig {
-            membership_epoch: 6,
-            local_failure_domain: 1,
-            roster: vec![PeerCandidate {
-                host: HostId(1),
-                weight: 1,
-                failure_domain: 2,
-                drained: false,
-            }],
-        }),
-    });
-    let effects = daemon.step(
-        Event::Admin(AdminCmd::CreateVset {
-            req: ReqId(21),
-            vset: VSET,
-            config: VsetConfig {
-                durability: DurabilityMode::Backup,
-                ..config()
-            },
-            from_base: None,
-        }),
-        &NoMem,
-    );
-    let [Effect::StoreCas { bytes, .. }] = effects.as_slice() else {
-        panic!("backup creation must first publish one fenced head: {effects:?}");
-    };
-    assert_eq!(HeadRecord::decode(VSET, bytes).expect("head").stash, None);
 }
 
 #[test]
@@ -1188,10 +1230,7 @@ fn failed_active_peer_rebinds_through_a_fenced_transition_before_sync_ack() {
         roster,
     });
     let record = JournalRecord {
-        config: VsetConfig {
-            durability: DurabilityMode::PeerStashed,
-            ..config()
-        },
+        config: VsetConfig { ..config() },
         seq: JournalSeq(4),
         fence: 1,
         kind: crate::journal::RecordKind::Commit,
@@ -1203,7 +1242,6 @@ fn failed_active_peer_rebinds_through_a_fenced_transition_before_sync_ack() {
         migrated_from: None,
     };
     let state = daemon.vsets.get_mut(&VSET).expect("created");
-    state.config.durability = DurabilityMode::PeerStashed;
     state.head_version = Some(5);
     state.stash_assignment = Some(crate::head::StashAssignment {
         assignment_epoch: 1,
@@ -1379,6 +1417,11 @@ fn failed_active_peer_rebinds_through_a_fenced_transition_before_sync_ack() {
                 vset: VSET,
                 assignment_epoch: 2,
                 info,
+                record: daemon.vsets[&VSET]
+                    .peer_committed_record
+                    .as_ref()
+                    .expect("replacement commit")
+                    .encode(VSET),
             },
         },
         &NoMem,
@@ -1456,6 +1499,637 @@ fn failed_active_peer_rebinds_through_a_fenced_transition_before_sync_ack() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn passive_replacement_resumes_sync_during_a_complete_store_outage() {
+    let roster = vec![
+        PeerCandidate {
+            host: HostId(0),
+            weight: 1,
+            failure_domain: 1,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(1),
+            weight: 1,
+            failure_domain: 2,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(2),
+            weight: 1,
+            failure_domain: 3,
+            drained: false,
+        },
+    ];
+    let ranked = rank_stash_candidates(6, HostId(0), 1, VSET, &roster);
+    let (failed, replacement) = (ranked[0], ranked[1]);
+    let mut daemon = created_daemon();
+    daemon.config.replica_placement = Some(ReplicaPlacementConfig {
+        membership_epoch: 6,
+        local_failure_domain: 1,
+        roster,
+    });
+    let record = JournalRecord {
+        config: VsetConfig { ..config() },
+        seq: JournalSeq(4),
+        fence: 1,
+        kind: crate::journal::RecordKind::Commit,
+        capture_seq: 10,
+        sync_covered_through: 10,
+        database: crate::journal::DatabaseMeta::default(),
+        overlay: BTreeMap::new(),
+        leaves: BTreeMap::new(),
+        migrated_from: None,
+    };
+    let state = daemon.vsets.get_mut(&VSET).expect("created");
+    state.head_version = Some(5);
+    state.stash_assignment = Some(crate::head::StashAssignment {
+        assignment_epoch: 1,
+        active_peer: failed,
+        active_assignment_epoch: 1,
+        transition_peer: None,
+        membership_epoch: 6,
+    });
+    state.best_record = Some(record.clone());
+    state.best = Some((10, JournalSeq(4)));
+    state.local_covered_through = 10;
+    state.pending_syncs = vec![(ReqId(92), 10)];
+    state.replica_send = Some(ReplicaSend {
+        target: failed,
+        assignment_epoch: 1,
+        record,
+        required: Vec::new(),
+        todo: Vec::new(),
+        awaiting: Some(PeerMsg::ReplicaStatus {
+            vset: VSET,
+            assignment_epoch: 1,
+        }),
+        retries: 2,
+        timer_generation: 1,
+    });
+
+    let effects = daemon.step(
+        Event::Timer(TimerId::Replica {
+            vset: VSET,
+            generation: 1,
+        }),
+        &NoMem,
+    );
+    let transition_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StoreCas { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("failed passive proposes a replacement");
+    let effects = daemon.step(
+        Event::StorePutDone {
+            io: transition_io,
+            result: Err(StoreFault::Unavailable),
+        },
+        &NoMem,
+    );
+    assert!(effects.contains(&Effect::PeerSend {
+        to: replacement,
+        msg: PeerMsg::ReplicaStatus {
+            vset: VSET,
+            assignment_epoch: 2,
+        },
+    }));
+
+    let effects = daemon.step(
+        Event::PeerDelivered {
+            from: replacement,
+            msg: PeerMsg::ReplicaStatusReply {
+                vset: VSET,
+                assignment_epoch: 2,
+                committed: None,
+            },
+        },
+        &NoMem,
+    );
+    let info = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::PeerSend {
+                to,
+                msg: PeerMsg::ReplicaCommit { info, .. },
+            } if *to == replacement => Some(*info),
+            _ => None,
+        })
+        .expect("replacement receives a complete baseline");
+    let effects = daemon.step(
+        Event::PeerDelivered {
+            from: replacement,
+            msg: PeerMsg::ReplicaCommitAck {
+                vset: VSET,
+                assignment_epoch: 2,
+                info,
+            },
+        },
+        &NoMem,
+    );
+    assert!(!effects.contains(&Effect::SyncOk { req: ReqId(92) }));
+    let activation_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StoreCas { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("durable replacement proposes activation");
+    let effects = daemon.step(
+        Event::StorePutDone {
+            io: activation_io,
+            result: Err(StoreFault::Unavailable),
+        },
+        &NoMem,
+    );
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::SyncOk { req: ReqId(92) }))
+            .count(),
+        1,
+        "a complete replacement is the durability proof; store age must not gate sync"
+    );
+    let state = &daemon.vsets[&VSET];
+    assert_eq!(
+        state
+            .stash_assignment
+            .expect("provisional active")
+            .active_peer,
+        replacement
+    );
+    assert!(state.replica_assignment_proposal.is_some());
+
+    let effects = daemon.step(Event::Timer(TimerId::Backup(VSET)), &NoMem);
+    let (retry_io, retry_head) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StoreCas { io, bytes, .. } => {
+                Some((*io, HeadRecord::decode(VSET, bytes).expect("head")))
+            }
+            _ => None,
+        })
+        .expect("assignment publication retries independently");
+    assert_eq!(
+        retry_head.stash.expect("assignment").active_peer,
+        replacement
+    );
+    assert_eq!(retry_head.retired_stashes[0].peer, failed);
+    let effects = daemon.step(
+        Event::StorePutDone {
+            io: retry_io,
+            result: Err(StoreFault::CasConflict { actual: Some(6) }),
+        },
+        &NoMem,
+    );
+    let refresh_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StoreGet { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("a conflict rereads assignment authority");
+    let old_head = HeadRecord {
+        vset: VSET,
+        holder: HostId(0),
+        fence: 1,
+        manifest: None,
+        stash: Some(crate::head::StashAssignment {
+            assignment_epoch: 1,
+            active_peer: failed,
+            active_assignment_epoch: 1,
+            transition_peer: None,
+            membership_epoch: 6,
+        }),
+        retired_stashes: Vec::new(),
+    };
+    let effects = daemon.step(
+        Event::StoreGetDone {
+            io: refresh_io,
+            result: Ok(Some((6, old_head.encode()))),
+        },
+        &NoMem,
+    );
+    assert_eq!(
+        daemon.vsets[&VSET]
+            .stash_assignment
+            .expect("provisional assignment survives refresh")
+            .active_peer,
+        replacement
+    );
+    let reconcile_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StoreCas { io, bytes, .. } => {
+                let head = HeadRecord::decode(VSET, bytes).expect("head");
+                (head.stash.expect("assignment").active_peer == replacement).then_some(*io)
+            }
+            _ => None,
+        })
+        .expect("an older head is reconciled to the durable replacement");
+    daemon.step(
+        Event::StorePutDone {
+            io: reconcile_io,
+            result: Ok(7),
+        },
+        &NoMem,
+    );
+    assert!(daemon.vsets[&VSET].replica_assignment_proposal.is_none());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn repeated_passive_failover_cycles_the_roster_without_losing_committed_state() {
+    let roster = vec![
+        PeerCandidate {
+            host: HostId(0),
+            weight: 1,
+            failure_domain: 1,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(1),
+            weight: 1,
+            failure_domain: 2,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(2),
+            weight: 1,
+            failure_domain: 3,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(3),
+            weight: 1,
+            failure_domain: 4,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(4),
+            weight: 1,
+            failure_domain: 5,
+            drained: false,
+        },
+    ];
+    let ranked = rank_stash_candidates(6, HostId(0), 1, VSET, &roster);
+    assert_eq!(ranked.len(), 4);
+    let mut daemon = created_daemon();
+    daemon.config.replica_placement = Some(ReplicaPlacementConfig {
+        membership_epoch: 6,
+        local_failure_domain: 1,
+        roster,
+    });
+    let mut store_version = 20;
+    let mut active = ranked[0];
+    daemon.vsets.get_mut(&VSET).expect("created").head_version = Some(store_version);
+    daemon
+        .vsets
+        .get_mut(&VSET)
+        .expect("created")
+        .stash_assignment = Some(crate::head::StashAssignment {
+        assignment_epoch: 1,
+        active_peer: active,
+        active_assignment_epoch: 1,
+        transition_peer: None,
+        membership_epoch: 6,
+    });
+
+    // Exceed both the number of candidates and the historical eight-entry
+    // retired-stash bound. Availability must not have either finite budget.
+    for failover in 0_u64..12 {
+        let assignment = daemon.vsets[&VSET]
+            .stash_assignment
+            .expect("active assignment");
+        let next_epoch = assignment.assignment_epoch + 1;
+        let expected_next = ranked[usize::try_from(next_epoch - 1).unwrap() % ranked.len()];
+        assert_ne!(expected_next, active);
+        let covered = 100 + failover;
+        let record = JournalRecord {
+            config: VsetConfig { ..config() },
+            seq: JournalSeq(50 + failover),
+            fence: 1,
+            kind: crate::journal::RecordKind::Commit,
+            capture_seq: 70 + failover,
+            sync_covered_through: covered,
+            database: crate::journal::DatabaseMeta::default(),
+            overlay: BTreeMap::new(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let req = ReqId(1_000 + failover);
+        let timer_generation = 500 + failover;
+        {
+            let state = daemon.vsets.get_mut(&VSET).expect("created");
+            state.best_record = Some(record.clone());
+            state.best = Some((record.capture_seq, record.seq));
+            state.local_covered_through = covered;
+            state.pending_syncs.push((req, covered));
+            state.replica_send = Some(ReplicaSend {
+                target: active,
+                assignment_epoch: assignment.active_assignment_epoch,
+                record: record.clone(),
+                required: Vec::new(),
+                todo: Vec::new(),
+                awaiting: Some(PeerMsg::ReplicaStatus {
+                    vset: VSET,
+                    assignment_epoch: assignment.active_assignment_epoch,
+                }),
+                retries: 2,
+                timer_generation,
+            });
+        }
+
+        let effects = daemon.step(
+            Event::Timer(TimerId::Replica {
+                vset: VSET,
+                generation: timer_generation,
+            }),
+            &NoMem,
+        );
+        let (transition_io, transition) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StoreCas { io, bytes, .. } => Some((
+                    *io,
+                    HeadRecord::decode(VSET, bytes).expect("transition head"),
+                )),
+                _ => None,
+            })
+            .expect("failed active must start another transition");
+        let transition_assignment = transition.stash.expect("transition assignment");
+        assert_eq!(transition_assignment.assignment_epoch, next_epoch);
+        assert_eq!(transition_assignment.active_peer, active);
+        assert_eq!(transition_assignment.transition_peer, Some(expected_next));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::SyncOk { .. }))
+        );
+
+        store_version += 1;
+        let effects = daemon.step(
+            Event::StorePutDone {
+                io: transition_io,
+                result: Ok(store_version),
+            },
+            &NoMem,
+        );
+        assert!(effects.contains(&Effect::PeerSend {
+            to: expected_next,
+            msg: PeerMsg::ReplicaStatus {
+                vset: VSET,
+                assignment_epoch: next_epoch,
+            },
+        }));
+        let effects = daemon.step(
+            Event::PeerDelivered {
+                from: expected_next,
+                msg: PeerMsg::ReplicaStatusReply {
+                    vset: VSET,
+                    assignment_epoch: next_epoch,
+                    committed: None,
+                },
+            },
+            &NoMem,
+        );
+        let info = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::PeerSend {
+                    to,
+                    msg: PeerMsg::ReplicaCommit { info, .. },
+                } if *to == expected_next => Some(*info),
+                _ => None,
+            })
+            .expect("replacement receives a complete commit");
+        assert_eq!(info, Daemon::commit_info(&record));
+
+        let effects = daemon.step(
+            Event::PeerDelivered {
+                from: expected_next,
+                msg: PeerMsg::ReplicaCommitAck {
+                    vset: VSET,
+                    assignment_epoch: next_epoch,
+                    info,
+                },
+            },
+            &NoMem,
+        );
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::SyncOk { .. })),
+            "commit alone is not authoritative until activation is fenced"
+        );
+        let (activate_io, activation) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StoreCas { io, bytes, .. } => Some((
+                    *io,
+                    HeadRecord::decode(VSET, bytes).expect("activation head"),
+                )),
+                _ => None,
+            })
+            .expect("replacement commit must start activation");
+        assert_eq!(activation.stash.expect("active").active_peer, expected_next);
+        assert_eq!(activation.retired_stashes.len(), 1);
+        assert_eq!(activation.retired_stashes[0].peer, active);
+
+        store_version += 1;
+        let effects = daemon.step(
+            Event::StorePutDone {
+                io: activate_io,
+                result: Ok(store_version),
+            },
+            &NoMem,
+        );
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| **effect == Effect::SyncOk { req })
+                .count(),
+            1,
+            "the covered sync must be acknowledged exactly once"
+        );
+        let state = &daemon.vsets[&VSET];
+        assert_eq!(state.best_record.as_ref(), Some(&record));
+        assert_eq!(state.peer_committed_record.as_ref(), Some(&record));
+        assert_eq!(state.sync_ack_through, covered);
+        assert_eq!(state.retired_stashes.len(), 1);
+        assert_eq!(
+            state.stash_assignment.expect("replacement").active_peer,
+            expected_next
+        );
+        let late = daemon.step(
+            Event::PeerDelivered {
+                from: active,
+                msg: PeerMsg::ReplicaCommitAck {
+                    vset: VSET,
+                    assignment_epoch: assignment.active_assignment_epoch,
+                    info,
+                },
+            },
+            &NoMem,
+        );
+        assert!(late.is_empty(), "a retired peer must not regain authority");
+        assert_eq!(daemon.vsets[&VSET].sync_ack_through, covered);
+        active = expected_next;
+    }
+}
+
+#[test]
+fn assignment_epochs_cycle_deterministically_without_authorizing_fanout() {
+    let roster: Vec<_> = (0..5)
+        .map(|host| PeerCandidate {
+            host: HostId(host),
+            weight: 1,
+            failure_domain: host + 1,
+            drained: false,
+        })
+        .collect();
+    let ranked = rank_stash_candidates(9, HostId(0), 1, VSET, &roster);
+    assert_eq!(ranked.len(), 4);
+    let mut daemon = created_daemon();
+    daemon.config.replica_placement = Some(ReplicaPlacementConfig {
+        membership_epoch: 9,
+        local_failure_domain: 1,
+        roster,
+    });
+    for assignment_epoch in 1..=20 {
+        let index = usize::try_from(assignment_epoch - 1).expect("test epoch fits");
+        let expected = ranked[index % ranked.len()];
+        for candidate in &ranked {
+            daemon.config.host = *candidate;
+            assert_eq!(
+                daemon.replica_authorized(HostId(0), VSET, assignment_epoch),
+                *candidate == expected,
+                "epoch {assignment_epoch} must authorize exactly one cyclic candidate"
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn passive_restart_rebuilds_the_highest_assignment_epoch_fence() {
+    let roster: Vec<_> = (0..5)
+        .map(|host| PeerCandidate {
+            host: HostId(host),
+            weight: 1,
+            failure_domain: host + 1,
+            drained: false,
+        })
+        .collect();
+    let ranked = rank_stash_candidates(9, HostId(0), 1, VSET, &roster);
+    let target = ranked[0];
+    let target_domain = roster
+        .iter()
+        .find(|candidate| candidate.host == target)
+        .unwrap()
+        .failure_domain;
+    let daemon_config = DaemonConfig {
+        archive: ArchivePolicy::default(),
+        host: target,
+        cache_pages: 8,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: Some(ReplicaPlacementConfig {
+            membership_epoch: 9,
+            local_failure_domain: target_domain,
+            roster,
+        }),
+    };
+    let seal = |assignment_epoch: u64, seq: u64| {
+        let info = ReplicaCommitInfo {
+            writer_fence: 4,
+            seq: JournalSeq(seq),
+            sync_covered_through: seq,
+        };
+        let record = JournalRecord {
+            config: VsetConfig { ..config() },
+            seq: info.seq,
+            fence: info.writer_fence,
+            kind: crate::journal::RecordKind::Commit,
+            capture_seq: seq,
+            sync_covered_through: seq,
+            database: crate::journal::DatabaseMeta::default(),
+            overlay: BTreeMap::new(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        }
+        .encode(VSET);
+        (
+            crate::replica_spool::seal_replica_commit(
+                HostId(0),
+                VSET,
+                assignment_epoch,
+                info,
+                &[],
+                &record,
+            )
+            .unwrap(),
+            info,
+        )
+    };
+    let new_epoch = 1 + ranked.len() as u64;
+    let (old_spool, _) = seal(1, 1);
+    let (new_spool, new_info) = seal(new_epoch, 5);
+    let old_name = layout::replica_spool_segment_blob(HostId(0), VSET, 1, 0);
+    let new_name = layout::replica_spool_segment_blob(HostId(0), VSET, new_epoch, 0);
+    let (mut recovered, _, _) = Daemon::recover(
+        daemon_config,
+        [
+            (old_name.as_str(), old_spool.as_slice()),
+            (new_name.as_str(), new_spool.as_slice()),
+        ]
+        .into_iter(),
+    );
+    let rejected_before = recovered.counters.replica_rejected;
+    assert!(
+        recovered
+            .step(
+                Event::PeerDelivered {
+                    from: HostId(0),
+                    msg: PeerMsg::ReplicaStatus {
+                        vset: VSET,
+                        assignment_epoch: 1,
+                    },
+                },
+                &NoMem,
+            )
+            .is_empty(),
+        "restart must not revive a stale cyclic assignment"
+    );
+    assert_eq!(recovered.counters.replica_rejected, rejected_before + 1);
+    assert_eq!(
+        recovered.step(
+            Event::PeerDelivered {
+                from: HostId(0),
+                msg: PeerMsg::ReplicaStatus {
+                    vset: VSET,
+                    assignment_epoch: new_epoch,
+                },
+            },
+            &NoMem,
+        ),
+        [Effect::PeerSend {
+            to: HostId(0),
+            msg: PeerMsg::ReplicaStatusReply {
+                vset: VSET,
+                assignment_epoch: new_epoch,
+                committed: Some(new_info),
+            },
+        }]
+    );
+}
+
+#[test]
 fn assignment_cas_conflict_rereads_authority_without_seeding_a_peer() {
     let mut daemon = created_daemon();
     let assignment = crate::head::StashAssignment {
@@ -1504,10 +2178,7 @@ fn claimed_recovery_head_releases_the_store_covered_active_residue() {
         ],
     });
     let record = JournalRecord {
-        config: VsetConfig {
-            durability: DurabilityMode::PeerStashed,
-            ..config()
-        },
+        config: VsetConfig { ..config() },
         seq: JournalSeq(3),
         fence: 2,
         kind: crate::journal::RecordKind::Commit,
@@ -1519,7 +2190,6 @@ fn claimed_recovery_head_releases_the_store_covered_active_residue() {
         migrated_from: None,
     };
     let state = daemon.vsets.get_mut(&VSET).expect("vset");
-    state.config.durability = DurabilityMode::PeerStashed;
     state.best_record = Some(record);
     state.best = Some((4, JournalSeq(3)));
     state.head_refreshing = true;
@@ -1560,7 +2230,6 @@ fn claimed_recovery_head_releases_the_store_covered_active_residue() {
 #[test]
 fn recovered_peer_stash_fences_on_membership_epoch_mismatch() {
     let mut daemon = created_daemon();
-    daemon.vsets.get_mut(&VSET).expect("vset").config.durability = DurabilityMode::PeerStashed;
     let head = HeadRecord {
         vset: VSET,
         holder: HostId(0),
@@ -1579,6 +2248,87 @@ fn recovered_peer_stash_fences_on_membership_epoch_mismatch() {
     daemon.head_refresh_done(VSET, Ok(Some((3, head.encode()))), &mut effects);
     assert_eq!(effects, vec![Effect::VsetFenced { vset: VSET }]);
     assert!(!daemon.vsets.contains_key(&VSET));
+}
+
+#[test]
+fn legacy_backup_head_is_upgraded_to_a_passive_assignment_before_recovery_opens() {
+    let mut daemon = created_daemon();
+    let state = daemon.vsets.get_mut(&VSET).expect("vset");
+    state.ready = false;
+    state.pending_verdict = Some(Verdict::ColdBoot);
+    state.head_refreshing = true;
+    state.stash_assignment = None;
+    state.replica_assignment_proposal = None;
+    state.replica_send = None;
+    state.peer_artifacts.clear();
+    state.peer_committed = None;
+    state.peer_committed_record = None;
+    let legacy_head = HeadRecord {
+        vset: VSET,
+        holder: HostId(0),
+        fence: 1,
+        manifest: None,
+        stash: None,
+        retired_stashes: Vec::new(),
+    };
+    let mut effects = Vec::new();
+    daemon.head_refresh_done(VSET, Ok(Some((3, legacy_head.encode()))), &mut effects);
+    assert!(daemon.vsets[&VSET].pending_verdict.is_some());
+    let (io, upgraded) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StoreCas { io, bytes, .. } => {
+                Some((*io, HeadRecord::decode(VSET, bytes).expect("head")))
+            }
+            _ => None,
+        })
+        .expect("legacy head gets one fenced passive assignment");
+    let assignment = upgraded.stash.expect("passive assignment");
+    assert_eq!(assignment.assignment_epoch, 1);
+    assert_eq!(assignment.transition_peer, None);
+
+    let effects = daemon.step(Event::StorePutDone { io, result: Ok(4) }, &NoMem);
+    assert!(effects.contains(&Effect::Admin(AdminReply::VsetRecovered {
+        vset: VSET,
+        verdict: Verdict::ColdBoot,
+    })));
+    assert!(effects.contains(&Effect::PeerSend {
+        to: assignment.active_peer,
+        msg: PeerMsg::ReplicaStatus {
+            vset: VSET,
+            assignment_epoch: 1,
+        },
+    }));
+    assert!(daemon.vsets[&VSET].ready);
+}
+
+#[test]
+fn legacy_local_recovery_creates_its_first_head_before_opening() {
+    let mut daemon = created_daemon();
+    let state = daemon.vsets.get_mut(&VSET).expect("vset");
+    state.ready = false;
+    state.pending_verdict = Some(Verdict::ColdBoot);
+    state.head_refreshing = true;
+    state.head_version = None;
+    state.stash_assignment = None;
+    let mut effects = Vec::new();
+    daemon.head_refresh_done(VSET, Ok(None), &mut effects);
+    let io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::StoreCas {
+                io, expected: None, ..
+            } => Some(*io),
+            _ => None,
+        })
+        .expect("legacy local recovery creates a fenced head");
+    let effects = daemon.step(Event::StorePutDone { io, result: Ok(1) }, &NoMem);
+    assert!(effects.contains(&Effect::Admin(AdminReply::VsetRecovered {
+        vset: VSET,
+        verdict: Verdict::ColdBoot,
+    })));
+    assert!(daemon.vsets[&VSET].ready);
+    assert!(daemon.vsets[&VSET].stash_assignment.is_some());
 }
 
 #[test]
@@ -1605,6 +2355,7 @@ fn release_preserves_acked_artifacts_for_the_next_commit() {
         .expect("target in roster")
         .failure_domain;
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: target,
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -1734,6 +2485,7 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
         .expect("target in roster")
         .failure_domain;
     let daemon_config = DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: target,
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -1768,10 +2520,7 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
         sync_covered_through: 12,
     };
     let record = JournalRecord {
-        config: VsetConfig {
-            durability: DurabilityMode::PeerStashed,
-            ..config()
-        },
+        config: VsetConfig { ..config() },
         seq: info.seq,
         fence: info.writer_fence,
         kind: crate::journal::RecordKind::Commit,
@@ -1855,7 +2604,7 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
                 assignment_epoch: 1,
                 info,
                 required: vec![artifact],
-                record,
+                record: record.clone(),
             },
         },
         &NoMem,
@@ -1902,14 +2651,47 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
             .all(|effect| !matches!(effect, Effect::ReplicaDelete { .. })),
         "a durable commit remains until its upload is covered"
     );
-    let artifact_put = effects
+    let archive_generation = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SetTimer {
+                timer:
+                    TimerId::ReplicaUpload {
+                        source: HostId(0),
+                        vset: VSET,
+                        assignment_epoch: 1,
+                        generation,
+                    },
+                ..
+            } => Some(*generation),
+            _ => None,
+        })
+        .expect("archive cadence timer");
+    let archive_effects = daemon.step(
+        Event::Timer(TimerId::ReplicaUpload {
+            source: HostId(0),
+            vset: VSET,
+            assignment_epoch: 1,
+            generation: archive_generation,
+        }),
+        &NoMem,
+    );
+    let artifact_put = archive_effects
         .iter()
         .find_map(|effect| match effect {
             Effect::StorePut { io, key, bytes } => Some((*io, key.clone(), bytes.clone())),
             _ => None,
         })
-        .expect("peer uploads the durable artifact directly");
-    assert_eq!(artifact_put.1, layout::segment_key(VSET, 4, SegId(3)));
+        .expect("the cadence packs and uploads the passive cut");
+    let archive_fence = u64::MAX - info.seq.0;
+    assert_eq!(
+        artifact_put.1,
+        layout::segment_key(VSET, archive_fence, SegId(0))
+    );
+    let (_, packed_fence, packed_seg, packed_entries) =
+        crate::segment::scan_segment(&artifact_put.2).expect("valid passive pack");
+    assert_eq!((packed_fence, packed_seg), (archive_fence, SegId(0)));
+    assert_eq!(packed_entries.len(), 1);
     let effects = daemon.step(
         Event::StorePutDone {
             io: artifact_put.0,
@@ -1917,33 +2699,61 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
         },
         &NoMem,
     );
-    let manifest_io = effects
+    let (manifest_io, packed_record) = effects
         .iter()
         .find_map(|effect| match effect {
-            Effect::StorePut { io, key, .. }
+            Effect::StorePut { io, key, bytes }
                 if *key == layout::manifest_key(VSET, 4, JournalSeq(8)) =>
             {
-                Some(*io)
+                Some((*io, bytes.clone()))
             }
             _ => None,
         })
         .expect("artifact completion uploads the manifest");
+    let effects = daemon.step(
+        Event::StorePutDone {
+            io: manifest_io,
+            result: Ok(1),
+        },
+        &NoMem,
+    );
+    assert!(effects.contains(&Effect::PeerSend {
+        to: HostId(0),
+        msg: PeerMsg::ReplicaUploadDone {
+            vset: VSET,
+            assignment_epoch: 1,
+            info,
+            record: packed_record,
+        },
+    }));
+    let awaiting_head_generation = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::SetTimer {
+                timer: TimerId::ReplicaUpload { generation, .. },
+                ..
+            } => Some(*generation),
+            _ => None,
+        })
+        .expect("head publication remains age-tracked");
+    let effects = daemon.step(
+        Event::Timer(TimerId::ReplicaUpload {
+            source: HostId(0),
+            vset: VSET,
+            assignment_epoch: 1,
+            generation: awaiting_head_generation,
+        }),
+        &NoMem,
+    );
+    assert!(
+        effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::StorePut { .. }))
+    );
     assert_eq!(
-        daemon.step(
-            Event::StorePutDone {
-                io: manifest_io,
-                result: Ok(1),
-            },
-            &NoMem,
-        ),
-        [Effect::PeerSend {
-            to: HostId(0),
-            msg: PeerMsg::ReplicaUploadDone {
-                vset: VSET,
-                assignment_epoch: 1,
-                info,
-            },
-        }]
+        daemon.replica_spool_metrics()[0].unarchived_age_ns,
+        daemon.config.archive.interval * 2,
+        "manifest upload alone must not advance the archived frontier"
     );
 
     let effects = daemon.step(
@@ -2007,6 +2817,7 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
         }]
     );
 
+    let spool_capacity = daemon.config.archive.spool_capacity_bytes;
     daemon.replicas.insert(
         ReplicaKey {
             source: HostId(0),
@@ -2014,7 +2825,7 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
             assignment_epoch: 1,
         },
         PassiveReplica {
-            stored_bytes: super::replica::MAX_REPLICA_SOURCE_BYTES,
+            stored_bytes: spool_capacity,
             ..PassiveReplica::default()
         },
     );
@@ -2035,6 +2846,49 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
             )
             .is_empty(),
         "capacity exhaustion must stall without append, ACK, or eviction"
+    );
+    let mut horizon_builder = SegmentBuilder::new(VSET, 4, SegId(4));
+    horizon_builder.add(page, Gen(3), &vec![0x6B; page_size()]);
+    let (horizon_segment, _) = horizon_builder.finish();
+    let horizon_artifact = ReplicaArtifact::Segment {
+        fence: 4,
+        seg: SegId(4),
+    };
+    {
+        let replica = daemon
+            .replicas
+            .get_mut(&ReplicaKey {
+                source: HostId(0),
+                vset: VSET,
+                assignment_epoch: 1,
+            })
+            .expect("replica state");
+        replica.stored_bytes = 0;
+        replica.unarchived_age = u64::MAX;
+    }
+    let backpressure_before = daemon.counters.replica_capacity_backpressure;
+    let effects = daemon.step(
+        Event::PeerDelivered {
+            from: HostId(0),
+            msg: PeerMsg::ReplicaPut {
+                vset: VSET,
+                assignment_epoch: 1,
+                artifact: horizon_artifact,
+                checksum: crate::format::crc32c(&horizon_segment),
+                bytes: horizon_segment,
+            },
+        },
+        &NoMem,
+    );
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReplicaAppend { .. })),
+        "arbitrarily old archive lag must not withhold a capacity-safe append"
+    );
+    assert_eq!(
+        daemon.counters.replica_capacity_backpressure, backpressure_before,
+        "archive age is observability only, never admission control"
     );
 
     let mut spool = artifact_frame.clone();
@@ -2109,9 +2963,698 @@ fn passive_replica_appends_idempotently_commits_and_recovers_status() {
     );
 }
 
+fn capacity_test_passive(capacity: u64, headroom: u64) -> (Daemon, HostId) {
+    let roster = vec![
+        PeerCandidate {
+            host: HostId(0),
+            weight: 1,
+            failure_domain: 1,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(1),
+            weight: 1,
+            failure_domain: 2,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(2),
+            weight: 1,
+            failure_domain: 3,
+            drained: false,
+        },
+    ];
+    let source = HostId(0);
+    let target = rank_stash_candidates(6, source, 1, VSET, &roster)[0];
+    let target_domain = roster
+        .iter()
+        .find(|candidate| candidate.host == target)
+        .expect("target in roster")
+        .failure_domain;
+    let archive = ArchivePolicy {
+        spool_capacity_bytes: capacity,
+        spool_headroom_bytes: headroom,
+        ..ArchivePolicy::default()
+    };
+    let (daemon, _) = Daemon::new(DaemonConfig {
+        archive,
+        host: target,
+        cache_pages: 8,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: Some(ReplicaPlacementConfig {
+            membership_epoch: 6,
+            local_failure_domain: target_domain,
+            roster,
+        }),
+    });
+    (daemon, source)
+}
+
+fn capacity_test_put(daemon: &mut Daemon, source: HostId, seg: u64) -> Vec<Effect> {
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(u32::try_from(seg).expect("test segment fits")),
+    };
+    let mut builder = SegmentBuilder::new(VSET, 4, SegId(seg));
+    builder.add(page, Gen(seg), &vec![0x5A; page_size()]);
+    let (bytes, _) = builder.finish();
+    daemon.step(
+        Event::PeerDelivered {
+            from: source,
+            msg: PeerMsg::ReplicaPut {
+                vset: VSET,
+                assignment_epoch: 1,
+                artifact: ReplicaArtifact::Segment {
+                    fence: 4,
+                    seg: SegId(seg),
+                },
+                checksum: crate::format::crc32c(&bytes),
+                bytes,
+            },
+        },
+        &NoMem,
+    )
+}
+
+#[test]
+fn passive_capacity_is_host_wide_across_source_hosts() {
+    let capacity = 1_000_000;
+    let (mut daemon, source) = capacity_test_passive(capacity, 100_000);
+    daemon.replicas.insert(
+        ReplicaKey {
+            source: HostId(2),
+            vset: VsetId(99),
+            assignment_epoch: 1,
+        },
+        PassiveReplica {
+            stored_bytes: capacity - 1,
+            ..PassiveReplica::default()
+        },
+    );
+
+    assert!(
+        !capacity_test_put(&mut daemon, source, 31)
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReplicaAppend { .. })),
+        "another source's residue must consume the same physical spool capacity"
+    );
+}
+
+#[test]
+fn passive_capacity_counts_appends_in_flight_on_other_vsets() {
+    let capacity = 1_000_000;
+    let (mut daemon, source) = capacity_test_passive(capacity, 100_000);
+    daemon.pending.insert(
+        IoId(99),
+        Pending::ReplicaArtifactAppend {
+            source,
+            vset: VsetId(98),
+            assignment_epoch: 1,
+            artifact: ReplicaArtifact::Segment {
+                fence: 4,
+                seg: SegId(98),
+            },
+            checksum: 0,
+            bytes: Vec::new(),
+            frame_len: capacity - 1,
+        },
+    );
+
+    assert!(
+        !capacity_test_put(&mut daemon, source, 32)
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReplicaAppend { .. })),
+        "concurrent durable appends must reserve capacity before completion"
+    );
+}
+
+#[test]
+fn an_inflight_closure_can_consume_soft_headroom_until_hard_capacity() {
+    let capacity = 1_000_000;
+    let headroom = 250_000;
+    let (mut daemon, source) = capacity_test_passive(capacity, headroom);
+    daemon.replicas.insert(
+        ReplicaKey {
+            source,
+            vset: VSET,
+            assignment_epoch: 1,
+        },
+        PassiveReplica {
+            stored_bytes: capacity - headroom,
+            uncommitted_artifacts: [ReplicaArtifact::Segment {
+                fence: 4,
+                seg: SegId(30),
+            }]
+            .into_iter()
+            .collect(),
+            ..PassiveReplica::default()
+        },
+    );
+
+    assert!(
+        capacity_test_put(&mut daemon, source, 33)
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReplicaAppend { .. })),
+        "soft headroom must remain available to finish a closure already in progress"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn passive_spool_compaction_is_crash_safe_and_recovers_the_newest_cut_without_store() {
+    let roster = vec![
+        PeerCandidate {
+            host: HostId(0),
+            weight: 1,
+            failure_domain: 1,
+            drained: false,
+        },
+        PeerCandidate {
+            host: HostId(1),
+            weight: 1,
+            failure_domain: 2,
+            drained: false,
+        },
+    ];
+    let target = rank_stash_candidates(6, HostId(0), 1, VSET, &roster)[0];
+    let target_domain = roster
+        .iter()
+        .find(|candidate| candidate.host == target)
+        .expect("target")
+        .failure_domain;
+    let daemon_config = DaemonConfig {
+        archive: ArchivePolicy {
+            interval: crate::types::secs(100),
+            max_unpublished_bytes: u64::MAX,
+            ..Default::default()
+        },
+        host: target,
+        cache_pages: 8,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: Some(ReplicaPlacementConfig {
+            membership_epoch: 6,
+            local_failure_domain: target_domain,
+            roster,
+        }),
+    };
+    let (mut daemon, _) = Daemon::new(daemon_config.clone());
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(0),
+    };
+    let mut old_log = Vec::new();
+    let mut compact_frame = None;
+    let mut compact_io = None;
+    let mut newest = None;
+
+    for seq in 1_u64..=10 {
+        let mut builder = SegmentBuilder::new(VSET, 4, SegId(seq));
+        builder.add(
+            page,
+            Gen(seq),
+            &vec![u8::try_from(seq).expect("test sequence fits"); page_size()],
+        );
+        let (segment, locs) = builder.finish();
+        let artifact = ReplicaArtifact::Segment {
+            fence: 4,
+            seg: SegId(seq),
+        };
+        let checksum = crate::format::crc32c(&segment);
+        let effects = daemon.step(
+            Event::PeerDelivered {
+                from: HostId(0),
+                msg: PeerMsg::ReplicaPut {
+                    vset: VSET,
+                    assignment_epoch: 1,
+                    artifact,
+                    checksum,
+                    bytes: segment,
+                },
+            },
+            &NoMem,
+        );
+        let (put_io, put_frame) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ReplicaAppend { io, bytes, .. } => Some((*io, bytes.clone())),
+                _ => None,
+            })
+            .expect("artifact append");
+        old_log.extend(put_frame);
+        daemon.step(Event::BlobWriteDone { io: put_io }, &NoMem);
+
+        let info = ReplicaCommitInfo {
+            writer_fence: 4,
+            seq: JournalSeq(seq),
+            sync_covered_through: seq,
+        };
+        let record = JournalRecord {
+            config: VsetConfig { ..config() },
+            seq: info.seq,
+            fence: info.writer_fence,
+            kind: crate::journal::RecordKind::Commit,
+            capture_seq: seq,
+            sync_covered_through: seq,
+            database: crate::journal::DatabaseMeta::default(),
+            overlay: BTreeMap::from([(page, (Gen(seq), locs[0].2))]),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        }
+        .encode(VSET);
+        let effects = daemon.step(
+            Event::PeerDelivered {
+                from: HostId(0),
+                msg: PeerMsg::ReplicaCommit {
+                    vset: VSET,
+                    assignment_epoch: 1,
+                    info,
+                    required: vec![artifact],
+                    record,
+                },
+            },
+            &NoMem,
+        );
+        let (commit_io, commit_frame) = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ReplicaAppend { io, bytes, .. } => Some((*io, bytes.clone())),
+                _ => None,
+            })
+            .expect("commit append");
+        old_log.extend(commit_frame);
+        newest = Some(info);
+        let effects = daemon.step(Event::BlobWriteDone { io: commit_io }, &NoMem);
+        if let Some((io, bytes)) = effects.iter().find_map(|effect| match effect {
+            Effect::ReplicaAppend {
+                io,
+                generation,
+                bytes,
+                ..
+            } if *generation > 0 => Some((*io, bytes.clone())),
+            _ => None,
+        }) {
+            compact_io = Some(io);
+            compact_frame = Some(bytes);
+            break;
+        }
+    }
+
+    let newest = newest.expect("committed cuts");
+    let compact_io = compact_io.expect("superseded history triggers compaction");
+    let compact_frame = compact_frame.expect("fresh compact generation");
+    let compact_scan = crate::replica_spool::scan_replica_spool(&compact_frame)
+        .expect("compact generation is independently valid");
+    assert_eq!(compact_scan.commits.last().expect("commit").info, newest);
+    assert_eq!(compact_scan.commits.len(), 1);
+    assert_eq!(compact_scan.artifacts.len(), 1);
+
+    let mut crash_between_write_and_delete = old_log;
+    crash_between_write_and_delete.extend_from_slice(&compact_frame);
+    let crash_scan = crate::replica_spool::scan_replica_spool(&crash_between_write_and_delete)
+        .expect("old and new generations coexist safely after a crash");
+    assert_eq!(
+        crash_scan.commits.last().expect("newest commit").info,
+        newest
+    );
+
+    let effects = daemon.step(Event::BlobWriteDone { io: compact_io }, &NoMem);
+    let delete_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReplicaDelete { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("fresh generation fsync precedes old-generation unlink");
+    daemon.step(Event::BlobWriteDone { io: delete_io }, &NoMem);
+    let metrics = daemon.replica_spool_metrics();
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].stored_bytes, compact_frame.len() as u64);
+    assert_eq!(
+        daemon.counters.replica_cleanup_rewrite_bytes,
+        compact_frame.len() as u64
+    );
+
+    let compact_artifact = *compact_scan
+        .artifacts
+        .keys()
+        .next()
+        .expect("retained artifact");
+    let dangling_info = ReplicaCommitInfo {
+        writer_fence: 4,
+        seq: JournalSeq(newest.seq.0 - 1),
+        sync_covered_through: newest.sync_covered_through - 1,
+    };
+    let dangling_record = JournalRecord {
+        config: VsetConfig { ..config() },
+        seq: dangling_info.seq,
+        fence: dangling_info.writer_fence,
+        kind: crate::journal::RecordKind::Commit,
+        capture_seq: dangling_info.seq.0,
+        sync_covered_through: dangling_info.sync_covered_through,
+        database: crate::journal::DatabaseMeta::default(),
+        overlay: BTreeMap::new(),
+        leaves: BTreeMap::new(),
+        migrated_from: None,
+    }
+    .encode(VSET);
+    let dangling_old_suffix = crate::replica_spool::seal_replica_commit(
+        HostId(0),
+        VSET,
+        1,
+        dangling_info,
+        &[compact_artifact],
+        &dangling_record,
+    )
+    .unwrap();
+    assert!(
+        crate::replica_spool::scan_replica_spool(&dangling_old_suffix).is_err(),
+        "partial deletion left a commit whose earlier artifact generation is gone"
+    );
+    let dangling_name = layout::replica_spool_segment_blob(HostId(0), VSET, 1, 0);
+    let compact_name = layout::replica_spool_segment_blob(HostId(0), VSET, 1, 1);
+    let (mut recovered, _, _) = Daemon::recover(
+        daemon_config,
+        [
+            (dangling_name.as_str(), dangling_old_suffix.as_slice()),
+            (compact_name.as_str(), compact_frame.as_slice()),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(
+        recovered.step(
+            Event::PeerDelivered {
+                from: HostId(0),
+                msg: PeerMsg::ReplicaStatus {
+                    vset: VSET,
+                    assignment_epoch: 1,
+                },
+            },
+            &NoMem,
+        ),
+        [Effect::PeerSend {
+            to: HostId(0),
+            msg: PeerMsg::ReplicaStatusReply {
+                vset: VSET,
+                assignment_epoch: 1,
+                committed: Some(newest),
+            },
+        }]
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn newer_cyclic_assignment_commit_durably_reclaims_older_epoch_on_the_same_peer() {
+    let roster: Vec<_> = (0..5)
+        .map(|host| PeerCandidate {
+            host: HostId(host),
+            weight: 1,
+            failure_domain: host + 1,
+            drained: false,
+        })
+        .collect();
+    let ranked = rank_stash_candidates(6, HostId(0), 1, VSET, &roster);
+    let target = ranked[0];
+    let target_domain = roster
+        .iter()
+        .find(|candidate| candidate.host == target)
+        .unwrap()
+        .failure_domain;
+    let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
+        host: target,
+        cache_pages: 8,
+        writeback_interval: 1_000_000,
+        backup_retry: 200_000_000,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 25,
+        replica_placement: Some(ReplicaPlacementConfig {
+            membership_epoch: 6,
+            local_failure_domain: target_domain,
+            roster,
+        }),
+    });
+    let old_key = ReplicaKey {
+        source: HostId(0),
+        vset: VSET,
+        assignment_epoch: 1,
+    };
+    daemon.replicas.insert(
+        old_key,
+        PassiveReplica {
+            stored_bytes: 1234,
+            current_generation: 2,
+            ..PassiveReplica::default()
+        },
+    );
+    let new_epoch = 1 + u64::try_from(ranked.len()).expect("test roster fits");
+    let index = usize::try_from(new_epoch - 1).expect("test epoch fits");
+    assert_eq!(ranked[index % ranked.len()], target);
+    let page = PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(1),
+        },
+        page: PageNo(0),
+    };
+    let mut builder = SegmentBuilder::new(VSET, 4, SegId(55));
+    builder.add(page, Gen(55), &vec![0x55; page_size()]);
+    let (segment, locs) = builder.finish();
+    let artifact = ReplicaArtifact::Segment {
+        fence: 4,
+        seg: SegId(55),
+    };
+    let effects = daemon.step(
+        Event::PeerDelivered {
+            from: HostId(0),
+            msg: PeerMsg::ReplicaPut {
+                vset: VSET,
+                assignment_epoch: new_epoch,
+                artifact,
+                checksum: crate::format::crc32c(&segment),
+                bytes: segment,
+            },
+        },
+        &NoMem,
+    );
+    let put_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReplicaAppend { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("new epoch artifact");
+    daemon.step(Event::BlobWriteDone { io: put_io }, &NoMem);
+    let info = ReplicaCommitInfo {
+        writer_fence: 4,
+        seq: JournalSeq(55),
+        sync_covered_through: 55,
+    };
+    let record = JournalRecord {
+        config: VsetConfig { ..config() },
+        seq: info.seq,
+        fence: info.writer_fence,
+        kind: crate::journal::RecordKind::Commit,
+        capture_seq: 55,
+        sync_covered_through: 55,
+        database: crate::journal::DatabaseMeta::default(),
+        overlay: BTreeMap::from([(page, (Gen(55), locs[0].2))]),
+        leaves: BTreeMap::new(),
+        migrated_from: None,
+    }
+    .encode(VSET);
+    let effects = daemon.step(
+        Event::PeerDelivered {
+            from: HostId(0),
+            msg: PeerMsg::ReplicaCommit {
+                vset: VSET,
+                assignment_epoch: new_epoch,
+                info,
+                required: vec![artifact],
+                record,
+            },
+        },
+        &NoMem,
+    );
+    assert!(
+        effects
+            .iter()
+            .all(|effect| !matches!(effect, Effect::ReplicaDelete { .. })),
+        "old epoch remains until the replacement commit is durable"
+    );
+    let commit_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReplicaAppend { io, .. } => Some(*io),
+            _ => None,
+        })
+        .expect("new epoch commit");
+    let effects = daemon.step(Event::BlobWriteDone { io: commit_io }, &NoMem);
+    let delete_io = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReplicaDelete {
+                io,
+                assignment_epoch: 1,
+                through_generation: 2,
+                ..
+            } => Some(*io),
+            _ => None,
+        })
+        .expect("covering replacement retires the old local epoch");
+    assert!(daemon.replicas.contains_key(&old_key));
+    daemon.step(Event::BlobWriteDone { io: delete_io }, &NoMem);
+    assert!(!daemon.replicas.contains_key(&old_key));
+    assert!(daemon.replicas.contains_key(&ReplicaKey {
+        source: HostId(0),
+        vset: VSET,
+        assignment_epoch: new_epoch,
+    }));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn passive_archive_pack_rewrites_leaf_entries_and_is_restart_deterministic() {
+    let pages = [
+        PageId {
+            volume: VolumeId {
+                vset: VSET,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(3),
+        },
+        PageId {
+            volume: VolumeId {
+                vset: VSET,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(7),
+        },
+    ];
+    let mut source_artifacts = BTreeMap::new();
+    let mut leaf_entries = Vec::new();
+    let mut required = Vec::new();
+    for (index, page) in pages.into_iter().enumerate() {
+        let seg = SegId(10 + index as u64);
+        let generation = Gen(20 + index as u64);
+        let mut builder = SegmentBuilder::new(VSET, 4, seg);
+        let fill = 0x40 + u8::try_from(index).expect("test index fits");
+        builder.add(page, generation, &vec![fill; page_size()]);
+        let (bytes, entries) = builder.finish();
+        let artifact = ReplicaArtifact::Segment { fence: 4, seg };
+        source_artifacts.insert(artifact, (crate::format::crc32c(&bytes), bytes));
+        required.push(artifact);
+        leaf_entries.push((page.volume.idx, page.page, generation, entries[0].2));
+    }
+    let leaf = crate::mapleaf::MapLeaf {
+        span: crate::mapleaf::span_of(pages[0]),
+        entries: leaf_entries,
+    };
+    let leaf_ptr = crate::mapleaf::LeafPtr {
+        base: 0,
+        fence: 4,
+        id: 6,
+    };
+    let leaf_bytes = leaf.encode(VSET, leaf_ptr.fence, leaf_ptr.id);
+    let leaf_artifact = ReplicaArtifact::Leaf {
+        fence: leaf_ptr.fence,
+        id: leaf_ptr.id,
+    };
+    source_artifacts.insert(
+        leaf_artifact,
+        (crate::format::crc32c(&leaf_bytes), leaf_bytes),
+    );
+    required.push(leaf_artifact);
+    let info = ReplicaCommitInfo {
+        writer_fence: 4,
+        seq: JournalSeq(12),
+        sync_covered_through: 19,
+    };
+    let record = JournalRecord {
+        config: config(),
+        seq: info.seq,
+        fence: info.writer_fence,
+        kind: crate::journal::RecordKind::Commit,
+        capture_seq: 19,
+        sync_covered_through: info.sync_covered_through,
+        database: crate::journal::DatabaseMeta::default(),
+        overlay: BTreeMap::new(),
+        leaves: BTreeMap::from([(leaf.span, leaf_ptr)]),
+        migrated_from: None,
+    }
+    .encode(VSET);
+    let replica = PassiveReplica {
+        artifacts: source_artifacts,
+        ..PassiveReplica::default()
+    };
+    let candidate = || ReplicaUpload {
+        info,
+        todo: required.clone(),
+        record: record.clone(),
+        derived: BTreeMap::new(),
+        inflight: false,
+    };
+    let first = Daemon::pack_replica_upload(VSET, &replica, candidate());
+    let after_restart = Daemon::pack_replica_upload(VSET, &replica, candidate());
+    assert_eq!(first.record, after_restart.record);
+    assert_eq!(first.todo, after_restart.todo);
+    assert_eq!(first.derived, after_restart.derived);
+
+    let archive_fence = u64::MAX - info.seq.0;
+    let segment_artifacts: Vec<_> = first
+        .derived
+        .keys()
+        .filter(|artifact| matches!(artifact, ReplicaArtifact::Segment { .. }))
+        .copied()
+        .collect();
+    assert_eq!(
+        segment_artifacts,
+        [ReplicaArtifact::Segment {
+            fence: archive_fence,
+            seg: SegId(0),
+        }]
+    );
+    let packed_record = JournalRecord::decode(VSET, &first.record).expect("packed record");
+    let packed_ptr = packed_record.leaves[&leaf.span];
+    assert_eq!((packed_ptr.fence, packed_ptr.id), (archive_fence, 0));
+    let packed_leaf_artifact = ReplicaArtifact::Leaf {
+        fence: packed_ptr.fence,
+        id: packed_ptr.id,
+    };
+    let packed_leaf = crate::mapleaf::MapLeaf::decode(
+        VSET,
+        packed_ptr.fence,
+        packed_ptr.id,
+        &first.derived[&packed_leaf_artifact],
+    )
+    .expect("packed leaf");
+    assert!(
+        packed_leaf
+            .entries
+            .iter()
+            .all(|(_, _, _, loc)| (loc.fence, loc.seg) == (archive_fence, SegId(0)))
+    );
+}
+
 #[test]
 fn passive_upload_backlog_keeps_only_the_latest_complete_commit() {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(1),
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -2119,7 +3662,7 @@ fn passive_upload_backlog_keeps_only_the_latest_complete_commit() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
     let key = ReplicaKey {
         source: HostId(0),
@@ -2137,6 +3680,7 @@ fn passive_upload_backlog_keeps_only_the_latest_complete_commit() {
                 },
                 todo: Vec::new(),
                 record: vec![1],
+                derived: BTreeMap::new(),
                 inflight: true,
             }),
             ..PassiveReplica::default()
@@ -2192,6 +3736,7 @@ fn checkpoint_cost_scales_with_the_delta_not_the_volume() {
     // R3.3: the first capture of a never-checkpointed volume is whole-
     // written-set sized; every later checkpoint pays only for what changed.
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: crate::types::HostId(0),
         cache_pages: 256,
         writeback_interval: 1_000_000_000,
@@ -2199,9 +3744,9 @@ fn checkpoint_cost_scales_with_the_delta_not_the_volume() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
-    let config = VsetConfig::compute(1, 64, false);
+    let config = VsetConfig::compute(1, 64);
     let effects = step_settled(
         &mut daemon,
         Event::Admin(AdminCmd::CreateVset {
@@ -2297,6 +3842,7 @@ fn large_checkpoint_resumes_after_batch_arm_before_any_page_copy() {
     }
 
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(0),
         cache_pages: 80,
         writeback_interval: 1_000_000,
@@ -2304,7 +3850,7 @@ fn large_checkpoint_resumes_after_batch_arm_before_any_page_copy() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
     let mem = CountingMem(std::cell::Cell::new(0));
     let _ = step_settled_with_mem(
@@ -2312,7 +3858,7 @@ fn large_checkpoint_resumes_after_batch_arm_before_any_page_copy() {
         Event::Admin(AdminCmd::CreateVset {
             req: ReqId(800),
             vset: VSET,
-            config: VsetConfig::compute(1, 80, false),
+            config: VsetConfig::compute(1, 80),
             from_base: None,
         }),
         &mem,
@@ -2381,7 +3927,10 @@ fn large_checkpoint_resumes_after_batch_arm_before_any_page_copy() {
 }
 
 #[derive(Default)]
-struct DatabaseMem(std::cell::RefCell<BTreeMap<PageId, Vec<u8>>>);
+struct DatabaseMem(
+    std::cell::RefCell<BTreeMap<PageId, Vec<u8>>>,
+    std::cell::RefCell<BTreeMap<String, Vec<u8>>>,
+);
 
 impl HostMap for DatabaseMem {
     fn read_page(&self, page: PageId) -> Vec<u8> {
@@ -2398,11 +3947,82 @@ fn database_step(daemon: &mut Daemon, mem: &DatabaseMem, event: Event) -> Vec<Ef
                 Effect::DatabaseInstall { page, bytes } => {
                     mem.0.borrow_mut().insert(page, bytes);
                 }
-                Effect::BlobWrite { io, .. } => queue.push_back(Event::BlobWriteDone { io }),
+                Effect::BlobWrite { io, name, bytes } => {
+                    mem.1.borrow_mut().insert(name, bytes);
+                    queue.push_back(Event::BlobWriteDone { io });
+                }
+                Effect::BlobRead { io, name } => queue.push_back(Event::BlobReadDone {
+                    io,
+                    bytes: mem.1.borrow().get(&name).cloned(),
+                }),
+                Effect::BlobDelete { name } => {
+                    mem.1.borrow_mut().remove(&name);
+                }
+                Effect::StoreCas {
+                    io, expected: None, ..
+                } => queue.push_back(Event::StorePutDone { io, result: Ok(1) }),
                 Effect::SetTimer {
                     timer: TimerId::DatabaseStep(vset),
                     ..
                 } => queue.push_back(Event::Timer(TimerId::DatabaseStep(vset))),
+                Effect::SetTimer {
+                    timer:
+                        TimerId::Replica { .. }
+                        | TimerId::ReplicaUpload { .. }
+                        | TimerId::ReplicaRelease(_),
+                    ..
+                } => {}
+                Effect::PeerSend {
+                    to: HostId(1),
+                    msg:
+                        PeerMsg::ReplicaStatus {
+                            vset,
+                            assignment_epoch,
+                        },
+                } => queue.push_back(Event::PeerDelivered {
+                    from: HostId(1),
+                    msg: PeerMsg::ReplicaStatusReply {
+                        vset,
+                        assignment_epoch,
+                        committed: None,
+                    },
+                }),
+                Effect::PeerSend {
+                    to: HostId(1),
+                    msg:
+                        PeerMsg::ReplicaPut {
+                            vset,
+                            assignment_epoch,
+                            artifact,
+                            checksum,
+                            ..
+                        },
+                } => queue.push_back(Event::PeerDelivered {
+                    from: HostId(1),
+                    msg: PeerMsg::ReplicaPutAck {
+                        vset,
+                        assignment_epoch,
+                        artifact,
+                        checksum,
+                    },
+                }),
+                Effect::PeerSend {
+                    to: HostId(1),
+                    msg:
+                        PeerMsg::ReplicaCommit {
+                            vset,
+                            assignment_epoch,
+                            info,
+                            ..
+                        },
+                } => queue.push_back(Event::PeerDelivered {
+                    from: HostId(1),
+                    msg: PeerMsg::ReplicaCommitAck {
+                        vset,
+                        assignment_epoch,
+                        info,
+                    },
+                }),
                 other => settled.push(other),
             }
         }
@@ -2415,6 +4035,7 @@ fn database_daemon_with_capacity(
     database_pages: u32,
 ) -> (Daemon, DatabaseMem, AttachmentId) {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: crate::types::HostId(0),
         cache_pages,
         writeback_interval: 1_000_000,
@@ -2422,7 +4043,7 @@ fn database_daemon_with_capacity(
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
     let mem = DatabaseMem::default();
     let effects = database_step(
@@ -2431,7 +4052,7 @@ fn database_daemon_with_capacity(
         Event::Admin(AdminCmd::CreateVset {
             req: ReqId(100),
             vset: VSET,
-            config: VsetConfig::database(database_pages, false),
+            config: VsetConfig::database(database_pages),
             from_base: None,
         }),
     );
@@ -2677,13 +4298,16 @@ fn database_byte_io_sync_truncate_and_recreate_are_exact() {
         105,
         DatabaseOp::Sync { handle: 1 },
     );
-    assert!(sync.iter().any(|effect| matches!(
-        effect,
-        Effect::Database(DatabaseReply::Synced {
-            req: ReqId(105),
-            sequence: 2,
-        })
-    )));
+    assert!(
+        sync.iter().any(|effect| matches!(
+            effect,
+            Effect::Database(DatabaseReply::Synced {
+                req: ReqId(105),
+                sequence: 2,
+            })
+        )),
+        "sync effects: {sync:?}"
+    );
 
     assert_eq!(
         database_request(
@@ -3498,6 +5122,11 @@ fn graceful_database_detach_chains_after_an_inflight_record() {
     );
 
     let capture = daemon.step(Event::Timer(TimerId::Writeback), &mem);
+    for effect in &capture {
+        if let Effect::BlobWrite { name, bytes, .. } = effect {
+            mem.1.borrow_mut().insert(name.clone(), bytes.clone());
+        }
+    }
     let segment_io = capture
         .iter()
         .find_map(|effect| match effect {
@@ -3506,6 +5135,11 @@ fn graceful_database_detach_chains_after_an_inflight_record() {
         })
         .expect("dirty capture writes a segment");
     let record_writes = daemon.step(Event::BlobWriteDone { io: segment_io }, &mem);
+    for effect in &record_writes {
+        if let Effect::BlobWrite { name, bytes, .. } = effect {
+            mem.1.borrow_mut().insert(name.clone(), bytes.clone());
+        }
+    }
     let record_ios: Vec<_> = record_writes
         .iter()
         .filter_map(|effect| match effect {
@@ -3557,6 +5191,7 @@ fn graceful_database_detach_chains_after_an_inflight_record() {
 #[test]
 fn five_hundred_idle_database_vsets_share_one_vm_without_page_residency() {
     let (mut daemon, _) = Daemon::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: crate::types::HostId(0),
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -3564,7 +5199,7 @@ fn five_hundred_idle_database_vsets_share_one_vm_without_page_residency() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     });
     let mem = DatabaseMem::default();
     for id in 1..=500 {
@@ -3576,7 +5211,7 @@ fn five_hundred_idle_database_vsets_share_one_vm_without_page_residency() {
                 Event::Admin(AdminCmd::CreateVset {
                     req: ReqId(id),
                     vset,
-                    config: VsetConfig::database(8, false),
+                    config: VsetConfig::database(8),
                     from_base: None,
                 }),
             )
@@ -3651,6 +5286,11 @@ fn database_cluster_step(
                 }
                 Effect::BlobDelete { name } => {
                     blobs[host].remove(&name);
+                }
+                Effect::ReplicaAppend { io, .. }
+                | Effect::ReplicaDelete { io, .. }
+                | Effect::ReplicaTruncate { io, .. } => {
+                    queue.push_back((host, Event::BlobWriteDone { io }));
                 }
                 Effect::PeerSend { to, msg } => queue.push_back((
                     usize::from(to.0),
@@ -3759,6 +5399,7 @@ impl DatabaseTestStore {
 #[allow(clippy::too_many_lines)]
 fn detached_database_migrates_without_vm_pause_and_reads_tail_from_peer() {
     let config = |host| DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(host),
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -3766,7 +5407,7 @@ fn detached_database_migrates_without_vm_pause_and_reads_tail_from_peer() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 25,
-        replica_placement: None,
+        replica_placement: Some(test_replica_placement()),
     };
     let (source, _) = Daemon::new(config(0));
     let (destination, _) = Daemon::new(config(1));
@@ -3787,7 +5428,7 @@ fn detached_database_migrates_without_vm_pause_and_reads_tail_from_peer() {
             Event::Admin(AdminCmd::CreateVset {
                 req: ReqId(200),
                 vset: VSET,
-                config: VsetConfig::database(8, false),
+                config: VsetConfig::database(8),
                 from_base: None,
             }),
         ),
@@ -3886,6 +5527,18 @@ fn detached_database_migrates_without_vm_pause_and_reads_tail_from_peer() {
         ),
     );
 
+    let source_state = &daemons[0].vsets[&VSET];
+    assert!(
+        source_state.ready
+            && source_state.outbound.is_none()
+            && source_state.migrate.is_none()
+            && source_state.peer_source.is_none()
+            && source_state.ckpt_pausing.is_none()
+            && !source_state.commit_running
+            && source_state.database_runtime.is_detached(),
+        "source not migration-ready: {source_state:?}"
+    );
+
     let moved = run(
         &mut daemons,
         &mut blobs,
@@ -3904,16 +5557,19 @@ fn detached_database_migrates_without_vm_pause_and_reads_tail_from_peer() {
             .any(|(_, effect)| matches!(effect, Effect::PauseGuest { .. })),
         "database movement must not pause a VM"
     );
-    assert!(moved.iter().any(|(host, effect)| matches!(
-        (host, effect),
-        (
-            1,
-            Effect::Admin(AdminReply::VsetMigratedIn {
-                verdict: Verdict::DatabaseReady { .. },
-                ..
-            })
-        )
-    )));
+    assert!(
+        moved.iter().any(|(host, effect)| matches!(
+            (host, effect),
+            (
+                1,
+                Effect::Admin(AdminReply::VsetMigratedIn {
+                    verdict: Verdict::DatabaseReady { .. },
+                    ..
+                })
+            )
+        )),
+        "migration effects: {moved:?}"
+    );
     let hydrated = DatabaseFile::Main.page(VSET, 0);
     assert_eq!(
         &mems[1].0.borrow()[&hydrated][211..211 + expected.len()],
@@ -3981,8 +5637,11 @@ fn detached_database_migrates_without_vm_pause_and_reads_tail_from_peer() {
         effect,
         Effect::Database(DatabaseReply::Read { req: ReqId(211), bytes, .. }) if *bytes == expected
     )));
+    assert!(store.objects.contains_key(&layout::head_key(VSET)));
     assert!(
-        store.objects.is_empty(),
-        "non-backed movement used the store"
+        store
+            .objects
+            .keys()
+            .any(|key| key.starts_with("v/0000000000000007/m/"))
     );
 }

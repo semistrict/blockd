@@ -6,7 +6,8 @@
 //! record size is O(overlay + spans) — never O(pages). Per-vset journal
 //! length stays O(1) records no matter how many checkpoints were ever
 //! taken (R3.4); recovery needs intact records and the leaves they name
-//! (R8.2). The same bytes are the backup manifest, verbatim.
+//! (R8.2). Archive manifests use this same encoding, with page locations
+//! optionally rewritten by passive packing.
 
 use std::collections::BTreeMap;
 
@@ -18,37 +19,6 @@ use crate::types::{
 };
 
 pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
-
-/// Immutable durability policy of a vset (R4.1).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum DurabilityMode {
-    /// Durable on this host only; never writes cluster-owned objects.
-    Local = 0,
-    /// Local durability with asynchronous object-store backup.
-    Backup = 1,
-    /// Backup plus guest-sync acknowledgment gated on one passive peer.
-    PeerStashed = 2,
-}
-
-impl DurabilityMode {
-    pub const fn uses_store(self) -> bool {
-        matches!(self, Self::Backup | Self::PeerStashed)
-    }
-
-    pub const fn requires_peer_sync(self) -> bool {
-        matches!(self, Self::PeerStashed)
-    }
-
-    fn decode(version: u16, value: u8) -> Result<Self, DecodeError> {
-        match (version, value) {
-            (4..=6, 0) => Ok(Self::Local),
-            (4..=6, 1) => Ok(Self::Backup),
-            (5 | 6, 2) => Ok(Self::PeerStashed),
-            _ => Err(DecodeError),
-        }
-    }
-}
 
 /// The immutable consistency/lifecycle kind of a vset (R1.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,34 +69,22 @@ pub struct VsetConfig {
     /// indices 0, 1 and 2 are main, WAL and rollback journal respectively.
     pub disk_volumes: u8,
     pub pages_per_volume: u32,
-    /// The one durability knob, set at creation, immutable (R4.1).
-    pub durability: DurabilityMode,
 }
 
 impl VsetConfig {
-    pub const fn compute(disk_volumes: u8, pages_per_volume: u32, backed_up: bool) -> Self {
+    pub const fn compute(disk_volumes: u8, pages_per_volume: u32) -> Self {
         Self {
             kind: VsetKind::Compute,
             disk_volumes,
             pages_per_volume,
-            durability: if backed_up {
-                DurabilityMode::Backup
-            } else {
-                DurabilityMode::Local
-            },
         }
     }
 
-    pub const fn database(pages_per_file: u32, backed_up: bool) -> Self {
+    pub const fn database(pages_per_file: u32) -> Self {
         Self {
             kind: VsetKind::Database,
             disk_volumes: 2,
             pages_per_volume: pages_per_file,
-            durability: if backed_up {
-                DurabilityMode::Backup
-            } else {
-                DurabilityMode::Local
-            },
         }
     }
 
@@ -247,7 +205,10 @@ impl JournalRecord {
         e.u8(self.config.kind as u8);
         e.u8(self.config.disk_volumes);
         e.u32(self.config.pages_per_volume);
-        e.u8(self.config.durability as u8);
+        // Version 6 previously encoded three per-vset policies here. The
+        // peer-first policy is now the sole accepted value; retaining its
+        // existing tag keeps already-created peer-first records readable.
+        e.u8(2);
         if self.config.kind == VsetKind::Database {
             for file in self.database.files() {
                 e.u8(u8::from(file.exists));
@@ -320,8 +281,11 @@ impl JournalRecord {
             kind: vset_kind,
             disk_volumes: d.u8()?,
             pages_per_volume: d.u32()?,
-            durability: DurabilityMode::decode(version, d.u8()?)?,
         };
+        let legacy_durability = d.u8()?;
+        if !matches!((version, legacy_durability), (4..=6, 0 | 1) | (5 | 6, 2)) {
+            return Err(DecodeError);
+        }
         if !config.valid() {
             return Err(DecodeError);
         }
@@ -457,7 +421,6 @@ mod tests {
                 kind: VsetKind::Compute,
                 disk_volumes: 2,
                 pages_per_volume: 16,
-                durability: DurabilityMode::Backup,
             },
             seq: JournalSeq(5),
             fence: 6,
@@ -488,8 +451,8 @@ mod tests {
         assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
         // Byte pin (R10.2): any change here is a storage format change.
         let expected = match page_size() {
-            4096 => (211, 0x553E_E971),
-            16_384 => (211, 0x9264_CB7C),
+            4096 => (211, 0xC33F_D568),
+            16_384 => (211, 0x0465_F765),
             size => panic!("byte pin missing for {size}-byte pages"),
         };
         assert_eq!((bytes.len(), crc32c(&bytes)), expected);
@@ -533,7 +496,7 @@ mod tests {
     #[test]
     fn database_records_round_trip_with_file_metadata() {
         let record = JournalRecord {
-            config: VsetConfig::database(1024, true),
+            config: VsetConfig::database(1024),
             seq: JournalSeq(7),
             fence: 3,
             kind: RecordKind::Commit,
@@ -562,7 +525,7 @@ mod tests {
     #[should_panic(expected = "record kind/metadata disagrees with vset kind")]
     fn database_records_cannot_carry_vmstate() {
         let record = JournalRecord {
-            config: VsetConfig::database(1, false),
+            config: VsetConfig::database(1),
             seq: JournalSeq(0),
             fence: 1,
             kind: RecordKind::Checkpoint {
@@ -648,7 +611,6 @@ mod tests {
                 kind: VsetKind::Compute,
                 disk_volumes: 0,
                 pages_per_volume: total,
-                durability: DurabilityMode::Backup,
             },
             seq: JournalSeq(9),
             fence: 3,

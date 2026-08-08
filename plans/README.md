@@ -8,7 +8,7 @@ status row when done.
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
-| 001 | Add peer-stashed sync durability | P1 | L | — | TODO |
+| 001 | Add peer-stashed sync durability | P1 | L | — | SUPERSEDED |
 
 Status values: TODO, IN PROGRESS, DONE, BLOCKED (with a one-line reason), or
 REJECTED (with a one-line rationale).
@@ -20,7 +20,7 @@ REJECTED (with a one-line rationale).
   its steps in order because the format and simulator changes define the
   behavior that the runtime must implement.
 
-## Findings considered and rejected
+## Historical findings from the superseded plan
 
 - Waiting for the object-store head update on every guest sync was rejected:
   it adds object-store tail latency and outage availability to a hot guest
@@ -30,5 +30,6 @@ REJECTED (with a one-line rationale).
   run the vset.
 - Treating TCP delivery as durability was rejected: the receiver can lose the
   frame, process, or machine before bytes reach stable storage.
-- Automatic promotion from the stash was deferred: the requested first version
-  is a recoverable second copy, not a new assignment or consensus protocol.
+- Automatic passive replacement was deferred by the historical plan. That
+  decision is superseded: passive loss now triggers a fenced, fully seeded
+  replacement and repeated failures cycle through eligible candidates.

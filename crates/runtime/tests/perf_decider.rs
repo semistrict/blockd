@@ -16,9 +16,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
-use blockd_core::daemon::{Daemon, DaemonConfig};
+use blockd_core::daemon::{ArchivePolicy, Daemon, DaemonConfig};
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, ReqId, StoreFault, TimerId};
+use blockd_core::placement::PeerCandidate;
+use blockd_core::seam::{
+    AdminCmd, AdminReply, Effect, Event, HostMap, PeerMsg, ReplicaCommitInfo, ReqId, StoreFault,
+    TimerId,
+};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
 use blockd_workload::{
     Backend, Capability, LogicalPage, Operation, WorkloadModel, WorkloadOutcome,
@@ -61,6 +65,7 @@ struct World {
     /// Resident pages and whether they are writable (false = WP-armed).
     resident: BTreeMap<PageId, bool>,
     admin: Vec<AdminReply>,
+    peer_committed: BTreeMap<VsetId, ReplicaCommitInfo>,
     applied: u64,
     /// Per bucket: (count, total ns, max single-step ns).
     times: BTreeMap<Bucket, (u64, u64, u64)>,
@@ -77,6 +82,7 @@ impl World {
             timers: Vec::new(),
             resident: BTreeMap::new(),
             admin: Vec::new(),
+            peer_committed: BTreeMap::new(),
             applied: 0,
             times: BTreeMap::new(),
         };
@@ -314,7 +320,62 @@ impl World {
             }
             Effect::FillFailed { page } => panic!("unservable page {page:?}"),
             Effect::VsetFenced { vset } => panic!("unexpected fence of {vset:?}"),
-            Effect::PeerSend { to, .. } => panic!("unexpected peer send to {to:?}"),
+            Effect::VsetUnservable { page } => panic!("unservable vset page {page:?}"),
+            Effect::PeerSend { to, msg } => {
+                assert_eq!(to, HostId(1), "unexpected passive target");
+                let reply = match msg {
+                    PeerMsg::ReplicaStatus {
+                        vset,
+                        assignment_epoch,
+                    } => Some(PeerMsg::ReplicaStatusReply {
+                        vset,
+                        assignment_epoch,
+                        committed: self.peer_committed.get(&vset).copied(),
+                    }),
+                    PeerMsg::ReplicaPut {
+                        vset,
+                        assignment_epoch,
+                        artifact,
+                        checksum,
+                        ..
+                    } => Some(PeerMsg::ReplicaPutAck {
+                        vset,
+                        assignment_epoch,
+                        artifact,
+                        checksum,
+                    }),
+                    PeerMsg::ReplicaCommit {
+                        vset,
+                        assignment_epoch,
+                        info,
+                        ..
+                    } => {
+                        self.peer_committed.insert(vset, info);
+                        Some(PeerMsg::ReplicaCommitAck {
+                            vset,
+                            assignment_epoch,
+                            info,
+                        })
+                    }
+                    PeerMsg::ReplicaArchive { .. } => None,
+                    PeerMsg::ReplicaRelease {
+                        vset,
+                        assignment_epoch,
+                        through,
+                    } => Some(PeerMsg::ReplicaReleaseAck {
+                        vset,
+                        assignment_epoch,
+                        through,
+                    }),
+                    other => panic!("unexpected passive message: {other:?}"),
+                };
+                if let Some(msg) = reply {
+                    local.push_back(Event::PeerDelivered {
+                        from: HostId(1),
+                        msg,
+                    });
+                }
+            }
             Effect::Abort { reason } => panic!("daemon abort: {reason}"),
         }
     }
@@ -344,6 +405,7 @@ impl DeciderBackend {
     fn new(vsets: u64) -> Self {
         Self {
             world: World::new(DaemonConfig {
+                archive: ArchivePolicy::default(),
                 host: HostId(0),
                 cache_pages: 1 << 22,
                 writeback_interval: millis(5),
@@ -351,7 +413,16 @@ impl DeciderBackend {
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 500,
-                replica_placement: None,
+                replica_placement: Some(blockd_core::daemon::ReplicaPlacementConfig {
+                    membership_epoch: 1,
+                    local_failure_domain: 0,
+                    roster: vec![PeerCandidate {
+                        host: HostId(1),
+                        weight: 1,
+                        failure_domain: 1,
+                        drained: false,
+                    }],
+                }),
             }),
             vsets,
             data_ops: 0,
@@ -380,11 +451,7 @@ impl Backend for DeciderBackend {
         match operation {
             Operation::Create => {
                 let shape = model.shape();
-                let config = VsetConfig::compute(
-                    shape.disk_volumes,
-                    shape.pages_per_volume,
-                    shape.backed_up,
-                );
+                let config = VsetConfig::compute(shape.disk_volumes, shape.pages_per_volume);
                 for n in 0..self.vsets {
                     self.world.step(
                         Event::Admin(AdminCmd::CreateVset {
@@ -444,6 +511,7 @@ fn drive(vsets: u64) -> (World, WorkloadOutcome) {
 fn profile_huge_vset_capture_stall() {
     const HUGE_PAGES: u32 = 300_000;
     let mut world = World::new(DaemonConfig {
+        archive: ArchivePolicy::default(),
         host: HostId(0),
         cache_pages: 1 << 22,
         writeback_interval: millis(5),
@@ -451,13 +519,22 @@ fn profile_huge_vset_capture_stall() {
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 500,
-        replica_placement: None,
+        replica_placement: Some(blockd_core::daemon::ReplicaPlacementConfig {
+            membership_epoch: 1,
+            local_failure_domain: 0,
+            roster: vec![PeerCandidate {
+                host: HostId(1),
+                weight: 1,
+                failure_domain: 1,
+                drained: false,
+            }],
+        }),
     });
     world.step(
         Event::Admin(AdminCmd::CreateVset {
             req: ReqId(1),
             vset: VsetId(1),
-            config: VsetConfig::compute(1, HUGE_PAGES, false),
+            config: VsetConfig::compute(1, HUGE_PAGES),
             from_base: None,
         }),
         Bucket::Admin,

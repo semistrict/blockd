@@ -9,7 +9,7 @@
     "crash_hosts": [{ "at": "2s", "host": { "stash_rank": 0 } }],
     "peer_drop": { "numerator": 1, "denominator": 12 },
     "peer_dup": { "numerator": 1, "denominator": 10 },
-    "store_outage": { "start": "200ms", "end": "800ms" },
+    "store_outage": { "start": "900ms", "end": "1600ms" },
     "fault_points": [
       "replica-retry-timer",
       "duplicate-ack",

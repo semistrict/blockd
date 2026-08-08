@@ -20,12 +20,7 @@ impl Backend for ReferenceBackend {
 fn config_for(spec: &WorkloadSpec) -> HarnessConfig {
     let mut config = blockd_sim::presets::single_host_base();
     config.vset_count = 1;
-    config.backed_vsets = u16::from(spec.shape.backed_up);
-    config.vset_config = VsetConfig::compute(
-        spec.shape.disk_volumes,
-        spec.shape.pages_per_volume,
-        spec.shape.backed_up,
-    );
+    config.vset_config = VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
     config.horizon = millis(10_000);
     config.think = (micros(1), micros(2));
     config.checkpoint_interval = None;

@@ -3,7 +3,7 @@
 //! verdicts, pressure, bit rot. Every run is deterministic, so assertions
 //! are exact; any drift is a real behavior change.
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::daemon::{ArchivePolicy, DaemonConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{micros, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
@@ -33,11 +33,11 @@ fn quiet_run_serves_and_syncs_without_incident() {
     assert_clean(&report);
     assert_eq!(report.crashes, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(1947, 1945));
+    assert_eq!(report.completed_ops, page_pin(1935, 1916));
     assert_eq!(report.counters.faults_unservable, 0);
     assert_eq!(report.counters.pressure_waits, 0);
     assert_eq!(report.counters.checkpoints_done, 0);
-    assert_eq!(report.counters.syncs_acked, page_pin(274, 306));
+    assert_eq!(report.counters.syncs_acked, page_pin(280, 268));
     assert_eq!(report.counters.guest_rejected, 0);
 }
 
@@ -73,12 +73,12 @@ fn crash_storm_with_checkpoints_resumes() {
     };
     let report = run(3, config);
     assert_clean(&report);
-    assert_eq!(report.crashes, page_pin(10, 8));
-    assert_eq!(report.resumes, page_pin(4, 3));
-    assert_eq!(report.cold_boots, page_pin(26, 21));
+    assert_eq!(report.crashes, page_pin(12, 10));
+    assert_eq!(report.resumes, page_pin(7, 1));
+    assert_eq!(report.cold_boots, page_pin(26, 27));
     assert_eq!(report.unrestorable, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(3714, 4168));
+    assert_eq!(report.completed_ops, page_pin(3215, 2950));
 }
 
 #[test]
@@ -98,9 +98,9 @@ fn crash_storm_without_checkpoints_cold_boots_at_sync_consistency() {
     assert_clean(&report);
     assert_eq!(report.crashes, page_pin(9, 10));
     assert_eq!(report.resumes, 0);
-    assert_eq!(report.cold_boots, page_pin(27, 30));
+    assert_eq!(report.cold_boots, page_pin(25, 27));
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.completed_ops, page_pin(2987, 3402));
+    assert_eq!(report.completed_ops, page_pin(2991, 2762));
 }
 
 #[test]
@@ -112,15 +112,15 @@ fn repeated_checkpoints_accrue_no_storage_debt() {
     config.checkpoint_interval = Some(millis(50));
     let report = run(5, config);
     assert_clean(&report);
-    assert_eq!(report.counters.checkpoints_done, page_pin(240, 239));
+    assert_eq!(report.counters.checkpoints_done, page_pin(247, 233));
     // R3.1: the guest-visible pause is the VMM pause round-trip only —
     // capture and persistence never extend it. Far under the 250 ms budget.
-    assert_eq!(report.max_pause_ns, page_pin(199_414, 197_701));
-    assert_eq!(report.counters.records_written, page_pin(1630, 1575));
+    assert_eq!(report.max_pause_ns, page_pin(198_100, 197_006));
+    assert_eq!(report.counters.records_written, page_pin(1420, 1381));
     // Bounded by live data: at worst ~one segment per live page plus two
     // records per vset (48 pages × 3 vsets ⇒ well under 150), an order of
     // magnitude below records_written — not growing with checkpoint count.
-    assert_eq!(report.blob_count, page_pin(57, 62));
+    assert_eq!(report.blob_count, page_pin(58, 62));
 }
 
 #[test]
@@ -134,11 +134,11 @@ fn pressure_slows_guests_but_never_kills() {
     let report = run(6, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.counters.pressure_waits, page_pin(259, 276));
+    assert_eq!(report.counters.pressure_waits, page_pin(258, 293));
     let progressed: Vec<u64> = report.per_guest_completed.values().copied().collect();
     assert_eq!(
         progressed,
-        page_pin([536, 542, 524, 528], [545, 541, 544, 538])
+        page_pin([523, 522, 514, 527], [505, 515, 491, 517])
     );
 }
 
@@ -159,7 +159,7 @@ fn bit_rot_kills_loudly_and_only_where_injected() {
     };
     let report = run(7, config);
     assert_clean(&report);
-    assert_eq!(report.bitflips, page_pin(16, 20));
+    assert_eq!(report.bitflips, page_pin(22, 23));
     assert_eq!(report.guest_deaths, 3);
     assert_eq!(report.counters.faults_unservable, 3);
 }
@@ -186,7 +186,7 @@ fn rot_on_either_record_copy_never_rolls_back_acked_syncs() {
     assert_eq!(report.crashes, 2);
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.cold_boots, 2);
-    assert_eq!(report.completed_ops, page_pin(687, 783));
+    assert_eq!(report.completed_ops, page_pin(803, 887));
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn full_chaos_stays_consistent() {
             report.guest_deaths,
             report.completed_ops,
         ),
-        page_pin((9, 20, 7, 0, 25, 1554), (8, 6, 18, 0, 9, 3751))
+        page_pin((9, 14, 13, 0, 23, 1078), (8, 2, 22, 0, 5, 3297))
     );
 }
 
@@ -339,12 +339,13 @@ fn chaos_seed_corpus_stays_consistent() {
 fn big_maps_cost_deltas_not_size() {
     let config = HarnessConfig {
         daemon: DaemonConfig {
+            archive: ArchivePolicy::default(),
             // A warm cache: the test measures the map's cost, not thrash.
             cache_pages: 32_768,
             ..base_config().daemon
         },
         vset_count: 1,
-        vset_config: VsetConfig::compute(2, 8_000, false),
+        vset_config: VsetConfig::compute(2, 8_000),
         think: (micros(5), micros(25)),
         horizon: secs(1),
         checkpoint_interval: Some(millis(300)),
@@ -402,11 +403,12 @@ fn big_maps_cost_deltas_not_size() {
 fn steady_overwrites_dont_amplify_disk_space() {
     let config = HarnessConfig {
         daemon: DaemonConfig {
+            archive: ArchivePolicy::default(),
             cache_pages: 8_192,
             ..base_config().daemon
         },
         vset_count: 1,
-        vset_config: VsetConfig::compute(2, 4_096, false),
+        vset_config: VsetConfig::compute(2, 4_096),
         think: (micros(10), micros(50)),
         horizon: secs(2),
         checkpoint_interval: None,

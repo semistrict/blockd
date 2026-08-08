@@ -3,13 +3,13 @@
 //! served from store-held snapshots, and a small HTTP control API:
 //!
 //!   POST /base                     bake the base snapshot into the store
-//!   POST /vm?backed=0|1            start a VM from the base + paired vset
+//!   POST /vm                       start a VM from the base + paired vset
 //!   POST /vm/{id}/work?bursts=N    guest work, mirrored into the vset
 //!   POST /vm/{id}/verify           re-verify the vset against its model
 //!   POST /vm/{id}/fork?n=N         snapshot the VM, start N forks off it
 //!   POST /vm/{id}/expect           (destination) accept a migration
 //!   POST /vm/{id}/migrate?to=H     live-migrate the vset; VM re-restores
-//!   POST /vm/{id}/restore          (after host death) backed vset restore
+//!   POST /vm/{id}/restore          restore after host death
 //!   GET  /status                   vms, counters, store bill
 //!   GET  /metrics                  Prometheus text exposition
 //!
@@ -26,7 +26,8 @@
 
 #[cfg(target_os = "linux")]
 mod api;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod config;
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

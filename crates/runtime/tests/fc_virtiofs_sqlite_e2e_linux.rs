@@ -77,6 +77,7 @@ fn artifacts(test_name: &str) -> Artifacts {
 fn runtime_config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
         daemon: DaemonConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 64,
             writeback_interval: millis(5),
@@ -138,7 +139,7 @@ fn stock_sqlite_wal_survives_hot_unplug_restart_and_replug() {
     let vset = VsetId(61);
 
     let runtime = Arc::new(Runtime::new(&config, Arc::clone(&store)));
-    runtime.create_vset(vset, VsetConfig::database(512, false));
+    runtime.create_vset(vset, VsetConfig::database(512));
     let (mut first, first_fs, first_attachment) =
         boot(&artifacts, Arc::clone(&runtime), VmId(81), "first", vset);
     let first_status = first.cmd("fs-status", "FSSTATUS ");
@@ -173,7 +174,7 @@ fn stock_sqlite_wal_survives_hot_unplug_restart_and_replug() {
     first_fs.wait().expect("first backend exit");
     drop(runtime);
 
-    let configs = BTreeMap::from([(vset, VsetConfig::database(512, false))]);
+    let configs = BTreeMap::from([(vset, VsetConfig::database(512))]);
     let (restarted, verdicts) = Runtime::recover(&config, store, &configs);
     assert!(matches!(
         verdicts.get(&vset),
@@ -203,7 +204,7 @@ fn forced_detach_makes_a_retained_dax_mapping_inaccessible() {
     let runtime = Arc::new(Runtime::new(&config, store));
     let vset = VsetId(63);
     let vm = VmId(84);
-    runtime.create_vset(vset, VsetConfig::database(512, false));
+    runtime.create_vset(vset, VsetConfig::database(512));
 
     let (mut machine, filesystem, attachment) =
         boot(&artifacts, Arc::clone(&runtime), vm, "forced-revoke", vset);
@@ -231,7 +232,7 @@ fn forced_detach_makes_a_retained_dax_mapping_inaccessible() {
     }
 
     let replacement = VsetId(64);
-    runtime.create_vset(replacement, VsetConfig::database(512, false));
+    runtime.create_vset(replacement, VsetConfig::database(512));
     filesystem
         .attach("users", replacement)
         .expect("attach replacement database after forced revocation");
@@ -262,7 +263,7 @@ fn repeated_graceful_hotplug_reuses_the_dax_aperture() {
     let runtime = Arc::new(Runtime::new(&config, store));
     let vm = VmId(85);
     let first_vset = VsetId(70);
-    runtime.create_vset(first_vset, VsetConfig::database(512, false));
+    runtime.create_vset(first_vset, VsetConfig::database(512));
     let (mut machine, filesystem, first_attachment) = boot(
         &artifacts,
         Arc::clone(&runtime),
@@ -288,7 +289,7 @@ fn repeated_graceful_hotplug_reuses_the_dax_aperture() {
         if index + 1 < 40 {
             let vset = VsetId(first_vset.0 + index + 1);
             let name = format!("db{}", index + 1);
-            runtime.create_vset(vset, VsetConfig::database(512, false));
+            runtime.create_vset(vset, VsetConfig::database(512));
             let attachment = filesystem.attach(&name, vset).unwrap().attachment;
             current = (name, vset, attachment);
         }
@@ -307,7 +308,7 @@ fn open_sqlite_connection_survives_firecracker_memory_snapshot() {
     let runtime = Arc::new(Runtime::new(&config, Arc::clone(&store)));
     let vset = VsetId(62);
     let vm = VmId(83);
-    runtime.create_vset(vset, VsetConfig::database(512, false));
+    runtime.create_vset(vset, VsetConfig::database(512));
 
     let (mut first, first_fs, _attachment) =
         boot(&artifacts, Arc::clone(&runtime), vm, "snapshot", vset);
@@ -329,7 +330,7 @@ fn open_sqlite_connection_survives_firecracker_memory_snapshot() {
     // Warm restore must reconstruct volatile attachment and handle state from
     // the validated filesystem snapshot; retaining the original daemon would
     // conceal stale attachment generations and unopened durable handles.
-    let configs = BTreeMap::from([(vset, VsetConfig::database(512, false))]);
+    let configs = BTreeMap::from([(vset, VsetConfig::database(512))]);
     let (recovered, verdicts) = Runtime::recover(&config, store, &configs);
     assert!(matches!(
         verdicts.get(&vset),
@@ -370,7 +371,7 @@ fn profile_parallel_virtiofs_request_queues() {
         ("audit", VsetId(93)),
     ];
     for (_, vset) in exports {
-        runtime.create_vset(vset, VsetConfig::database(512, false));
+        runtime.create_vset(vset, VsetConfig::database(512));
     }
     let (mut machine, filesystem, _) = boot_with_vcpus(
         &artifacts,

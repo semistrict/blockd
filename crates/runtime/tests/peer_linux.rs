@@ -126,6 +126,7 @@ fn sample_msgs() -> Vec<PeerMsg> {
             vset: VsetId(7),
             assignment_epoch: 2,
             info,
+            record: vec![0xD4; 19],
         },
         PeerMsg::ReplicaRelease {
             vset: VsetId(7),

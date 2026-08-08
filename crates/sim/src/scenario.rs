@@ -10,8 +10,8 @@
 
 use std::fmt;
 
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
-use blockd_core::journal::{DurabilityMode, VsetConfig, VsetKind};
+use blockd_core::daemon::{ArchivePolicy, DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
 use blockd_core::types::{HostId, VsetId};
 use serde::Deserialize;
@@ -279,12 +279,7 @@ impl Scenario {
                 "topology.pages-per-volume must be positive",
             ));
         }
-        let vset_config = VsetConfig {
-            kind: VsetKind::Compute,
-            disk_volumes,
-            pages_per_volume,
-            durability: self.spec.topology.durability.into(),
-        };
+        let vset_config = VsetConfig::compute(disk_volumes, pages_per_volume);
         let vset_count = r.u16(&topology.vset_count, "topology.vset-count")?;
         if vset_count == 0 {
             return Err(ScenarioError::new("topology.vset-count must be positive"));
@@ -365,6 +360,10 @@ impl Scenario {
         }
         Ok(Common {
             daemon: DaemonConfig {
+                archive: ArchivePolicy {
+                    interval: blockd_core::types::secs(1),
+                    ..ArchivePolicy::default()
+                },
                 host: HostId(0),
                 cache_pages,
                 writeback_interval,
@@ -388,18 +387,7 @@ impl Scenario {
 
     fn realize_single(&self, r: &Realizer) -> Result<HarnessConfig, ScenarioError> {
         let common = self.common(r)?;
-        let backed_vsets = self
-            .spec
-            .topology
-            .backed_vsets
-            .as_ref()
-            .map_or(Ok(0), |v| r.u16(v, "topology.backed-vsets"))?;
-        if backed_vsets > common.vset_count {
-            return Err(ScenarioError::new(
-                "topology.backed-vsets exceeds vset-count",
-            ));
-        }
-        if self.spec.topology.hosts.is_some() || self.spec.topology.nonbacked_vsets.is_some() {
+        if self.spec.topology.hosts.is_some() {
             return Err(ScenarioError::new(
                 "single-host scenarios cannot set cluster topology fields",
             ));
@@ -459,7 +447,6 @@ impl Scenario {
             bdev: common.bdev,
             store: common.store,
             vset_count: common.vset_count,
-            backed_vsets,
             vset_config: common.vset_config,
             horizon: common.horizon,
             think: common.think,
@@ -494,22 +481,6 @@ impl Scenario {
                 "cluster scenarios require at least two hosts",
             ));
         }
-        let nonbacked_vsets = self
-            .spec
-            .topology
-            .nonbacked_vsets
-            .as_ref()
-            .map_or(Ok(0), |v| r.u16(v, "topology.nonbacked-vsets"))?;
-        if nonbacked_vsets > common.vset_count {
-            return Err(ScenarioError::new(
-                "topology.nonbacked-vsets exceeds vset-count",
-            ));
-        }
-        if self.spec.topology.backed_vsets.is_some() {
-            return Err(ScenarioError::new(
-                "cluster scenarios use nonbacked-vsets, not backed-vsets",
-            ));
-        }
         common.daemon.replica_placement = self
             .spec
             .topology
@@ -532,7 +503,6 @@ impl Scenario {
             store: common.store,
             vset_count: common.vset_count,
             vset_config: common.vset_config,
-            nonbacked_vsets,
             horizon: common.horizon,
             think: common.think,
             checkpoint_interval: common.checkpoint_interval,
@@ -855,30 +825,9 @@ struct ObjectStoreSpec {
 struct TopologySpec {
     hosts: Option<CountSpec>,
     vset_count: CountSpec,
-    backed_vsets: Option<CountSpec>,
-    nonbacked_vsets: Option<CountSpec>,
     disk_volumes: CountSpec,
     pages_per_volume: CountSpec,
-    durability: DurabilitySpec,
     replica_placement: Option<PlacementSpec>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum DurabilitySpec {
-    Local,
-    Backup,
-    PeerStashed,
-}
-
-impl From<DurabilitySpec> for DurabilityMode {
-    fn from(value: DurabilitySpec) -> Self {
-        match value {
-            DurabilitySpec::Local => Self::Local,
-            DurabilitySpec::Backup => Self::Backup,
-            DurabilitySpec::PeerStashed => Self::PeerStashed,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1435,8 +1384,8 @@ mod tests {
     #[test]
     fn legacy_scenarios_keep_their_pinned_trace_hashes() {
         let single = [
-            ("single-host-base", 31, 0x5801_dee4_e548_b14b),
-            ("chaos", 31, 0x88de_8da0_e0c0_0cfa),
+            ("single-host-base", 31, 0xc66e_fe12_8d12_ae4d),
+            ("chaos", 31, 0xdefc_978a_ccfa_8305),
         ];
         for (name, seed, expected) in single {
             let RealizedScenario::SingleHost(config) = load(name)
@@ -1453,13 +1402,13 @@ mod tests {
             );
         }
         let cluster = [
-            ("cluster", 31, 0x252a_840b_4ee5_9c1a),
-            ("migration", 31, 0xb550_da76_44f0_5c7d),
-            ("peer-stash", 73, 0x91df_d146_2b07_685b),
-            ("peer-attrition", 117, 0x2976_c1e6_62d8_4cff),
-            ("peer-links", 119, 0x300f_33d3_dee8_149e),
-            ("peer-rare", 127, 0xbf14_9550_f44c_92cb),
-            ("placement-fear", 149, 0x57a4_8b12_38b0_0c19),
+            ("cluster", 31, 0xf119_1b3b_8711_7800),
+            ("migration", 31, 0x1470_b38b_7804_2d54),
+            ("peer-stash", 73, 0x1d6c_a9fa_636c_356f),
+            ("peer-attrition", 117, 0x0cd0_49b5_c11e_181c),
+            ("peer-links", 119, 0x5fc6_fbda_1c97_c786),
+            ("peer-rare", 127, 0xd033_a366_c992_9f0a),
+            ("placement-fear", 149, 0xe41b_6399_58c3_6d44),
         ];
         for (name, seed, expected) in cluster {
             let RealizedScenario::Cluster(config) = load(name)

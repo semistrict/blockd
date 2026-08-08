@@ -174,8 +174,14 @@ async fn main() {
     };
     let mut store_objects = BTreeMap::new();
     let report = loop {
-        let report =
-            report_replica_recovery(args.source, args.vset, &head, &residues(), &store_objects);
+        let report = report_replica_recovery(
+            args.source,
+            args.vset,
+            head_version,
+            &head,
+            &residues(),
+            &store_objects,
+        );
         let mut fetched = false;
         for key in &report.missing_objects {
             if store_objects.contains_key(key) {
@@ -205,9 +211,15 @@ async fn main() {
         ReplicaRecoveryStatus::Complete,
         "recovery incomplete"
     );
-    let export =
-        export_replica_recovery(args.source, args.vset, &head, &residues(), &store_objects)
-            .expect("verified recovery export");
+    let export = export_replica_recovery(
+        args.source,
+        args.vset,
+        head_version,
+        &head,
+        &residues(),
+        &store_objects,
+    )
+    .expect("verified recovery export");
     let installed = install_replica_recovery(
         args.target.as_deref().expect("install target"),
         store,

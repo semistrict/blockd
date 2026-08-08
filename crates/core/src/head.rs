@@ -1,4 +1,4 @@
-//! The head record: one small object per backed-up vset at
+//! The head record: one small object per archived vset at
 //! `layout::head_key`, and the system's assignment authority (R6.3). Every
 //! update goes through the store's compare-and-swap; the store version that
 //! a successful claim returns *is* the claimant's fence — the namespace all
@@ -40,8 +40,11 @@ pub struct StashAssignment {
 
 pub const MAX_RETIRED_STASHES: usize = 8;
 
-/// A former active peer retained in assignment authority until a covering S3
-/// publication and durable release prove its residue is no longer needed.
+/// The immediately former active peer. It is a redundant recovery source and
+/// cleanup target after a covering replacement commit; an older entry is
+/// superseded on the next activation so dead peers cannot form a finite
+/// failover budget. The decoder accepts the wider historical bound for rolling
+/// compatibility.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RetiredStash {
     pub peer: HostId,

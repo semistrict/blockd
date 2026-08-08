@@ -7,7 +7,7 @@
 //! verification close the connection and the peer reconnects.
 //!
 //! Plain TCP remains available for migration-only development fixtures, but
-//! the runtime refuses to enable peer-stashed durability without TLS.
+//! the runtime refuses to enable passive durability without TLS.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -46,7 +46,7 @@ pub struct PeerConfig {
     /// Per-destination wire version during a rolling deployment. Omitted
     /// peers use the current version. Version 1 cannot carry peer-stash data.
     pub outbound_protocol_versions: BTreeMap<HostId, u16>,
-    /// Required for peer-stashed durability. The server config must require
+    /// Required for passive durability. The server config must require
     /// client certificates and the client config must present this host's
     /// certificate. Exact leaf DER binds certificates to roster identities.
     pub tls: Option<PeerTlsConfig>,

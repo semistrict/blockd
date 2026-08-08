@@ -193,7 +193,7 @@ impl Drop for RequestMetrics {
 
 pub struct MetricsSnapshot {
     pub host: u16,
-    pub vms: BTreeMap<(String, bool), u64>,
+    pub vms: BTreeMap<String, u64>,
     pub runtime: Counters,
     pub store: StoreMetrics,
     pub peer_dropped_sends: u64,
@@ -214,7 +214,7 @@ pub struct MetricsSnapshot {
     pub store_latency: Vec<LatencySeries>,
     pub firecracker_fault_latency: Vec<(&'static str, HistogramSnapshot)>,
     pub blob_filesystem_space: Option<(u64, u64)>,
-    pub backup_lag_age: Vec<(u64, f64)>,
+    pub archive_lag_age: Vec<(u64, f64)>,
     pub active_operation_age: Vec<(u64, &'static str, f64)>,
 }
 
@@ -321,14 +321,14 @@ impl Metrics {
         append_family(
             &mut out,
             "blockd_vms",
-            "Current VMs by lifecycle state and backup mode.",
+            "Current VMs by lifecycle state.",
             "gauge",
         );
-        for ((state, backed), count) in &snapshot.vms {
+        for (state, count) in &snapshot.vms {
             append_sample(
                 &mut out,
                 "blockd_vms",
-                &format!("state=\"{}\",backed=\"{backed}\"", escape_label(state)),
+                &format!("state=\"{}\"", escape_label(state)),
                 count,
             );
         }
@@ -363,7 +363,7 @@ impl Metrics {
         append_store_metrics(&mut out, snapshot.store);
         append_daemon_state(&mut out, &snapshot.daemon);
         append_capacity_signal(&mut out, snapshot.capacity);
-        append_backup_lag_age(&mut out, &snapshot.backup_lag_age);
+        append_archive_lag_age(&mut out, &snapshot.archive_lag_age);
         append_active_operation_age(&mut out, &snapshot.active_operation_age);
         if let Some((capacity, available)) = snapshot.blob_filesystem_space {
             append_family(
@@ -540,13 +540,13 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
     );
     append_family(
         out,
-        "blockd_vset_backup_lag_captures",
+        "blockd_vset_archive_lag_captures",
         "Durable local captures not yet published.",
         "gauge",
     );
     append_family(
         out,
-        "blockd_vset_backup_lag_bytes",
+        "blockd_vset_archive_lag_bytes",
         "Durable local segment bytes not yet published.",
         "gauge",
     );
@@ -573,10 +573,7 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
         append_sample(
             out,
             "blockd_vset_state",
-            &format!(
-                "vset_id=\"{id}\",state=\"{lifecycle}\",backed=\"{}\"",
-                vset.backed_up
-            ),
+            &format!("vset_id=\"{id}\",state=\"{lifecycle}\""),
             1,
         );
         for (page_state, value) in [
@@ -603,18 +600,18 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
                 value,
             );
         }
-        if let Some(lag) = vset.backup_lag_captures {
+        if let Some(lag) = vset.archive_lag_captures {
             append_sample(
                 out,
-                "blockd_vset_backup_lag_captures",
+                "blockd_vset_archive_lag_captures",
                 &format!("vset_id=\"{id}\""),
                 lag,
             );
         }
-        if let Some(bytes) = vset.backup_lag_bytes {
+        if let Some(bytes) = vset.archive_lag_bytes {
             append_sample(
                 out,
-                "blockd_vset_backup_lag_bytes",
+                "blockd_vset_archive_lag_bytes",
                 &format!("vset_id=\"{id}\""),
                 bytes,
             );
@@ -713,17 +710,17 @@ fn append_capacity_signal(out: &mut String, signal: CapacitySignal) {
     }
 }
 
-fn append_backup_lag_age(out: &mut String, lag_age: &[(u64, f64)]) {
+fn append_archive_lag_age(out: &mut String, lag_age: &[(u64, f64)]) {
     append_family(
         out,
-        "blockd_vset_backup_lag_seconds",
+        "blockd_vset_archive_lag_seconds",
         "Continuous time with unpublished captures.",
         "gauge",
     );
     for (vset, seconds) in lag_age {
         append_sample(
             out,
-            "blockd_vset_backup_lag_seconds",
+            "blockd_vset_archive_lag_seconds",
             &format!("vset_id=\"{vset}\""),
             seconds,
         );
@@ -981,6 +978,9 @@ fn append_runtime_counters(out: &mut String, counters: &Counters) {
         leaf_fills => "Map leaves hydrated lazily.",
         segs_compacted => "Mostly-dead segments compacted.",
         pages_compacted => "Live pages rewritten by compaction.",
+        archive_cycles => "Passive archive cycles started.",
+        archive_commits_coalesced => "Intermediate passive commits coalesced before archival.",
+        replica_capacity_backpressure => "Passive writes held because host-wide spool hard capacity is exhausted.",
     }
 }
 
@@ -1096,7 +1096,7 @@ mod tests {
         let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        assert_eq!((custom.len(), custom_hash), (15_641, 0xa9bd_5b32_a38f_8524));
+        assert_eq!((custom.len(), custom_hash), (16_240, 0xac24_39a2_3478_a4ea));
     }
 
     #[test]
@@ -1106,7 +1106,7 @@ mod tests {
         request.set_status(200);
         drop(request);
         let mut vms = BTreeMap::new();
-        vms.insert(("running".to_owned(), true), 2);
+        vms.insert("running".to_owned(), 2);
         let snapshot = MetricsSnapshot {
             host: 7,
             vms,
@@ -1128,7 +1128,6 @@ mod tests {
                 dirty_pages: 3,
                 vsets: vec![blockd_core::daemon::VsetStats {
                     vset: blockd_core::types::VsetId(42),
-                    backed_up: true,
                     role: VsetRole::Hydrating,
                     fence: 8,
                     dirty_pages: 3,
@@ -1137,8 +1136,8 @@ mod tests {
                     pending_syncs: 2,
                     pending_leaf_spans: 5,
                     hydration_remaining_pages: 9,
-                    backup_lag_captures: Some(6),
-                    backup_lag_bytes: Some(3072),
+                    archive_lag_captures: Some(6),
+                    archive_lag_bytes: Some(3072),
                     operations: VsetOperations::default(),
                     live_segment_bytes: 1024,
                     local_segment_bytes: 2048,
@@ -1167,7 +1166,7 @@ mod tests {
             store_latency: Vec::new(),
             firecracker_fault_latency: Vec::new(),
             blob_filesystem_space: None,
-            backup_lag_age: vec![(42, 12.5)],
+            archive_lag_age: vec![(42, 12.5)],
             active_operation_age: vec![(42, "hydration", 8.25)],
         };
 
@@ -1182,12 +1181,12 @@ mod tests {
         assert!(text.contains("blockd_runtime_wedged_guests_total 1"));
         assert!(text.contains("blockd_peer_connected{peer_host=\"8\"} 0"));
         assert!(text.contains("blockd_store_requests_total{operation=\"get\"} 3"));
-        assert!(text.contains("blockd_vms{state=\"running\",backed=\"true\"} 2"));
+        assert!(text.contains("blockd_vms{state=\"running\"} 2"));
         assert!(text.contains("blockd_cache_pages{state=\"dirty\"} 3"));
         assert_capacity_metrics(&text);
-        assert!(text.contains("blockd_vset_backup_lag_captures{vset_id=\"42\"} 6"));
-        assert!(text.contains("blockd_vset_backup_lag_bytes{vset_id=\"42\"} 3072"));
-        assert!(text.contains("blockd_vset_backup_lag_seconds{vset_id=\"42\"} 12.5"));
+        assert!(text.contains("blockd_vset_archive_lag_captures{vset_id=\"42\"} 6"));
+        assert!(text.contains("blockd_vset_archive_lag_bytes{vset_id=\"42\"} 3072"));
+        assert!(text.contains("blockd_vset_archive_lag_seconds{vset_id=\"42\"} 12.5"));
         assert!(text.contains(
             "blockd_vset_operation_active_seconds{vset_id=\"42\",operation=\"hydration\"} 8.25"
         ));

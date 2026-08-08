@@ -75,6 +75,7 @@ fn unix_stream_runs_sqlite_shaped_io_through_the_real_daemon() {
     let runtime = Arc::new(Runtime::new(
         &RuntimeConfig {
             daemon: blockd_core::daemon::DaemonConfig {
+                archive: Default::default(),
                 host: HostId(0),
                 cache_pages: 16,
                 writeback_interval: millis(10),
@@ -91,7 +92,7 @@ fn unix_stream_runs_sqlite_shaped_io_through_the_real_daemon() {
     ));
     let vset = VsetId(88);
     let vm = VmId(4);
-    runtime.create_vset(vset, VsetConfig::database(32, false));
+    runtime.create_vset(vset, VsetConfig::database(32));
     let attachment = runtime.attach_database(vset, vm);
 
     let (mut client, server) = UnixStream::pair().expect("socketpair");

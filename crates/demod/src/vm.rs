@@ -1,7 +1,8 @@
 //! VM orchestration: real Firecracker microVMs restored from store-held
 //! snapshots (one fill server per snapshot prefix, forks share one copy),
 //! each paired with a daemon-managed vset that carries its durable state
-//! — checkpointed continuously, backed up to the store when `backed`, and
+//! — checkpointed continuously, replicated to a passive peer, published to
+//! the store, and
 //! live-migrated over the peer transport.
 
 use std::collections::BTreeMap;
@@ -10,12 +11,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::DaemonConfig;
+use base64::Engine;
+use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
+use blockd_core::placement::PeerCandidate;
 use blockd_core::seam::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts_async};
-use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, PeerConfig, Runtime, RuntimeConfig};
+use blockd_runtime::{
+    GcsConfig, GcsStore, ObjectStore, PeerConfig, PeerTlsConfig, Runtime, RuntimeConfig,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 use crate::config::DemodConfig;
 use crate::observability::Metrics;
@@ -38,8 +46,8 @@ pub struct MigrationTimings {
     pub overlap_ms: u128,
 }
 
-fn vset_config(backed: bool) -> VsetConfig {
-    VsetConfig::compute(1, VSET_PAGES, backed)
+fn vset_config() -> VsetConfig {
+    VsetConfig::compute(1, VSET_PAGES)
 }
 
 fn disk_page(vset: VsetId, page: u32) -> PageId {
@@ -60,7 +68,6 @@ fn mirror_value(id: u64, burst: u64, page: u32) -> u64 {
 
 pub struct Vm {
     pub state: String,
-    pub backed: bool,
     /// The snapshot prefix this VM was restored from.
     pub prefix: String,
     fc: Option<Arc<Mutex<FcVm>>>,
@@ -86,6 +93,51 @@ pub struct Demod {
 }
 
 impl Demod {
+    fn pem(path: &Path) -> Vec<u8> {
+        let text = std::fs::read_to_string(path).expect("read PEM");
+        let body: String = text
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .expect("PEM base64")
+    }
+
+    fn peer_tls(cfg: &DemodConfig) -> PeerTlsConfig {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = RootCertStore::empty();
+        let mut certificate_identities = BTreeMap::new();
+        for (&host, paths) in &cfg.identities {
+            for path in paths {
+                let certificate = Self::pem(path);
+                roots
+                    .add(CertificateDer::from(certificate.clone()))
+                    .expect("trust anchor");
+                certificate_identities.insert(certificate, host);
+            }
+        }
+        let certificate = CertificateDer::from(Self::pem(&cfg.certificate));
+        let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(Self::pem(&cfg.private_key)));
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
+            .build()
+            .expect("client verifier");
+        let server = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![certificate.clone()], key())
+            .expect("server identity");
+        let client = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![certificate], key())
+            .expect("client identity");
+        PeerTlsConfig {
+            server: Arc::new(server),
+            client: Arc::new(client),
+            server_names: cfg.server_names.clone(),
+            certificate_identities,
+        }
+    }
+
     pub fn firecracker_fault_latency(
         &self,
     ) -> Vec<(&'static str, blockd_runtime::HistogramSnapshot)> {
@@ -105,8 +157,29 @@ impl Demod {
             endpoint: cfg.gcs_endpoint.clone(),
             metadata_endpoint: cfg.gcs_metadata.clone(),
         }));
+        let mut roster: Vec<PeerCandidate> = cfg
+            .peers
+            .keys()
+            .copied()
+            .chain(std::iter::once(cfg.host))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|host| PeerCandidate {
+                host,
+                weight: 1,
+                failure_domain: host.0,
+                drained: false,
+            })
+            .collect();
+        roster.sort_by_key(|candidate| candidate.host);
         let runtime_config = RuntimeConfig {
             daemon: DaemonConfig {
+                archive: blockd_core::daemon::ArchivePolicy {
+                    interval: millis(cfg.archive_interval_ms),
+                    max_unpublished_bytes: cfg.archive_lag_bytes,
+                    spool_capacity_bytes: cfg.peer_spool_capacity_bytes,
+                    spool_headroom_bytes: cfg.peer_spool_headroom_bytes,
+                },
                 host: cfg.host,
                 cache_pages: cfg.cache_pages,
                 writeback_interval: millis(cfg.writeback_interval_ms),
@@ -114,14 +187,18 @@ impl Demod {
                 disk_capacity: cfg.disk_capacity_bytes,
                 disk_headroom: cfg.disk_headroom_bytes,
                 wedge_ticks: cfg.wedge_ticks,
-                replica_placement: None,
+                replica_placement: Some(ReplicaPlacementConfig {
+                    membership_epoch: 1,
+                    local_failure_domain: cfg.host.0,
+                    roster,
+                }),
             },
             blob_dir: cfg.blob_dir.clone(),
             peer: Some(PeerConfig {
                 listen: cfg.peer_listen,
                 peers: cfg.peers.clone(),
                 outbound_protocol_versions: BTreeMap::new(),
-                tls: None,
+                tls: Some(Self::peer_tls(&cfg)),
             }),
         };
         let rt = Runtime::new(&runtime_config, store.clone());
@@ -292,22 +369,21 @@ impl Demod {
 
     /// Start a fresh VM from the base snapshot with its paired vset.
     #[tracing::instrument(skip(self), fields(vm_id = tracing::field::Empty))]
-    pub fn start_vm(&self, backed: bool) -> u64 {
+    pub fn start_vm(&self) -> u64 {
         let id = self.next_vm.fetch_add(1, Ordering::SeqCst);
         tracing::Span::current().record("vm_id", id);
         let mut fc = self.boot_from(id, "base");
         fc.cmd("ping", "PONG");
-        self.rt.create_vset(VsetId(id), vset_config(backed));
+        self.rt.create_vset(VsetId(id), vset_config());
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
                 state: "running".to_owned(),
-                backed,
                 prefix: "base".to_owned(),
                 fc: Some(Arc::new(Mutex::new(fc))),
             },
         );
-        tracing::info!(vm_id = id, backed, "VM started");
+        tracing::info!(vm_id = id, "VM started");
         id
     }
 
@@ -402,12 +478,11 @@ impl Demod {
             let (rss, pss) = rss_pss_of_pid(fc.pid());
             rss_sum += rss;
             pss_sum += pss;
-            self.rt.create_vset(VsetId(fork_id), vset_config(false));
+            self.rt.create_vset(VsetId(fork_id), vset_config());
             self.vms.lock().expect("lock").insert(
                 fork_id,
                 Vm {
                     state: "running".to_owned(),
-                    backed: false,
                     prefix: prefix.clone(),
                     fc: Some(Arc::new(Mutex::new(fc))),
                 },
@@ -438,12 +513,11 @@ impl Demod {
     pub fn expect(self: &Arc<Demod>, id: u64, ready: impl FnOnce()) {
         let prefix = format!("vm{id}/mig");
         let previous_snapshot = self.snapshot_generation(&prefix);
-        self.rt.expect_migration(VsetId(id), vset_config(false));
+        self.rt.expect_migration(VsetId(id), vset_config());
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
                 state: "expecting".to_owned(),
-                backed: false,
                 prefix: prefix.clone(),
                 fc: None,
             },
@@ -530,18 +604,17 @@ impl Demod {
         }
     }
 
-    /// After the owning host died: restore a backed vset from the store
+    /// After the owning host died: restore a vset from the store
     /// alone (R6.1) and give it a fresh microVM from the base image.
     #[tracing::instrument(skip(self), fields(vm_id = id))]
     pub fn restore(&self, id: u64) -> String {
-        let verdict = self.rt.restore_vset(VsetId(id), vset_config(true));
+        let verdict = self.rt.restore_vset(VsetId(id), vset_config());
         let mut fc = self.boot_from(id, "base");
         fc.cmd("ping", "PONG");
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
                 state: "restored".to_owned(),
-                backed: true,
                 prefix: "base".to_owned(),
                 fc: Some(Arc::new(Mutex::new(fc))),
             },

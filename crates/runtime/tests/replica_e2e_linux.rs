@@ -1,6 +1,7 @@
 //! Real three-runtime peer-stash recovery: TCP, durable filesystem spools,
 //! object-store outage, loss of the primary root, peer export, restart,
-//! publication, and whole-spool unlink without cleanup rewriting.
+//! publication, failover during archive-data outage, and crash-safe spool
+//! reclamation.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blockd_core::head::HeadRecord;
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::replica_recovery::{ReplicaResidue, export_replica_recovery};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
@@ -55,6 +56,163 @@ fn spool_files(root: &Path, source: HostId, vset: VsetId) -> Vec<(u64, PathBuf)>
     found
 }
 
+fn durable_cluster(
+    tag: &str,
+    cache_pages: usize,
+) -> (
+    [SocketAddr; 3],
+    BTreeMap<HostId, SocketAddr>,
+    [PathBuf; 3],
+    Arc<S3Store>,
+    Vec<Option<Runtime>>,
+) {
+    let addresses = [free_addr(), free_addr(), free_addr()];
+    let peers: BTreeMap<HostId, SocketAddr> = addresses
+        .iter()
+        .enumerate()
+        .map(|(host, &address)| (HostId(u16::try_from(host).expect("fits")), address))
+        .collect();
+    let roots = std::array::from_fn(|host| temp_dir(&format!("{tag}-{host}")));
+    let store = Arc::new(S3Store::new());
+    let runtimes = (0..3)
+        .map(|host| {
+            let mut config = runtime_config(
+                host,
+                roots[usize::from(host)].clone(),
+                addresses[usize::from(host)],
+                peers.clone(),
+            );
+            config.daemon.cache_pages = cache_pages;
+            Some(Runtime::new(&config, store.clone()))
+        })
+        .collect();
+    (addresses, peers, roots, store, runtimes)
+}
+
+fn page(volume: u8, number: u32) -> PageId {
+    PageId {
+        volume: VolumeId {
+            vset: VSET,
+            idx: VolumeIdx(volume),
+        },
+        page: PageNo(number),
+    }
+}
+
+fn read_word(runtime: &Runtime, page: PageId) -> u64 {
+    let bytes = runtime.guest_read(VSET, page);
+    u64::from_ne_bytes(bytes[..8].try_into().expect("word"))
+}
+
+#[test]
+fn durable_checkpoint_crash_resumes_memory_and_disks_byte_exactly() {
+    let (addresses, peers, roots, store, mut runtimes) = durable_cluster("checkpoint", 64);
+    let config = VsetConfig::compute(2, 16);
+    let primary = runtimes[0].take().expect("primary");
+    primary.create_vset(VSET, config);
+    primary.guest_write(VSET, page(1, 3), 0x1111);
+    primary.guest_write(VSET, page(2, 7), 0x2222);
+    primary.guest_write(VSET, page(0, 5), 0xAAAA);
+    assert!(primary.guest_sync(VSET, VolumeIdx(1)));
+    assert_eq!(primary.checkpoint(VSET), 1);
+    let vmstate = primary.guest_applied(VSET);
+    drop(primary);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (recovered, immediate) = Runtime::recover(
+        &runtime_config(0, roots[0].clone(), addresses[0], peers),
+        store,
+        &BTreeMap::from([(VSET, config)]),
+    );
+    assert!(immediate.is_empty());
+    assert_eq!(
+        recovered.wait_recovered(VSET),
+        Verdict::Resume {
+            epoch: blockd_core::types::Epoch(1),
+            vmstate,
+        }
+    );
+    assert_eq!(read_word(&recovered, page(1, 3)), 0x1111);
+    assert_eq!(read_word(&recovered, page(2, 7)), 0x2222);
+    assert_eq!(read_word(&recovered, page(0, 5)), 0xAAAA);
+    assert!(recovered.incidents().is_empty());
+
+    drop(recovered);
+    drop(runtimes);
+    for root in roots {
+        std::fs::remove_dir_all(root).expect("cleanup root");
+    }
+}
+
+#[test]
+fn durable_sync_crash_cold_boots_disks_and_discards_memory() {
+    let (addresses, peers, roots, store, mut runtimes) = durable_cluster("cold-boot", 64);
+    let config = VsetConfig::compute(2, 16);
+    let primary = runtimes[0].take().expect("primary");
+    primary.create_vset(VSET, config);
+    primary.guest_write(VSET, page(1, 2), 0x1234);
+    primary.guest_write(VSET, page(2, 9), 0x5678);
+    primary.guest_write(VSET, page(0, 4), 0xDEAD);
+    assert!(primary.guest_sync(VSET, VolumeIdx(1)));
+    assert!(primary.guest_sync(VSET, VolumeIdx(2)));
+    drop(primary);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (recovered, immediate) = Runtime::recover(
+        &runtime_config(0, roots[0].clone(), addresses[0], peers),
+        store,
+        &BTreeMap::from([(VSET, config)]),
+    );
+    assert!(immediate.is_empty());
+    assert_eq!(recovered.wait_recovered(VSET), Verdict::ColdBoot);
+    assert_eq!(read_word(&recovered, page(1, 2)), 0x1234);
+    assert_eq!(read_word(&recovered, page(2, 9)), 0x5678);
+    assert!(
+        recovered
+            .guest_read(VSET, page(0, 4))
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    assert!(recovered.incidents().is_empty());
+
+    drop(recovered);
+    drop(runtimes);
+    for root in roots {
+        std::fs::remove_dir_all(root).expect("cleanup root");
+    }
+}
+
+#[test]
+fn durable_eviction_bounds_residency_and_refaults_exact_disk_bytes() {
+    let (_addresses, _peers, roots, _store, runtimes) = durable_cluster("eviction", 8);
+    let config = VsetConfig::compute(1, 32);
+    let primary = runtimes[0].as_ref().expect("primary");
+    primary.create_vset(VSET, config);
+    for number in 0..32 {
+        primary.guest_write(VSET, page(1, number), 0x1000 + u64::from(number));
+        if number % 8 == 7 {
+            assert!(primary.guest_sync(VSET, VolumeIdx(1)));
+        }
+    }
+    let resident = primary.guest_resident_bytes(VSET);
+    assert!(
+        resident <= 16 * page_size(),
+        "eviction did not bound physical memory: {resident} bytes"
+    );
+    for number in 0..32 {
+        assert_eq!(
+            read_word(primary, page(1, number)),
+            0x1000 + u64::from(number)
+        );
+    }
+    assert!(primary.incidents().is_empty());
+
+    drop(runtimes);
+    for root in roots {
+        std::fs::remove_dir_all(root).expect("cleanup root");
+    }
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks() {
@@ -83,7 +241,6 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         kind: blockd_core::journal::VsetKind::Compute,
         disk_volumes: 1,
         pages_per_volume: 8,
-        durability: DurabilityMode::PeerStashed,
     };
     a.create_vset(VSET, config);
     let (head_version, head_bytes) = store
@@ -117,6 +274,7 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
     let export = export_replica_recovery(
         HostId(0),
         VSET,
+        head_version,
         &head,
         &[ReplicaResidue {
             peer: active,
@@ -218,23 +376,18 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
         kind: blockd_core::journal::VsetKind::Compute,
         disk_volumes: 1,
         pages_per_volume: 8,
-        durability: DurabilityMode::PeerStashed,
     };
     let primary = runtimes[0].as_ref().expect("primary");
     primary.create_vset(VSET, config);
-    let initial_head = HeadRecord::decode(
-        VSET,
-        &store
-            .get(&layout::head_key(VSET))
-            .expect("head get")
-            .expect("head")
-            .1,
-    )
-    .expect("valid head");
+    let (_, initial_head_bytes) = store
+        .get(&layout::head_key(VSET))
+        .expect("head get")
+        .expect("head");
+    let initial_head = HeadRecord::decode(VSET, &initial_head_bytes).expect("valid head");
     let failed_peer = initial_head.stash.expect("stash").active_peer;
     assert_ne!(failed_peer, HostId(0));
 
-    store.set_data_outage(true);
+    store.set_outage(true);
     let page = PageId {
         volume: VolumeId {
             vset: VSET,
@@ -252,25 +405,30 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
     let primary = runtimes[0].as_ref().expect("primary remains");
     primary.guest_write(VSET, page, 4);
     assert!(primary.guest_sync(VSET, VolumeIdx(1)));
-
-    let (head_version, head_bytes) = store
-        .get(&layout::head_key(VSET))
-        .expect("head get")
-        .expect("head");
-    let head = HeadRecord::decode(VSET, &head_bytes).expect("valid replacement head");
-    let assignment = head.stash.expect("replacement assignment");
-    let replacement = assignment.active_peer;
-    assert_ne!(replacement, failed_peer);
-    assert_eq!(assignment.transition_peer, None);
-    assert_eq!(assignment.assignment_epoch, 2);
-    let primary_counters = primary.counters();
-    assert!(primary_counters.replica_replacement_bytes > 0);
-    assert_eq!(primary_counters.replica_nonactive_bytes, 0);
+    let replacement = [HostId(1), HostId(2)]
+        .into_iter()
+        .find(|peer| *peer != failed_peer)
+        .expect("one replacement candidate");
+    let replacement_root = &roots[usize::from(replacement.0)];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let counters = primary.counters();
+        if counters.replica_replacement_bytes > 0
+            && !spool_files(replacement_root, HostId(0), VSET).is_empty()
+        {
+            assert_eq!(counters.replica_nonactive_bytes, 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement did not become durable during the store outage"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     drop(runtimes[0].take());
     std::thread::sleep(Duration::from_millis(100));
     std::fs::remove_dir_all(&roots[0]).expect("delete primary durable root");
-    let replacement_root = &roots[usize::from(replacement.0)];
     let spool_paths = spool_files(replacement_root, HostId(0), VSET);
     assert!(
         !spool_paths.is_empty(),
@@ -280,20 +438,26 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
     for (_, path) in spool_paths {
         spool.extend(std::fs::read(path).expect("read replacement spool"));
     }
+    store.set_outage(false);
+    let (head_version, head_bytes) = store
+        .get(&layout::head_key(VSET))
+        .expect("head get")
+        .expect("head");
+    let head = HeadRecord::decode(VSET, &head_bytes).expect("valid stale assignment head");
     let export = export_replica_recovery(
         HostId(0),
         VSET,
+        head_version,
         &head,
         &[ReplicaResidue {
             peer: replacement,
-            assignment_epoch: assignment.active_assignment_epoch,
+            assignment_epoch: 2,
             bytes: &spool,
         }],
         &BTreeMap::new(),
     )
-    .expect("replacement has a complete acknowledged recovery point");
+    .expect("current-fence replacement survives unpublished assignment");
 
-    store.set_data_outage(false);
     install_replica_recovery(
         &roots[0],
         store.clone(),

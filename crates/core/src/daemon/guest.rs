@@ -361,11 +361,7 @@ impl Daemon {
             });
             return;
         }
-        let backed = self
-            .vsets
-            .get(&page.volume.vset)
-            .is_some_and(|v| v.config.durability.uses_store());
-        if backed {
+        if self.vsets.contains_key(&page.volume.vset) {
             let io = self.io();
             self.pending.insert(
                 io,
@@ -392,7 +388,8 @@ impl Daemon {
         self.fill_exhausted(page, out);
     }
 
-    /// A peer fetch resolved (or failed): verify and serve, or exhaust.
+    /// A peer fetch resolved (or failed): verify and serve, then fall back
+    /// to a durable passive spool held on this host before the archive tier.
     pub(super) fn peer_fetch_resolved(
         &mut self,
         page: PageId,
@@ -402,10 +399,11 @@ impl Daemon {
         bytes: Option<Vec<u8>>,
         out: &mut Vec<Effect>,
     ) {
+        let bytes = bytes.or_else(|| self.replica_segment_range(page.volume.vset, loc));
         if let Some(raw) = Self::verify_entry(page, generation, bytes) {
             self.serve_fill(page, write, loc, raw, out);
         } else {
-            self.fill_exhausted(page, out);
+            self.fill_read_done(page, write, generation, loc, None, out);
         }
     }
 

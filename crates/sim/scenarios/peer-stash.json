@@ -6,8 +6,6 @@
   "kind": "cluster",
   "topology": {
     "vset_count": 3,
-    "nonbacked_vsets": 0,
-    "durability": "peer-stashed",
     "replica_placement": {
       "mode": "weighted-hosts",
       "membership_epoch": 1,

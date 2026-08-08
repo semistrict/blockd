@@ -46,6 +46,7 @@ impl ObjectStore for EmptyStore {
 fn config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
         daemon: DaemonConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 32,
             writeback_interval: millis(5),
@@ -78,7 +79,7 @@ fn sqlite_commit_survives_daemon_restart_and_generation_change() {
     let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
     let vset = VsetId(51);
     let vm = VmId(12);
-    let database_config = VsetConfig::database(256, false);
+    let database_config = VsetConfig::database(256);
 
     let runtime = Arc::new(Runtime::new(&runtime_config, store.clone()));
     runtime.create_vset(vset, database_config);

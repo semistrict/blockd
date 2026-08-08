@@ -8,11 +8,20 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use blockd_core::daemon::{Counters, Daemon, DaemonConfig};
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::daemon::{Counters, Daemon, DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::head::HeadRecord;
+use blockd_core::journal::{JournalRecord, VsetConfig};
 use blockd_core::layout::{self, BlobName};
-use blockd_core::seam::{AdminCmd, AdminReply, Effect, Event, HostMap, IoId, ReqId, Verdict};
-use blockd_core::types::{PageId, PageNo, SimTime, VolumeId, VolumeIdx, VsetId, micros, millis};
+use blockd_core::mapleaf::MapLeaf;
+use blockd_core::placement::PeerCandidate;
+use blockd_core::seam::{
+    AdminCmd, AdminReply, Effect, Event, HostMap, IoId, PeerMsg, ReplicaArtifact,
+    ReplicaCommitInfo, ReqId, Verdict,
+};
+use blockd_core::segment::scan_segment;
+use blockd_core::types::{
+    HostId, PageId, PageNo, SimTime, VolumeId, VolumeIdx, VsetId, micros, millis,
+};
 use blockd_workload::{
     LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
 };
@@ -23,7 +32,7 @@ use crate::guest::{
 use crate::kernel::Kernel;
 use crate::oracle::Oracle;
 use crate::world::blobdev::{BdevIo, BlobDev, BlobDevConfig};
-use crate::world::store::{ObjectStore, StoreConfig, StoreError, Version};
+use crate::world::store::{ObjectStore, StoreConfig, StoreCounters, StoreError, Version};
 use blockd_core::seam::StoreFault;
 
 #[derive(Clone, Debug)]
@@ -81,9 +90,6 @@ pub struct HarnessConfig {
     pub bdev: BlobDevConfig,
     pub store: StoreConfig,
     pub vset_count: u16,
-    /// The first `backed_vsets` vsets are created backed-up (R4.1); the
-    /// rest never touch the store (R4.4).
-    pub backed_vsets: u16,
     pub vset_config: VsetConfig,
     /// Stop issuing new work after this instant; the run drains briefly and
     /// stops.
@@ -131,6 +137,21 @@ pub struct RunReport {
     pub restores: u64,
     /// Every object key in the store at the end of the run (R4.4 audits).
     pub store_keys: Vec<String>,
+    /// Submission- and completion-level object-store accounting, including
+    /// object kind, CAS outcomes, retries, and size distribution.
+    pub store: StoreCounters,
+    /// Physical bytes in segment objects reachable from the final archived
+    /// heads, split into live entries, dead entries, and framing overhead.
+    pub published_segment_bytes: u64,
+    pub published_live_entry_bytes: u64,
+    pub published_dead_entry_bytes: u64,
+    pub published_segment_overhead_bytes: u64,
+    /// Final passive-spool occupancy and the two durability frontiers.
+    pub replica_spool_bytes: u64,
+    pub max_replica_spool_bytes: u64,
+    pub peer_committed_through: u64,
+    pub archived_through: u64,
+    pub archive_lag_bytes: u64,
     /// Total bytes of page-map metadata written locally across the run —
     /// journal records and map leaves. The cost of remembering where pages
     /// live must track the DELTA, not the vset size.
@@ -183,6 +204,11 @@ enum Ev {
     /// Targeted rot: the newest record's primary or mirror (`true`) copy.
     RotNewestRecord(bool),
     StoreOutage(bool),
+    ReplicaUpload {
+        vset: VsetId,
+        assignment_epoch: u64,
+        generation: u64,
+    },
 }
 
 // The checkpoint's vset is carried for Debug context only.
@@ -262,11 +288,19 @@ impl HostMap for MemView<'_> {
     }
 }
 
+type FakeReplicaCommit = (ReplicaCommitInfo, Vec<ReplicaArtifact>, Vec<u8>);
+
 struct Harness {
     config: HarnessConfig,
     kernel: Kernel<Ev>,
     bdev: BlobDev,
     store: ObjectStore,
+    replica_artifacts: BTreeMap<(VsetId, ReplicaArtifact), Vec<u8>>,
+    replica_commits: BTreeMap<(VsetId, u64), FakeReplicaCommit>,
+    replica_archived: BTreeMap<(VsetId, u64), ReplicaCommitInfo>,
+    replica_archive_generation: BTreeMap<(VsetId, u64), u64>,
+    replica_archive_armed: BTreeSet<(VsetId, u64)>,
+    max_replica_spool_bytes: u64,
     daemon: Option<Daemon>,
     inc: u32,
     mems: BTreeMap<VsetId, VsetMem>,
@@ -341,7 +375,6 @@ pub fn run_workload(
     }
     if config.vset_config.disk_volumes != spec.shape.disk_volumes
         || config.vset_config.pages_per_volume != spec.shape.pages_per_volume
-        || (config.backed_vsets == 1) != spec.shape.backed_up
     {
         return Err("simulator vset shape does not match workload shape".to_owned());
     }
@@ -371,7 +404,23 @@ pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(Str
     (report, blobs)
 }
 
-fn run_inner(seed: u64, config: HarnessConfig, scripted: Option<ScriptedWorkload>) -> HarnessRun {
+fn run_inner(
+    seed: u64,
+    mut config: HarnessConfig,
+    scripted: Option<ScriptedWorkload>,
+) -> HarnessRun {
+    if config.daemon.replica_placement.is_none() {
+        config.daemon.replica_placement = Some(ReplicaPlacementConfig {
+            membership_epoch: 1,
+            local_failure_domain: 1,
+            roster: vec![PeerCandidate {
+                host: HostId(1),
+                weight: 1,
+                failure_domain: 2,
+                drained: false,
+            }],
+        });
+    }
     let kernel = Kernel::new(seed);
     let (daemon, effects) = Daemon::new(config.daemon.clone());
     let bdev = BlobDev::new(config.bdev.clone());
@@ -381,6 +430,12 @@ fn run_inner(seed: u64, config: HarnessConfig, scripted: Option<ScriptedWorkload
         kernel,
         bdev,
         store,
+        replica_artifacts: BTreeMap::new(),
+        replica_commits: BTreeMap::new(),
+        replica_archived: BTreeMap::new(),
+        replica_archive_generation: BTreeMap::new(),
+        replica_archive_armed: BTreeSet::new(),
+        max_replica_spool_bytes: 0,
         daemon: Some(daemon),
         inc: 0,
         mems: BTreeMap::new(),
@@ -442,6 +497,43 @@ fn run_inner(seed: u64, config: HarnessConfig, scripted: Option<ScriptedWorkload
         .sum();
     h.report.seg_live_bytes_end = h.daemon.as_ref().map_or(0, |d| d.seg_space().0);
     h.report.parked_end = h.daemon.as_ref().map_or(0, Daemon::parked_fills);
+    h.report.store = h.store.counters;
+    let vsets: Vec<_> = h.guests.keys().copied().collect();
+    let (physical, live, dead, overhead) = archive_segment_efficiency(&h.store, &vsets);
+    h.report.published_segment_bytes = physical;
+    h.report.published_live_entry_bytes = live;
+    h.report.published_dead_entry_bytes = dead;
+    h.report.published_segment_overhead_bytes = overhead;
+    if let Some(daemon) = &h.daemon {
+        let replica = daemon.replica_metrics();
+        h.report.peer_committed_through = replica
+            .iter()
+            .map(|metrics| metrics.peer_committed_through)
+            .sum();
+        h.report.archived_through = replica
+            .iter()
+            .map(|metrics| metrics.store_published_through)
+            .sum();
+        h.report.archive_lag_bytes = daemon
+            .stats()
+            .vsets
+            .iter()
+            .filter_map(|stats| stats.archive_lag_bytes)
+            .sum();
+    }
+    h.report.replica_spool_bytes = h
+        .bdev
+        .scan()
+        .filter(|(name, _)| {
+            matches!(
+                layout::parse_blob(name),
+                Some(BlobName::ReplicaSpool { .. })
+            )
+        })
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum::<u64>()
+        + h.fake_replica_spool_bytes();
+    h.report.max_replica_spool_bytes = h.max_replica_spool_bytes.max(h.report.replica_spool_bytes);
     if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
         let mut blobs: Vec<(usize, &String)> = h
             .bdev
@@ -465,15 +557,106 @@ fn run_inner(seed: u64, config: HarnessConfig, scripted: Option<ScriptedWorkload
     (h.report, blobs, h.scripted)
 }
 
-impl Harness {
-    fn vset_config_for(&self, vset: VsetId) -> VsetConfig {
-        let mut config = self.config.vset_config;
-        config.durability = if vset.0 <= u64::from(self.config.backed_vsets) {
-            DurabilityMode::Backup
-        } else {
-            DurabilityMode::Local
+pub(crate) fn archive_segment_efficiency(
+    store: &ObjectStore,
+    vsets: &[VsetId],
+) -> (u64, u64, u64, u64) {
+    let mut physical = 0u64;
+    let mut live = 0u64;
+    let mut dead = 0u64;
+    for &vset in vsets {
+        let Some(head_bytes) = store.peek(&layout::head_key(vset)) else {
+            continue;
         };
-        config
+        let Ok(head) = HeadRecord::decode(vset, head_bytes) else {
+            continue;
+        };
+        let Some(ptr) = head.manifest else {
+            continue;
+        };
+        let Some(record_bytes) = store.peek(&layout::manifest_key(vset, ptr.fence, ptr.seq)) else {
+            continue;
+        };
+        let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
+            continue;
+        };
+        let mut page_map = BTreeMap::new();
+        for leaf_ptr in record.leaves.values() {
+            let (owner, key) = if leaf_ptr.base == 0 {
+                (vset, layout::leaf_key(vset, leaf_ptr.fence, leaf_ptr.id))
+            } else {
+                (
+                    VsetId(leaf_ptr.base),
+                    layout::base_leaf_key(leaf_ptr.base, leaf_ptr.fence, leaf_ptr.id),
+                )
+            };
+            let Some(bytes) = store.peek(&key) else {
+                continue;
+            };
+            let Ok(leaf) = MapLeaf::decode(owner, leaf_ptr.fence, leaf_ptr.id, bytes) else {
+                continue;
+            };
+            for (idx, page, generation, loc) in leaf.entries {
+                page_map.insert(
+                    PageId {
+                        volume: blockd_core::types::VolumeId { vset, idx },
+                        page,
+                    },
+                    (generation, loc),
+                );
+            }
+        }
+        page_map.extend(record.overlay);
+        let segments: BTreeSet<_> = page_map
+            .values()
+            .filter(|(_, loc)| loc.base == 0)
+            .map(|(_, loc)| (loc.fence, loc.seg))
+            .collect();
+        for (fence, seg) in segments {
+            let Some(bytes) = store.peek(&layout::segment_key(vset, fence, seg)) else {
+                continue;
+            };
+            let Ok((_, _, _, entries)) = scan_segment(bytes) else {
+                continue;
+            };
+            physical += bytes.len() as u64;
+            for (page, generation, loc) in entries {
+                if page_map.get(&page) == Some(&(generation, loc)) {
+                    live += u64::from(loc.len);
+                } else {
+                    dead += u64::from(loc.len);
+                }
+            }
+        }
+    }
+    let overhead = physical.saturating_sub(live + dead);
+    (physical, live, dead, overhead)
+}
+
+impl Harness {
+    fn fake_replica_spool_bytes(&self) -> u64 {
+        let artifacts: u64 = self
+            .replica_artifacts
+            .values()
+            .map(|bytes| bytes.len() as u64)
+            .sum();
+        let records: u64 = self
+            .replica_commits
+            .values()
+            .map(|(_, _, record)| record.len() as u64)
+            .sum();
+        artifacts + records
+    }
+
+    fn observe_fake_replica_spool(&mut self) {
+        self.max_replica_spool_bytes = self
+            .max_replica_spool_bytes
+            .max(self.fake_replica_spool_bytes());
+    }
+
+    fn vset_config_for(&self, vset: VsetId) -> VsetConfig {
+        let _ = vset;
+        self.config.vset_config
     }
 
     fn req(&mut self) -> ReqId {
@@ -821,16 +1004,24 @@ impl Harness {
                     let _ = self.store.delete(now, self.kernel.rng(), &key);
                 }
                 Effect::VsetFenced { vset } => {
-                    // The node manager kills the fenced vset's guest (R6.4);
-                    // for backed-up vsets the control plane restores from
-                    // the store (R6.1).
+                    // The node manager kills the fenced vset's guest and
+                    // restores it from the store (R6.1/R6.4).
                     if let Some(guest) = self.guests.get_mut(&vset) {
                         guest.state = GuestState::Dead;
                     }
-                    if self.vset_config_for(vset).durability.uses_store() {
-                        let req = self.req();
-                        self.admin_reqs.insert(req, AdminKind::Restore(vset));
-                        self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
+                    let req = self.req();
+                    self.admin_reqs.insert(req, AdminKind::Restore(vset));
+                    self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
+                }
+                Effect::VsetUnservable { page } => {
+                    let vset = page.volume.vset;
+                    let sanctioned = self.poisoned.contains(&vset);
+                    self.oracle.on_fill_failed(page, sanctioned);
+                    if let Some(guest) = self.guests.get_mut(&vset)
+                        && !matches!(guest.state, GuestState::Dead)
+                    {
+                        guest.state = GuestState::Dead;
+                        self.report.guest_deaths += 1;
                     }
                 }
                 Effect::DatabaseInstall { page, bytes } => {
@@ -840,11 +1031,7 @@ impl Harness {
                 }
                 Effect::Database(_) => {}
                 Effect::Admin(reply) => self.admin_reply(reply),
-                Effect::PeerSend { .. } => {
-                    self.report
-                        .violations
-                        .push("peer send on a single host".to_string());
-                }
+                Effect::PeerSend { to, msg } => self.fake_peer_send(to, msg),
                 Effect::Abort { reason } => {
                     self.report
                         .violations
@@ -933,6 +1120,11 @@ impl Harness {
                 }
             }
             Ev::StoreOutage(out) => self.store.set_outage(out),
+            Ev::ReplicaUpload {
+                vset,
+                assignment_epoch,
+                generation,
+            } => self.fake_replica_archive_timer(vset, assignment_epoch, generation),
             Ev::Bitflip => {
                 let flipped = self.bdev.flip_random_bit_where(self.kernel.rng(), |name| {
                     matches!(layout::parse_blob(name), Some(BlobName::Segment { .. }))
@@ -948,6 +1140,252 @@ impl Harness {
                 }
             }
         }
+    }
+
+    fn schedule_peer_reply(&mut self, msg: PeerMsg) {
+        self.kernel.schedule_after(
+            micros(50),
+            Ev::Daemon {
+                inc: self.inc,
+                event: Event::PeerDelivered {
+                    from: HostId(1),
+                    msg,
+                },
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fake_peer_send(&mut self, to: HostId, msg: PeerMsg) {
+        if to != HostId(1) {
+            self.report
+                .violations
+                .push(format!("single-host passive target was {to:?}"));
+            return;
+        }
+        match msg {
+            PeerMsg::ReplicaStatus {
+                vset,
+                assignment_epoch,
+            } => {
+                let committed = self
+                    .replica_commits
+                    .get(&(vset, assignment_epoch))
+                    .map(|(info, _, _)| *info);
+                self.schedule_peer_reply(PeerMsg::ReplicaStatusReply {
+                    vset,
+                    assignment_epoch,
+                    committed,
+                });
+            }
+            PeerMsg::ReplicaPut {
+                vset,
+                assignment_epoch,
+                artifact,
+                checksum,
+                bytes,
+            } => {
+                self.replica_artifacts.insert((vset, artifact), bytes);
+                self.observe_fake_replica_spool();
+                self.schedule_peer_reply(PeerMsg::ReplicaPutAck {
+                    vset,
+                    assignment_epoch,
+                    artifact,
+                    checksum,
+                });
+            }
+            PeerMsg::ReplicaCommit {
+                vset,
+                assignment_epoch,
+                info,
+                required,
+                record,
+            } => {
+                self.replica_commits
+                    .insert((vset, assignment_epoch), (info, required, record));
+                self.observe_fake_replica_spool();
+                self.schedule_peer_reply(PeerMsg::ReplicaCommitAck {
+                    vset,
+                    assignment_epoch,
+                    info,
+                });
+                self.arm_fake_replica_archive(
+                    vset,
+                    assignment_epoch,
+                    self.config.daemon.archive.interval,
+                );
+            }
+            PeerMsg::ReplicaArchive {
+                vset,
+                assignment_epoch,
+                through,
+            } => {
+                let committed = self
+                    .replica_commits
+                    .get(&(vset, assignment_epoch))
+                    .map(|(info, _, _)| *info);
+                if committed.is_some_and(|info| {
+                    (info.writer_fence, info.seq, info.sync_covered_through)
+                        >= (
+                            through.writer_fence,
+                            through.seq,
+                            through.sync_covered_through,
+                        )
+                }) {
+                    self.invalidate_fake_replica_archive(vset, assignment_epoch);
+                    self.fake_replica_upload(vset, assignment_epoch);
+                }
+            }
+            PeerMsg::ReplicaRelease {
+                vset,
+                assignment_epoch,
+                through,
+            } => {
+                let covered = self
+                    .replica_commits
+                    .get(&(vset, assignment_epoch))
+                    .is_none_or(|(committed, _, _)| {
+                        (
+                            committed.writer_fence,
+                            committed.seq,
+                            committed.sync_covered_through,
+                        ) <= (
+                            through.writer_fence,
+                            through.seq,
+                            through.sync_covered_through,
+                        )
+                    })
+                    && self
+                        .replica_archived
+                        .get(&(vset, assignment_epoch))
+                        .is_none_or(|archived| {
+                            (
+                                archived.writer_fence,
+                                archived.seq,
+                                archived.sync_covered_through,
+                            ) <= (
+                                through.writer_fence,
+                                through.seq,
+                                through.sync_covered_through,
+                            )
+                        });
+                if !covered {
+                    return;
+                }
+                if let Some((_, required, _)) =
+                    self.replica_commits.remove(&(vset, assignment_epoch))
+                {
+                    for artifact in required {
+                        self.replica_artifacts.remove(&(vset, artifact));
+                    }
+                }
+                self.replica_archived.remove(&(vset, assignment_epoch));
+                self.schedule_peer_reply(PeerMsg::ReplicaReleaseAck {
+                    vset,
+                    assignment_epoch,
+                    through,
+                });
+            }
+            other => self
+                .report
+                .violations
+                .push(format!("unexpected single-host peer message {other:?}")),
+        }
+    }
+
+    fn arm_fake_replica_archive(&mut self, vset: VsetId, assignment_epoch: u64, after: u64) {
+        let key = (vset, assignment_epoch);
+        if !self.replica_archive_armed.insert(key) {
+            return;
+        }
+        let generation = self.replica_archive_generation.entry(key).or_default();
+        *generation = generation.wrapping_add(1).max(1);
+        self.kernel.schedule_after(
+            after,
+            Ev::ReplicaUpload {
+                vset,
+                assignment_epoch,
+                generation: *generation,
+            },
+        );
+    }
+
+    fn invalidate_fake_replica_archive(&mut self, vset: VsetId, assignment_epoch: u64) {
+        let key = (vset, assignment_epoch);
+        self.replica_archive_armed.remove(&key);
+        let generation = self.replica_archive_generation.entry(key).or_default();
+        *generation = generation.wrapping_add(1).max(1);
+    }
+
+    fn fake_replica_archive_timer(&mut self, vset: VsetId, assignment_epoch: u64, generation: u64) {
+        let key = (vset, assignment_epoch);
+        if !self.replica_archive_armed.contains(&key)
+            || self.replica_archive_generation.get(&key).copied() != Some(generation)
+        {
+            return;
+        }
+        self.invalidate_fake_replica_archive(vset, assignment_epoch);
+        self.fake_replica_upload(vset, assignment_epoch);
+    }
+
+    fn fake_replica_upload(&mut self, vset: VsetId, assignment_epoch: u64) {
+        let Some((info, required, record)) =
+            self.replica_commits.get(&(vset, assignment_epoch)).cloned()
+        else {
+            return;
+        };
+        if self
+            .replica_archived
+            .get(&(vset, assignment_epoch))
+            .is_some_and(|archived| {
+                (archived.writer_fence, archived.seq) >= (info.writer_fence, info.seq)
+            })
+        {
+            return;
+        }
+        let now = self.kernel.now();
+        for artifact in required {
+            let Some(bytes) = self.replica_artifacts.get(&(vset, artifact)).cloned() else {
+                self.report
+                    .violations
+                    .push(format!("passive replica missing {artifact:?}"));
+                return;
+            };
+            let key = match artifact {
+                ReplicaArtifact::Segment { fence, seg } => layout::segment_key(vset, fence, seg),
+                ReplicaArtifact::Leaf { fence, id } => layout::leaf_key(vset, fence, id),
+            };
+            let (_, result) = self.store.put(now, self.kernel.rng(), &key, bytes);
+            if result.is_err() {
+                self.arm_fake_replica_archive(
+                    vset,
+                    assignment_epoch,
+                    self.config.daemon.backup_retry,
+                );
+                return;
+            }
+        }
+        let (_, result) = self.store.put(
+            now,
+            self.kernel.rng(),
+            &layout::manifest_key(vset, info.writer_fence, info.seq),
+            record,
+        );
+        if result.is_err() {
+            self.arm_fake_replica_archive(vset, assignment_epoch, self.config.daemon.backup_retry);
+            return;
+        }
+        self.replica_archived.insert((vset, assignment_epoch), info);
+        self.schedule_peer_reply(PeerMsg::ReplicaUploadDone {
+            vset,
+            assignment_epoch,
+            info,
+            record: self
+                .replica_commits
+                .get(&(vset, assignment_epoch))
+                .map(|(_, _, record)| record.clone())
+                .expect("fake passive retains archived record"),
+        });
     }
 
     // ── guests ──────────────────────────────────────────────────────────
@@ -1394,9 +1832,6 @@ impl Harness {
                 self.admin_reqs.remove(&req);
                 self.report.restores += 1;
                 self.mems.insert(vset, VsetMem::default());
-                // Restores may legitimately land behind acked syncs: the
-                // loss bound on host death is the backup lag (R4.3).
-                self.oracle.allow_sync_loss(vset);
                 match verdict {
                     Verdict::Resume { vmstate, .. } => {
                         self.oracle.on_resume(vset, vmstate);
@@ -1499,12 +1934,12 @@ impl Harness {
                 Some(Verdict::DatabaseReady { .. }) => {
                     unreachable!("compute harness found a database vset")
                 }
-                None if self.vset_config_for(vset).durability.uses_store() => {
+                None => {
                     // Recovery defers the verdict until the head confirms
                     // ownership; the guest waits for `VsetRecovered` (or a
                     // fence followed by a restore).
                 }
-                Some(Verdict::Unrestorable) | None => {
+                Some(Verdict::Unrestorable) => {
                     self.report.unrestorable += 1;
                     if !self.poisoned.contains(&vset) {
                         self.report
@@ -1512,13 +1947,9 @@ impl Harness {
                             .push(format!("{vset:?} unrestorable without injected damage"));
                     }
                     self.guests.get_mut(&vset).expect("listed").state = GuestState::Dead;
-                    // Backed-up vsets come back from the store (R6.1): the
-                    // control plane requests a restore.
-                    if self.vset_config_for(vset).durability.uses_store() {
-                        let req = self.req();
-                        self.admin_reqs.insert(req, AdminKind::Restore(vset));
-                        self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
-                    }
+                    let req = self.req();
+                    self.admin_reqs.insert(req, AdminKind::Restore(vset));
+                    self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
                 }
             }
         }

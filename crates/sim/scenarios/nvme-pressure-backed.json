@@ -10,8 +10,7 @@
     "disk_headroom_bytes": { "uniform": { "min": 49152, "max": 81920 } }
   },
   "topology": {
-    "vset_count": 1,
-    "backed_vsets": 1
+    "vset_count": 1
   },
   "coverage": [
     { "metric": "nvme-reclaim", "label": "NVMe reclaim" },
