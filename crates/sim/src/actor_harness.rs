@@ -45,6 +45,8 @@ pub struct ActorFaultPlan {
     pub restart_delay: (u64, u64),
     pub store_outage: Option<(u64, u64)>,
     pub bitflip_mean_interval: u64,
+    pub journal_bitflip_mean_interval: u64,
+    pub rot_records_at: Vec<(u64, bool)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -59,6 +61,7 @@ pub struct ActorRunReport {
     pub store_keys: Vec<String>,
     pub map_bytes_written: u64,
     pub max_page_reads_in_poll: u64,
+    pub max_pause_ns: u64,
     pub max_record_blob_bytes: u64,
     pub seg_bytes_end: u64,
     pub seg_live_bytes_end: u64,
@@ -247,6 +250,15 @@ pub fn run_final_blobs(
         config.clone(),
     ));
     let mut fault_actors = Vec::new();
+    fault_actors.push(executor.spawn(abort_schedule(
+        Rc::clone(&world),
+        Rc::clone(&host_slot),
+        Rc::clone(&state_slot),
+        Rc::clone(&guest_slots),
+        Rc::clone(&events),
+        config.host.clone(),
+        config.faults.restart_delay,
+    )));
     if !config.faults.crash_at.is_empty() || config.faults.crash_mean_interval != 0 {
         fault_actors.push(executor.spawn(crash_schedule(
             Rc::clone(&world),
@@ -268,6 +280,16 @@ pub fn run_final_blobs(
             config.faults.bitflip_mean_interval,
             config.horizon,
         )));
+    }
+    if config.faults.journal_bitflip_mean_interval != 0 {
+        fault_actors.push(executor.spawn(record_bitflip_schedule(
+            Rc::clone(&world),
+            config.faults.journal_bitflip_mean_interval,
+            config.horizon,
+        )));
+    }
+    for &(at, mirror) in &config.faults.rot_records_at {
+        fault_actors.push(executor.spawn(record_bitflip_at(Rc::clone(&world), at, mirror)));
     }
     if let Some(interval) = config.checkpoint_interval {
         fault_actors.push(executor.spawn(checkpoint_schedule(
@@ -315,6 +337,7 @@ pub fn run_final_blobs(
         seg_live_bytes_end: final_state.borrow().seg_space().0,
         parked_end: final_state.borrow().stats().parked_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
+        max_pause_ns: world.max_pause_ns(),
         crashes: events.crashes.get(),
         resumes: events.resumes.get(),
         cold_boots: events.cold_boots.get(),
@@ -585,6 +608,7 @@ fn report_from_state(
         seg_live_bytes_end: state.borrow().seg_space().0,
         parked_end: state.borrow().stats().parked_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
+        max_pause_ns: world.max_pause_ns(),
         bitflips: world.bitflips(),
         ..ActorRunReport::default()
     };
@@ -702,28 +726,70 @@ async fn crash_schedule(
         if now() < crash_at {
             delay(crash_at - now()).await;
         }
-        if let Some(mut host) = host_slot.borrow_mut().take() {
-            host.cancel();
-        }
-        for guest in guest_slots.borrow_mut().values_mut() {
-            if let Some(mut guest) = guest.take() {
-                guest.cancel();
-            }
-        }
-        let _ = world.crash_pending();
-        world.crash_guest_io();
-        events.crashes.set(events.crashes.get().saturating_add(1));
-        delay(random_between(
-            faults.restart_delay.0,
-            faults.restart_delay.1,
-        ))
+        crash_and_restart(
+            &world,
+            &host_slot,
+            &state_slot,
+            &guest_slots,
+            &events,
+            &host_config,
+            faults.restart_delay,
+        )
         .await;
-        world.clear_abort();
-        let state = Rc::new(RefCell::new(HostState::new(host_config.clone())));
-        *state_slot.borrow_mut() = Rc::clone(&state);
-        let handle = spawn(host_actor_with_state(state, Rc::clone(&world)));
-        *host_slot.borrow_mut() = Some(handle);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn abort_schedule(
+    world: Rc<SimWorld>,
+    host_slot: HostSlot,
+    state_slot: StateSlot,
+    guest_slots: GuestSlots,
+    events: Rc<RunEvents>,
+    host_config: HostConfig,
+    restart_delay: (u64, u64),
+) {
+    while world.next_abort().await.is_some() {
+        crash_and_restart(
+            &world,
+            &host_slot,
+            &state_slot,
+            &guest_slots,
+            &events,
+            &host_config,
+            restart_delay,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn crash_and_restart(
+    world: &Rc<SimWorld>,
+    host_slot: &HostSlot,
+    state_slot: &StateSlot,
+    guest_slots: &GuestSlots,
+    events: &RunEvents,
+    host_config: &HostConfig,
+    restart_delay: (u64, u64),
+) {
+    if let Some(mut host) = host_slot.borrow_mut().take() {
+        host.cancel();
+    }
+    for guest in guest_slots.borrow_mut().values_mut() {
+        if let Some(mut guest) = guest.take() {
+            guest.cancel();
+        }
+    }
+    let _ = world.crash_pending();
+    world.crash_guest_io();
+    events.crashes.set(events.crashes.get().saturating_add(1));
+    delay(random_between(restart_delay.0, restart_delay.1)).await;
+    world.clear_abort();
+    let state = Rc::new(RefCell::new(HostState::new(host_config.clone())));
+    *state_slot.borrow_mut() = Rc::clone(&state);
+    let handle = spawn(host_actor_with_state(state, Rc::clone(world)));
+    *host_slot.borrow_mut() = Some(handle);
 }
 
 async fn store_outage(world: Rc<SimWorld>, window: (u64, u64)) {
@@ -745,6 +811,23 @@ async fn bitflip_schedule(world: Rc<SimWorld>, mean: u64, horizon: u64) {
         }
         let _ = world.bitflip_segment();
     }
+}
+
+async fn record_bitflip_schedule(world: Rc<SimWorld>, mean: u64, horizon: u64) {
+    loop {
+        delay(random_between(1, mean.saturating_mul(2))).await;
+        if now() > horizon {
+            return;
+        }
+        let _ = world.bitflip_record(None);
+    }
+}
+
+async fn record_bitflip_at(world: Rc<SimWorld>, at: u64, mirror: bool) {
+    if now() < at {
+        delay(at - now()).await;
+    }
+    let _ = world.bitflip_record(Some(mirror));
 }
 
 async fn checkpoint_schedule(world: Rc<SimWorld>, interval: u64, horizon: u64, vset_count: u16) {

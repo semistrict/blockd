@@ -37,7 +37,12 @@ struct GuestState {
 enum Request {
     Create,
     Checkpoint,
-    Migrate { from: u16, to: u16, started: u64 },
+    Migrate {
+        vset: VsetId,
+        from: u16,
+        to: u16,
+        started: u64,
+    },
     Restore { sent: u64 },
 }
 
@@ -129,6 +134,17 @@ pub(crate) fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
                 Rc::clone(&control),
                 Rc::clone(&worlds),
                 Rc::clone(&config),
+            ))
+            .detach();
+        executor
+            .spawn(abort_monitor(
+                host,
+                Rc::clone(&config),
+                Rc::clone(&worlds),
+                Rc::clone(&network),
+                Rc::clone(&slots),
+                Rc::clone(&states),
+                Rc::clone(&control),
             ))
             .detach();
     }
@@ -225,6 +241,21 @@ pub(crate) fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
     std::mem::take(&mut control.report)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn abort_monitor(
+    host: u16,
+    config: Rc<ClusterConfig>,
+    worlds: Rc<Vec<Rc<SimWorld>>>,
+    network: Rc<SimNetwork>,
+    slots: HostSlots,
+    states: StateSlots,
+    control: Rc<RefCell<Control>>,
+) {
+    while worlds[usize::from(host)].next_abort().await.is_some() {
+        crash_host(host, &config, &worlds, &network, &slots, &states, &control).await;
+    }
+}
+
 fn host_config(config: &ClusterConfig, host: u16) -> HostConfig {
     HostConfig {
         host: HostId(host),
@@ -279,7 +310,12 @@ async fn reply_actor(
                 let started = {
                     let mut control = control.borrow_mut();
                     let request = control.requests.iter().find_map(|(&req, request)| match request {
-                        Request::Migrate { to, started, .. } if *to == host => Some((req, *started)),
+                        Request::Migrate {
+                            vset: requested,
+                            to,
+                            started,
+                            ..
+                        } if *requested == vset && *to == host => Some((req, *started)),
                         _ => None,
                     });
                     if let Some((req, started)) = request {
@@ -339,19 +375,13 @@ async fn reply_actor(
             AdminReply::AdminFailed { req } => {
                 let request = control.borrow_mut().requests.remove(&req);
                 match request {
-                    Some(Request::Migrate { from, .. }) => {
+                    Some(Request::Migrate { vset, from, .. }) => {
                         {
                             let mut control = control.borrow_mut();
                             control.report.migrations_refused =
                                 control.report.migrations_refused.saturating_add(1);
                         }
-                        let vset = control
-                            .borrow()
-                            .placement
-                            .iter()
-                            .find(|(_, placed)| **placed == from)
-                            .map(|(&vset, _)| vset);
-                        if let Some(vset) = vset {
+                        if control.borrow().placement.get(&vset) == Some(&from) {
                             start_guest(vset, from, &control, &worlds, &config);
                         }
                     }
@@ -575,6 +605,7 @@ fn choose_page(config: &ClusterConfig, vset: VsetId) -> PageId {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn spawn_schedules(
     executor: &mut Executor,
     config: &Rc<ClusterConfig>,
@@ -638,6 +669,14 @@ fn spawn_schedules(
         })
         .detach();
     }
+    if let Some(at) = config.rot_leaves_at {
+        let world = Rc::clone(&worlds[0]);
+        executor.spawn(async move {
+            delay(at).await;
+            let _ = world.rot_store_leaf();
+        })
+        .detach();
+    }
     if let Some(interval) = config.checkpoint_interval {
         executor.spawn(checkpoint_schedule(
             interval,
@@ -650,11 +689,19 @@ fn spawn_schedules(
     if config.crash_mean_interval != 0 {
         executor.spawn(random_crashes(
             Rc::clone(config),
-            worlds,
-            network,
-            slots,
-            states,
-            control,
+            Rc::clone(&worlds),
+            Rc::clone(&network),
+            Rc::clone(&slots),
+            Rc::clone(&states),
+            Rc::clone(&control),
+        ))
+        .detach();
+    }
+    if config.migrate_mean_interval != 0 {
+        executor.spawn(random_migrations(
+            Rc::clone(config),
+            Rc::clone(&worlds),
+            Rc::clone(&control),
         ))
         .detach();
     }
@@ -787,18 +834,39 @@ async fn at_migrate(
     control: Rc<RefCell<Control>>,
 ) {
     delay(at.saturating_sub(now())).await;
+    start_migration(vset, to, &worlds, &control);
+}
+
+fn start_migration(
+    vset: VsetId,
+    to: u16,
+    worlds: &[Rc<SimWorld>],
+    control: &Rc<RefCell<Control>>,
+) -> bool {
     let Some(&from) = control.borrow().placement.get(&vset) else {
-        return;
+        return false;
     };
-    cancel_guest(vset, &control);
-    let req = control
-        .borrow_mut()
-        .req(Request::Migrate { from, to, started: now() });
+    if from == to
+        || !control.borrow().live[usize::from(to)]
+        || control.borrow().requests.values().any(|request| {
+            matches!(request, Request::Migrate { vset: pending, .. } if *pending == vset)
+        })
+    {
+        return false;
+    }
+    cancel_guest(vset, control);
+    let req = control.borrow_mut().req(Request::Migrate {
+        vset,
+        from,
+        to,
+        started: now(),
+    });
     worlds[usize::from(from)].enqueue_admin(AdminCmd::MigrateOut {
         req,
         vset,
         to: HostId(to),
     });
+    true
 }
 
 async fn checkpoint_schedule(
@@ -835,6 +903,46 @@ async fn random_crashes(
         }
         let host = u16::try_from(random_u64() % u64::from(config.hosts)).expect("host fits");
         crash_host(host, &config, &worlds, &network, &slots, &states, &control).await;
+    }
+}
+
+async fn random_migrations(
+    config: Rc<ClusterConfig>,
+    worlds: Rc<Vec<Rc<SimWorld>>>,
+    control: Rc<RefCell<Control>>,
+) {
+    loop {
+        delay(random_between(
+            1,
+            config.migrate_mean_interval.saturating_mul(2),
+        ))
+        .await;
+        if now() > config.horizon {
+            return;
+        }
+        let candidates = control
+            .borrow()
+            .placement
+            .iter()
+            .filter_map(|(&vset, &host)| {
+                control.borrow().live[usize::from(host)].then_some(vset)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            continue;
+        }
+        let vset = candidates
+            [usize::try_from(random_u64() % candidates.len() as u64).expect("vset index fits")];
+        let from = control.borrow().placement[&vset];
+        let destinations = (0..config.hosts)
+            .filter(|&host| host != from && control.borrow().live[usize::from(host)])
+            .collect::<Vec<_>>();
+        if destinations.is_empty() {
+            continue;
+        }
+        let to = destinations[usize::try_from(random_u64() % destinations.len() as u64)
+            .expect("host index fits")];
+        let _ = start_migration(vset, to, &worlds, &control);
     }
 }
 

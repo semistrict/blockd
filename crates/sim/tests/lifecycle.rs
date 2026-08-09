@@ -124,6 +124,22 @@ fn repeated_checkpoints_accrue_no_storage_debt() {
 }
 
 #[test]
+fn one_rotated_record_copy_recovers_from_its_intact_mirror() {
+    let mut config = base_config();
+    config.vset_count = 1;
+    config.horizon = millis(500);
+    config.rot_records_at = vec![(millis(250), false)];
+    config.crash_at = vec![millis(300)];
+    config.faults.restart_delay = (millis(1), millis(1));
+    let report = run(47, config);
+    assert_clean(&report);
+    assert_eq!(report.bitflips, 1);
+    assert_eq!(report.crashes, 1);
+    assert_eq!(report.unrestorable, 0);
+    assert!(report.cold_boots + report.resumes > 0);
+}
+
+#[test]
 fn pressure_slows_guests_but_never_kills() {
     // R2.5: cache far smaller than the combined working set. Faults wait on
     // writeback-driven eviction; everyone still progresses; nobody dies.

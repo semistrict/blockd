@@ -147,6 +147,23 @@ fn forced_replica_fault_point_is_hit_and_idempotent() {
 }
 
 #[test]
+fn injected_replica_crash_cancels_and_recovers_the_host_actor_tree() {
+    let mut config = blockd_sim::presets::peer_stash_chaos();
+    config.peer_drop = (0, 1);
+    config.peer_dup = (0, 1);
+    config.store_outage = None;
+    config.vset_count = 1;
+    config.horizon = millis(800);
+    config.think = (millis(2), millis(4));
+    let point = FaultPoint::CrashPrimaryAfterClosureCapture;
+    config.fault_points = vec![point];
+    let report = run(139, config);
+    assert_clean(&report);
+    assert!(report.fault_coverage.get(&point).copied().unwrap_or(0) > 0);
+    assert!(report.host_crashes > 0, "injected abort did not cancel the host");
+}
+
+#[test]
 fn corrupt_resume_set_costs_warmth_not_correctness() {
     let mut config = restore_config();
     config.vset_count = 1;

@@ -217,6 +217,7 @@ pub(crate) struct SimWorld {
     faults: Stream<GuestFault>,
     syncs: Stream<GuestSync>,
     peers: Stream<(HostId, PeerMsg)>,
+    aborts: Stream<&'static str>,
     network: Rc<SimNetwork>,
     fault_waiters: RefCell<BTreeMap<PageId, Vec<OneSender<bool>>>>,
     sync_waiters: RefCell<BTreeMap<ReqId, OneSender<bool>>>,
@@ -228,6 +229,8 @@ pub(crate) struct SimWorld {
     page_read_poll: Cell<Option<u64>>,
     page_reads_in_poll: Cell<u64>,
     max_page_reads_in_poll: Cell<u64>,
+    pause_started: RefCell<BTreeMap<VsetId, u64>>,
+    max_pause_ns: Cell<u64>,
 }
 
 impl SimWorld {
@@ -248,6 +251,10 @@ impl SimWorld {
 
     pub(crate) fn max_page_reads_in_poll(&self) -> u64 {
         self.max_page_reads_in_poll.get()
+    }
+
+    pub(crate) fn max_pause_ns(&self) -> u64 {
+        self.max_pause_ns.get()
     }
 
     pub(crate) fn cluster(
@@ -292,6 +299,7 @@ impl SimWorld {
             faults: Stream::new(),
             syncs: Stream::new(),
             peers: Stream::new(),
+            aborts: Stream::new(),
             network: Rc::clone(network),
             fault_waiters: RefCell::new(BTreeMap::new()),
             sync_waiters: RefCell::new(BTreeMap::new()),
@@ -303,6 +311,8 @@ impl SimWorld {
             page_read_poll: Cell::new(None),
             page_reads_in_poll: Cell::new(0),
             max_page_reads_in_poll: Cell::new(0),
+            pause_started: RefCell::new(BTreeMap::new()),
+            max_pause_ns: Cell::new(0),
         });
         network
             .inboxes
@@ -365,6 +375,37 @@ impl SimWorld {
         changed
     }
 
+    pub(crate) fn rot_store_leaf(&self) -> bool {
+        let keys = self
+            .store
+            .borrow()
+            .objects
+            .iter()
+            .filter_map(|(key, (_, bytes))| {
+                (!bytes.is_empty()
+                    && matches!(
+                        blockd_core::layout::parse_key(key),
+                        Some(
+                            blockd_core::layout::StoreKey::Leaf { .. }
+                                | blockd_core::layout::StoreKey::BaseLeaf { .. }
+                        )
+                    ))
+                .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return false;
+        }
+        let key = &keys[usize::try_from(random_u64() % keys.len() as u64).expect("index fits")];
+        self.store
+            .borrow_mut()
+            .objects
+            .get_mut(key)
+            .expect("selected leaf exists")
+            .1[0] ^= 1;
+        true
+    }
+
     pub(crate) fn set_store_outage(&self, outage: bool) {
         self.store.borrow_mut().outage = outage;
     }
@@ -390,7 +431,15 @@ impl SimWorld {
         *self.abort_reason.borrow()
     }
 
+    pub(crate) async fn next_abort(&self) -> Option<&'static str> {
+        self.aborts.recv().await
+    }
+
     pub(crate) fn crash_guest_io(&self) {
+        for started in std::mem::take(&mut *self.pause_started.borrow_mut()).into_values() {
+            self.max_pause_ns
+                .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
+        }
         let fault_waiters = std::mem::take(&mut *self.fault_waiters.borrow_mut());
         for waiter in fault_waiters.into_values().flatten() {
             let _ = waiter.send(false);
@@ -403,17 +452,33 @@ impl SimWorld {
     }
 
     pub(crate) fn bitflip_segment(&self) -> bool {
+        self.bitflip_local(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("seg"))
+        })
+    }
+
+    pub(crate) fn bitflip_record(&self, mirror: Option<bool>) -> bool {
+        self.bitflip_local(|name| {
+            let extension = std::path::Path::new(name)
+                .extension()
+                .and_then(|extension| extension.to_str());
+            match mirror {
+                Some(false) => extension == Some("rec"),
+                Some(true) => extension == Some("recm"),
+                None => matches!(extension, Some("rec" | "recm")),
+            }
+        })
+    }
+
+    fn bitflip_local(&self, matches: impl Fn(&str) -> bool) -> bool {
         let names = self
             .blobs
             .borrow()
             .durable
             .iter()
-            .filter(|(name, bytes)| {
-                std::path::Path::new(name)
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("seg"))
-                    && !bytes.is_empty()
-            })
+            .filter(|(name, bytes)| matches(name) && !bytes.is_empty())
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         if names.is_empty() {
@@ -1000,12 +1065,17 @@ impl GuestMem for SimWorld {
     }
 
     async fn pause(&self, vset: VsetId) -> u64 {
+        self.pause_started.borrow_mut().entry(vset).or_insert(now());
         let mut memory = self.memory.borrow_mut();
         memory.paused.insert(vset);
         memory.vmstate.get(&vset).copied().unwrap_or(0)
     }
 
     async fn resume(&self, vset: VsetId) {
+        if let Some(started) = self.pause_started.borrow_mut().remove(&vset) {
+            self.max_pause_ns
+                .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
+        }
         self.memory.borrow_mut().paused.remove(&vset);
         let pages = self
             .fault_waiters
@@ -1080,6 +1150,7 @@ impl AdminIo for SimWorld {
     async fn abort(&self, reason: &'static str) {
         self.aborted.set(true);
         self.abort_reason.borrow_mut().replace(reason);
+        let _ = self.aborts.send(reason);
     }
 }
 
