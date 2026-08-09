@@ -671,7 +671,7 @@ pub async fn peer_fetch_page<W: Peers>(
         let (send, receive) = oneshot();
         let io = {
             let mut host = state.borrow_mut();
-            let io = host.allocate_peer_io();
+            let io = host.allocate_peer_request();
             host.peer_pages.insert(io, send);
             io
         };
@@ -918,7 +918,7 @@ pub async fn peer_fetch_leaf<W: Peers>(
         let (send, receive) = oneshot();
         let io = {
             let mut host = state.borrow_mut();
-            let io = host.allocate_peer_io();
+            let io = host.allocate_peer_request();
             host.peer_leaves.insert(io, send);
             io
         };

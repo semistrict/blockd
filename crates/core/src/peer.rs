@@ -12,7 +12,7 @@
 //! verbatim, damage included (R8.1: the reader decides).
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::protocol::{IoId, MAX_OBJECT_BYTES, PeerMsg};
+use crate::protocol::{MAX_OBJECT_BYTES, PeerMsg, PeerRequestId};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
 };
@@ -294,7 +294,7 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             vset: VsetId(d.u64()?),
         },
         2 => PeerMsg::FetchRange {
-            io: IoId(d.u64()?),
+            io: PeerRequestId(d.u64()?),
             vset: VsetId(d.u64()?),
             fence: d.u64()?,
             seg: SegId(d.u64()?),
@@ -302,18 +302,18 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             len: d.u32()?,
         },
         3 => PeerMsg::Page {
-            io: IoId(d.u64()?),
+            io: PeerRequestId(d.u64()?),
             bytes: decode_opt_bytes(&mut d)?,
         },
         4 => PeerMsg::FetchLeaf {
-            io: IoId(d.u64()?),
+            io: PeerRequestId(d.u64()?),
             vset: VsetId(d.u64()?),
             base: d.u64()?,
             fence: d.u64()?,
             id: d.u64()?,
         },
         5 => PeerMsg::Leaf {
-            io: IoId(d.u64()?),
+            io: PeerRequestId(d.u64()?),
             bytes: decode_opt_bytes(&mut d)?,
         },
         6 => PeerMsg::Released {
@@ -415,7 +415,7 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
 mod tests {
     use super::*;
     use crate::format::crc32c;
-    use crate::seam::{ReplicaArtifact, ReplicaCommitInfo};
+    use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
     use crate::types::JournalSeq;
 
     #[allow(clippy::too_many_lines)]
@@ -437,7 +437,7 @@ mod tests {
             },
             PeerMsg::MigrateAccept { vset: VsetId(7) },
             PeerMsg::FetchRange {
-                io: IoId(99),
+                io: PeerRequestId(99),
                 vset: VsetId(7),
                 fence: 3,
                 seg: SegId(12),
@@ -445,26 +445,26 @@ mod tests {
                 len: 640,
             },
             PeerMsg::Page {
-                io: IoId(99),
+                io: PeerRequestId(99),
                 bytes: Some(vec![0x5A; 640]),
             },
             PeerMsg::Page {
-                io: IoId(100),
+                io: PeerRequestId(100),
                 bytes: None,
             },
             PeerMsg::FetchLeaf {
-                io: IoId(101),
+                io: PeerRequestId(101),
                 vset: VsetId(7),
                 base: 0,
                 fence: 3,
                 id: 2,
             },
             PeerMsg::Leaf {
-                io: IoId(101),
+                io: PeerRequestId(101),
                 bytes: Some(vec![0xC3; 136]),
             },
             PeerMsg::Leaf {
-                io: IoId(102),
+                io: PeerRequestId(102),
                 bytes: None,
             },
             PeerMsg::Released { vset: VsetId(7) },

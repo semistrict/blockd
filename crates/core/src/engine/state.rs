@@ -29,8 +29,8 @@ pub struct HostState {
     pub pressure_waiters: VecDeque<OneSender<()>>,
     pub filling_pages: BTreeSet<PageId>,
     pub page_fill_waiters: BTreeMap<PageId, Vec<OneSender<bool>>>,
-    pub peer_pages: BTreeMap<crate::protocol::IoId, OneSender<Option<Vec<u8>>>>,
-    pub peer_leaves: BTreeMap<crate::protocol::IoId, OneSender<Option<Vec<u8>>>>,
+    pub peer_pages: BTreeMap<crate::protocol::PeerRequestId, OneSender<Option<Vec<u8>>>>,
+    pub peer_leaves: BTreeMap<crate::protocol::PeerRequestId, OneSender<Option<Vec<u8>>>>,
     pub inbound_migrations: BTreeSet<VsetId>,
     pub migration_accepts: BTreeMap<VsetId, OneSender<()>>,
     pub replicas: BTreeMap<ReplicaKey, ReplicaState>,
@@ -40,7 +40,7 @@ pub struct HostState {
         BTreeMap<(VsetId, u64, crate::protocol::ReplicaArtifact, u32), OneSender<HostId>>,
     pub replica_commit_waiters: BTreeMap<(VsetId, u64, u64, JournalSeq, u64), OneSender<HostId>>,
     pub replica_releases: Vec<(HostId, VsetId, u64, crate::protocol::ReplicaCommitInfo)>,
-    next_peer_io: u64,
+    next_peer_request: u64,
     next_attachment_generation: u64,
     next_incarnation: u64,
 }
@@ -67,7 +67,7 @@ impl HostState {
             replica_put_waiters: BTreeMap::new(),
             replica_commit_waiters: BTreeMap::new(),
             replica_releases: Vec::new(),
-            next_peer_io: 0,
+            next_peer_request: 0,
             next_attachment_generation: 0,
             next_incarnation: 0,
         }
@@ -99,10 +99,13 @@ impl HostState {
         }
     }
 
-    pub fn allocate_peer_io(&mut self) -> crate::protocol::IoId {
-        let io = crate::protocol::IoId(self.next_peer_io);
-        self.next_peer_io = self.next_peer_io.checked_add(1).expect("peer io overflow");
-        io
+    pub fn allocate_peer_request(&mut self) -> crate::protocol::PeerRequestId {
+        let request = crate::protocol::PeerRequestId(self.next_peer_request);
+        self.next_peer_request = self
+            .next_peer_request
+            .checked_add(1)
+            .expect("peer request overflow");
+        request
     }
 
     pub fn allocate_attachment(&mut self, vm: crate::types::VmId) -> AttachmentId {

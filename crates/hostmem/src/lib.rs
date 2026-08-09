@@ -28,7 +28,7 @@
 //!
 //! This crate is the audited home of `unsafe`; the deterministic core
 //! (`blockd-core`) stays `#![forbid(unsafe_code)]` and drives these same
-//! semantics through its `Effect` seam. The integration tests
+//! semantics through its async guest-memory world. The integration tests
 //! (`tests/uffd_linux.rs`) prove the machinery against a live kernel.
 
 #[cfg(target_os = "linux")]

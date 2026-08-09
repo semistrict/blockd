@@ -1,16 +1,10 @@
-//! blockd-runtime: the production-side host that runs the REAL daemon
-//! state machine (`blockd_core::Daemon`) against REAL Linux machinery —
-//! guest memory through `blockd-hostmem` (memfd + userfaultfd), local
-//! blobs as files on real disk, and an object store spoken through an
-//! accurate S3-shaped API.
+//! blockd-runtime: the production host for the shared async protocol actors.
 //!
-//! This is the other interpreter of the same `Effect` seam the
-//! deterministic simulation interprets (R10.1): the daemon code is
-//! byte-for-byte the code the simulation proved; only the world differs.
-//! Threads, wall clocks, and blocking I/O live HERE — never in core.
+//! The same actor tree used by deterministic simulation runs here against
+//! Linux userfaultfd/memfd mappings, a durable blob directory, peers, and an
+//! object-store adapter. Threads, wall clocks, and blocking I/O stay here.
 
-// This crate is the nondeterministic side of the seam: threads and wall
-// time are the implementation, not a hazard.
+// This crate owns the nondeterministic world boundary.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 #[cfg(target_os = "linux")]

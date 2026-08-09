@@ -12,11 +12,11 @@ use crate::types::{Epoch, HostId, SegId, VmId, VsetId};
 /// overhead for payloads whose unframed contract is 64 MiB.
 pub const MAX_OBJECT_BYTES: u32 = 64 * 1024 * 1024 + 4096;
 
-/// Daemon-issued I/O id, unique per daemon incarnation.
+/// Actor-issued peer request id, unique per host incarnation.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct IoId(pub u64);
+pub struct PeerRequestId(pub u64);
 
-impl fmt::Debug for IoId {
+impl fmt::Debug for PeerRequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "io{}", self.0)
     }
@@ -75,7 +75,7 @@ pub enum PeerMsg {
     },
     /// Demand fetch of one page entry from a peer (the peer tier of R2.3).
     FetchRange {
-        io: IoId,
+        io: PeerRequestId,
         vset: VsetId,
         fence: u64,
         seg: SegId,
@@ -85,14 +85,14 @@ pub enum PeerMsg {
     /// Peer fetch response: raw stored bytes, damage included (the reader
     /// verifies, R8.1). `None` = the peer no longer has it.
     Page {
-        io: IoId,
+        io: PeerRequestId,
         bytes: Option<Vec<u8>>,
     },
     /// Fetch one map leaf blob from a peer (post-copy hydration of a
     /// migrated vset's map, R7.1). `base` is 0 for the vset's own
     /// namespace, else the base whose leaf this is.
     FetchLeaf {
-        io: IoId,
+        io: PeerRequestId,
         vset: VsetId,
         base: u64,
         fence: u64,
@@ -100,7 +100,7 @@ pub enum PeerMsg {
     },
     /// Leaf fetch response: the blob's raw bytes, damage included.
     Leaf {
-        io: IoId,
+        io: PeerRequestId,
         bytes: Option<Vec<u8>>,
     },
     /// The destination holds every byte it needs: the source may reclaim

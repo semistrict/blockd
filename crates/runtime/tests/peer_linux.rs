@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use blockd_core::protocol::{IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo};
+use blockd_core::protocol::{PeerMsg, PeerRequestId, ReplicaArtifact, ReplicaCommitInfo};
 use blockd_core::types::{HostId, JournalSeq, SegId, VsetId};
 use blockd_runtime::{PeerConfig, PeerNet};
 
@@ -64,7 +64,7 @@ fn sample_msgs() -> Vec<PeerMsg> {
         },
         PeerMsg::MigrateAccept { vset: VsetId(7) },
         PeerMsg::FetchRange {
-            io: IoId(1),
+            io: PeerRequestId(1),
             vset: VsetId(7),
             fence: 2,
             seg: SegId(3),
@@ -72,18 +72,18 @@ fn sample_msgs() -> Vec<PeerMsg> {
             len: 5,
         },
         PeerMsg::Page {
-            io: IoId(1),
+            io: PeerRequestId(1),
             bytes: Some(vec![9; 640]),
         },
         PeerMsg::FetchLeaf {
-            io: IoId(2),
+            io: PeerRequestId(2),
             vset: VsetId(7),
             base: 0,
             fence: 2,
             id: 1,
         },
         PeerMsg::Leaf {
-            io: IoId(2),
+            io: PeerRequestId(2),
             bytes: None,
         },
         PeerMsg::Released { vset: VsetId(7) },
@@ -245,7 +245,7 @@ fn a_segment_sized_payload_round_trips() {
         HostId(0),
         HostId(1),
         &PeerMsg::Page {
-            io: IoId(77),
+            io: PeerRequestId(77),
             bytes: Some(payload.clone()),
         },
     );
@@ -255,7 +255,7 @@ fn a_segment_sized_payload_round_trips() {
     assert_eq!(
         got,
         PeerMsg::Page {
-            io: IoId(77),
+            io: PeerRequestId(77),
             bytes: Some(payload),
         }
     );
