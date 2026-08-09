@@ -110,6 +110,7 @@ struct RuntimeContext {
     observations: Rc<RefCell<Vec<String>>>,
     rng: Rc<RefCell<Option<Pcg64>>>,
     faults: Rc<RefCell<FaultConfig>>,
+    fault_hits: Rc<RefCell<BTreeMap<FaultPoint, u64>>>,
     next_task: Rc<Cell<TaskId>>,
     spawn_requests: Rc<RefCell<Vec<SpawnRequest>>>,
 }
@@ -125,6 +126,7 @@ impl Clone for RuntimeContext {
             observations: Rc::clone(&self.observations),
             rng: Rc::clone(&self.rng),
             faults: Rc::clone(&self.faults),
+            fault_hits: Rc::clone(&self.fault_hits),
             next_task: Rc::clone(&self.next_task),
             spawn_requests: Rc::clone(&self.spawn_requests),
         }
@@ -230,6 +232,10 @@ pub fn fault_point(point: FaultPoint) -> bool {
             .observations
             .borrow_mut()
             .push(format!("Fault({point:?}, {result})"));
+        if result {
+            let mut hits = context.fault_hits.borrow_mut();
+            *hits.entry(point).or_default() += 1;
+        }
         result
     })
 }
@@ -414,6 +420,7 @@ impl Executor {
                 observations: Rc::new(RefCell::new(Vec::new())),
                 rng: Rc::new(RefCell::new(rng)),
                 faults: Rc::new(RefCell::new(FaultConfig::default())),
+                fault_hits: Rc::new(RefCell::new(BTreeMap::new())),
                 next_task: Rc::new(Cell::new(0)),
                 spawn_requests: Rc::new(RefCell::new(Vec::new())),
             },
@@ -433,6 +440,10 @@ impl Executor {
 
     pub fn set_fault_config(&mut self, config: FaultConfig) {
         *self.context.faults.borrow_mut() = config;
+    }
+
+    pub fn fault_hits(&self) -> BTreeMap<FaultPoint, u64> {
+        self.context.fault_hits.borrow().clone()
     }
 
     pub fn spawn<F, T>(&mut self, future: F) -> TaskHandle<T>

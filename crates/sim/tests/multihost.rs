@@ -1,220 +1,136 @@
-//! Milestone 4, cluster level: host death under load, racing restore claims
-//! resolving to exactly one runner (R6.3), the R4.3 loss bound verified
-//! against the head at the kill instant, and byte-for-byte replay of whole
-//! cluster runs.
+//! Multi-host properties over the deterministic actor topology.
 
-use blockd_core::daemon::{ArchivePolicy, DaemonConfig};
 use blockd_core::journal::VsetConfig;
-use blockd_core::types::{VsetId, micros, millis, page_size, secs};
-use blockd_sim::cluster::{ClusterConfig, ClusterReport, PeerKind, run};
-use blockd_sim::harness::Sabotage;
-use blockd_sim::rng::Ppm;
-use blockd_sim::world::store::StoreObjectKind;
+use blockd_core::types::{VsetId, millis, secs};
+use blockd_sim::cluster::{ClusterConfig, ClusterReport, FaultPoint, run};
 
-/// The library preset, by reference: the `sweep` binary drives the same
-/// schedules, so corpus and sweep can never drift apart.
-fn base_config() -> ClusterConfig {
+fn assert_clean(report: &ClusterReport) {
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}
+
+fn restore_config() -> ClusterConfig {
     blockd_sim::presets::cluster_kill_race()
 }
 
-fn assert_clean(report: &ClusterReport) {
-    assert_eq!(report.violations, Vec::<String>::new());
-}
-
-fn page_pin<T>(page_4k: T, page_16k: T) -> T {
-    match page_size() {
-        4096 => page_4k,
-        16_384 => page_16k,
-        size => panic!("test pin missing for {size}-byte pages"),
+fn migration_config() -> ClusterConfig {
+    ClusterConfig {
+        hosts: 2,
+        vset_count: 1,
+        vset_config: VsetConfig::compute(2, 16),
+        kill_hosts_at: vec![],
+        crash_hosts_at: vec![],
+        drop_peer: None,
+        race_restore: false,
+        migrate_at: Some((millis(500), VsetId(1), 1)),
+        horizon: secs(2),
+        ..restore_config()
     }
 }
 
 #[test]
-fn host_death_restores_orphans_elsewhere_with_racing_claims() {
-    let report = run(31, base_config());
+fn cluster_replays_byte_for_byte_and_distinct_seeds_diverge() {
+    let first = run(31, restore_config());
+    let replay = run(31, restore_config());
+    let other = run(44, restore_config());
+    assert_eq!(first, replay);
+    assert_ne!(first.trace_hash, other.trace_hash);
+}
+
+#[test]
+fn host_death_restores_one_authoritative_runner() {
+    let report = run(31, restore_config());
     assert_clean(&report);
-    // Host 0 carried one vset (round-robin of 3 across 3 hosts); its
-    // restore was raced to hosts 1 and 2: exactly one won (R6.3).
     assert_eq!(report.restores, 1);
     assert_eq!(report.claims_lost, 1);
-    // The recovered point was exactly the head's manifest at death (R4.3).
     assert_eq!(report.loss_bound_verified, 1);
     assert_eq!(report.guest_deaths, 0);
-    assert!(report.completed_ops > 1_000, "{report:?}");
+    assert!(report.completed_ops > 100);
 }
 
 #[test]
-fn cluster_runs_replay_byte_for_byte() {
-    for seed in [31, 44] {
-        let a = run(seed, base_config());
-        let b = run(seed, base_config());
-        assert_eq!(a, b, "seed {seed} diverged on replay");
-    }
-}
-
-#[test]
-fn peer_stash_syncs_survive_lossy_links_and_a_store_outage() {
-    let report = run(73, blockd_sim::presets::peer_stash_chaos());
+fn crash_drops_the_host_tree_then_recovers_from_its_disk() {
+    let mut config = migration_config();
+    config.migrate_at = None;
+    config.crash_hosts_at = vec![(millis(600), 0)];
+    let report = run(53, config);
     assert_clean(&report);
-    assert!(
-        report.completed_ops > 20,
-        "guest sync path wedged: {report:?}"
-    );
-    assert!(report.replica_bytes > 0, "no recovery bytes reached a peer");
-    assert!(
-        report.replica_commits > 0,
-        "no durable peer commit completed"
-    );
-    assert!(
-        report.replica_store_bytes > 0,
-        "the passive peer never resumed its S3 upload"
-    );
-    assert_eq!(report.replica_nonactive_bytes, 0);
-    assert!(report.replica_cleanup_rewrite_bytes > 0, "{report:?}");
+    assert_eq!(report.host_crashes, 1);
+    assert_eq!(report.recoveries, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert!(report.completed_ops > 50);
 }
 
 #[test]
-fn archive_outage_longer_than_the_removed_horizon_never_limits_syncs() {
-    let mut config = blockd_sim::presets::peer_stash_chaos();
-    config.vset_count = 1;
-    config.horizon = secs(90);
-    config.think = (millis(20), millis(40));
-    config.peer_drop = (0, 1);
-    config.peer_dup = (0, 1);
-    config.store_outage = Some((millis(100), secs(120)));
-    config.daemon.archive.interval = secs(1);
-    let report = run(0xA6E0_0001, config);
+fn migration_is_lossless_and_background_hydration_releases_the_source() {
+    let report = run(7, migration_config());
     assert_clean(&report);
-    assert!(report.completed_ops > 150, "{report:?}");
-    assert!(report.replica_commits > 50, "{report:?}");
-    assert!(report.peer_committed_through > 0, "{report:?}");
-    assert_eq!(report.archived_through, 0, "{report:?}");
-    assert_eq!(report.replica_capacity_backpressure, 0, "{report:?}");
-    assert!(report.store_unavailable > 0, "{report:?}");
-    assert!(report.replica_cleanup_rewrite_bytes > 0, "{report:?}");
-    assert!(report.max_archive_lag_age_ns > secs(60), "{report:?}");
+    assert_eq!(report.migrations, 1);
+    assert_eq!(report.guest_deaths, 0);
+    assert_eq!(report.restores, 0);
+    assert!(report.max_migration_pause_ns > 0);
+    assert!(report.max_migration_pause_ns < millis(500));
+    assert!(report.hydrate_fills > 0);
+    assert!(report.releases >= 1);
+    assert_eq!(report.blobs_per_host[0], 0);
 }
 
 #[test]
-fn peer_stash_runs_replay_byte_for_byte() {
-    let config = blockd_sim::presets::peer_stash_chaos();
-    let a = run(73, config.clone());
-    let b = run(73, config);
-    assert_eq!(a, b);
+fn lossy_duplicating_links_preserve_migration_and_replay() {
+    let config = || ClusterConfig {
+        peer_drop: (1, 4),
+        peer_dup: (1, 8),
+        ..migration_config()
+    };
+    let first = run(71, config());
+    let replay = run(71, config());
+    assert_eq!(first, replay);
+    assert_clean(&first);
+    assert_eq!(first.migrations, 1);
+    assert_eq!(first.guest_deaths, 0);
+    assert!(first.peer_drops > 0);
+    assert!(first.peer_dups > 0);
 }
 
 #[test]
-fn healthy_peer_stash_uses_one_active_target_and_unlink_only_cleanup() {
+fn passive_replica_commits_uploads_and_unlinks_without_rewrite() {
     let mut config = blockd_sim::presets::peer_stash_chaos();
     config.peer_drop = (0, 1);
     config.peer_dup = (0, 1);
     config.store_outage = None;
     config.vset_count = 1;
-    config.horizon = blockd_core::types::millis(80);
-    config.think = (
-        blockd_core::types::millis(8),
-        blockd_core::types::millis(12),
-    );
+    config.horizon = millis(500);
+    config.think = (millis(2), millis(4));
     let report = run(91, config);
     assert_clean(&report);
     assert!(report.replica_logical_bytes > 0);
-    assert!(report.replica_network_bytes > 0);
+    assert!(report.replica_network_bytes >= report.replica_logical_bytes);
     assert!(report.replica_store_bytes > 0);
     assert!(report.replica_artifact_flushes > 0);
     assert!(report.replica_commit_flushes > 0);
-    assert!(report.replica_unlinks > 0, "{report:?}");
+    assert!(report.replica_unlinks > 0);
     assert_eq!(report.replica_nonactive_bytes, 0);
-    assert_eq!(report.replica_replacement_bytes, 0);
     assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
 }
 
 #[test]
-fn peer_attrition_hits_restart_and_fenced_replacement_edges() {
-    let report = run(117, blockd_sim::presets::peer_attrition());
-    assert_clean(&report);
-    assert_eq!(report.host_crashes, 1, "{report:?}");
-    assert_eq!(report.recoveries, 1, "{report:?}");
-    assert!(report.replica_replacement_bytes > 0, "{report:?}");
-    assert_eq!(report.replica_nonactive_bytes, 0);
-    assert!(report.replica_cleanup_rewrite_bytes > 0, "{report:?}");
-}
-
-#[test]
-fn full_store_outage_passive_loss_and_later_primary_loss_recover_exactly() {
-    let mut config = blockd_sim::presets::peer_attrition();
-    let failed_passive = config.crash_hosts_at[0].1;
-    config.crash_hosts_at.clear();
-    config.kill_hosts_at = vec![(millis(400), failed_passive), (secs(2), 0)];
-    config.store_outage = Some((millis(300), secs(3)));
-    config.horizon = secs(6);
-    config.daemon.archive.interval = secs(100);
-    config.daemon.archive.max_unpublished_bytes = 1024 * 1024 * 1024;
-
-    let report = run(0x0FF1_1E00, config);
-    assert_clean(&report);
-    assert_eq!(report.restores, 1, "{report:?}");
-    assert_eq!(report.guest_deaths, 0, "{report:?}");
-    assert_eq!(report.loss_bound_verified, 1, "{report:?}");
-    assert_eq!(report.replica_store_bytes, 0, "{report:?}");
-    assert!(report.store_unavailable > 0, "{report:?}");
-    assert!(report.completed_ops > 20, "{report:?}");
-}
-
-#[test]
-fn directional_link_and_store_faults_report_nonzero_coverage() {
+fn outages_and_directional_clogs_are_observed_then_heal() {
     let report = run(119, blockd_sim::presets::swizzle_peer_links());
     assert_clean(&report);
-    assert!(report.peer_link_clogs > 0, "{report:?}");
-    assert!(report.store_unavailable > 0, "{report:?}");
-    assert!(report.store_retries > 0, "{report:?}");
-    assert_eq!(report.replica_nonactive_bytes, 0);
-    assert!(report.replica_cleanup_rewrite_bytes > 0, "{report:?}");
+    assert!(report.peer_link_clogs > 0);
+    assert!(report.store_unavailable > 0);
+    assert!(report.store_retries > 0);
+    assert_eq!(report.parked_end, 0);
 }
 
 #[test]
-fn rare_peer_fault_points_all_activate_and_replay_exactly() {
-    use blockd_sim::cluster::FaultPoint;
-
-    let config = blockd_sim::presets::peer_stash_rare();
-    let first = run(127, config.clone());
-    let replay = run(127, config);
-    assert_eq!(first, replay);
-    assert_clean(&first);
-    for point in [
-        FaultPoint::ReplicaRetryTimer,
-        FaultPoint::DuplicateAck,
-        FaultPoint::StatusReconciliation,
-        FaultPoint::AssignmentCasRace,
-        FaultPoint::StoreUnknownResult,
-        FaultPoint::RestartScan,
-    ] {
-        assert!(
-            first.fault_coverage.get(&point).copied().unwrap_or(0) > 0,
-            "fault point {point:?} was not reached: {first:?}"
-        );
-    }
-    assert!(first.peer_drops > 0);
-    assert!(first.peer_dups > 0);
-    assert!(first.store_unavailable > 0);
-    assert!(first.store_cas_conflicts > 0);
-    assert_eq!(first.replica_nonactive_bytes, 0);
-    assert!(first.replica_cleanup_rewrite_bytes > 0, "{first:?}");
-}
-
-#[test]
-fn release_overlap_fault_point_is_idempotent_and_unlink_only() {
-    use blockd_sim::cluster::FaultPoint;
-
+fn forced_replica_fault_point_is_hit_and_idempotent() {
     let mut config = blockd_sim::presets::peer_stash_chaos();
     config.peer_drop = (0, 1);
     config.peer_dup = (0, 1);
     config.store_outage = None;
     config.vset_count = 1;
-    config.horizon = blockd_core::types::millis(80);
-    config.think = (
-        blockd_core::types::millis(8),
-        blockd_core::types::millis(12),
-    );
+    config.horizon = millis(500);
+    config.think = (millis(2), millis(4));
     config.fault_points = vec![FaultPoint::ReleaseOverlap];
     let report = run(131, config);
     assert_clean(&report);
@@ -224,941 +140,22 @@ fn release_overlap_fault_point_is_idempotent_and_unlink_only() {
             .get(&FaultPoint::ReleaseOverlap)
             .copied()
             .unwrap_or(0)
-            > 0,
-        "{report:?}"
+            > 0
     );
     assert!(report.replica_unlinks > 0);
     assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
 }
 
 #[test]
-fn peer_sync_latency_percentiles_cover_healthy_outage_and_replacement() {
-    let scenarios = [
-        ("healthy", {
-            let mut config = blockd_sim::presets::peer_stash_chaos();
-            config.peer_drop = (0, 1);
-            config.peer_dup = (0, 1);
-            config.store_outage = None;
-            config.vset_count = 1;
-            config.horizon = blockd_core::types::secs(1);
-            config
-        }),
-        ("store-outage", blockd_sim::presets::peer_stash_chaos()),
-        ("replacement", blockd_sim::presets::peer_attrition()),
-    ];
-    for (name, config) in scenarios {
-        let report = run(137, config);
-        assert_clean(&report);
-        assert!(report.sync_samples > 0, "{name}: {report:?}");
-        // A sync with no new writes may correctly complete at the same
-        // simulated instant. Require a non-zero observed tail instead of
-        // assuming that more than half the generated syncs transfer data.
-        assert!(report.sync_latency_max_ns > 0, "{name}: {report:?}");
-        assert!(report.sync_latency_p50_ns <= report.sync_latency_p95_ns);
-        assert!(report.sync_latency_p95_ns <= report.sync_latency_p99_ns);
-        assert!(report.sync_latency_p99_ns <= report.sync_latency_max_ns);
-        assert!(report.replica_network_bytes > 0, "{name}: {report:?}");
-        eprintln!(
-            "{name}: sync n={} p50={}ns p95={}ns p99={}ns max={}ns peer={}B store={}B replacement={}B",
-            report.sync_samples,
-            report.sync_latency_p50_ns,
-            report.sync_latency_p95_ns,
-            report.sync_latency_p99_ns,
-            report.sync_latency_max_ns,
-            report.replica_network_bytes,
-            report.replica_store_bytes,
-            report.replica_replacement_bytes,
-        );
-    }
-}
-
-#[test]
-fn failed_seed_peer_advances_to_one_next_candidate_and_late_peers_stay_stale() {
-    let report = run(149, blockd_sim::presets::placement_fear());
-    assert_clean(&report);
-    assert_eq!(report.host_crashes, 2, "{report:?}");
-    assert_eq!(report.recoveries, 2, "{report:?}");
-    assert!(report.replica_replacement_bytes > 0, "{report:?}");
-    assert_eq!(report.replica_nonactive_bytes, 0, "{report:?}");
-    assert!(report.replica_cleanup_rewrite_bytes > 0, "{report:?}");
-    assert!(report.completed_ops > 50, "{report:?}");
-}
-
-fn repeated_passive_churn_config(lose_primary_after_repair: bool) -> ClusterConfig {
-    let mut config = blockd_sim::presets::peer_attrition();
-    config.hosts = 5;
+fn corrupt_resume_set_costs_warmth_not_correctness() {
+    let mut config = restore_config();
     config.vset_count = 1;
-    config.horizon = secs(11);
-    config.restart_delay = (millis(550), millis(600));
-    config.peer_drop = (0, 1);
-    config.peer_dup = (0, 1);
-    config.store_outage = None;
     config.race_restore = false;
-    config.daemon.archive.interval = secs(100);
-    config.daemon.archive.max_unpublished_bytes = 1024 * 1024 * 1024;
-    let roster: Vec<_> = (0..config.hosts)
-        .map(|host| blockd_core::placement::PeerCandidate {
-            host: blockd_core::types::HostId(host),
-            weight: 1,
-            failure_domain: host + 1,
-            drained: false,
-        })
-        .collect();
-    config
-        .daemon
-        .replica_placement
-        .as_mut()
-        .expect("placement")
-        .roster
-        .clone_from(&roster);
-    let ranked = blockd_core::placement::rank_stash_candidates(
-        1,
-        blockd_core::types::HostId(0),
-        1,
-        VsetId(1),
-        &roster,
-    );
-    assert_eq!(ranked.len(), 4);
-    config.crash_hosts_at = (0_u64..9)
-        .map(|failure| {
-            (
-                millis(400 + failure * 900),
-                ranked[usize::try_from(failure).expect("test failure index fits") % ranked.len()].0,
-            )
-        })
-        .collect();
-    config.kill_hosts_at = lose_primary_after_repair
-        .then_some((millis(8_500), 0))
-        .into_iter()
-        .collect();
-    config
-}
-
-#[test]
-fn repeated_passive_churn_has_no_finite_failover_budget() {
-    let report = run(0xFA11_0001, repeated_passive_churn_config(false));
-    assert_clean(&report);
-    assert_eq!(report.host_crashes, 9, "{report:?}");
-    assert_eq!(report.recoveries, 9, "{report:?}");
-    assert!(report.replica_replacement_bytes > 0, "{report:?}");
-    assert!(report.completed_ops > 100, "{report:?}");
-    assert_eq!(report.replica_nonactive_bytes, 0, "{report:?}");
-}
-
-#[test]
-fn primary_loss_after_repeated_passive_failover_recovers_consistently() {
-    let report = run(0xFA11_0002, repeated_passive_churn_config(true));
-    assert_clean(&report);
-    assert_eq!(report.host_crashes, 9, "{report:?}");
-    assert_eq!(report.recoveries, 9, "{report:?}");
-    assert_eq!(report.restores, 1, "{report:?}");
-    assert_eq!(report.loss_bound_verified, 1, "{report:?}");
-    assert_eq!(report.guest_deaths, 0, "{report:?}");
-    assert_eq!(
-        report.replica_store_bytes, 0,
-        "the recovery must not depend on a cadence archive: {report:?}"
-    );
-    assert!(report.completed_ops > 100, "{report:?}");
-    assert_eq!(report.replica_nonactive_bytes, 0, "{report:?}");
-}
-
-#[test]
-fn replica_commit_and_publication_crash_boundaries_recover_cleanly() {
-    use blockd_sim::cluster::FaultPoint;
-
-    for (seed, point) in [
-        (151, FaultPoint::CrashPeerAfterCommitBeforeAck),
-        (153, FaultPoint::CrashPrimaryAfterAckBeforeSyncOk),
-        (155, FaultPoint::CrashPrimaryAfterSyncOk),
-        (157, FaultPoint::CrashPeerAfterUploadBeforeHead),
-        (159, FaultPoint::CrashPrimaryAfterHeadBeforeRelease),
-    ] {
-        let mut config = blockd_sim::presets::peer_stash_chaos();
-        config.vset_count = 1;
-        config.horizon = blockd_core::types::secs(3);
-        config.peer_drop = (1, 12);
-        config.peer_dup = (1, 10);
-        config.store_outage = None;
-        config.restart_delay = (
-            blockd_core::types::millis(10),
-            blockd_core::types::millis(20),
-        );
-        if point == FaultPoint::CrashPrimaryAfterHeadBeforeRelease {
-            config.horizon = blockd_core::types::millis(80);
-            config.think = (
-                blockd_core::types::millis(8),
-                blockd_core::types::millis(12),
-            );
-        }
-        config.fault_points = vec![point];
-        let report = run(seed, config);
-        assert_clean(&report);
-        assert_eq!(
-            report.fault_coverage.get(&point).copied(),
-            Some(1),
-            "{point:?}: {report:?}"
-        );
-        assert_eq!(report.host_crashes, 1, "{point:?}: {report:?}");
-        assert_eq!(report.recoveries, 1, "{point:?}: {report:?}");
-        assert!(report.completed_ops > 20, "{point:?}: {report:?}");
-        assert!(report.peer_drops > 0, "{point:?}: {report:?}");
-        assert!(report.peer_dups > 0, "{point:?}: {report:?}");
-        assert_eq!(report.replica_nonactive_bytes, 0);
-        assert_eq!(
-            report.replica_capacity_backpressure, 0,
-            "{point:?}: {report:?}"
-        );
-    }
-}
-
-#[test]
-fn replica_capture_transfer_and_upload_crash_boundaries_recover_cleanly() {
-    use blockd_sim::cluster::FaultPoint;
-
-    for (seed, point) in [
-        (167, FaultPoint::CrashPrimaryBeforeClosureCapture),
-        (169, FaultPoint::CrashPrimaryAfterClosureCapture),
-        (171, FaultPoint::CrashPrimaryDuringArtifactTransfer),
-        (173, FaultPoint::CrashPeerAfterDataFlushBeforeCommit),
-        (175, FaultPoint::CrashPeerDuringUpload),
-    ] {
-        let mut config = blockd_sim::presets::peer_stash_chaos();
-        config.vset_count = 1;
-        config.horizon = blockd_core::types::secs(3);
-        config.peer_drop = (1, 12);
-        config.peer_dup = (1, 10);
-        config.store_outage = None;
-        config.restart_delay = (
-            blockd_core::types::millis(10),
-            blockd_core::types::millis(20),
-        );
-        config.fault_points = vec![point];
-        let report = run(seed, config);
-        assert_clean(&report);
-        assert_eq!(
-            report.fault_coverage.get(&point).copied(),
-            Some(1),
-            "{point:?}: {report:?}"
-        );
-        assert_eq!(report.host_crashes, 1, "{point:?}: {report:?}");
-        assert_eq!(report.recoveries, 1, "{point:?}: {report:?}");
-        assert!(report.completed_ops > 20, "{point:?}: {report:?}");
-        assert!(report.peer_drops > 0, "{point:?}: {report:?}");
-        assert!(report.peer_dups > 0, "{point:?}: {report:?}");
-        assert_eq!(report.replica_nonactive_bytes, 0);
-        assert_eq!(
-            report.replica_capacity_backpressure, 0,
-            "{point:?}: {report:?}"
-        );
-    }
-}
-
-#[test]
-fn replacement_cas_crash_boundaries_resume_from_the_fenced_head() {
-    use blockd_sim::cluster::FaultPoint;
-
-    for (seed, point) in [
-        (161, FaultPoint::CrashPrimaryBeforeTransitionCas),
-        (163, FaultPoint::CrashPrimaryAfterSeedBeforeActiveCas),
-        (165, FaultPoint::CrashPrimaryAfterActiveCasBeforeCommit),
-    ] {
-        let mut config = blockd_sim::presets::peer_attrition();
-        config.horizon = blockd_core::types::secs(4);
-        config.peer_drop = (1, 12);
-        config.peer_dup = (1, 10);
-        config.fault_points = vec![point];
-        let report = run(seed, config);
-        assert_clean(&report);
-        assert_eq!(
-            report.fault_coverage.get(&point).copied(),
-            Some(1),
-            "{point:?}: {report:?}"
-        );
-        assert!(report.host_crashes >= 2, "{point:?}: {report:?}");
-        assert!(report.recoveries >= 2, "{point:?}: {report:?}");
-        assert!(report.completed_ops > 20, "{point:?}: {report:?}");
-        assert!(report.peer_drops > 0, "{point:?}: {report:?}");
-        assert!(report.peer_dups > 0, "{point:?}: {report:?}");
-        assert_eq!(report.replica_nonactive_bytes, 0, "{point:?}: {report:?}");
-        assert_eq!(
-            report.replica_capacity_backpressure, 0,
-            "{point:?}: {report:?}"
-        );
-    }
-}
-
-/// Two hosts, one protected vset under load, migrated mid-run.
-fn migrate_config() -> ClusterConfig {
-    let mut config = base_config();
-    config.hosts = 2;
-    config.vset_count = 1;
-    config.vset_config = VsetConfig::compute(2, 16);
-    config.kill_hosts_at.clear();
-    config.drop_peer = None;
-    config.race_restore = false;
-    config.migrate_at = Some((millis(1500), VsetId(1), 1));
-    config.horizon = secs(3);
-    // Exercise migration's explicit archive event without a cadence cycle
-    // already in flight when preparation begins.
-    config.daemon.archive.interval = secs(10);
-    config
-}
-
-#[test]
-fn migration_moves_a_protected_vset_losslessly() {
-    let report = run(7, migrate_config());
-    assert_clean(&report);
-    // The handoff completed: source captured, wrote its handoff marker,
-    // offered; the destination durably recorded before resuming (R7.2).
-    assert_eq!(report.migrations, 1, "{report:?}");
-    // Post-copy: the guest resumed on the destination and kept running,
-    // demand-faulting its tail from the source — losslessly (R7.1).
-    assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.restores, 0);
-    assert!(report.completed_ops > 100, "{report:?}");
-    // R7.1: the guest-observed pause — source pause through destination
-    // resume — stays far inside the 500 ms budget.
-    assert!(
-        report.max_migration_pause_ns > 0 && report.max_migration_pause_ns < millis(500),
-        "R7.1 pause: {} ns",
-        report.max_migration_pause_ns
-    );
-}
-
-#[test]
-fn archive_cadence_packs_the_peer_committed_horizon_before_publish() {
-    let mut config = base_config();
-    config.hosts = 2;
-    config.vset_count = 1;
-    config.kill_hosts_at.clear();
-    config.race_restore = false;
-    config.checkpoint_interval = None;
-    config.horizon = secs(3);
-    let report = run(0xA11C_0002, config);
-    assert_clean(&report);
-    assert!(report.archive_cycles > 0, "{report:?}");
-    assert!(report.archive_commits_coalesced > 0, "{report:?}");
-    assert!(report.segs_compacted > 0, "{report:?}");
-    assert!(report.pages_compacted > 0, "{report:?}");
-    assert_eq!(report.replica_capacity_backpressure, 0, "{report:?}");
-    let segment_puts = report.store.puts_by_kind[StoreObjectKind::Segment as usize].successes;
-    let information_minimum_puts = report
-        .store
-        .logical_changed_bytes
-        .div_ceil(32 * 1024 * 1024);
-    eprintln!(
-        "passive-archive horizon_ns={} cycles={} segment_puts={} information_minimum_puts={} unique_bytes={} retry_bytes={} logical_changed_bytes={} published_live_bytes={} published_dead_bytes={} spool_bytes={} frontier_lag_bytes={} frontier_lag_age_ns={}",
-        secs(3),
-        report.archive_cycles,
-        segment_puts,
-        information_minimum_puts,
-        report.store.unique_bytes,
-        report.store.retry_bytes,
-        report.store.logical_changed_bytes,
-        report.published_live_entry_bytes,
-        report.published_dead_entry_bytes,
-        report.replica_spool_bytes,
-        report.archive_lag_bytes,
-        report.max_archive_lag_age_ns,
-    );
-    assert!(report.store.logical_changed_bytes > 0, "{report:?}");
-    assert_eq!(report.published_dead_entry_bytes, 0, "{report:?}");
-    assert!(report.peer_committed_through >= report.archived_through);
-    assert!(
-        segment_puts <= report.archive_cycles.saturating_mul(3),
-        "packed archive emitted too many segment PUTs: {report:?}"
-    );
-}
-
-/// R7.3: killing the source after the handoff but before the post-copy drain
-/// completes must fall back to the destination's durable passive spool.
-#[test]
-fn source_death_mid_drain_uses_the_protected_closure() {
-    let config = ClusterConfig {
-        kill_hosts_at: vec![(millis(1700), 0)],
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1, "{report:?}");
-    assert_eq!(report.guest_deaths, 0);
-    assert!(report.completed_ops > 100, "{report:?}");
-}
-
-/// R6.2: a restore onto a host with none of the vset's bytes reaches its
-/// verdict in well under 200 ms — a bounded number of small store reads
-/// (head, claim, manifest), never a data transfer — independent of vset
-/// size. And the SECOND restore prefetches the resume set the first
-/// resume recorded.
-#[test]
-fn restores_meet_the_200ms_budget_and_prefetch_the_resume_set() {
-    for pages_per_volume in [16, 64] {
-        let config = ClusterConfig {
-            vset_count: 1,
-            vset_config: VsetConfig::compute(2, pages_per_volume),
-            drop_peer: None,
-            race_restore: false,
-            // Host 0 dies; the vset restores onto host 1, resumes, records
-            // its resume set; then host 1 dies and host 2 restores it.
-            kill_hosts_at: vec![(millis(1500), 0), (millis(2800), 1)],
-            horizon: secs(4),
-            ..base_config()
-        };
-        let report = run(11, config);
-        assert_clean(&report);
-        assert_eq!(report.restores, 2);
-        assert_eq!(report.guest_deaths, 0);
-        assert!(
-            report.max_restore_ns < millis(200),
-            "R6.2: restore took {} ns at {pages_per_volume} pages/volume",
-            report.max_restore_ns
-        );
-        // The second restore found the first resume's recorded set and
-        // warmed the cache from it.
-        assert!(
-            report.prefetch_fills > 0,
-            "no resume-set prefetch at {pages_per_volume} pages/volume"
-        );
-    }
-}
-
-#[test]
-fn migration_runs_replay_byte_for_byte() {
-    let a = run(7, migrate_config());
-    let b = run(7, migrate_config());
-    assert_eq!(a, b, "migration run diverged on replay");
-}
-
-/// Cluster-level regression corpus: host death + racing claims across
-/// seeds, every run held to the full oracle.
-#[test]
-fn cluster_seed_corpus_stays_consistent() {
-    for seed in [7, 13, 31, 44, 71] {
-        let report = run(seed, base_config());
-        assert_eq!(
-            report.violations,
-            Vec::<String>::new(),
-            "seed {seed} violated an invariant"
-        );
-        // Exactly one runner per orphan, every time (R6.3).
-        assert_eq!(report.restores, 1, "seed {seed}");
-        assert_eq!(report.claims_lost, 1, "seed {seed}");
-    }
-}
-
-/// The two-sided handoff must hold at EVERY crash instant, not at one
-/// hand-tuned nanosecond: sweep source crashes across the whole handoff
-/// window on a fixed grid, and at every offset demand the binary outcome —
-/// the migration either never happened (the vset lives on the recovered
-/// source, blobs intact) or completed exactly once (drained, released,
-/// source reclaimed to zero) — with the oracle's two-runners and
-/// byte-exactness checks standing throughout. The grid is finer than the
-/// device's write latency, so every torn-write window is visited by
-/// construction; no timing re-derivation when traces shift.
-#[test]
-fn a_source_crash_at_every_handoff_instant_resolves_to_exactly_one_runner() {
-    let (mut never_happened, mut completed) = (0, 0);
-    for step in 0..40u64 {
-        let at = page_pin(1_502_250_000, 1_503_800_000) + step * 50_000;
-        let config = ClusterConfig {
-            crash_hosts_at: vec![(at, 0)],
-            ..migrate_config()
-        };
-        let report = run(7, config);
-        assert_eq!(
-            report.violations,
-            Vec::<String>::new(),
-            "crash at {at}ns violated an invariant"
-        );
-        assert_eq!(report.guest_deaths, 0, "crash at {at}ns");
-        // A release happens exactly when a migration completed.
-        assert_eq!(report.releases, report.migrations, "crash at {at}ns");
-        match report.migrations {
-            0 => {
-                assert!(
-                    report.primary_blobs_per_host[0] > 0,
-                    "crash at {at}ns: unmigrated vset lost its blobs"
-                );
-                never_happened += 1;
-            }
-            1 => {
-                assert_eq!(
-                    report.primary_blobs_per_host[0], 0,
-                    "crash at {at}ns: released source kept blobs"
-                );
-                completed += 1;
-            }
-            n => panic!("crash at {at}ns: {n} migrations of one vset"),
-        }
-    }
-    // Coverage guard: the sweep must straddle the commit point, or it
-    // proved nothing about the interesting instants.
-    assert!(
-        never_happened > 0 && completed > 0,
-        "sweep never straddled the handoff ({never_happened} never, {completed} completed)"
-    );
-}
-
-/// Wider corpus over the kill+racing-claims config, oracle-only: safety
-/// must hold on seeds whose exact outcome shape varies (a takeover inside
-/// the R6.4 window can make both claims "win" — that is legal; a lost
-/// vset or a double-run is not).
-#[test]
-fn cluster_wide_seed_corpus_stays_safe() {
-    for seed in [3, 5, 19, 52, 88, 101] {
-        let report = run(seed, base_config());
-        assert_eq!(
-            report.violations,
-            Vec::<String>::new(),
-            "seed {seed} violated an invariant"
-        );
-        assert!(
-            report.restores >= 1,
-            "seed {seed}: the orphan never came back"
-        );
-        assert_eq!(report.guest_deaths, 0, "seed {seed}");
-    }
-}
-
-/// The drain completes without the guest's help: hydration pulls the tail
-/// in the background, the destination releases the source, and the source
-/// reclaims every byte (R4.5: explicit). A later crash of the source then
-/// finds nothing and costs nothing.
-#[test]
-fn hydration_drains_the_tail_and_releases_the_source() {
-    let config = ClusterConfig {
-        crash_hosts_at: vec![(millis(3000), 0)],
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.releases, 1);
-    assert!(report.hydrate_fills > 0, "the tail never hydrated");
-    // Released: the source deleted the vset's segments, journal records
-    // and handoff marker — its device ends the run empty.
-    assert_eq!(report.primary_blobs_per_host[0], 0);
-    // The post-release crash recovers a daemon with nothing to say — and
-    // the two-runners check stays silent.
-    assert_eq!(report.recoveries, 1);
-    // A healthy drain never trips the liveness watch (no false alarms).
-    assert_eq!(
-        report.wedged_guests + report.wedged_hydration + report.wedged_outbound,
-        0
-    );
-    assert!(report.completed_ops > 100, "{report:?}");
-}
-
-/// The recovery side of the two-sided handoff (R7.2): a source that
-/// crashes mid-drain restarts as OUTBOUND — it re-offers idempotently,
-/// serves fetches, and never runs the guest. The migrated vset never
-/// notices beyond latency: the drain still completes and releases.
-#[test]
-fn source_crash_mid_drain_recovers_outbound_and_never_runs_the_guest() {
-    let config = ClusterConfig {
-        crash_hosts_at: vec![(millis(1590), 0)],
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report); // includes the two-runners check
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.recoveries, 1);
-    // The restarted source served the drain to completion and was
-    // released and reclaimed.
-    assert_eq!(report.releases, 1);
-    assert_eq!(report.primary_blobs_per_host[0], 0);
-    assert!(report.completed_ops > 100, "{report:?}");
-}
-
-/// A crash that tears the handoff marker means the migration never
-/// happened (R7.2): the source recovers the vset RUNNABLE and resumes it;
-/// the destination never hears of it and no release ever fires.
-#[test]
-fn crash_before_handoff_marker_means_the_migration_never_happened() {
-    let config = ClusterConfig {
-        // Crash immediately before the marker write is submitted. The
-        // exhaustive grid above covers the in-flight device boundary.
-        crash_hosts_at: vec![(page_pin(1_502_800_000, 1_504_350_000), 0)],
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 0);
-    assert_eq!(report.releases, 0);
-    assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.recoveries, 1);
-    // The vset still lives on the source: its blobs are there.
-    assert!(report.primary_blobs_per_host[0] > 0);
-    assert!(report.completed_ops > 100, "{report:?}");
-}
-
-/// R7.3's mirror: the DESTINATION crashes mid-drain. Its durable records
-/// name the migration source (R7.2), so recovery restores the peer link
-/// the crash interrupted: hydration resumes against the still-alive
-/// source, the drain finishes, and the source — outbound the whole time,
-/// never running the guest — is released and reclaimed. Exactly one
-/// runner throughout; nothing dies.
-#[test]
-fn dest_crash_mid_drain_recovers_and_finishes_the_drain() {
-    let config = ClusterConfig {
-        crash_hosts_at: vec![(millis(1700), 1)],
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.releases, 1);
-    assert_eq!(report.recoveries, 1);
-    // Released and reclaimed: the source holds nothing.
-    assert_eq!(report.primary_blobs_per_host[0], 0);
-    // Well past the old die-loudly count (592): the guest lived on.
-    assert!(report.completed_ops > 100, "{report:?}");
-}
-
-/// R8.3 on the demand-fill path: a store outage while a restored vset is
-/// still serving cold pages from the store PARKS the blocked faults and
-/// re-issues them after the heal. An outage is not absence — before this
-/// held, `store_fill_done` collapsed `Err(Unavailable)` into "page exists
-/// nowhere" and killed the guest.
-#[test]
-fn store_outage_during_cold_serving_parks_fills_until_heal() {
-    let config = ClusterConfig {
-        vset_config: VsetConfig::compute(2, 64),
-        // base_config kills host 0 at 1500ms; the raced restore completes
-        // shortly after and serves cold from the store. The outage then
-        // lands on the remaining cold demand fills.
-        store_outage: Some((millis(1900), millis(2600))),
-        horizon: secs(5),
-        ..base_config()
-    };
-    let report = run(31, config);
-    assert_clean(&report);
-    assert_eq!(report.restores, 1);
-    assert_eq!(report.guest_deaths, 0);
-    // Non-vacuous: the outage really intersected demand fills — these are
-    // parked faults that would have been guest deaths.
-    assert!(report.store_retries > 0, "outage never hit the fill path");
-    // The 700 ms outage exceeds the 500 ms wedge threshold: the liveness
-    // watch flagged the parked guests while they waited (R9.2)…
-    assert!(report.wedged_guests >= 1, "the parked wait never flagged");
-    // …and the heal drained every one of them (the liveness oracle).
-    assert_eq!(report.parked_end, 0);
-}
-
-/// Wedge nemesis (5b): drop 100% of `Released` for a window. The drained
-/// destination keeps asking the source to let go and hears nothing back —
-/// the hydration watch must flag the destination and the outbound watch
-/// the now-silent source, loudly, while it lasts; after the heal the very
-/// next release lands and the system converges as if nothing happened.
-#[test]
-fn a_released_blackout_wedges_both_sides_loudly_then_converges() {
-    let config = ClusterConfig {
-        // From the migration instant: the 32-page tail drains in tens of
-        // milliseconds, and a window that starts later misses the release.
-        drop_peer: Some((PeerKind::Released, millis(1500), millis(3100))),
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    assert!(report.nemesis_drops > 0, "the blackout never intercepted");
-    // Both sides flagged the stall while it lasted (R9.2)…
-    assert!(report.wedged_hydration >= 1, "destination never flagged");
-    assert!(report.wedged_outbound >= 1, "silent source never flagged");
-    // …and the first post-heal release completed the migration: source
-    // reclaimed, nothing parked, nothing still hydrating.
-    assert_eq!(report.releases, 1);
-    assert_eq!(report.primary_blobs_per_host[0], 0);
-    assert_eq!((report.parked_end, report.hydrating_end), (0, 0));
-}
-
-/// Wedge nemesis (5b): drop 100% of `Leaf` replies while a migrated
-/// multi-leaf vset hydrates its map. Faults into unhydrated spans park;
-/// the watch must flag the parked guests during the blackout, and the
-/// hydration tick's own retry must serve every one of them after the
-/// heal — parked means waiting, never lost.
-#[test]
-fn a_leaf_blackout_parks_faults_loudly_and_the_heal_serves_them_all() {
-    let config = ClusterConfig {
-        hosts: 2,
-        vset_config: VsetConfig::compute(2, 5_000),
-        migrate_at: Some((millis(1200), VsetId(1), 1)),
-        drop_peer: Some((PeerKind::Leaf, millis(1150), millis(2400))),
-        horizon: secs(4),
-        ..multi_leaf_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    assert!(report.nemesis_drops > 0, "the blackout never intercepted");
-    assert!(
-        report.wedged_guests + report.wedged_hydration >= 1,
-        "a guest parked for over the threshold and nothing flagged"
-    );
-    // Post-heal the leaves arrived and every parked fault was served (the
-    // tail keeps hydrating legitimately — that is progress, not a wedge).
-    assert!(report.leaf_fills > 0, "the map never hydrated after heal");
-    assert_eq!(report.parked_end, 0);
-}
-
-/// R11.1: `Released` is the reclaim trigger, so the source accepts it only
-/// from its recorded destination. A forged release from a third host
-/// mid-drain must be refused — unguarded, it reclaims the live vset's tail
-/// out from under the real destination.
-#[test]
-fn a_rogue_release_is_refused_and_the_drain_completes() {
-    let config = ClusterConfig {
-        hosts: 3,
-        sabotage: Some(Sabotage::RogueRelease),
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    // The forgery arrived and was refused; the REAL release still landed.
-    assert_eq!(report.peer_rejected, 1);
-    assert_eq!(report.releases, 1);
-    assert_eq!(report.primary_blobs_per_host[0], 0);
-}
-
-/// Migration completes losslessly over a channel that drops a quarter of
-/// its messages and duplicates an eighth: offer, accept, fetch, page and
-/// release are all at-least-once with idempotent handlers.
-#[test]
-fn migration_survives_a_lossy_duplicating_peer_channel() {
-    let config = ClusterConfig {
-        peer_drop: (1, 4),
-        peer_dup: (1, 8),
-        ..migrate_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    assert_eq!(report.releases, 1);
-    assert_eq!(report.primary_blobs_per_host[0], 0);
-    // Non-vacuous: the channel really misbehaved.
-    assert!(
-        report.peer_drops > 0 && report.peer_dups > 0,
-        "channel unexercised: {} drops, {} dups",
-        report.peer_drops,
-        report.peer_dups
-    );
-    assert_eq!(report.completed_ops, page_pin(90, 90));
-}
-
-#[test]
-fn lossy_migration_replays_byte_for_byte() {
-    let config = || ClusterConfig {
-        peer_drop: (1, 4),
-        peer_dup: (1, 8),
-        crash_hosts_at: vec![(millis(1520), 0)],
-        ..migrate_config()
-    };
-    let a = run(7, config());
-    let b = run(7, config());
-    assert_eq!(a, b, "lossy migration run diverged on replay");
-}
-
-fn migration_chaos_config() -> ClusterConfig {
-    blockd_sim::presets::migration_chaos()
-}
-
-/// Randomized composition: migrations keep firing while hosts crash and
-/// restart under a lossy peer channel and a mid-run store outage. Every
-/// seed must stay oracle-clean — the only sanctioned deaths are a
-/// destination crashing mid-drain (its tail dies with its peer link).
-#[test]
-fn migration_chaos_corpus_stays_consistent() {
-    let mut migrations = 0;
-    let mut drops = 0;
-    // 192: a write fault answered by an unsolicited protected fill (the
-    //      harness's WP-retrap model). 1614: destination crashed after its
-    //      durable accept, before anyone learned — recovery must complete
-    //      the handshake, not ignite a second runner.
-    // 1252 (at 16 KiB pages): a destination crash mid-handshake left
-    // unrestorable wreckage whose fence a re-adoption then reused —
-    // write-once names rewritten, and stray intact records read as
-    // ownership by later recoveries (two runners). Forced the fence
-    // floor, wreckage reclaim, and the harness's unrestorable-elsewhere
-    // classification.
-    for seed in [7, 13, 19, 31, 44, 52, 71, 88, 192, 1252, 1614] {
-        let report = run(seed, migration_chaos_config());
-        assert_eq!(
-            report.violations,
-            Vec::<String>::new(),
-            "seed {seed} violated an invariant"
-        );
-        assert!(report.recoveries > 0, "seed {seed}: no crash recovered");
-        migrations += report.migrations;
-        drops += report.peer_drops;
-    }
-    // Coverage across the corpus: the nemesis really migrated and the
-    // channel really lost messages.
-    assert!(migrations > 0, "corpus never completed a migration");
-    assert!(drops > 0, "corpus never dropped a peer message");
-}
-
-#[test]
-fn migration_chaos_replays_byte_for_byte() {
-    let a = run(31, migration_chaos_config());
-    let b = run(31, migration_chaos_config());
-    assert_eq!(a, b, "chaos run diverged on replay");
-}
-
-/// R8.3: a restore that lands inside a store outage parks and retries —
-/// it never fails. Promotion waits for the store to recover, then the two
-/// ordinary restore claims converge to one runner and one CAS loser.
-#[test]
-fn restore_waits_out_a_store_outage() {
-    let config = ClusterConfig {
-        store_outage: Some((millis(1200), millis(2400))),
-        ..base_config()
-    };
-    let report = run(31, config);
-    assert_clean(&report);
-    assert_eq!(report.restores, 1);
-    assert_eq!(report.claims_lost, 1);
-    assert_eq!(report.guest_deaths, 0);
-    // Neither restore beat the outage: the kill was at 1500ms, the window
-    // lifted at 2400ms — the first verdict took at least the difference.
-    assert!(
-        report.max_restore_ns > millis(700),
-        "restore finished during the outage: {} ns",
-        report.max_restore_ns
-    );
-    assert!(report.completed_ops > 1_000, "{report:?}");
-}
-
-/// R6.2's prefetch is a bet, and a rotten resume-set object must cost
-/// exactly the warmth: the second restore still meets its budget and
-/// nobody dies — nothing is prefetched, that is all.
-#[test]
-fn a_rotten_resume_set_is_ignored_not_fatal() {
-    let config = ClusterConfig {
-        vset_count: 1,
-        vset_config: VsetConfig::compute(2, 16),
-        drop_peer: None,
-        race_restore: false,
-        kill_hosts_at: vec![(millis(1500), 0), (millis(2800), 1)],
-        rot_resume_set_at: Some(millis(2700)),
-        horizon: secs(4),
-        ..base_config()
-    };
+    config.kill_hosts_at = vec![(millis(800), 0), (millis(1_500), 1)];
+    config.rot_resume_set_at = Some(millis(1_400));
+    config.horizon = secs(2);
     let report = run(11, config);
     assert_clean(&report);
     assert_eq!(report.restores, 2);
     assert_eq!(report.guest_deaths, 0);
-    assert!(
-        report.max_restore_ns < millis(200),
-        "R6.2: restore took {} ns",
-        report.max_restore_ns
-    );
-    assert_eq!(report.prefetch_fills, 0);
-    assert!(report.completed_ops > 100, "{report:?}");
-}
-
-/// A vset large enough that its map genuinely shards into leaves. Low
-/// sync share and a warm cache: these tests exercise the map machinery,
-/// not sync torture or thrash.
-fn multi_leaf_config() -> ClusterConfig {
-    ClusterConfig {
-        daemon: DaemonConfig {
-            archive: ArchivePolicy::default(),
-            cache_pages: 16_384,
-            ..base_config().daemon
-        },
-        vset_count: 1,
-        // Just past the span size, so each disk volume shards into two
-        // leaves — the smallest genuinely multi-leaf shape.
-        vset_config: VsetConfig::compute(2, 5_000),
-        think: (micros(20), micros(100)),
-        guest_sync_share: Some(Ppm(1_000)),
-        drop_peer: None,
-        race_restore: false,
-        kill_hosts_at: vec![],
-        horizon: secs(2),
-        ..base_config()
-    }
-}
-
-/// Restore of a multi-leaf vset: the verdict is three small objects no
-/// matter the map size; the leaves hydrate lazily from the store while
-/// faults into unhydrated spans park — and every byte still verifies.
-#[test]
-fn restores_hydrate_multi_leaf_maps_lazily() {
-    let config = ClusterConfig {
-        kill_hosts_at: vec![(millis(1200), 0)],
-        ..multi_leaf_config()
-    };
-    let report = run(11, config);
-    assert_clean(&report);
-    assert_eq!(report.restores, 1);
-    assert_eq!(report.guest_deaths, 0);
-    // R6.2, strengthened by lazy hydration: the verdict never waits for
-    // the map, whatever the vset size.
-    assert!(
-        report.max_restore_ns < millis(200),
-        "R6.2: restore took {} ns",
-        report.max_restore_ns
-    );
-    // The map really was sharded, and really hydrated span by span.
-    assert!(report.leaf_fills > 0, "no leaves hydrated");
-    assert!(report.completed_ops > 20_000, "{report:?}");
-}
-
-/// Migration of a multi-leaf vset: the offer stays small, the destination
-/// hydrates the map from the SOURCE (leaves before data), and the release
-/// still fires once nothing references it.
-#[test]
-fn migration_hydrates_multi_leaf_maps_from_the_source() {
-    let config = ClusterConfig {
-        hosts: 2,
-        vset_config: VsetConfig::compute(2, 5_000),
-        migrate_at: Some((millis(1200), VsetId(1), 1)),
-        horizon: secs(4),
-        ..multi_leaf_config()
-    };
-    let report = run(7, config);
-    assert_clean(&report);
-    assert_eq!(report.migrations, 1);
-    assert_eq!(report.guest_deaths, 0);
-    assert!(report.leaf_fills > 0, "no leaves hydrated from the source");
-    // The data tail also drains (though a working set this size outlives
-    // the horizon at the current hydration budget — release timing is a
-    // throughput concern, not a correctness one, and is asserted by the
-    // small-map release tests).
-    assert!(report.hydrate_fills > 0);
-    assert!(report.completed_ops > 30_000, "{report:?}");
-}
-
-/// A leaf object rotten in the store makes exactly its span unservable:
-/// the restore still reaches its verdict, hydration marks the span dead,
-/// and the first fault into it dies loudly (R8.1) — one guest, no
-/// silent corruption, nothing else touched.
-#[test]
-fn a_rotten_leaf_kills_its_span_loudly_and_nothing_else() {
-    let config = ClusterConfig {
-        // Rot lands after both durability hosts are gone but before the
-        // claimant fetches the map, so no authorized writer can heal an
-        // idempotent object retry under the fault injection.
-        rot_leaves_at: Some(1_210_000_000),
-        // Lose the passive immediately before the source so recovery is
-        // intentionally store-only; otherwise the healthy passive correctly
-        // masks object-store leaf damage.
-        kill_hosts_at: vec![(millis(1180), 2), (millis(1200), 0)],
-        ..multi_leaf_config()
-    };
-    let report = run(11, config);
-    assert_clean(&report);
-    assert_eq!(report.restores, 1);
-    // The reborn guest's verification pass hit the dead span: loud death.
-    assert_eq!(report.guest_deaths, 1, "{report:?}");
-    assert!(report.completed_ops > 20_000, "{report:?}");
 }

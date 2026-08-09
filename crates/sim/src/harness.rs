@@ -162,8 +162,8 @@ fn actor_config(config: &HarnessConfig) -> crate::actor_harness::ActorHarnessCon
                 }
             }),
         },
-        blobs: config.bdev.clone(),
-        store: config.store.clone(),
+        blobs: config.bdev,
+        store: config.store,
         vset_count: config.vset_count,
         vset: config.vset_config,
         horizon: config.horizon,

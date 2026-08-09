@@ -1051,6 +1051,13 @@ where
             AdminIo::abort(world.as_ref(), "injected primary crash").await;
             return;
         }
+        {
+            let mut host = state.borrow_mut();
+            host.counters.replica_logical_bytes = host
+                .counters
+                .replica_logical_bytes
+                .saturating_add(bytes.len() as u64);
+        }
         let checksum = crc32c(&bytes);
         if wait_put_ack(
             &state,
@@ -1572,6 +1579,13 @@ async fn wait_put_ack<W: Peers>(
             .borrow_mut()
             .replica_put_waiters
             .insert((vset, assignment_epoch, artifact, checksum), send);
+        {
+            let mut host = state.borrow_mut();
+            host.counters.replica_network_bytes = host
+                .counters
+                .replica_network_bytes
+                .saturating_add(bytes.len() as u64);
+        }
         Peers::send(
             world,
             target,

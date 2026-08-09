@@ -3,7 +3,7 @@ use std::rc::Rc;
 use blockd_exec::channel::oneshot;
 use blockd_exec::delay;
 
-use super::state::{CacheReservation, SharedHost};
+use super::state::{CacheReservation, PageFillLease, SharedHost};
 use super::{hydrate_mapping, peer_fetch_page};
 use crate::journal::VsetKind;
 use crate::layout;
@@ -121,6 +121,7 @@ async fn serve_missing_fault<W>(
             victim: Option<PageId>,
         },
         Wait(blockd_exec::channel::OneReceiver<()>),
+        Filling(blockd_exec::channel::OneReceiver<bool>),
         Gone,
     }
 
@@ -145,7 +146,12 @@ async fn serve_missing_fault<W>(
                 let memory = vset.config.is_memory(page.volume.idx);
                 let backed = vset.config.durability.uses_store();
                 let source = vset.peer_source;
-                if let Some(victim) = host.cache.reserve_slot() {
+                if host.filling_pages.contains(&page) {
+                    let (wake, wait) = oneshot();
+                    host.page_fill_waiters.entry(page).or_default().push(wake);
+                    Slot::Filling(wait)
+                } else if let Some(victim) = host.cache.reserve_slot() {
+                    host.filling_pages.insert(page);
                     Slot::Ready {
                         location,
                         memory,
@@ -177,8 +183,13 @@ async fn serve_missing_fault<W>(
                 }
                 continue;
             }
+            Slot::Filling(wait) => {
+                let _ = wait.await;
+                return;
+            }
             Slot::Gone => return,
         };
+        let fill_lease = PageFillLease::new(&state, page);
         let reservation = CacheReservation::new(&state);
         if let Some(victim) = victim {
             GuestMem::evict(world.as_ref(), victim).await;
@@ -207,6 +218,7 @@ async fn serve_missing_fault<W>(
             }
             reservation.commit();
             GuestMem::fill(world.as_ref(), page, vec![0; page_size()], write).await;
+            fill_lease.finish(true);
             return;
         };
 
@@ -265,6 +277,7 @@ async fn serve_missing_fault<W>(
         }
         reservation.commit();
         GuestMem::fill(world.as_ref(), page, raw, write).await;
+        fill_lease.finish(true);
         return;
     }
 }

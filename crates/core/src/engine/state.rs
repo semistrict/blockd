@@ -27,6 +27,8 @@ pub struct HostState {
     pub blob_sizes: BTreeMap<String, u64>,
     pub disk_reclaim_requested: bool,
     pub pressure_waiters: VecDeque<OneSender<()>>,
+    pub filling_pages: BTreeSet<PageId>,
+    pub page_fill_waiters: BTreeMap<PageId, Vec<OneSender<bool>>>,
     pub peer_pages: BTreeMap<crate::protocol::IoId, OneSender<Option<Vec<u8>>>>,
     pub peer_leaves: BTreeMap<crate::protocol::IoId, OneSender<Option<Vec<u8>>>>,
     pub inbound_migrations: BTreeSet<VsetId>,
@@ -53,6 +55,8 @@ impl HostState {
             blob_sizes: BTreeMap::new(),
             disk_reclaim_requested: false,
             pressure_waiters: VecDeque::new(),
+            filling_pages: BTreeSet::new(),
+            page_fill_waiters: BTreeMap::new(),
             peer_pages: BTreeMap::new(),
             peer_leaves: BTreeMap::new(),
             inbound_migrations: BTreeSet::new(),
@@ -608,6 +612,46 @@ impl VsetState {
 pub struct CacheReservation {
     state: SharedHost,
     active: bool,
+}
+
+pub struct PageFillLease {
+    state: SharedHost,
+    page: PageId,
+    active: bool,
+}
+
+impl PageFillLease {
+    pub fn new(state: &SharedHost, page: PageId) -> Self {
+        Self {
+            state: Rc::clone(state),
+            page,
+            active: true,
+        }
+    }
+
+    pub fn finish(mut self, success: bool) {
+        self.active = false;
+        wake_page_fill(&self.state, self.page, success);
+    }
+}
+
+impl Drop for PageFillLease {
+    fn drop(&mut self) {
+        if self.active {
+            wake_page_fill(&self.state, self.page, false);
+        }
+    }
+}
+
+fn wake_page_fill(state: &SharedHost, page: PageId, success: bool) {
+    let waiters = {
+        let mut host = state.borrow_mut();
+        host.filling_pages.remove(&page);
+        host.page_fill_waiters.remove(&page).unwrap_or_default()
+    };
+    for waiter in waiters {
+        let _ = waiter.send(success);
+    }
 }
 
 pub struct CaptureLease {

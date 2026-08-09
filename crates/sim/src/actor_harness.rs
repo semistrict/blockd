@@ -108,8 +108,8 @@ pub fn run_final_blobs(
     network.set_latency(1_000, 10_000);
     let world = SimWorld::new(
         config.host.host,
-        config.blobs.clone(),
-        config.store.clone(),
+        config.blobs,
+        config.store,
         &network,
     );
     world.set_corrupt_fills(config.corrupt_fills);
@@ -292,23 +292,17 @@ pub fn run_workload(
     network.set_latency(1_000, 10_000);
     let world = SimWorld::new(
         config.host.host,
-        config.blobs.clone(),
-        config.store.clone(),
+        config.blobs,
+        config.store,
         &network,
     );
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let vset = VsetId(1);
-    let mut vset_config = config.vset;
-    vset_config.durability = if config.backed_vsets == 1 {
-        DurabilityMode::Backup
-    } else {
-        DurabilityMode::Local
-    };
     world.enqueue_admin(AdminCmd::CreateVset {
         req: ReqId(1),
         vset,
-        config: vset_config,
+        config: config.vset,
         from_base: None,
     });
     let mut executor = Executor::simulation(seed);
@@ -890,8 +884,7 @@ mod tests {
                 ns_per_byte: 0,
             },
             vset_count: 2,
-            backed_vsets: 1,
-            vset: VsetConfig::compute(2, 16, false),
+            vset: VsetConfig::compute(2, 16),
             horizon: millis(100),
             think: (50_000, 100_000),
             sync_share: None,
@@ -920,7 +913,6 @@ mod tests {
     fn crash_drops_the_task_tree_and_recovers_on_the_same_executor() {
         let mut crash = config();
         crash.vset_count = 1;
-        crash.backed_vsets = 0;
         crash.faults.crash_at = vec![millis(40)];
         crash.faults.restart_delay = (millis(1), millis(1));
         let first = run(23, crash.clone());

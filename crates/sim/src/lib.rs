@@ -7,12 +7,11 @@
 //! replayable.
 
 pub mod actor_harness;
+mod actor_cluster;
 pub(crate) mod actor_world;
 pub mod cluster;
 pub mod guest;
 pub mod harness;
-pub mod kernel;
-pub mod oracle;
 pub mod presets;
 pub mod scenario;
 pub mod world;

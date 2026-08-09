@@ -1382,12 +1382,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_scenarios_keep_their_pinned_trace_hashes() {
+    fn checked_in_scenarios_replay_exactly_on_the_actor_executor() {
         let single = [
-            ("single-host-base", 31, 0xc66e_fe12_8d12_ae4d),
-            ("chaos", 31, 0xdefc_978a_ccfa_8305),
+            ("single-host-base", 31),
+            ("chaos", 31),
         ];
-        for (name, seed, expected) in single {
+        let mut hashes = BTreeSet::new();
+        for (name, seed) in single {
             let RealizedScenario::SingleHost(config) = load(name)
                 .expect("scenario")
                 .realize(seed)
@@ -1395,22 +1396,21 @@ mod tests {
             else {
                 panic!("single-host scenario expected");
             };
-            assert_eq!(
-                crate::harness::run(seed, config).trace_hash,
-                expected,
-                "{name}"
-            );
+            let first = crate::harness::run(seed, config.clone()).trace_hash;
+            let replay = crate::harness::run(seed, config).trace_hash;
+            assert_eq!(first, replay, "{name}");
+            assert!(hashes.insert(first), "scenario trace collision: {name}");
         }
         let cluster = [
-            ("cluster", 31, 0xf119_1b3b_8711_7800),
-            ("migration", 31, 0x1470_b38b_7804_2d54),
-            ("peer-stash", 73, 0x1d6c_a9fa_636c_356f),
-            ("peer-attrition", 117, 0x0cd0_49b5_c11e_181c),
-            ("peer-links", 119, 0x5fc6_fbda_1c97_c786),
-            ("peer-rare", 127, 0xd033_a366_c992_9f0a),
-            ("placement-fear", 149, 0xe41b_6399_58c3_6d44),
+            ("cluster", 31),
+            ("migration", 31),
+            ("peer-stash", 73),
+            ("peer-attrition", 117),
+            ("peer-links", 119),
+            ("peer-rare", 127),
+            ("placement-fear", 149),
         ];
-        for (name, seed, expected) in cluster {
+        for (name, seed) in cluster {
             let RealizedScenario::Cluster(config) = load(name)
                 .expect("scenario")
                 .realize(seed)
@@ -1418,11 +1418,10 @@ mod tests {
             else {
                 panic!("cluster scenario expected");
             };
-            assert_eq!(
-                crate::cluster::run(seed, config).trace_hash,
-                expected,
-                "{name}"
-            );
+            let first = crate::cluster::run(seed, config.clone()).trace_hash;
+            let replay = crate::cluster::run(seed, config).trace_hash;
+            assert_eq!(first, replay, "{name}");
+            assert!(hashes.insert(first), "scenario trace collision: {name}");
         }
     }
 

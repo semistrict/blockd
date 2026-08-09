@@ -121,6 +121,8 @@ struct StoreState {
     objects: BTreeMap<String, (u64, Vec<u8>)>,
     next_version: u64,
     outage: bool,
+    unavailable: u64,
+    cas_conflicts: u64,
 }
 
 #[derive(Default)]
@@ -139,12 +141,66 @@ type PeerInbox = UnboundedSender<(HostId, PeerMsg)>;
 pub(crate) struct SimNetwork {
     inboxes: RefCell<BTreeMap<HostId, PeerInbox>>,
     blocked: RefCell<BTreeSet<(HostId, HostId)>>,
+    down: RefCell<BTreeSet<HostId>>,
+    outages: RefCell<Vec<(u64, u64, HostId, HostId)>>,
+    targeted_drop: Cell<Option<(u8, u64, u64)>>,
+    drop_odds: Cell<(u64, u64)>,
+    dup_odds: Cell<(u64, u64)>,
+    drops: Cell<u64>,
+    dups: Cell<u64>,
+    clogs: Cell<u64>,
+    targeted_drops: Cell<u64>,
+    delivered: RefCell<BTreeMap<u8, u64>>,
     latency: Cell<(u64, u64)>,
 }
 
 impl SimNetwork {
     pub(crate) fn set_latency(&self, low: u64, high: u64) {
         self.latency.set((low, high));
+    }
+
+    pub(crate) fn configure_faults(
+        &self,
+        drop_odds: (u64, u64),
+        dup_odds: (u64, u64),
+        outages: Vec<(u64, u64, HostId, HostId)>,
+        targeted_drop: Option<(u8, u64, u64)>,
+    ) {
+        self.drop_odds.set(drop_odds);
+        self.dup_odds.set(dup_odds);
+        *self.outages.borrow_mut() = outages;
+        self.targeted_drop.set(targeted_drop);
+    }
+
+    pub(crate) fn set_host_down(&self, host: HostId, down: bool) {
+        if down {
+            self.down.borrow_mut().insert(host);
+        } else {
+            self.down.borrow_mut().remove(&host);
+        }
+    }
+
+    pub(crate) fn counters(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.drops.get(),
+            self.dups.get(),
+            self.clogs.get(),
+            self.targeted_drops.get(),
+            self.delivered.borrow().get(&6).copied().unwrap_or(0),
+        )
+    }
+
+    fn unavailable(&self, from: HostId, to: HostId, at: u64) -> bool {
+        self.down.borrow().contains(&from)
+            || self.down.borrow().contains(&to)
+            || self.blocked.borrow().contains(&(from, to))
+            || self
+                .outages
+                .borrow()
+                .iter()
+                .any(|&(begin, end, source, dest)| {
+                    source == from && dest == to && (begin..end).contains(&at)
+                })
     }
 }
 
@@ -169,6 +225,7 @@ pub(crate) struct SimWorld {
     abort_reason: RefCell<Option<&'static str>>,
     corrupt_fills: Cell<bool>,
     drop_write_protect: Cell<bool>,
+    drop_handoff_writes: Cell<bool>,
 }
 
 impl SimWorld {
@@ -185,6 +242,27 @@ impl SimWorld {
             network,
             Rc::new(RefCell::new(StoreState::default())),
         )
+    }
+
+    pub(crate) fn cluster(
+        hosts: u16,
+        blob_config: BlobDevConfig,
+        store_config: StoreConfig,
+    ) -> (Rc<SimNetwork>, Vec<Rc<Self>>) {
+        let network = Rc::new(SimNetwork::default());
+        let store = Rc::new(RefCell::new(StoreState::default()));
+        let worlds = (0..hosts)
+            .map(|host| {
+                Self::with_store(
+                    HostId(host),
+                    blob_config,
+                    store_config,
+                    &network,
+                    Rc::clone(&store),
+                )
+            })
+            .collect();
+        (network, worlds)
     }
 
     fn with_store(
@@ -215,6 +293,7 @@ impl SimWorld {
             abort_reason: RefCell::new(None),
             corrupt_fills: Cell::new(false),
             drop_write_protect: Cell::new(false),
+            drop_handoff_writes: Cell::new(false),
         });
         network
             .inboxes
@@ -248,6 +327,35 @@ impl SimWorld {
         self.store.borrow().objects.keys().cloned().collect()
     }
 
+    pub(crate) fn store_counters(&self) -> (u64, u64) {
+        let store = self.store.borrow();
+        (store.unavailable, store.cas_conflicts)
+    }
+
+    pub(crate) fn store_bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.store
+            .borrow()
+            .objects
+            .get(key)
+            .map(|(_, bytes)| bytes.clone())
+    }
+
+    pub(crate) fn blob_count(&self) -> usize {
+        self.blobs.borrow().durable.len()
+    }
+
+    pub(crate) fn rot_store_suffix(&self, suffix: &str) -> u64 {
+        let mut store = self.store.borrow_mut();
+        let mut changed = 0_u64;
+        for (key, (_, bytes)) in &mut store.objects {
+            if key.ends_with(suffix) && !bytes.is_empty() {
+                bytes[0] ^= 1;
+                changed = changed.saturating_add(1);
+            }
+        }
+        changed
+    }
+
     pub(crate) fn set_store_outage(&self, outage: bool) {
         self.store.borrow_mut().outage = outage;
     }
@@ -258,6 +366,10 @@ impl SimWorld {
 
     pub(crate) fn set_drop_write_protect(&self, enabled: bool) {
         self.drop_write_protect.set(enabled);
+    }
+
+    pub(crate) fn set_drop_handoff_writes(&self, enabled: bool) {
+        self.drop_handoff_writes.set(enabled);
     }
 
     pub(crate) fn clear_abort(&self) {
@@ -335,6 +447,11 @@ impl SimWorld {
         memory.pages.insert(page, bytes);
         memory.accessed.insert(page);
         true
+    }
+
+    pub(crate) fn write_fault_mutates(&self, page: PageId) -> bool {
+        let memory = self.memory.borrow();
+        !memory.pages.contains_key(&page) || memory.protected.contains(&page)
     }
 
     pub(crate) async fn fault(&self, page: PageId, write: bool) -> bool {
@@ -498,6 +615,10 @@ impl Blobs for SimWorld {
 
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
         let latency = self.blob_latency(bytes.len(), true);
+        if self.drop_handoff_writes.get() && name.ends_with("/handoff") {
+            delay(latency).await;
+            return Ok(());
+        }
         let io = self.submit_blob(name, bytes, BlobWriteKind::New);
         self.finish_blob(io, latency).await
     }
@@ -566,6 +687,7 @@ impl Store for SimWorld {
         let result = {
             let mut store = self.store.borrow_mut();
             if store.outage {
+                store.unavailable = store.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
                 store.next_version = store.next_version.saturating_add(1);
@@ -590,6 +712,7 @@ impl Store for SimWorld {
         let result = {
             let mut store = self.store.borrow_mut();
             if store.outage {
+                store.unavailable = store.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
                 let actual = store.objects.get(&key).map(|(version, _)| *version);
@@ -599,6 +722,7 @@ impl Store for SimWorld {
                     store.objects.insert(key, (version, bytes.clone()));
                     Ok(version)
                 } else {
+                    store.cas_conflicts = store.cas_conflicts.saturating_add(1);
                     Err(StoreError::Fault(StoreFault::CasConflict { actual }))
                 }
             }
@@ -609,8 +733,9 @@ impl Store for SimWorld {
 
     async fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
         let result = {
-            let store = self.store.borrow();
+            let mut store = self.store.borrow_mut();
             if store.outage {
+                store.unavailable = store.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
                 Ok(store.objects.get(key).cloned())
@@ -632,8 +757,9 @@ impl Store for SimWorld {
         len: u64,
     ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
         let result = {
-            let store = self.store.borrow();
+            let mut store = self.store.borrow_mut();
             if store.outage {
+                store.unavailable = store.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
                 Ok(store.objects.get(key).map(|(version, bytes)| {
@@ -658,6 +784,7 @@ impl Store for SimWorld {
         let result = {
             let mut store = self.store.borrow_mut();
             if store.outage {
+                store.unavailable = store.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
                 Ok(store.objects.remove(key).is_some())
@@ -669,8 +796,9 @@ impl Store for SimWorld {
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
         let result = {
-            let store = self.store.borrow();
+            let mut store = self.store.borrow_mut();
             if store.outage {
+                store.unavailable = store.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
                 Ok(store
@@ -691,23 +819,91 @@ impl Peers for SimWorld {
     async fn send(&self, to: HostId, message: PeerMsg) {
         let from = self.host;
         let network = Rc::clone(&self.network);
+        let sent_at = now();
+        if network.targeted_drop.get().is_some_and(|(kind, begin, end)| {
+            kind == peer_tag(&message) && (begin..end).contains(&sent_at)
+        }) {
+            network
+                .targeted_drops
+                .set(network.targeted_drops.get().saturating_add(1));
+            return;
+        }
+        if network
+            .outages
+            .borrow()
+            .iter()
+            .any(|&(begin, end, source, dest)| {
+                source == from && dest == to && (begin..end).contains(&sent_at)
+            })
+        {
+            network.clogs.set(network.clogs.get().saturating_add(1));
+            return;
+        }
+        if network.down.borrow().contains(&from)
+            || network.down.borrow().contains(&to)
+            || network.blocked.borrow().contains(&(from, to))
+            || odds(network.drop_odds.get())
+        {
+            network.drops.set(network.drops.get().saturating_add(1));
+            return;
+        }
+        let copies = if odds(network.dup_odds.get()) {
+            network.dups.set(network.dups.get().saturating_add(1));
+            2
+        } else {
+            1
+        };
         let (low, high) = network.latency.get();
-        spawn(async move {
-            if high != 0 {
-                delay(random_between(low, high)).await;
-            }
-            if network.blocked.borrow().contains(&(from, to)) {
-                return;
-            }
-            if let Some(inbox) = network.inboxes.borrow().get(&to) {
-                let _ = inbox.send((from, message));
-            }
-        })
-        .detach();
+        for _ in 0..copies {
+            let network = Rc::clone(&network);
+            let message = message.clone();
+            spawn(async move {
+                if high != 0 {
+                    delay(random_between(low, high)).await;
+                }
+                if network.unavailable(from, to, now()) {
+                    network.drops.set(network.drops.get().saturating_add(1));
+                    return;
+                }
+                if let Some(inbox) = network.inboxes.borrow().get(&to) {
+                    let mut delivered = network.delivered.borrow_mut();
+                    *delivered.entry(peer_tag(&message)).or_default() += 1;
+                    drop(delivered);
+                    let _ = inbox.send((from, message));
+                }
+            })
+            .detach();
+        }
     }
 
     async fn recv(&self) -> Option<(HostId, PeerMsg)> {
         self.peers.recv().await
+    }
+}
+
+fn odds((numerator, denominator): (u64, u64)) -> bool {
+    numerator != 0 && denominator != 0 && random_u64() % denominator < numerator
+}
+
+fn peer_tag(message: &PeerMsg) -> u8 {
+    match message {
+        PeerMsg::MigrateOffer { .. } => 0,
+        PeerMsg::MigrateAccept { .. } => 1,
+        PeerMsg::FetchRange { .. } => 2,
+        PeerMsg::Page { .. } => 3,
+        PeerMsg::FetchLeaf { .. } => 4,
+        PeerMsg::Leaf { .. } => 5,
+        PeerMsg::Released { .. } => 6,
+        PeerMsg::ReleasedAck { .. } => 7,
+        PeerMsg::ReplicaPut { .. } => 8,
+        PeerMsg::ReplicaPutAck { .. } => 9,
+        PeerMsg::ReplicaCommit { .. } => 10,
+        PeerMsg::ReplicaCommitAck { .. } => 11,
+        PeerMsg::ReplicaStatus { .. } => 12,
+        PeerMsg::ReplicaStatusReply { .. } => 13,
+        PeerMsg::ReplicaUploadDone { .. } => 14,
+        PeerMsg::ReplicaRelease { .. } => 15,
+        PeerMsg::ReplicaReleaseAck { .. } => 16,
     }
 }
 

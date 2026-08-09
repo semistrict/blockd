@@ -18,7 +18,7 @@ use blockd_core::types::SimTime;
 
 use crate::rng::Pcg64;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct BlobDevConfig {
     pub read_latency_min: u64,
     pub read_latency_max: u64,
