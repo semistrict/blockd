@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use blockd_core::daemon::{Counters, DaemonConfig};
+use blockd_core::hostmeta::{Counters, HostConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::millis;
 use blockd_workload::{WorkloadOutcome, WorkloadSpec};
@@ -41,7 +41,7 @@ pub enum Sabotage {
 
 #[derive(Clone, Debug)]
 pub struct HarnessConfig {
-    pub daemon: DaemonConfig,
+    pub daemon: HostConfig,
     pub bdev: BlobDevConfig,
     pub store: StoreConfig,
     pub vset_count: u16,
@@ -146,22 +146,7 @@ fn run_actor(seed: u64, config: &HarnessConfig) -> (RunReport, Vec<(String, Vec<
 
 fn actor_config(config: &HarnessConfig) -> crate::actor_harness::ActorHarnessConfig {
     crate::actor_harness::ActorHarnessConfig {
-        host: blockd_core::hostmeta::HostConfig {
-            host: config.daemon.host,
-            cache_pages: config.daemon.cache_pages,
-            writeback_interval: config.daemon.writeback_interval,
-            backup_retry: config.daemon.backup_retry,
-            disk_capacity: config.daemon.disk_capacity,
-            disk_headroom: config.daemon.disk_headroom,
-            wedge_ticks: config.daemon.wedge_ticks,
-            replica_placement: config.daemon.replica_placement.as_ref().map(|placement| {
-                blockd_core::hostmeta::ReplicaPlacementConfig {
-                    membership_epoch: placement.membership_epoch,
-                    local_failure_domain: placement.local_failure_domain,
-                    roster: placement.roster.clone(),
-                }
-            }),
-        },
+        host: config.daemon.clone(),
         blobs: config.bdev,
         store: config.store,
         vset_count: config.vset_count,
@@ -187,7 +172,7 @@ fn compat_report(actor: crate::actor_harness::ActorRunReport) -> RunReport {
     RunReport {
         trace_hash: actor.trace_hash,
         violations: actor.violations,
-        counters: legacy_counters(&actor.counters),
+        counters: actor.counters,
         completed_ops: actor.completed_ops,
         per_guest_completed: actor.per_guest_completed,
         crashes: actor.crashes,
@@ -216,55 +201,5 @@ fn compat_report(actor: crate::actor_harness::ActorRunReport) -> RunReport {
         seg_bytes_end: actor.seg_bytes_end,
         seg_live_bytes_end: actor.seg_live_bytes_end,
         parked_end: actor.parked_end,
-    }
-}
-
-fn legacy_counters(value: &blockd_core::hostmeta::Counters) -> Counters {
-    Counters {
-        fills: value.fills,
-        zero_fills: value.zero_fills,
-        shared_fills: value.shared_fills,
-        wp_faults: value.wp_faults,
-        guest_pages_dirtied: value.guest_pages_dirtied,
-        faults_unservable: value.faults_unservable,
-        pressure_waits: value.pressure_waits,
-        pages_flushed: value.pages_flushed,
-        records_written: value.records_written,
-        checkpoints_done: value.checkpoints_done,
-        syncs_acked: value.syncs_acked,
-        guest_rejected: value.guest_rejected,
-        peer_rejected: value.peer_rejected,
-        blobs_deleted: value.blobs_deleted,
-        manifests_published: value.manifests_published,
-        store_retries: value.store_retries,
-        fenced: value.fenced,
-        assignment_claims: value.assignment_claims,
-        assignment_claim_conflicts: value.assignment_claim_conflicts,
-        nvme_reclaims: value.nvme_reclaims,
-        nvme_stalls: value.nvme_stalls,
-        prefetch_fills: value.prefetch_fills,
-        hydrate_fills: value.hydrate_fills,
-        peer_retries: value.peer_retries,
-        cow_captures: value.cow_captures,
-        wedged_guests: value.wedged_guests,
-        wedged_hydration: value.wedged_hydration,
-        wedged_outbound: value.wedged_outbound,
-        leaf_rolls: value.leaf_rolls,
-        leaf_fills: value.leaf_fills,
-        segs_compacted: value.segs_compacted,
-        pages_compacted: value.pages_compacted,
-        replica_bytes: value.replica_bytes,
-        replica_rejected: value.replica_rejected,
-        replica_commits: value.replica_commits,
-        replica_store_bytes: value.replica_store_bytes,
-        replica_unlinks: value.replica_unlinks,
-        replica_network_bytes: value.replica_network_bytes,
-        replica_logical_bytes: value.replica_logical_bytes,
-        replica_nonactive_bytes: value.replica_nonactive_bytes,
-        replica_replacement_bytes: value.replica_replacement_bytes,
-        replica_cleanup_rewrite_bytes: value.replica_cleanup_rewrite_bytes,
-        replica_artifact_flushes: value.replica_artifact_flushes,
-        replica_commit_flushes: value.replica_commit_flushes,
-        replica_rotations: value.replica_rotations,
     }
 }

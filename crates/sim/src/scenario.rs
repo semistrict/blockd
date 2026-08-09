@@ -10,8 +10,8 @@
 
 use std::fmt;
 
-use blockd_core::daemon::{ArchivePolicy, DaemonConfig, ReplicaPlacementConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
+use blockd_core::journal::{VsetConfig, VsetKind};
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
 use blockd_core::types::{HostId, VsetId};
 use serde::Deserialize;
@@ -359,11 +359,7 @@ impl Scenario {
             ));
         }
         Ok(Common {
-            daemon: DaemonConfig {
-                archive: ArchivePolicy {
-                    interval: blockd_core::types::secs(1),
-                    ..ArchivePolicy::default()
-                },
+            daemon: HostConfig {
                 host: HostId(0),
                 cache_pages,
                 writeback_interval,
@@ -1293,7 +1289,7 @@ fn resolve_host(
 }
 
 struct Common {
-    daemon: DaemonConfig,
+    daemon: HostConfig,
     bdev: BlobDevConfig,
     store: StoreConfig,
     vset_count: u16,

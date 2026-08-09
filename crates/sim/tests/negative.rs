@@ -3,7 +3,7 @@
 //! these fail red — an oracle that misses planted misbehavior would pass
 //! every honest run vacuously.
 
-use blockd_core::daemon::{ArchivePolicy, DaemonConfig};
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{HostId, millis, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, Sabotage, run};
@@ -12,8 +12,7 @@ use blockd_sim::world::store::StoreConfig;
 
 fn base_config() -> HarnessConfig {
     HarnessConfig {
-        daemon: DaemonConfig {
-            archive: ArchivePolicy::default(),
+        daemon: HostConfig {
             host: HostId(0),
             cache_pages: 256,
             writeback_interval: millis(20),
@@ -93,8 +92,7 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         hosts: 2,
         vset_count: 1,
         vset_config: VsetConfig::compute(2, 16),
-        daemon: DaemonConfig {
-            archive: ArchivePolicy::default(),
+        daemon: HostConfig {
             host: HostId(0),
             cache_pages: 128,
             writeback_interval: millis(20),

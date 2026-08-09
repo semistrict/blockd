@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::VsetId;
 
@@ -39,7 +39,7 @@ pub enum PeerKind {
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub hosts: u16,
-    pub daemon: DaemonConfig,
+    pub daemon: HostConfig,
     pub bdev: BlobDevConfig,
     pub store: StoreConfig,
     pub vset_count: u16,
