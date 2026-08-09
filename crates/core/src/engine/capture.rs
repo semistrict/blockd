@@ -10,13 +10,14 @@ use crate::journal::{JournalRecord, RecordKind, VsetConfig};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_of};
 use crate::protocol::{AdminReply, ReqId};
-use crate::segment::SegmentBatchBuilder;
+use crate::segment::{PageLoc, SegmentBatchBuilder, open_entry, scan_segment};
 use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
 use crate::world::{AdminIo, Blobs, GuestMem, Store};
 
 const DRAIN_PAGES_PER_POLL: usize = 64;
 const OVERLAY_MAX: usize = 2048;
 const ROLL_THRESHOLD: usize = 256;
+const COMPACT_BATCH: usize = 8;
 
 type LeafWrite = (LeafPtr, Vec<u8>, BTreeSet<(u64, SegId)>);
 type PageMap = BTreeMap<PageId, (Gen, crate::segment::PageLoc)>;
@@ -26,6 +27,112 @@ struct Checkpoint {
     req: Option<ReqId>,
     epoch: crate::types::Epoch,
     vmstate: u64,
+}
+
+struct CompactionRescue {
+    victim: (u64, SegId),
+    entries: Vec<(PageId, Gen, PageLoc, Vec<u8>)>,
+}
+
+/// Verify and decompress the live entries of the sparsest local segments.
+/// The serving map is rechecked when the capture reserves its cut, so reads
+/// that race a newer capture are harmless stale work.
+async fn prepare_compaction<W: Blobs>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+) -> Vec<CompactionRescue> {
+    let candidates = {
+        let host = state.borrow();
+        let Some(vset_state) = host.vsets.get(&vset).filter(|state| state.ready) else {
+            return Vec::new();
+        };
+        if vset_state.outbound.is_some() || vset_state.migration_running {
+            return Vec::new();
+        }
+        let mut candidates = vset_state
+            .segment_blobs
+            .iter()
+            .filter_map(|&(fence, segment, size)| {
+                let live = vset_state
+                    .page_locs
+                    .values()
+                    .filter(|(_, location)| {
+                        location.base == 0 && (location.fence, location.seg) == (fence, segment)
+                    })
+                    .map(|(_, location)| u64::from(location.len))
+                    .sum::<u64>();
+                (live > 0 && live.saturating_mul(2) <= size).then_some((
+                    live.saturating_mul(1_000_000) / size,
+                    fence,
+                    segment,
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.truncate(COMPACT_BATCH);
+        candidates
+    };
+
+    let mut rescues = Vec::new();
+    for (_, fence, segment) in candidates {
+        let expected = {
+            let host = state.borrow();
+            let Some(vset_state) = host.vsets.get(&vset) else {
+                break;
+            };
+            vset_state
+                .page_locs
+                .iter()
+                .filter(|(_, (_, location))| {
+                    location.base == 0 && (location.fence, location.seg) == (fence, segment)
+                })
+                .map(|(&page, &entry)| (page, entry))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let name = layout::segment_blob(vset, fence, segment);
+        let Ok(Some(bytes)) = Blobs::read(world, &name).await else {
+            continue;
+        };
+        let Ok((owner, blob_fence, blob_segment, entries)) = scan_segment(&bytes) else {
+            continue;
+        };
+        if (owner, blob_fence, blob_segment) != (vset, fence, segment) {
+            continue;
+        }
+        let mut decoded = Vec::new();
+        let mut damaged = false;
+        for (index, (page, generation, location)) in entries.into_iter().enumerate() {
+            if expected.get(&page) != Some(&(generation, location)) {
+                continue;
+            }
+            let start = location.offset as usize;
+            let end = start.saturating_add(location.len as usize);
+            let Some(frame) = bytes.get(start..end) else {
+                damaged = true;
+                break;
+            };
+            let Ok((decoded_page, decoded_generation, raw)) = open_entry(vset, frame) else {
+                damaged = true;
+                break;
+            };
+            if (decoded_page, decoded_generation) != (page, generation) {
+                damaged = true;
+                break;
+            }
+            decoded.push((page, generation, location, raw));
+            if (index + 1) % DRAIN_PAGES_PER_POLL == 0 {
+                yield_now().await;
+            }
+        }
+        if !damaged && decoded.len() == expected.len() {
+            rescues.push(CompactionRescue {
+                victim: (fence, segment),
+                entries: decoded,
+            });
+        }
+    }
+    rescues
 }
 
 pub async fn create_fresh_local<W>(
@@ -211,10 +318,43 @@ where
 {
     let pre_reserved = reservation.is_some();
     let reserved_incarnation = reservation.as_ref().map(|(incarnation, _)| *incarnation);
-    let (incarnation, seq, capture_seq, fence, pages, protect, first_seg) = {
+    let prepared_compaction = prepare_compaction(&state, world.as_ref(), vset).await;
+    let (incarnation, seq, capture_seq, fence, pages, protect, first_seg, compact_victims) = {
         let mut host = state.borrow_mut();
         let vset_state = host.vsets.get(&vset)?;
+        let flush_set = host
+            .cache
+            .unstable_pages_of(vset)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut rescues = Vec::new();
+        let mut compact_victims = BTreeSet::new();
+        for prepared in prepared_compaction {
+            let prepared_pages = prepared
+                .entries
+                .iter()
+                .map(|(page, generation, location, _)| (*page, (*generation, *location)))
+                .collect::<BTreeMap<_, _>>();
+            let all_live_covered = vset_state.page_locs.iter().all(|(page, entry)| {
+                let location = entry.1;
+                (location.base != 0 || (location.fence, location.seg) != prepared.victim)
+                    || flush_set.contains(page)
+                    || prepared_pages.get(page) == Some(entry)
+            });
+            if !all_live_covered {
+                continue;
+            }
+            for (page, generation, location, bytes) in prepared.entries {
+                if !flush_set.contains(&page)
+                    && vset_state.page_locs.get(&page) == Some(&(generation, location))
+                {
+                    rescues.push((page, bytes));
+                }
+            }
+            compact_victims.insert(prepared.victim);
+        }
         let needs_commit = host.cache.has_dirty_of(vset)
+            || !compact_victims.is_empty()
             || vset_state
                 .pending_syncs
                 .iter()
@@ -241,7 +381,9 @@ where
             let first_seg = SegId(vset_state.next_seg);
             vset_state.next_seg = vset_state
                 .next_seg
-                .checked_add(u64::try_from(pages.len()).expect("page count fits u64"))
+                .checked_add(
+                    u64::try_from(pages.len() + rescues.len()).expect("page count fits u64"),
+                )
                 .expect("segment id overflow");
             let mut unread = BTreeMap::new();
             for &page in &pages {
@@ -255,6 +397,15 @@ where
                 unread,
                 copied_on_fault: BTreeMap::new(),
                 armed: pages.clone(),
+                rescues: rescues
+                    .into_iter()
+                    .map(|(page, bytes)| {
+                        let generation = Gen(vset_state.next_gen);
+                        vset_state.next_gen += 1;
+                        (page, generation, bytes)
+                    })
+                    .collect(),
+                compact_victims: compact_victims.clone(),
             });
             (seq, capture_seq, first_seg, vset_state.fence)
         };
@@ -269,6 +420,7 @@ where
             pages,
             protect,
             first_seg,
+            compact_victims,
         )
     };
     let lease = reservation.map_or_else(
@@ -302,8 +454,23 @@ where
             yield_now().await;
         }
     }
+    let rescues = {
+        let mut host = state.borrow_mut();
+        let vset_state = host
+            .vsets
+            .get_mut(&vset)
+            .filter(|state| state.incarnation == incarnation)?;
+        std::mem::take(&mut vset_state.drain.as_mut()?.rescues)
+    };
+    for (index, (page, generation, bytes)) in rescues.into_iter().enumerate() {
+        builder.add(page, generation, &bytes);
+        if (index + 1) % DRAIN_PAGES_PER_POLL == 0 {
+            yield_now().await;
+        }
+    }
 
     let segment_blobs = builder.finish();
+    let flushed_pages = pages.iter().copied().collect::<BTreeSet<_>>();
     for (segment, bytes, entries) in &segment_blobs {
         let name = layout::segment_blob(vset, fence, *segment);
         if !state
@@ -338,9 +505,10 @@ where
                 .push((fence, *segment, bytes.len() as u64));
         }
         for &(page, _, _) in entries {
-            host.cache.end_flush(page);
+            if flushed_pages.contains(&page) {
+                host.cache.end_flush(page);
+            }
         }
-        host.counters.pages_flushed += entries.len() as u64;
         host.wake_pressure_waiter();
     }
 
@@ -350,6 +518,7 @@ where
             .vsets
             .get_mut(&vset)
             .filter(|state| state.incarnation == incarnation)?;
+        force_victim_spans(vset_state, &compact_victims);
         shard_map(vset_state, vset)
     };
     for (pointer, bytes, segments) in &leaf_writes {
@@ -457,6 +626,16 @@ where
             }
         }
         host.counters.records_written += 1;
+        host.counters.pages_flushed += pages.len() as u64;
+        host.counters.segs_compacted += compact_victims.len() as u64;
+        host.counters.pages_compacted += u64::try_from(
+            segment_blobs
+                .iter()
+                .flat_map(|(_, _, entries)| entries)
+                .filter(|(page, _, _)| !flushed_pages.contains(page))
+                .count(),
+        )
+        .expect("compacted page count fits u64");
         host.counters.syncs_acked += completed.len() as u64;
         host.counters.checkpoints_done += u64::from(checkpoint.is_some());
         (completed, waiters)
@@ -526,11 +705,13 @@ where
             Decision::Busy(wait) => {
                 let _ = wait.await;
             }
-            Decision::Reserved(incarnation, epoch) => break (
-                incarnation,
-                epoch,
-                CaptureLease::new(&state, vset, incarnation),
-            ),
+            Decision::Reserved(incarnation, epoch) => {
+                break (
+                    incarnation,
+                    epoch,
+                    CaptureLease::new(&state, vset, incarnation),
+                );
+            }
         }
     };
     let vmstate = GuestMem::pause(world.as_ref(), vset).await;
@@ -546,6 +727,35 @@ where
         Some((incarnation, lease)),
     )
     .await
+}
+
+fn force_victim_spans(state: &mut super::VsetState, victims: &BTreeSet<(u64, SegId)>) {
+    if victims.is_empty() {
+        return;
+    }
+    let spans = state
+        .leaf_table
+        .iter()
+        .filter_map(|(&span, pointer)| {
+            state
+                .leaf_blobs
+                .get(pointer)
+                .is_some_and(|(_, segments)| {
+                    segments.iter().any(|segment| victims.contains(segment))
+                })
+                .then_some(span)
+        })
+        .collect::<Vec<_>>();
+    for span in spans {
+        state.leaf_table.remove(&span);
+        state.overlay.extend(
+            state
+                .page_locs
+                .iter()
+                .filter(|(page, _)| span_of(**page) == span)
+                .map(|(&page, &entry)| (page, entry)),
+        );
+    }
 }
 
 pub(super) fn shard_map(
@@ -630,6 +840,17 @@ pub(super) async fn write_record_copies<W: Blobs>(
     let primary_name = layout::journal_blob(vset, record.fence, record.seq);
     let mirror_name = layout::journal_mirror_blob(vset, record.fence, record.seq);
     let len = bytes.len() as u64;
+    let (had_primary, had_mirror) = {
+        let mut host = state.borrow_mut();
+        let had_primary = host.blob_sizes.contains_key(&primary_name);
+        let had_mirror = host.blob_sizes.contains_key(&mirror_name);
+        if !host
+            .try_reserve_metadata_blobs(&[(primary_name.clone(), len), (mirror_name.clone(), len)])
+        {
+            return false;
+        }
+        (had_primary, had_mirror)
+    };
     let (primary, mirror) = join2(
         Blobs::write(world, primary_name.clone(), bytes.clone()),
         Blobs::write(world, mirror_name.clone(), bytes),
@@ -637,9 +858,13 @@ pub(super) async fn write_record_copies<W: Blobs>(
     .await;
     if primary.is_ok() {
         state.borrow_mut().record_blob(primary_name, len);
+    } else if !had_primary {
+        state.borrow_mut().blob_sizes.remove(&primary_name);
     }
     if mirror.is_ok() {
         state.borrow_mut().record_blob(mirror_name, len);
+    } else if !had_mirror {
+        state.borrow_mut().blob_sizes.remove(&mirror_name);
     }
     primary.is_ok() && mirror.is_ok()
 }

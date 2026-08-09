@@ -200,6 +200,31 @@ impl HostState {
         true
     }
 
+    /// Reserve commit metadata from the capacity headroom kept aside for it.
+    /// Data writes stop below `disk_headroom`; journal copies may consume that
+    /// margin, but never exceed the device's actual configured capacity.
+    pub fn try_reserve_metadata_blobs(&mut self, blobs: &[(String, u64)]) -> bool {
+        let mut next = self.blob_sizes.values().sum::<u64>();
+        for (name, bytes) in blobs {
+            next = next
+                .saturating_sub(self.blob_sizes.get(name).copied().unwrap_or(0))
+                .saturating_add(*bytes);
+        }
+        if self
+            .config
+            .disk_capacity
+            .is_some_and(|capacity| next > capacity)
+        {
+            self.counters.nvme_stalls += 1;
+            self.disk_reclaim_requested = true;
+            return false;
+        }
+        for (name, bytes) in blobs {
+            self.blob_sizes.insert(name.clone(), *bytes);
+        }
+        true
+    }
+
     pub fn try_reserve_append(&mut self, name: String, bytes: u64) -> bool {
         let next = self.blob_sizes.values().sum::<u64>().saturating_add(bytes);
         if self
@@ -473,6 +498,8 @@ pub struct DrainState {
     pub unread: BTreeMap<PageId, Gen>,
     pub copied_on_fault: BTreeMap<PageId, (Gen, Vec<u8>)>,
     pub armed: Vec<PageId>,
+    pub rescues: Vec<(PageId, Gen, Vec<u8>)>,
+    pub compact_victims: BTreeSet<(u64, SegId)>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
