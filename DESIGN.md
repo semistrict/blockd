@@ -205,6 +205,25 @@ guest loudly — inventing a page is the defining forbidden failure (R8.1).
 Pressure — memory or NVMe — slows guests and raises observable signals;
 it never kills and never corrupts (R2.5/R2.7).
 
+### One actor runtime in simulation and production
+
+The core protocol is expressed as current-thread async actors over the
+contracts in `crates/core/src/world.rs`. Fault service, capture, publication,
+restore, migration, replication, database I/O, compaction, and store garbage
+collection are straight-line futures sharing host state only between await
+points. A host owns those children as one cancellation tree: a simulated crash
+or production teardown drops the root, then recovery reconstructs state from
+durable bytes rather than continuing an in-memory conversation.
+
+`crates/exec` is the scheduler in both environments. Simulation owns virtual
+time, seeded randomness, fault-point decisions, and a closed ready queue;
+production adds monotonic timers and a thread-safe external-event injector.
+FIFO wake ordering and declaration-order selection are fixed. Every simulated
+poll folds virtual time, task identity, and wake source into the trace hash, so
+R10.1 replay checks the actual actor interleaving rather than a second model of
+the protocol. Simulation and production differ only in their world trait
+implementations for blobs, object storage, peers, guest memory, and admin I/O.
+
 ## Verification
 
 Three tiers, in the repo and green:
@@ -218,7 +237,7 @@ Three tiers, in the repo and green:
   targeted crash grids cover each replica commit, publication, release, and
   replacement boundary before large deterministic seed ensembles run.
 - **Real-kernel machinery** (`crates/hostmem`, `crates/runtime`): the same
-  daemon state machine driven against real userfaultfd, memfds, O_DIRECT
+  actor tree driven against real userfaultfd, memfds, O_DIRECT
   disk I/O and an S3-shaped store in a Linux VM, with physical memory
   measured and asserted.
 - **Real Firecracker** (`crates/runtime` fc tests, `crates/fc-guest`):

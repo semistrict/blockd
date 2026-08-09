@@ -48,7 +48,7 @@ mkdir -p "$artifact_dir"
     echo "replay command: scripts/run-sim-ensemble.sh $scenario $start $count $artifact_dir"
 } >"$artifact_dir/ensemble.txt"
 
-cargo build --release -p blockd-sim --bin sweep
+cargo build --release -p blockd-sim --bin sweep --features test-page-size
 
 set +e
 BLOCKD_SWEEP_ARTIFACT_DIR=$artifact_dir \
