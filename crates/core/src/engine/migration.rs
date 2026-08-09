@@ -984,7 +984,6 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
         state.borrow_mut().forget_blobs(&names);
     }
     if authorized {
-        GuestMem::fence(world, vset).await;
         for page in resident {
             GuestMem::evict(world, page).await;
         }
