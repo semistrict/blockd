@@ -510,9 +510,7 @@ mod tests {
             panic!("unexpected failed sync: {req:?}")
         }
 
-        async fn fence(&self, _vset: VsetId) {
-            unreachable!()
-        }
+        async fn fence(&self, _vset: VsetId) {}
     }
 
     #[async_trait(?Send)]
@@ -1308,7 +1306,6 @@ mod tests {
             req: ReqId(41),
             vset,
         }));
-
         destination
             .faults
             .borrow_mut()
@@ -1336,6 +1333,7 @@ mod tests {
                 .borrow()
                 .contains_key(&layout::handoff_blob(vset))
         );
+        assert!(!source.memory.borrow().contains_key(&page));
 
         drop(source_actor);
         drop(destination_actor);

@@ -586,7 +586,7 @@ where
             database: vset_state.database,
             overlay: record_overlay,
             leaves: record_leaves,
-            migrated_from: None,
+            migrated_from: vset_state.peer_source,
         }
     };
     if !write_record_copies(&state, world.as_ref(), vset, &record).await {

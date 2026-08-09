@@ -235,6 +235,10 @@ pub(crate) struct SimWorld {
 }
 
 impl SimWorld {
+    pub(crate) fn host_id(&self) -> HostId {
+        self.host
+    }
+
     pub(crate) fn new(
         host: HostId,
         blob_config: BlobDevConfig,

@@ -943,7 +943,7 @@ pub async fn peer_fetch_leaf<W: Peers>(
     }
 }
 
-async fn release_source<W: Blobs + Peers>(
+async fn release_source<W: Blobs + Peers + GuestMem>(
     state: &SharedHost,
     world: &W,
     from: HostId,
@@ -954,10 +954,13 @@ async fn release_source<W: Blobs + Peers>(
         .vsets
         .get(&vset)
         .is_none_or(|vset_state| vset_state.outbound == Some(from));
-    let removed = if authorized {
-        state.borrow_mut().vsets.remove(&vset)
+    let (removed, resident) = if authorized {
+        let mut host = state.borrow_mut();
+        let removed = host.vsets.remove(&vset);
+        let resident = host.cache.purge_vset(vset);
+        (removed, resident)
     } else {
-        None
+        (None, Vec::new())
     };
     if let Some(vset_state) = removed {
         let mut names = vset_state
@@ -981,6 +984,10 @@ async fn release_source<W: Blobs + Peers>(
         state.borrow_mut().forget_blobs(&names);
     }
     if authorized {
+        GuestMem::fence(world, vset).await;
+        for page in resident {
+            GuestMem::evict(world, page).await;
+        }
         Peers::send(world, from, PeerMsg::ReleasedAck { vset }).await;
     }
 }

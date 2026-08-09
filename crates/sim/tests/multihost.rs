@@ -3,6 +3,7 @@
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{VsetId, millis, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, FaultPoint, run};
+use blockd_sim::scenario::{RealizedScenario, load};
 
 fn assert_clean(report: &ClusterReport) {
     assert!(report.violations.is_empty(), "{:?}", report.violations);
@@ -89,6 +90,23 @@ fn lossy_duplicating_links_preserve_migration_and_replay() {
     assert_eq!(first.guest_deaths, 0);
     assert!(first.peer_drops > 0);
     assert!(first.peer_dups > 0);
+}
+
+#[test]
+fn return_migration_and_crash_preserve_every_page() {
+    for seed in [1, 16, 92] {
+        let RealizedScenario::Cluster(config) = load("migration")
+            .expect("scenario")
+            .realize(seed)
+            .expect("realization")
+        else {
+            panic!("migration is a cluster scenario");
+        };
+        let report = run(seed, config);
+        assert_clean(&report);
+        assert!(report.migrations >= 2);
+        assert!(report.releases >= 2);
+    }
 }
 
 #[test]

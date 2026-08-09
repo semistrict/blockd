@@ -317,6 +317,11 @@ async fn reply_actor(
                 let _ = control.borrow().requests.get(&req);
             }
             AdminReply::VsetMigratedIn { vset, verdict } => {
+                let migrated = control.borrow().guest_state[&vset]
+                    .expected
+                    .borrow()
+                    .clone();
+                *control.borrow().guest_state[&vset].durable.borrow_mut() = migrated;
                 prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
                 let started = {
                     let mut control = control.borrow_mut();
@@ -448,21 +453,18 @@ fn prepare_recovered(state: &GuestState, vset: VsetId, config: &ClusterConfig, v
     match verdict {
         Verdict::Resume { vmstate, .. } => {
             state.completed.set(vmstate);
-            *state.expected.borrow_mut() = state
-                .history
-                .borrow()
-                .get(&vmstate)
-                .cloned()
-                .unwrap_or_else(|| state.durable.borrow().clone());
+            *state.expected.borrow_mut() = state.durable.borrow().clone();
         }
         Verdict::ColdBoot => {
-            *state.expected.borrow_mut() = state
+            let cold = state
                 .durable
                 .borrow()
                 .iter()
                 .filter(|(page, _)| page.volume.idx.0 != 0)
                 .map(|(page, bytes)| (*page, bytes.clone()))
-                .collect();
+                .collect::<BTreeMap<_, _>>();
+            state.expected.borrow_mut().clone_from(&cold);
+            *state.durable.borrow_mut() = cold;
         }
         Verdict::Unrestorable => {
             state
@@ -605,7 +607,8 @@ async fn guest_actor(
                     .violations
                     .borrow_mut()
                     .push(format!(
-                        "read returned stale or foreign bytes for {page:?}: actual sequence {claimed}, expected {expected_claimed}, durable floor {durable_floor}, recovering {recovering}, possible {possible}, vmstate {} at {}",
+                        "read returned stale or foreign bytes on {:?} for {page:?}: actual sequence {claimed}, expected {expected_claimed}, durable floor {durable_floor}, recovering {recovering}, possible {possible}, vmstate {} at {}",
+                        world.host_id(),
                         state.completed.get(),
                         now(),
                     ));
