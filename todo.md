@@ -39,5 +39,5 @@ Status legend: `[ ]` pending, `[~]` validated/in progress, `[x]` fixed and verif
 
 - [x] Format and lint changed code.
 - [x] Run focused regression tests.
-- [~] Run the full workspace test suite and configured integration/Linux lanes.
-- [ ] Run pre-ship review, resolve findings, commit, push, and open a pull request to `main`.
+- [x] Run the full workspace test suite and configured integration/Linux lanes.
+- [x] Run pre-ship review, resolve findings, commit, push, and open a pull request to `main`.
