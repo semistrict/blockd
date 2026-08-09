@@ -452,6 +452,7 @@ struct ProductionWorld {
     admin_reply: Sender<AdminReply>,
     shared: Arc<Shared>,
     fault_work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
+    shared_pages: RefCell<BTreeMap<(u64, u64, blockd_core::types::SegId, u32), Vec<u8>>>,
 }
 
 impl ProductionWorld {
@@ -711,12 +712,39 @@ impl GuestMem for ProductionWorld {
     async fn fill_shared(
         &self,
         page: PageId,
-        _share: (u64, u64, blockd_core::types::SegId, u32),
+        share: (u64, u64, blockd_core::types::SegId, u32),
+        bytes: Option<Vec<u8>>,
         writable: bool,
     ) {
-        self.shared.stats.record_world(world_kind::FILL_SHARED, 0);
-        self.fill(page, vec![0; page_size()], writable, FillSource::Zero)
+        if let Some(bytes) = bytes {
+            self.shared_pages.borrow_mut().insert(share, bytes);
+        }
+        let bytes = self
+            .shared_pages
+            .borrow()
+            .get(&share)
+            .cloned()
+            .expect("shared base page admitted before reuse");
+        let host = self.host(page.volume.vset);
+        let (reply, response) = injector();
+        self.fault_work
+            .send(FaultWork::Fill {
+                host: Arc::clone(&host),
+                page,
+                bytes,
+                writable,
+                reply,
+            })
+            .expect("fault I/O runtime alive");
+        self.fault_response(&response, world_kind::FILL_SHARED)
             .await;
+        complete_fault(
+            &self.shared,
+            Some(&host),
+            page,
+            FaultSource::Shared,
+            "served",
+        );
     }
 
     async fn fail(&self, page: PageId) {
@@ -1047,6 +1075,7 @@ impl Runtime {
                     admin_reply,
                     shared: Arc::clone(&actor_shared),
                     fault_work,
+                    shared_pages: RefCell::new(BTreeMap::new()),
                 });
                 let clock = Arc::new(move || elapsed_ns(monotonic_epoch.elapsed()));
                 let mut executor = Executor::production_with_clock(clock);

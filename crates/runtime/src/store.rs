@@ -42,10 +42,7 @@ pub trait ObjectStore: Send + Sync + 'static {
     /// cannot provide a complete snapshot must fail closed: an empty
     /// successful result would make a collector mistake live objects for an
     /// empty namespace.
-    async fn list_prefix(
-        self: Arc<Self>,
-        _prefix: String,
-    ) -> Result<Vec<String>, StoreFault> {
+    async fn list_prefix(self: Arc<Self>, _prefix: String) -> Result<Vec<String>, StoreFault> {
         Err(StoreFault::Unavailable)
     }
 }

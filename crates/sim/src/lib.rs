@@ -6,8 +6,8 @@
 //! ghost truth. A run is `(seed, config) → trace hash`, byte-for-byte
 //! replayable.
 
-pub mod actor_harness;
 mod actor_cluster;
+pub mod actor_harness;
 pub(crate) mod actor_world;
 pub mod cluster;
 pub mod guest;

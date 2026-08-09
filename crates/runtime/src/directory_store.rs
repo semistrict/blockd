@@ -246,10 +246,7 @@ impl ObjectStore for DirectoryStore {
         .await;
     }
 
-    async fn list_prefix(
-        self: Arc<Self>,
-        prefix: String,
-    ) -> Result<Vec<String>, StoreFault> {
+    async fn list_prefix(self: Arc<Self>, prefix: String) -> Result<Vec<String>, StoreFault> {
         tokio::task::spawn_blocking(move || {
             let mut keys = Vec::new();
             Self::list(&self.root, &self.root, &prefix, &mut keys)
@@ -293,9 +290,21 @@ mod tests {
     async fn listing_returns_a_sorted_complete_prefix_snapshot() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(DirectoryStore::new(root.path().to_owned()).unwrap());
-        store.clone().put("v/2/b".to_owned(), vec![2]).await.unwrap();
-        store.clone().put("v/1/a".to_owned(), vec![1]).await.unwrap();
-        store.clone().put("other".to_owned(), vec![3]).await.unwrap();
+        store
+            .clone()
+            .put("v/2/b".to_owned(), vec![2])
+            .await
+            .unwrap();
+        store
+            .clone()
+            .put("v/1/a".to_owned(), vec![1])
+            .await
+            .unwrap();
+        store
+            .clone()
+            .put("other".to_owned(), vec![3])
+            .await
+            .unwrap();
 
         assert_eq!(
             store.clone().list_prefix("v/".to_owned()).await.unwrap(),

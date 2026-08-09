@@ -47,21 +47,25 @@ async fn prepare_compaction<W: Blobs>(
         let Some(vset_state) = host.vsets.get(&vset).filter(|state| state.ready) else {
             return Vec::new();
         };
-        if vset_state.outbound.is_some() || vset_state.migration_running {
+        if vset_state.outbound.is_some()
+            || vset_state.migration_running
+            || vset_state.page_locs.len() < ROLL_THRESHOLD
+        {
             return Vec::new();
+        }
+        let mut live_by_segment = BTreeMap::<(u64, SegId), u64>::new();
+        for (_, location) in vset_state.page_locs.values() {
+            if location.base == 0 {
+                *live_by_segment
+                    .entry((location.fence, location.seg))
+                    .or_default() += u64::from(location.len);
+            }
         }
         let mut candidates = vset_state
             .segment_blobs
             .iter()
             .filter_map(|&(fence, segment, size)| {
-                let live = vset_state
-                    .page_locs
-                    .values()
-                    .filter(|(_, location)| {
-                        location.base == 0 && (location.fence, location.seg) == (fence, segment)
-                    })
-                    .map(|(_, location)| u64::from(location.len))
-                    .sum::<u64>();
+                let live = live_by_segment.get(&(fence, segment)).copied().unwrap_or(0);
                 (live > 0 && live.saturating_mul(2) <= size).then_some((
                     live.saturating_mul(1_000_000) / size,
                     fence,

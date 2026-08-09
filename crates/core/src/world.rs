@@ -141,6 +141,7 @@ pub trait GuestMem {
         &self,
         page: PageId,
         share: (u64, u64, crate::types::SegId, u32),
+        bytes: Option<Vec<u8>>,
         writable: bool,
     );
     async fn fail(&self, page: PageId);

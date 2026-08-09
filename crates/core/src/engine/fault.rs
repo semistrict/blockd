@@ -11,6 +11,15 @@ use crate::segment::{PageLoc, open_entry};
 use crate::types::{Gen, PageId, page_size};
 use crate::world::{Blobs, FillSource, GuestMem, Peers, Store, StoreError};
 
+#[derive(Clone, Copy)]
+struct FetchPlan {
+    generation: Gen,
+    location: PageLoc,
+    backed: bool,
+    source: Option<crate::types::HostId>,
+    retry_delay: u64,
+}
+
 pub async fn serve_fault<W>(state: SharedHost, world: Rc<W>, page: PageId, write: bool)
 where
     W: Blobs + Store + Peers + GuestMem + 'static,
@@ -120,6 +129,11 @@ async fn serve_missing_fault<W>(
             source: Option<crate::types::HostId>,
             victim: Option<PageId>,
         },
+        Shared {
+            share: crate::cache::BaseKey,
+            memory: bool,
+            victim: Option<PageId>,
+        },
         Wait(blockd_exec::channel::OneReceiver<()>),
         Filling(blockd_exec::channel::OneReceiver<bool>),
         Gone,
@@ -146,18 +160,40 @@ async fn serve_missing_fault<W>(
                 let memory = vset.config.is_memory(page.volume.idx);
                 let backed = vset.config.durability.uses_store();
                 let source = vset.peer_source;
+                let shared = location
+                    .map(|(_, location)| location)
+                    .filter(|location| location.base != 0)
+                    .map(|location| (location.base, location.fence, location.seg, location.offset))
+                    .filter(|key| host.cache.base_is_resident(*key));
                 if host.filling_pages.contains(&page) {
                     let (wake, wait) = oneshot();
                     host.page_fill_waiters.entry(page).or_default().push(wake);
                     Slot::Filling(wait)
+                } else if let Some(share) = shared
+                    && !write
+                {
+                    host.filling_pages.insert(page);
+                    Slot::Shared {
+                        share,
+                        memory,
+                        victim: None,
+                    }
                 } else if let Some(victim) = host.cache.reserve_slot() {
                     host.filling_pages.insert(page);
-                    Slot::Ready {
-                        location,
-                        memory,
-                        backed,
-                        source,
-                        victim,
+                    if let Some(share) = shared {
+                        Slot::Shared {
+                            share,
+                            memory,
+                            victim,
+                        }
+                    } else {
+                        Slot::Ready {
+                            location,
+                            memory,
+                            backed,
+                            source,
+                            victim,
+                        }
                     }
                 } else {
                     let (wake, wait) = oneshot();
@@ -177,6 +213,45 @@ async fn serve_missing_fault<W>(
                 source,
                 victim,
             } => (location, memory, backed, source, victim),
+            Slot::Shared {
+                share,
+                memory,
+                victim,
+            } => {
+                let fill_lease = PageFillLease::new(&state, page);
+                let reservation = write.then(|| CacheReservation::new(&state));
+                if let Some(victim) = victim {
+                    GuestMem::evict(world.as_ref(), victim).await;
+                }
+                if write {
+                    let mut host = state.borrow_mut();
+                    if !same_incarnation(&host, page, incarnation) {
+                        return;
+                    }
+                    host.cache.fill_slot(page, true, memory);
+                    host.vsets
+                        .get_mut(&page.volume.vset)
+                        .expect("validated vset")
+                        .mutation_seq += 1;
+                    host.counters.guest_pages_dirtied += 1;
+                    host.wake_pressure_waiter();
+                }
+                {
+                    let mut host = state.borrow_mut();
+                    host.counters.shared_fills += 1;
+                    host.vsets
+                        .get_mut(&page.volume.vset)
+                        .expect("validated vset")
+                        .wedge
+                        .fills += 1;
+                }
+                if let Some(reservation) = reservation {
+                    reservation.commit();
+                }
+                GuestMem::fill_shared(world.as_ref(), page, share, None, write).await;
+                fill_lease.finish(true);
+                return;
+            }
             Slot::Wait(wait) => {
                 if wait.await.is_err() {
                     return;
@@ -234,15 +309,16 @@ async fn serve_missing_fault<W>(
             &state,
             world.as_ref(),
             page,
-            location,
-            backed,
-            source,
-            retry_delay,
+            FetchPlan {
+                generation,
+                location,
+                backed,
+                source,
+                retry_delay,
+            },
         )
         .await;
-        let Some((raw, fill_source)) = bytes.and_then(|(bytes, source)| {
-            verify_entry(page, generation, Some(bytes)).map(|raw| (raw, source))
-        }) else {
+        let Some((raw, fill_source)) = bytes else {
             let advanced = state
                 .borrow()
                 .vsets
@@ -269,7 +345,18 @@ async fn serve_missing_fault<W>(
                 drop(reservation);
                 continue;
             }
-            host.cache.fill_slot(page, write, memory);
+            let share = (location.base != 0 && !write).then_some((
+                location.base,
+                location.fence,
+                location.seg,
+                location.offset,
+            ));
+            if let Some(share) = share {
+                host.cache.base_insert(share);
+                host.counters.shared_fills += 1;
+            } else {
+                host.cache.fill_slot(page, write, memory);
+            }
             if write {
                 host.vsets
                     .get_mut(&page.volume.vset)
@@ -285,7 +372,16 @@ async fn serve_missing_fault<W>(
                 .fills += 1;
         }
         reservation.commit();
-        GuestMem::fill(world.as_ref(), page, raw, write, fill_source).await;
+        if let Some(share) = (location.base != 0 && !write).then_some((
+            location.base,
+            location.fence,
+            location.seg,
+            location.offset,
+        )) {
+            GuestMem::fill_shared(world.as_ref(), page, share, Some(raw), false).await;
+        } else {
+            GuestMem::fill(world.as_ref(), page, raw, write, fill_source).await;
+        }
         fill_lease.finish(true);
         return;
     }
@@ -301,27 +397,42 @@ async fn fetch_page<W: Blobs + Store + Peers>(
     state: &SharedHost,
     world: &W,
     page: PageId,
-    location: PageLoc,
-    backed: bool,
-    source: Option<crate::types::HostId>,
-    retry_delay: u64,
+    plan: FetchPlan,
 ) -> Option<(Vec<u8>, FillSource)> {
-    let local_name = layout::segment_blob(page.volume.vset, location.fence, location.seg);
-    if let Ok(Some(bytes)) = Blobs::read_range(
-        world,
-        &local_name,
-        u64::from(location.offset),
-        u64::from(location.len),
-    )
-    .await
-    {
-        return Some((bytes, FillSource::Local));
+    let FetchPlan {
+        generation,
+        location,
+        backed,
+        source,
+        retry_delay,
+    } = plan;
+    let belongs_to_source = location.base == 0
+        && source.is_some()
+        && state
+            .borrow()
+            .vsets
+            .get(&page.volume.vset)
+            .is_some_and(|vset| location.fence < vset.fence);
+    if !belongs_to_source {
+        let local_name = layout::segment_blob(page.volume.vset, location.fence, location.seg);
+        if let Ok(Some(bytes)) = Blobs::read_range(
+            world,
+            &local_name,
+            u64::from(location.offset),
+            u64::from(location.len),
+        )
+        .await
+            && let Some(raw) = verify_entry(page, generation, Some(bytes))
+        {
+            return Some((raw, FillSource::Local));
+        }
     }
     if location.base == 0
         && let Some(source) = source
         && let Some(bytes) = peer_fetch_page(state, world, source, page.volume.vset, location).await
+        && let Some(raw) = verify_entry(page, generation, Some(bytes))
     {
-        return Some((bytes, FillSource::Peer));
+        return Some((raw, FillSource::Peer));
     }
     if !backed && location.base == 0 {
         return None;
@@ -340,7 +451,10 @@ async fn fetch_page<W: Blobs + Store + Peers>(
         )
         .await
         {
-            Ok(Some((_, bytes))) => return Some((bytes, FillSource::Store)),
+            Ok(Some((_, bytes))) => {
+                return verify_entry(page, generation, Some(bytes))
+                    .map(|raw| (raw, FillSource::Store));
+            }
             Ok(None) | Err(StoreError::TooLarge) => return None,
             Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
                 delay(retry_delay).await;
@@ -391,11 +505,18 @@ where
     let Some((generation, location)) = location else {
         return Some(vec![0; page_size()]);
     };
-    verify_entry(
+    fetch_page(
+        state,
+        world,
         page,
-        generation,
-        fetch_page(state, world, page, location, backed, source, retry)
-            .await
-            .map(|(bytes, _)| bytes),
+        FetchPlan {
+            generation,
+            location,
+            backed,
+            source,
+            retry_delay: retry,
+        },
     )
+    .await
+    .map(|(raw, _)| raw)
 }

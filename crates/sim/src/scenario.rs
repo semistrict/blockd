@@ -1379,10 +1379,7 @@ mod tests {
 
     #[test]
     fn checked_in_scenarios_replay_exactly_on_the_actor_executor() {
-        let single = [
-            ("single-host-base", 31),
-            ("chaos", 31),
-        ];
+        let single = [("single-host-base", 31), ("chaos", 31)];
         let mut hashes = BTreeSet::new();
         for (name, seed) in single {
             let RealizedScenario::SingleHost(config) = load(name)

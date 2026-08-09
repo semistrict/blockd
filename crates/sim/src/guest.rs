@@ -49,7 +49,16 @@ mod tests {
         let bytes = page_pattern(page, 41);
         assert_eq!(bytes.len(), page_size());
         assert_eq!(claimed_vol_seq(&bytes), 41);
-        assert_ne!(bytes, page_pattern(PageId { page: PageNo(8), ..page }, 41));
+        assert_ne!(
+            bytes,
+            page_pattern(
+                PageId {
+                    page: PageNo(8),
+                    ..page
+                },
+                41
+            )
+        );
         assert_eq!(page_pattern(page, 0), vec![0; page_size()]);
     }
 }

@@ -48,6 +48,10 @@ pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>
     children.spawn(sync_source(Rc::clone(&state), Rc::clone(&world)));
     children.spawn(peer_source(Rc::clone(&state), Rc::clone(&world)));
     children.spawn(database_source(Rc::clone(&state), Rc::clone(&world)));
+    children.spawn(super::store_gc::store_gc_actor(
+        Rc::clone(&state),
+        Rc::clone(&world),
+    ));
     let outbound = state
         .borrow()
         .vsets
@@ -243,8 +247,9 @@ mod tests {
     use async_trait::async_trait;
     use blockd_exec::{Executor, delay};
 
-    use super::host_actor;
+    use super::{host_actor, host_actor_with_state};
     use crate::database::{DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest};
+    use crate::engine::HostState;
     use crate::head::HeadRecord;
     use crate::hostmeta::HostConfig as DaemonConfig;
     use crate::journal::{JournalRecord, VsetConfig};
@@ -270,6 +275,7 @@ mod tests {
         store: ModelStore,
         next_store_version: Rc<Cell<u64>>,
         memory: RefCell<BTreeMap<PageId, Vec<u8>>>,
+        shared_pages: RefCell<BTreeMap<crate::cache::BaseKey, Vec<u8>>>,
         peer_inbox: RefCell<VecDeque<(HostId, PeerMsg)>>,
         peer_outbox: RefCell<Vec<(HostId, PeerMsg)>>,
         database_requests: RefCell<VecDeque<DatabaseRequest>>,
@@ -452,11 +458,16 @@ mod tests {
 
         async fn fill_shared(
             &self,
-            _page: PageId,
-            _share: (u64, u64, crate::types::SegId, u32),
+            page: PageId,
+            share: (u64, u64, crate::types::SegId, u32),
+            bytes: Option<Vec<u8>>,
             _writable: bool,
         ) {
-            unreachable!()
+            if let Some(bytes) = bytes {
+                self.shared_pages.borrow_mut().insert(share, bytes);
+            }
+            let bytes = self.shared_pages.borrow()[&share].clone();
+            self.memory.borrow_mut().insert(page, bytes);
         }
 
         async fn fail(&self, page: PageId) {
@@ -1101,6 +1112,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn pinned_checkpoint_becomes_a_faultable_fork_base() {
         let source = VsetId(13);
         let fork = VsetId(14);
@@ -1137,7 +1149,8 @@ mod tests {
             replica_placement: None,
         };
         let mut executor = Executor::simulation(7);
-        let actor = executor.spawn(host_actor(config, Rc::clone(&world)));
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        let actor = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
         executor.run_until(4);
         world.faults.borrow_mut().push_back(GuestFault {
             page: source_page,
@@ -1188,12 +1201,27 @@ mod tests {
         });
         executor.run_until(26);
         assert_eq!(world.memory.borrow().get(&fork_page), Some(&expected));
+        assert_eq!(state.borrow().cache.base_resident_count(), 1);
+
+        world.faults.borrow_mut().push_back(GuestFault {
+            page: fork_page,
+            write: false,
+        });
+        executor.run_until(27);
+        world.faults.borrow_mut().push_back(GuestFault {
+            page: fork_page,
+            write: true,
+        });
+        executor.run_until(28);
+        assert_eq!(world.memory.borrow().get(&fork_page), Some(&expected));
+        assert!(state.borrow().cache.is_dirty(fork_page));
+        assert_eq!(state.borrow().counters.shared_fills, 3);
 
         world.admin.borrow_mut().push_back(AdminCmd::DeleteBase {
             req: ReqId(34),
             base,
         });
-        executor.run_until(28);
+        executor.run_until(30);
         assert!(
             !world
                 .store

@@ -1,4 +1,4 @@
-//! Cluster garbage collection (R9.3): a separate process, against the
+//! Cluster garbage collection (R9.3): a host actor operating against the
 //! bucket alone. Mark from the only roots that exist — head records and
 //! base records — then sweep what nothing reachable references, and only
 //! once it is older than the in-flight grace (which protects publishes

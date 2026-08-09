@@ -13,6 +13,7 @@ mod recovery;
 mod replica;
 mod restore;
 mod state;
+mod store_gc;
 
 pub use backup::{create_backed, publish_latest, reconcile_backed_recovery};
 pub use capture::{capture_local, capture_migration, checkpoint_local, create_fresh_local};

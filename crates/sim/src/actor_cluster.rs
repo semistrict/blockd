@@ -43,7 +43,9 @@ enum Request {
         to: u16,
         started: u64,
     },
-    Restore { sent: u64 },
+    Restore {
+        sent: u64,
+    },
 }
 
 struct Control {
@@ -61,7 +63,10 @@ struct Control {
 impl Control {
     fn req(&mut self, request: Request) -> ReqId {
         let req = ReqId(self.next_req);
-        self.next_req = self.next_req.checked_add(1).expect("cluster request overflow");
+        self.next_req = self
+            .next_req
+            .checked_add(1)
+            .expect("cluster request overflow");
         self.requests.insert(req, request);
         req
     }
@@ -93,7 +98,11 @@ pub(crate) fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
 
     let states = Rc::new(
         (0..config.hosts)
-            .map(|host| RefCell::new(Rc::new(RefCell::new(HostState::new(host_config(&config, host))))))
+            .map(|host| {
+                RefCell::new(Rc::new(RefCell::new(HostState::new(host_config(
+                    &config, host,
+                )))))
+            })
             .collect::<Vec<_>>(),
     );
     let slots: HostSlots = Rc::new((0..config.hosts).map(|_| RefCell::new(None)).collect());
@@ -270,7 +279,9 @@ fn host_config(config: &ClusterConfig, host: u16) -> HostConfig {
                 .roster
                 .iter()
                 .find(|candidate| candidate.host == HostId(host))
-                .map_or(placement.local_failure_domain, |candidate| candidate.failure_domain);
+                .map_or(placement.local_failure_domain, |candidate| {
+                    candidate.failure_domain
+                });
             ReplicaPlacementConfig {
                 membership_epoch: placement.membership_epoch,
                 local_failure_domain,
@@ -309,15 +320,19 @@ async fn reply_actor(
                 prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
                 let started = {
                     let mut control = control.borrow_mut();
-                    let request = control.requests.iter().find_map(|(&req, request)| match request {
-                        Request::Migrate {
-                            vset: requested,
-                            to,
-                            started,
-                            ..
-                        } if *requested == vset && *to == host => Some((req, *started)),
-                        _ => None,
-                    });
+                    let request =
+                        control
+                            .requests
+                            .iter()
+                            .find_map(|(&req, request)| match request {
+                                Request::Migrate {
+                                    vset: requested,
+                                    to,
+                                    started,
+                                    ..
+                                } if *requested == vset && *to == host => Some((req, *started)),
+                                _ => None,
+                            });
                     if let Some((req, started)) = request {
                         control.requests.remove(&req);
                         control.report.migrations = control.report.migrations.saturating_add(1);
@@ -333,11 +348,14 @@ async fn reply_actor(
                 start_guest(vset, host, &control, &worlds, &config);
             }
             AdminReply::VsetRecovered { vset, verdict } => {
-                let already_elsewhere = control
-                    .borrow()
-                    .placement
-                    .get(&vset)
-                    .is_some_and(|&placed| placed != host && control.borrow().live[usize::from(placed)]);
+                let already_elsewhere =
+                    control
+                        .borrow()
+                        .placement
+                        .get(&vset)
+                        .is_some_and(|&placed| {
+                            placed != host && control.borrow().live[usize::from(placed)]
+                        });
                 if already_elsewhere {
                     control
                         .borrow_mut()
@@ -413,7 +431,11 @@ fn start_guest(
         vset,
         Rc::clone(config),
     ));
-    control.borrow().guests.borrow_mut().insert(vset, Some(guest));
+    control
+        .borrow()
+        .guests
+        .borrow_mut()
+        .insert(vset, Some(guest));
 }
 
 fn cancel_guest(vset: VsetId, control: &Rc<RefCell<Control>>) {
@@ -422,16 +444,16 @@ fn cancel_guest(vset: VsetId, control: &Rc<RefCell<Control>>) {
     }
 }
 
-fn prepare_recovered(
-    state: &GuestState,
-    vset: VsetId,
-    config: &ClusterConfig,
-    verdict: Verdict,
-) {
+fn prepare_recovered(state: &GuestState, vset: VsetId, config: &ClusterConfig, verdict: Verdict) {
     match verdict {
         Verdict::Resume { vmstate, .. } => {
             state.completed.set(vmstate);
-            *state.expected.borrow_mut() = state.durable.borrow().clone();
+            *state.expected.borrow_mut() = state
+                .history
+                .borrow()
+                .get(&vmstate)
+                .cloned()
+                .unwrap_or_else(|| state.durable.borrow().clone());
         }
         Verdict::ColdBoot => {
             *state.expected.borrow_mut() = state
@@ -536,7 +558,12 @@ async fn guest_actor(
                 }
             }
             state.expected.borrow_mut().insert(page, bytes);
-            state.written.borrow_mut().entry(page).or_default().insert(sequence);
+            state
+                .written
+                .borrow_mut()
+                .entry(page)
+                .or_default()
+                .insert(sequence);
             state.recovering.borrow_mut().remove(&page);
             if mutation {
                 state.mutation.set(state.mutation.get().saturating_add(1));
@@ -546,13 +573,16 @@ async fn guest_actor(
                 .borrow_mut()
                 .insert(state.mutation.get(), state.expected.borrow().clone());
         } else {
-            let actual = world.page_bytes(page).unwrap_or_else(|| vec![0; page_size()]);
+            let actual = world
+                .page_bytes(page)
+                .unwrap_or_else(|| vec![0; page_size()]);
             let expected = state
                 .expected
                 .borrow()
                 .get(&page)
                 .cloned()
                 .unwrap_or_else(|| vec![0; page_size()]);
+            let expected_claimed = crate::guest::claimed_vol_seq(&expected);
             let recovering = state.recovering.borrow_mut().remove(&page);
             let claimed = crate::guest::claimed_vol_seq(&actual);
             let durable_floor = state
@@ -574,7 +604,11 @@ async fn guest_actor(
                 state
                     .violations
                     .borrow_mut()
-                    .push(format!("read returned stale or foreign bytes for {page:?}"));
+                    .push(format!(
+                        "read returned stale or foreign bytes for {page:?}: actual sequence {claimed}, expected {expected_claimed}, durable floor {durable_floor}, recovering {recovering}, possible {possible}, vmstate {} at {}",
+                        state.completed.get(),
+                        now(),
+                    ));
                 return;
             }
             if valid_recovery {
@@ -616,94 +650,103 @@ fn spawn_schedules(
     control: Rc<RefCell<Control>>,
 ) {
     for &(at, host) in &config.crash_hosts_at {
-        executor.spawn(at_crash(
-            at,
-            host,
-            Rc::clone(config),
-            Rc::clone(&worlds),
-            Rc::clone(&network),
-            Rc::clone(&slots),
-            Rc::clone(&states),
-            Rc::clone(&control),
-        ))
-        .detach();
+        executor
+            .spawn(at_crash(
+                at,
+                host,
+                Rc::clone(config),
+                Rc::clone(&worlds),
+                Rc::clone(&network),
+                Rc::clone(&slots),
+                Rc::clone(&states),
+                Rc::clone(&control),
+            ))
+            .detach();
     }
     for &(at, host) in &config.kill_hosts_at {
-        executor.spawn(at_kill(
-            at,
-            host,
-            Rc::clone(config),
-            Rc::clone(&worlds),
-            Rc::clone(&network),
-            Rc::clone(&slots),
-            Rc::clone(&states),
-            Rc::clone(&control),
-        ))
-        .detach();
+        executor
+            .spawn(at_kill(
+                at,
+                host,
+                Rc::clone(config),
+                Rc::clone(&worlds),
+                Rc::clone(&network),
+                Rc::clone(&slots),
+                Rc::clone(&states),
+                Rc::clone(&control),
+            ))
+            .detach();
     }
     if let Some((at, vset, to)) = config.migrate_at {
-        executor.spawn(at_migrate(
-            at,
-            vset,
-            to,
-            Rc::clone(&worlds),
-            Rc::clone(&control),
-        ))
-        .detach();
+        executor
+            .spawn(at_migrate(
+                at,
+                vset,
+                to,
+                Rc::clone(&worlds),
+                Rc::clone(&control),
+            ))
+            .detach();
     }
     if let Some((begin, end)) = config.store_outage {
         let world = Rc::clone(&worlds[0]);
-        executor.spawn(async move {
-            delay(begin).await;
-            world.set_store_outage(true);
-            delay(end.saturating_sub(begin)).await;
-            world.set_store_outage(false);
-        })
-        .detach();
+        executor
+            .spawn(async move {
+                delay(begin).await;
+                world.set_store_outage(true);
+                delay(end.saturating_sub(begin)).await;
+                world.set_store_outage(false);
+            })
+            .detach();
     }
     if let Some(at) = config.rot_resume_set_at {
         let world = Rc::clone(&worlds[0]);
-        executor.spawn(async move {
-            delay(at).await;
-            let _ = world.rot_store_suffix("/rs");
-        })
-        .detach();
+        executor
+            .spawn(async move {
+                delay(at).await;
+                let _ = world.rot_store_suffix("/rs");
+            })
+            .detach();
     }
     if let Some(at) = config.rot_leaves_at {
         let world = Rc::clone(&worlds[0]);
-        executor.spawn(async move {
-            delay(at).await;
-            let _ = world.rot_store_leaf();
-        })
-        .detach();
+        executor
+            .spawn(async move {
+                delay(at).await;
+                let _ = world.rot_store_leaf();
+            })
+            .detach();
     }
     if let Some(interval) = config.checkpoint_interval {
-        executor.spawn(checkpoint_schedule(
-            interval,
-            config.horizon,
-            Rc::clone(&worlds),
-            Rc::clone(&control),
-        ))
-        .detach();
+        executor
+            .spawn(checkpoint_schedule(
+                interval,
+                config.horizon,
+                Rc::clone(&worlds),
+                Rc::clone(&control),
+            ))
+            .detach();
     }
     if config.crash_mean_interval != 0 {
-        executor.spawn(random_crashes(
-            Rc::clone(config),
-            Rc::clone(&worlds),
-            Rc::clone(&network),
-            Rc::clone(&slots),
-            Rc::clone(&states),
-            Rc::clone(&control),
-        ))
-        .detach();
+        executor
+            .spawn(random_crashes(
+                Rc::clone(config),
+                Rc::clone(&worlds),
+                Rc::clone(&network),
+                Rc::clone(&slots),
+                Rc::clone(&states),
+                Rc::clone(&control),
+            ))
+            .detach();
     }
     if config.migrate_mean_interval != 0 {
-        executor.spawn(random_migrations(
-            Rc::clone(config),
-            Rc::clone(&worlds),
-            Rc::clone(&control),
-        ))
-        .detach();
+        executor
+            .spawn(random_migrations(
+                Rc::clone(config),
+                Rc::clone(&worlds),
+                Rc::clone(&control),
+            ))
+            .detach();
     }
 }
 
@@ -756,7 +799,11 @@ async fn crash_host(
         let mut control = control.borrow_mut();
         control.report.host_crashes = control.report.host_crashes.saturating_add(1);
     }
-    delay(random_between(config.restart_delay.0, config.restart_delay.1)).await;
+    delay(random_between(
+        config.restart_delay.0,
+        config.restart_delay.1,
+    ))
+    .await;
     worlds[usize::from(host)].clear_abort();
     let state = Rc::new(RefCell::new(HostState::new(host_config(config, host))));
     *states[usize::from(host)].borrow_mut() = Rc::clone(&state);
@@ -848,9 +895,9 @@ fn start_migration(
     };
     if from == to
         || !control.borrow().live[usize::from(to)]
-        || control.borrow().requests.values().any(|request| {
-            matches!(request, Request::Migrate { vset: pending, .. } if *pending == vset)
-        })
+        || control.borrow().requests.values().any(
+            |request| matches!(request, Request::Migrate { vset: pending, .. } if *pending == vset),
+        )
     {
         return false;
     }
@@ -897,7 +944,11 @@ async fn random_crashes(
     control: Rc<RefCell<Control>>,
 ) {
     loop {
-        delay(random_between(1, config.crash_mean_interval.saturating_mul(2))).await;
+        delay(random_between(
+            1,
+            config.crash_mean_interval.saturating_mul(2),
+        ))
+        .await;
         if now() > config.horizon {
             return;
         }
@@ -924,9 +975,7 @@ async fn random_migrations(
             .borrow()
             .placement
             .iter()
-            .filter_map(|(&vset, &host)| {
-                control.borrow().live[usize::from(host)].then_some(vset)
-            })
+            .filter_map(|(&vset, &host)| control.borrow().live[usize::from(host)].then_some(vset))
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             continue;
@@ -940,8 +989,8 @@ async fn random_migrations(
         if destinations.is_empty() {
             continue;
         }
-        let to = destinations[usize::try_from(random_u64() % destinations.len() as u64)
-            .expect("host index fits")];
+        let to = destinations
+            [usize::try_from(random_u64() % destinations.len() as u64).expect("host index fits")];
         let _ = start_migration(vset, to, &worlds, &control);
     }
 }

@@ -160,7 +160,10 @@ fn injected_replica_crash_cancels_and_recovers_the_host_actor_tree() {
     let report = run(139, config);
     assert_clean(&report);
     assert!(report.fault_coverage.get(&point).copied().unwrap_or(0) > 0);
-    assert!(report.host_crashes > 0, "injected abort did not cancel the host");
+    assert!(
+        report.host_crashes > 0,
+        "injected abort did not cancel the host"
+    );
 }
 
 #[test]

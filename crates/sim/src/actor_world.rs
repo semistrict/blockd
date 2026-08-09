@@ -127,6 +127,7 @@ struct StoreState {
 #[derive(Default)]
 struct MemoryState {
     pages: BTreeMap<PageId, Vec<u8>>,
+    shared_pages: BTreeMap<(u64, u64, blockd_core::types::SegId, u32), Vec<u8>>,
     protected: BTreeSet<PageId>,
     accessed: BTreeSet<PageId>,
     paused: BTreeSet<VsetId>,
@@ -530,12 +531,16 @@ impl SimWorld {
 
     pub(crate) async fn fault(&self, page: PageId, write: bool) -> bool {
         loop {
-            let ready = {
+            let (ready, paused) = {
                 let memory = self.memory.borrow();
-                !memory.failed.contains(&page)
-                    && !memory.paused.contains(&page.volume.vset)
-                    && memory.pages.contains_key(&page)
-                    && (!write || !memory.protected.contains(&page))
+                let paused = memory.paused.contains(&page.volume.vset);
+                (
+                    !memory.failed.contains(&page)
+                        && !paused
+                        && memory.pages.contains_key(&page)
+                        && (!write || !memory.protected.contains(&page)),
+                    paused,
+                )
             };
             if ready {
                 self.memory.borrow_mut().accessed.insert(page);
@@ -550,7 +555,7 @@ impl SimWorld {
                 .entry(page)
                 .or_default()
                 .push(send);
-            if !self.faults.send(GuestFault { page, write }) {
+            if !paused && !self.faults.send(GuestFault { page, write }) {
                 return false;
             }
             if receive.await != Ok(true) {
@@ -1032,16 +1037,15 @@ impl GuestMem for SimWorld {
     async fn fill_shared(
         &self,
         page: PageId,
-        _share: (u64, u64, blockd_core::types::SegId, u32),
+        share: (u64, u64, blockd_core::types::SegId, u32),
+        bytes: Option<Vec<u8>>,
         writable: bool,
     ) {
-        self.fill(
-            page,
-            vec![0; blockd_core::types::page_size()],
-            writable,
-            FillSource::Zero,
-        )
-        .await;
+        if let Some(bytes) = bytes {
+            self.memory.borrow_mut().shared_pages.insert(share, bytes);
+        }
+        let bytes = self.memory.borrow().shared_pages[&share].clone();
+        self.fill(page, bytes, writable, FillSource::Store).await;
     }
 
     async fn fail(&self, page: PageId) {
@@ -1218,5 +1222,62 @@ mod tests {
         assert!(state.borrow().vsets[&VsetId(2)].ready);
         drop(actor);
         executor.run_ready();
+    }
+
+    #[test]
+    fn paused_guests_do_not_emit_faults_until_resume() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let page = PageId {
+            volume: blockd_core::types::VolumeId {
+                vset: VsetId(1),
+                idx: blockd_core::types::VolumeIdx(0),
+            },
+            page: blockd_core::types::PageNo(3),
+        };
+        let seen_at = Rc::new(Cell::new(None));
+        let mut executor = Executor::simulation(9);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            async move { GuestMem::pause(world.as_ref(), VsetId(1)).await }
+        });
+        executor
+            .spawn({
+                let world = Rc::clone(&world);
+                let seen_at = Rc::clone(&seen_at);
+                async move {
+                    let fault = GuestMem::next_fault(world.as_ref()).await.expect("fault");
+                    seen_at.set(Some(now()));
+                    GuestMem::fill(
+                        world.as_ref(),
+                        fault.page,
+                        vec![0; blockd_core::types::page_size()],
+                        fault.write,
+                        FillSource::Zero,
+                    )
+                    .await;
+                }
+            })
+            .detach();
+        let client = executor.spawn({
+            let world = Rc::clone(&world);
+            async move { world.fault(page, false).await }
+        });
+        executor
+            .spawn({
+                let world = Rc::clone(&world);
+                async move {
+                    delay(10).await;
+                    GuestMem::resume(world.as_ref(), VsetId(1)).await;
+                }
+            })
+            .detach();
+        assert_eq!(executor.block_on(client), Ok(true));
+        assert_eq!(seen_at.get(), Some(10));
     }
 }
