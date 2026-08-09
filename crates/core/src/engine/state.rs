@@ -25,6 +25,7 @@ pub struct HostState {
     pub vsets: BTreeMap<VsetId, VsetState>,
     pub counters: Counters,
     pub blob_sizes: BTreeMap<String, u64>,
+    pub disk_reclaim_requested: bool,
     pub pressure_waiters: VecDeque<OneSender<()>>,
     pub peer_pages: BTreeMap<crate::protocol::IoId, OneSender<Option<Vec<u8>>>>,
     pub peer_leaves: BTreeMap<crate::protocol::IoId, OneSender<Option<Vec<u8>>>>,
@@ -50,6 +51,7 @@ impl HostState {
             vsets: BTreeMap::new(),
             counters: Counters::default(),
             blob_sizes: BTreeMap::new(),
+            disk_reclaim_requested: false,
             pressure_waiters: VecDeque::new(),
             peer_pages: BTreeMap::new(),
             peer_leaves: BTreeMap::new(),
@@ -162,6 +164,7 @@ impl HostState {
             .is_some_and(|capacity| next > capacity.saturating_sub(self.config.disk_headroom))
         {
             self.counters.nvme_stalls += 1;
+            self.disk_reclaim_requested = true;
             return false;
         }
         self.blob_sizes.insert(name, bytes);
@@ -181,6 +184,7 @@ impl HostState {
             .is_some_and(|capacity| next > capacity.saturating_sub(self.config.disk_headroom))
         {
             self.counters.nvme_stalls += 1;
+            self.disk_reclaim_requested = true;
             return false;
         }
         for (name, bytes) in blobs {
@@ -197,6 +201,7 @@ impl HostState {
             .is_some_and(|capacity| next > capacity.saturating_sub(self.config.disk_headroom))
         {
             self.counters.nvme_stalls += 1;
+            self.disk_reclaim_requested = true;
             return false;
         }
         self.append_blob(name, bytes);
@@ -489,6 +494,7 @@ pub struct VsetState {
     pub pending_syncs: Vec<(crate::protocol::ReqId, u64)>,
     pub commit_running: bool,
     pub checkpoint_running: bool,
+    pub capture_waiters: Vec<OneSender<()>>,
     pub checkpoint_results: BTreeMap<crate::protocol::ReqId, Epoch>,
     pub pinned: Option<JournalRecord>,
     pub drain: Option<DrainState>,
@@ -540,6 +546,7 @@ impl VsetState {
             pending_syncs: Vec::new(),
             commit_running: false,
             checkpoint_running: false,
+            capture_waiters: Vec::new(),
             checkpoint_results: BTreeMap::new(),
             pinned: None,
             drain: None,
@@ -645,6 +652,7 @@ impl Drop for CaptureLease {
             .unwrap_or_default();
         vset.commit_running = false;
         vset.checkpoint_running = false;
+        let waiters = std::mem::take(&mut vset.capture_waiters);
         for page in armed {
             host.cache.end_flush(page);
             if !host.cache.is_dirty(page) {
@@ -652,6 +660,10 @@ impl Drop for CaptureLease {
             }
         }
         host.wake_pressure_waiter();
+        drop(host);
+        for waiter in waiters {
+            let _ = waiter.send(());
+        }
     }
 }
 

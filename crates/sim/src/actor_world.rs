@@ -11,7 +11,9 @@ use blockd_core::types::{HostId, PageId, VsetId};
 use blockd_core::world::{
     AdminIo, BlobEntry, BlobError, Blobs, GuestFault, GuestMem, GuestSync, Peers, Store, StoreError,
 };
-use blockd_exec::channel::{OneSender, Receiver, UnboundedSender, oneshot, unbounded};
+use blockd_exec::channel::{
+    OneSender, Receiver, UnboundedSender, oneshot, unbounded,
+};
 use blockd_exec::{delay, now, random_u64, spawn};
 
 use crate::world::blobdev::{BlobDevConfig, CrashFate};
@@ -79,6 +81,15 @@ impl<T> Stream<T> {
 
     async fn recv(&self) -> Option<T> {
         self.lease().recv().await
+    }
+
+    fn try_recv(&self) -> Option<T> {
+        self.receiver
+            .borrow_mut()
+            .as_mut()
+            .expect("receiver is not leased")
+            .try_recv()
+            .ok()
     }
 }
 
@@ -155,6 +166,9 @@ pub(crate) struct SimWorld {
     fault_waiters: RefCell<BTreeMap<PageId, Vec<OneSender<bool>>>>,
     sync_waiters: RefCell<BTreeMap<ReqId, OneSender<bool>>>,
     aborted: Cell<bool>,
+    abort_reason: RefCell<Option<&'static str>>,
+    corrupt_fills: Cell<bool>,
+    drop_write_protect: Cell<bool>,
 }
 
 impl SimWorld {
@@ -198,6 +212,9 @@ impl SimWorld {
             fault_waiters: RefCell::new(BTreeMap::new()),
             sync_waiters: RefCell::new(BTreeMap::new()),
             aborted: Cell::new(false),
+            abort_reason: RefCell::new(None),
+            corrupt_fills: Cell::new(false),
+            drop_write_protect: Cell::new(false),
         });
         network
             .inboxes
@@ -212,6 +229,10 @@ impl SimWorld {
 
     pub(crate) async fn next_admin_reply(&self) -> Option<AdminReply> {
         self.admin_reply_events.recv().await
+    }
+
+    pub(crate) fn try_next_admin_reply(&self) -> Option<AdminReply> {
+        self.admin_reply_events.try_recv()
     }
 
     pub(crate) fn durable_blobs(&self) -> Vec<(String, Vec<u8>)> {
@@ -231,8 +252,21 @@ impl SimWorld {
         self.store.borrow_mut().outage = outage;
     }
 
+    pub(crate) fn set_corrupt_fills(&self, enabled: bool) {
+        self.corrupt_fills.set(enabled);
+    }
+
+    pub(crate) fn set_drop_write_protect(&self, enabled: bool) {
+        self.drop_write_protect.set(enabled);
+    }
+
     pub(crate) fn clear_abort(&self) {
         self.aborted.set(false);
+        self.abort_reason.borrow_mut().take();
+    }
+
+    pub(crate) fn abort_reason(&self) -> Option<&'static str> {
+        *self.abort_reason.borrow()
     }
 
     pub(crate) fn crash_guest_io(&self) {
@@ -689,10 +723,16 @@ impl GuestMem for SimWorld {
     }
 
     async fn arm_write_protect(&self, pages: &[PageId]) {
+        if self.drop_write_protect.get() {
+            return;
+        }
         self.memory.borrow_mut().protected.extend(pages);
     }
 
-    async fn fill(&self, page: PageId, bytes: Vec<u8>, writable: bool) {
+    async fn fill(&self, page: PageId, mut bytes: Vec<u8>, writable: bool) {
+        if self.corrupt_fills.get() && !bytes.is_empty() {
+            bytes[0] ^= 1;
+        }
         let mut memory = self.memory.borrow_mut();
         memory.pages.insert(page, bytes);
         memory.failed.remove(&page);
@@ -813,8 +853,9 @@ impl AdminIo for SimWorld {
         self.database_replies.borrow_mut().push(reply);
     }
 
-    async fn abort(&self, _reason: &'static str) {
+    async fn abort(&self, reason: &'static str) {
         self.aborted.set(true);
+        self.abort_reason.borrow_mut().replace(reason);
     }
 }
 

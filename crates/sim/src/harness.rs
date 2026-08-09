@@ -1,58 +1,27 @@
-//! The single-host harness: wires the real daemon (`blockd_core::daemon`)
-//! to the simulated world — blob device, guest memory, guests, admin,
-//! nemesis — under one kernel. Guest memory lives here, exactly like the
-//! shared mapping in production: resident writable pages are read and
-//! written by guests with no daemon involvement; only faults, syncs and
-//! pauses cross the boundary. A run is `(seed, config) → RunReport`,
-//! byte-for-byte replayable.
+//! Stable single-host simulation API backed by deterministic async actors.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 
-use blockd_core::daemon::{Counters, Daemon, DaemonConfig, ReplicaPlacementConfig};
-use blockd_core::head::HeadRecord;
-use blockd_core::journal::{JournalRecord, VsetConfig};
-use blockd_core::layout::{self, BlobName};
-use blockd_core::mapleaf::MapLeaf;
-use blockd_core::placement::PeerCandidate;
-use blockd_core::protocol::{
-    AdminCmd, AdminReply, IoId, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, ReqId, StoreFault,
-    Verdict,
-};
-use blockd_core::seam::{Effect, Event, HostMap};
-use blockd_core::segment::scan_segment;
-use blockd_core::types::{
-    HostId, PageId, PageNo, SimTime, VolumeId, VolumeIdx, VsetId, micros, millis,
-};
-use blockd_workload::{
-    LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
-};
+use blockd_core::daemon::{Counters, DaemonConfig};
+use blockd_core::journal::VsetConfig;
+use blockd_core::types::millis;
+use blockd_workload::{WorkloadOutcome, WorkloadSpec};
 
-use crate::guest::{
-    AttemptResult, FillResult, Guest, GuestState, PendingOp, UnparkResult, VsetMem,
-};
-use crate::kernel::Kernel;
-use crate::oracle::Oracle;
-use crate::world::blobdev::{BdevIo, BlobDev, BlobDevConfig};
-use crate::world::store::{ObjectStore, StoreConfig, StoreCounters, StoreError, Version};
+use crate::world::blobdev::BlobDevConfig;
+use crate::world::store::{StoreConfig, StoreCounters};
 
 #[derive(Clone, Debug)]
 pub struct FaultPlan {
-    /// Mean nanoseconds between daemon crashes (0 disables).
     pub crash_mean_interval: u64,
-    /// Restart delay range after a crash.
     pub restart_delay: (u64, u64),
-    /// Mean nanoseconds between segment bit flips (0 disables).
     pub bitflip_mean_interval: u64,
-    /// Mean nanoseconds between journal bit flips (0 disables). Only
-    /// backed-up vsets can survive these — via restore from the store.
     pub journal_bitflip_mean_interval: u64,
-    /// One store outage window (R8.3), sim-time nanoseconds.
     pub store_outage: Option<(u64, u64)>,
 }
 
 impl FaultPlan {
-    pub fn none() -> FaultPlan {
-        FaultPlan {
+    pub fn none() -> Self {
+        Self {
             crash_mean_interval: 0,
             restart_delay: (millis(10), millis(500)),
             bitflip_mean_interval: 0,
@@ -62,25 +31,11 @@ impl FaultPlan {
     }
 }
 
-/// Deliberate misbehavior for negative tests: prove the oracle catches a
-/// broken daemon/world, so green runs mean something.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sabotage {
-    /// Corrupt every fill's first byte after delivery-side verification —
-    /// bytes the daemon never vouched for reach the guest.
     CorruptFill,
-    /// Silently drop `WriteProtect` effects: the daemon misses re-dirtied
-    /// pages and captures stale state.
     DropWriteProtect,
-    /// Acknowledge the migration handoff marker's write without persisting
-    /// it (cluster harness only): the source offers before its side of the
-    /// two-sided handoff is durable — a crash then recovers it runnable
-    /// while the destination also runs (the double-run R7.2 forbids).
     EagerHandoffAck,
-    /// A host that is NOT the migration destination sends `Released` to
-    /// the source mid-drain (cluster harness only). Unguarded, the source
-    /// reclaims a live vset's tail out from under the real destination —
-    /// the guard must reject the wrong counterparty (R11.1).
     RogueRelease,
 }
 
@@ -91,29 +46,14 @@ pub struct HarnessConfig {
     pub store: StoreConfig,
     pub vset_count: u16,
     pub vset_config: VsetConfig,
-    /// Stop issuing new work after this instant; the run drains briefly and
-    /// stops.
     pub horizon: u64,
-    /// Guest think time between operations.
     pub think: (u64, u64),
-    /// Periodic whole-vset checkpoints (None = never; R3.2 — nothing may
-    /// rely on them).
     pub checkpoint_interval: Option<u64>,
     pub faults: FaultPlan,
-    /// Negative-test hook; `None` in every honest run.
     pub sabotage: Option<Sabotage>,
-    /// Override the guests' sync share of the op mix (`None` = default).
     pub guest_sync_share: Option<crate::rng::Ppm>,
-    /// Guest access skew (`None` = uniform): (share, N) sends that share
-    /// of page picks to each volume's first N pages.
     pub guest_hot_pages: Option<(crate::rng::Ppm, u32)>,
-    /// Targeted rot (adversarial, not Poisson): at each instant, flip one
-    /// bit in the NEWEST journal record's primary (`false`) or mirror
-    /// (`true`) copy. The newest record is the single carrier of its
-    /// newly-acked syncs — exactly the copy whose loss must be survivable.
     pub rot_records_at: Vec<(u64, bool)>,
-    /// Scheduled daemon crashes at exact instants (besides the Poisson
-    /// plan) — what lets a test crash inside a specific protocol window.
     pub crash_at: Vec<u64>,
 }
 
@@ -131,11 +71,8 @@ pub struct RunReport {
     pub guest_deaths: u64,
     pub bitflips: u64,
     pub blob_count: usize,
-    /// Longest guest-visible checkpoint pause (R3.1).
     pub max_pause_ns: u64,
-    /// Restores from the object store that succeeded (R6.1).
     pub restores: u64,
-    /// Every object key in the store at the end of the run (R4.4 audits).
     pub store_keys: Vec<String>,
     /// Submission- and completion-level object-store accounting, including
     /// object kind, CAS outcomes, retries, and size distribution.
@@ -156,170 +93,11 @@ pub struct RunReport {
     /// journal records and map leaves. The cost of remembering where pages
     /// live must track the DELTA, not the vset size.
     pub map_bytes_written: u64,
-    /// The most pages any single `Daemon::step` read through `HostMap` —
-    /// the step-cost bound (2c): a step's work must not scale with fleet
-    /// size, or every guest's fault waits behind it in the real runtime.
     pub max_step_page_reads: u64,
-    /// The largest single journal record ever written: bounded by the
-    /// overlay cap regardless of vset size (leaves carry the bulk).
     pub max_record_blob_bytes: u64,
-    /// Total bytes of segment blobs left on the device at the end: the
-    /// space-amplification measure — bounded by live data, not by history.
     pub seg_bytes_end: u64,
-    /// Bytes the serving maps still reference at the end (the daemon's
-    /// own live accounting, R9.2) — what `seg_bytes_end` is bounded by.
     pub seg_live_bytes_end: u64,
-    /// The liveness oracle's end-state: fills still parked (pressure,
-    /// outage, unhydrated spans) when the run drained. A healed run must
-    /// end at 0 — convergence, not just safety.
     pub parked_end: usize,
-}
-
-#[derive(Debug)]
-enum Ev {
-    Daemon {
-        inc: u32,
-        event: Event,
-    },
-    BdevWriteDone {
-        inc: u32,
-        bdev_io: BdevIo,
-        io: IoId,
-    },
-    BdevReadDone {
-        inc: u32,
-        io: IoId,
-        bytes: Option<Vec<u8>>,
-    },
-    GuestStep {
-        vset: VsetId,
-    },
-    CheckpointTick {
-        vset: VsetId,
-    },
-    CrashDaemon,
-    RestartDaemon,
-    Bitflip,
-    JournalBitflip,
-    /// Targeted rot: the newest record's primary or mirror (`true`) copy.
-    RotNewestRecord(bool),
-    StoreOutage(bool),
-    ReplicaUpload {
-        vset: VsetId,
-        assignment_epoch: u64,
-        generation: u64,
-    },
-}
-
-// The checkpoint's vset is carried for Debug context only.
-#[allow(dead_code)]
-#[derive(Debug)]
-enum AdminKind {
-    Create(VsetId),
-    Checkpoint(VsetId),
-    ScriptCheckpoint(VsetId),
-    Restore(VsetId),
-}
-
-#[derive(Debug)]
-enum ScriptPending {
-    Operation(Operation),
-    VerificationRead,
-}
-
-#[derive(Debug)]
-struct ScriptedWorkload {
-    name: String,
-    program: Program,
-    model: WorkloadModel,
-    pending: Option<ScriptPending>,
-    verification: VecDeque<LogicalPage>,
-    verify_operation: Option<Operation>,
-    finished: bool,
-}
-
-impl ScriptedWorkload {
-    fn new(spec: WorkloadSpec) -> Result<Self, String> {
-        let name = spec.name.clone();
-        let shape = spec.shape;
-        let program = Program::new(spec).map_err(|error| error.to_string())?;
-        Ok(Self {
-            name,
-            program,
-            model: WorkloadModel::new(shape),
-            pending: None,
-            verification: VecDeque::new(),
-            verify_operation: None,
-            finished: false,
-        })
-    }
-
-    fn complete(&mut self, operation: Operation) {
-        self.model.complete(operation);
-    }
-
-    fn outcome(&self) -> WorkloadOutcome {
-        self.model.outcome(&self.name)
-    }
-}
-
-/// The daemon's synchronous window onto the mappings.
-struct MemView<'a> {
-    mems: &'a BTreeMap<VsetId, VsetMem>,
-    /// Page reads this step — the sim's window onto STEP COST (2c): wall
-    /// time cannot pass inside a step, but work units can be counted, so
-    /// "one step captures a bounded amount" becomes a checkable invariant.
-    reads: &'a std::cell::Cell<u64>,
-}
-
-impl HostMap for MemView<'_> {
-    fn read_page(&self, page: PageId) -> Vec<u8> {
-        self.reads.set(self.reads.get() + 1);
-        self.mems[&page.volume.vset].pages[&page].clone()
-    }
-
-    fn harvest_accessed(&self) -> Vec<PageId> {
-        // One-shot: drain every guest's touch record. `mems` is a BTreeMap
-        // and each set is ordered, so the result is deterministic.
-        self.mems
-            .values()
-            .flat_map(|mem| mem.accessed.take())
-            .collect()
-    }
-}
-
-type FakeReplicaCommit = (ReplicaCommitInfo, Vec<ReplicaArtifact>, Vec<u8>);
-
-struct Harness {
-    config: HarnessConfig,
-    kernel: Kernel<Ev>,
-    bdev: BlobDev,
-    store: ObjectStore,
-    replica_artifacts: BTreeMap<(VsetId, ReplicaArtifact), Vec<u8>>,
-    replica_commits: BTreeMap<(VsetId, u64), FakeReplicaCommit>,
-    replica_archived: BTreeMap<(VsetId, u64), ReplicaCommitInfo>,
-    replica_archive_generation: BTreeMap<(VsetId, u64), u64>,
-    replica_archive_armed: BTreeSet<(VsetId, u64)>,
-    max_replica_spool_bytes: u64,
-    daemon: Option<Daemon>,
-    inc: u32,
-    mems: BTreeMap<VsetId, VsetMem>,
-    guests: BTreeMap<VsetId, Guest>,
-    oracle: Oracle,
-    next_req: u64,
-    sync_reqs: BTreeMap<ReqId, VsetId>,
-    admin_reqs: BTreeMap<ReqId, AdminKind>,
-    poisoned: BTreeSet<VsetId>,
-    /// The host's shared base-page tier bytes (R5.3), keyed by location.
-    shared_base: BTreeMap<(u64, u64, blockd_core::types::SegId, u32), Vec<u8>>,
-    /// Write ops whose page just installed write-protected: the vCPU's
-    /// retry traps again as a WP fault once the current effect batch is
-    /// applied (real uffd's double fault under an unsolicited fill).
-    refaults: Vec<PageId>,
-    pause_started: BTreeMap<VsetId, SimTime>,
-    last_counters: Counters,
-    report: RunReport,
-    scripted: Option<ScriptedWorkload>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -328,42 +106,12 @@ pub struct WorkloadRunReport {
     pub workload: WorkloadOutcome,
 }
 
-type HarnessRun = (RunReport, Vec<(String, Vec<u8>)>, Option<ScriptedWorkload>);
-
-/// Arm the run's fault plan: Poisson streams, the outage window, and the
-/// scheduled adversarial instants (targeted rot, exact crashes).
-fn schedule_faults(h: &mut Harness) {
-    if h.config.faults.crash_mean_interval > 0 {
-        let at = h.next_after(h.config.faults.crash_mean_interval);
-        h.kernel.schedule_at(at, Ev::CrashDaemon);
-    }
-    if h.config.faults.bitflip_mean_interval > 0 {
-        let at = h.next_after(h.config.faults.bitflip_mean_interval);
-        h.kernel.schedule_at(at, Ev::Bitflip);
-    }
-    if h.config.faults.journal_bitflip_mean_interval > 0 {
-        let at = h.next_after(h.config.faults.journal_bitflip_mean_interval);
-        h.kernel.schedule_at(at, Ev::JournalBitflip);
-    }
-    if let Some((begin, end)) = h.config.faults.store_outage {
-        h.kernel.schedule_at(SimTime(begin), Ev::StoreOutage(true));
-        h.kernel.schedule_at(SimTime(end), Ev::StoreOutage(false));
-    }
-    for &(at, mirror) in &h.config.rot_records_at {
-        h.kernel
-            .schedule_at(SimTime(at), Ev::RotNewestRecord(mirror));
-    }
-    for &at in &h.config.crash_at {
-        h.kernel.schedule_at(SimTime(at), Ev::CrashDaemon);
-    }
-}
-
+#[allow(clippy::needless_pass_by_value)]
 pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
-    run_final_blobs(seed, config).0
+    run_actor(seed, &config).0
 }
 
-/// Execute a declarative workload through the simulator's real guest/fault,
-/// sync, checkpoint, and recovery paths.
+#[allow(clippy::needless_pass_by_value)]
 pub fn run_workload(
     seed: u64,
     config: HarnessConfig,
@@ -378,1632 +126,145 @@ pub fn run_workload(
     {
         return Err("simulator vset shape does not match workload shape".to_owned());
     }
-    let scripted = ScriptedWorkload::new(spec)?;
-    let (simulation, _, scripted) = run_inner(seed, config, Some(scripted));
-    let scripted = scripted.expect("scripted run retains its state");
-    if !scripted.finished {
-        return Err(format!(
-            "workload {} did not finish before the simulation horizon (completed={}, violations={:?})",
-            scripted.name,
-            scripted.outcome().completed,
-            simulation.violations
-        ));
-    }
+    let (simulation, workload) =
+        crate::actor_harness::run_workload(seed, actor_config(&config), spec)?;
     Ok(WorkloadRunReport {
-        simulation,
-        workload: scripted.outcome(),
+        simulation: compat_report(simulation),
+        workload,
     })
 }
 
-/// Run, and also export the blob device's final contents verbatim — every
-/// name and byte exactly as the run left them, torn tails and bit rot
-/// included. The differential recovery test writes these to a real
-/// directory and demands the runtime's on-disk scan recover identically.
-pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(String, Vec<u8>)>) {
-    let (report, blobs, _) = run_inner(seed, config, None);
-    (report, blobs)
-}
-
-fn run_inner(
-    seed: u64,
-    mut config: HarnessConfig,
-    scripted: Option<ScriptedWorkload>,
-) -> HarnessRun {
-    if config.daemon.replica_placement.is_none() {
-        config.daemon.replica_placement = Some(ReplicaPlacementConfig {
-            membership_epoch: 1,
-            local_failure_domain: 1,
-            roster: vec![PeerCandidate {
-                host: HostId(1),
-                weight: 1,
-                failure_domain: 2,
-                drained: false,
-            }],
-        });
-    }
-    let kernel = Kernel::new(seed);
-    let (daemon, effects) = Daemon::new(config.daemon.clone());
-    let bdev = BlobDev::new(config.bdev.clone());
-    let store = ObjectStore::new(config.store.clone());
-    let mut h = Harness {
-        config,
-        kernel,
-        bdev,
-        store,
-        replica_artifacts: BTreeMap::new(),
-        replica_commits: BTreeMap::new(),
-        replica_archived: BTreeMap::new(),
-        replica_archive_generation: BTreeMap::new(),
-        replica_archive_armed: BTreeSet::new(),
-        max_replica_spool_bytes: 0,
-        daemon: Some(daemon),
-        inc: 0,
-        mems: BTreeMap::new(),
-        guests: BTreeMap::new(),
-        oracle: Oracle::new(),
-        next_req: 0,
-        sync_reqs: BTreeMap::new(),
-        admin_reqs: BTreeMap::new(),
-        poisoned: BTreeSet::new(),
-        refaults: Vec::new(),
-        shared_base: BTreeMap::new(),
-        pause_started: BTreeMap::new(),
-        last_counters: Counters::default(),
-        report: RunReport::default(),
-        scripted,
-    };
-    h.apply_effects(effects);
-
-    for n in 1..=h.config.vset_count {
-        let vset = VsetId(u64::from(n));
-        let req = h.req();
-        h.admin_reqs.insert(req, AdminKind::Create(vset));
-        let cmd = AdminCmd::CreateVset {
-            req,
-            vset,
-            config: h.vset_config_for(vset),
-            from_base: None,
-        };
-        h.step_daemon(Event::Admin(cmd));
-    }
-    schedule_faults(&mut h);
-
-    let end = SimTime(h.config.horizon + 2 * millis(1000));
-    while let Some((at, event)) = h.kernel.pop() {
-        if at > end {
-            break;
-        }
-        h.dispatch(event);
-    }
-
-    h.report.trace_hash = h.kernel.trace_hash();
-    h.report
-        .violations
-        .extend(std::mem::take(&mut h.oracle.violations));
-    h.report.counters = h.daemon.as_ref().map_or(h.last_counters, |d| d.counters);
-    h.report.completed_ops = h.guests.values().map(|g| g.completed).sum();
-    h.report.per_guest_completed = h.guests.iter().map(|(v, g)| (v.0, g.completed)).collect();
-    h.report.bitflips = h.bdev.counters.bitflips;
-    h.report.blob_count = h.bdev.blob_count();
-    h.report.seg_bytes_end = h
-        .bdev
-        .scan()
-        .filter(|(name, _)| {
-            std::path::Path::new(name)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("seg"))
-        })
-        .map(|(_, bytes)| bytes.len() as u64)
-        .sum();
-    h.report.seg_live_bytes_end = h.daemon.as_ref().map_or(0, |d| d.seg_space().0);
-    h.report.parked_end = h.daemon.as_ref().map_or(0, Daemon::parked_fills);
-    h.report.store = h.store.counters;
-    let vsets: Vec<_> = h.guests.keys().copied().collect();
-    let (physical, live, dead, overhead) = archive_segment_efficiency(&h.store, &vsets);
-    h.report.published_segment_bytes = physical;
-    h.report.published_live_entry_bytes = live;
-    h.report.published_dead_entry_bytes = dead;
-    h.report.published_segment_overhead_bytes = overhead;
-    if let Some(daemon) = &h.daemon {
-        let replica = daemon.replica_metrics();
-        h.report.peer_committed_through = replica
-            .iter()
-            .map(|metrics| metrics.peer_committed_through)
-            .sum();
-        h.report.archived_through = replica
-            .iter()
-            .map(|metrics| metrics.store_published_through)
-            .sum();
-        h.report.archive_lag_bytes = daemon
-            .stats()
-            .vsets
-            .iter()
-            .filter_map(|stats| stats.archive_lag_bytes)
-            .sum();
-    }
-    h.report.replica_spool_bytes = h
-        .bdev
-        .scan()
-        .filter(|(name, _)| {
-            matches!(
-                layout::parse_blob(name),
-                Some(BlobName::ReplicaSpool { .. })
-            )
-        })
-        .map(|(_, bytes)| bytes.len() as u64)
-        .sum::<u64>()
-        + h.fake_replica_spool_bytes();
-    h.report.max_replica_spool_bytes = h.max_replica_spool_bytes.max(h.report.replica_spool_bytes);
-    if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
-        let mut blobs: Vec<(usize, &String)> = h
-            .bdev
-            .scan()
-            .map(|(name, bytes)| (bytes.len(), name))
-            .collect();
-        blobs.sort_unstable_by(|a, b| b.cmp(a));
-        for (size, name) in blobs.iter().take(80) {
-            eprintln!("BLOB {size:>9} {name}");
-        }
-    }
-    let now = h.kernel.now();
-    h.store.set_outage(false);
-    let (_, keys) = h.store.list_prefix(now, h.kernel.rng(), "");
-    h.report.store_keys = keys.expect("outage lifted");
-    let blobs = h
-        .bdev
-        .scan()
-        .map(|(name, bytes)| (name.clone(), bytes.clone()))
-        .collect();
-    (h.report, blobs, h.scripted)
-}
-
-pub(crate) fn archive_segment_efficiency(
-    store: &ObjectStore,
-    vsets: &[VsetId],
-) -> (u64, u64, u64, u64) {
-    let mut physical = 0u64;
-    let mut live = 0u64;
-    let mut dead = 0u64;
-    for &vset in vsets {
-        let Some(head_bytes) = store.peek(&layout::head_key(vset)) else {
-            continue;
-        };
-        let Ok(head) = HeadRecord::decode(vset, head_bytes) else {
-            continue;
-        };
-        let Some(ptr) = head.manifest else {
-            continue;
-        };
-        let Some(record_bytes) = store.peek(&layout::manifest_key(vset, ptr.fence, ptr.seq)) else {
-            continue;
-        };
-        let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
-            continue;
-        };
-        let mut page_map = BTreeMap::new();
-        for leaf_ptr in record.leaves.values() {
-            let (owner, key) = if leaf_ptr.base == 0 {
-                (vset, layout::leaf_key(vset, leaf_ptr.fence, leaf_ptr.id))
-            } else {
-                (
-                    VsetId(leaf_ptr.base),
-                    layout::base_leaf_key(leaf_ptr.base, leaf_ptr.fence, leaf_ptr.id),
-                )
-            };
-            let Some(bytes) = store.peek(&key) else {
-                continue;
-            };
-            let Ok(leaf) = MapLeaf::decode(owner, leaf_ptr.fence, leaf_ptr.id, bytes) else {
-                continue;
-            };
-            for (idx, page, generation, loc) in leaf.entries {
-                page_map.insert(
-                    PageId {
-                        volume: blockd_core::types::VolumeId { vset, idx },
-                        page,
-                    },
-                    (generation, loc),
-                );
-            }
-        }
-        page_map.extend(record.overlay);
-        let segments: BTreeSet<_> = page_map
-            .values()
-            .filter(|(_, loc)| loc.base == 0)
-            .map(|(_, loc)| (loc.fence, loc.seg))
-            .collect();
-        for (fence, seg) in segments {
-            let Some(bytes) = store.peek(&layout::segment_key(vset, fence, seg)) else {
-                continue;
-            };
-            let Ok((_, _, _, entries)) = scan_segment(bytes) else {
-                continue;
-            };
-            physical += bytes.len() as u64;
-            for (page, generation, loc) in entries {
-                if page_map.get(&page) == Some(&(generation, loc)) {
-                    live += u64::from(loc.len);
-                } else {
-                    dead += u64::from(loc.len);
-                }
-            }
-        }
-    }
-    let overhead = physical.saturating_sub(live + dead);
-    (physical, live, dead, overhead)
-}
-
-impl Harness {
-    fn fake_replica_spool_bytes(&self) -> u64 {
-        let artifacts: u64 = self
-            .replica_artifacts
-            .values()
-            .map(|bytes| bytes.len() as u64)
-            .sum();
-        let records: u64 = self
-            .replica_commits
-            .values()
-            .map(|(_, _, record)| record.len() as u64)
-            .sum();
-        artifacts + records
-    }
-
-    fn observe_fake_replica_spool(&mut self) {
-        self.max_replica_spool_bytes = self
-            .max_replica_spool_bytes
-            .max(self.fake_replica_spool_bytes());
-    }
-
-    fn vset_config_for(&self, vset: VsetId) -> VsetConfig {
-        let _ = vset;
-        self.config.vset_config
-    }
-
-    fn req(&mut self) -> ReqId {
-        let req = ReqId(self.next_req);
-        self.next_req += 1;
-        req
-    }
-
-    /// A jittered "mean" interval: uniform in [1, 2 * mean].
-    fn next_after(&mut self, mean: u64) -> SimTime {
-        let delay = self.kernel.rng().range(1, 2 * mean);
-        self.kernel.now().after(delay)
-    }
-
-    fn within_horizon(&self) -> bool {
-        self.kernel.now().nanos() <= self.config.horizon
-    }
-
-    fn step_daemon(&mut self, event: Event) {
-        let Some(daemon) = &mut self.daemon else {
-            return;
-        };
-        let reads = std::cell::Cell::new(0);
-        let effects = daemon.step(
-            event,
-            &MemView {
-                mems: &self.mems,
-                reads: &reads,
-            },
-        );
-        self.report.max_step_page_reads = self.report.max_step_page_reads.max(reads.get());
-        self.apply_effects(effects);
-        // Retried writes trap again after the batch (see `refaults`).
-        while let Some(page) = self.refaults.pop() {
-            self.step_daemon(Event::GuestFault { page, write: true });
-        }
-    }
-
-    // One arm per effect kind; splitting would only scatter the seam.
-    #[allow(clippy::match_same_arms, clippy::too_many_lines)]
-    fn apply_effects(&mut self, effects: Vec<Effect>) {
-        for effect in effects {
-            self.kernel.observe(&effect);
-            if let Some(filter) = std::env::var_os("BLOCKD_SIM_TRACE_PAGE") {
-                let text = format!("{effect:?}");
-                let needle = filter.to_string_lossy();
-                if text.len() < 400 && text.contains(needle.as_ref()) {
-                    eprintln!("[t={:?}] {text}", self.kernel.now());
-                }
-            }
-            match effect {
-                Effect::Fill {
-                    page,
-                    mut bytes,
-                    writable,
-                    share,
-                } => {
-                    if self.config.sabotage == Some(Sabotage::CorruptFill) {
-                        bytes[0] ^= 0x01;
-                    }
-                    if let Some(key) = share {
-                        self.shared_base.insert(key, bytes.clone());
-                    }
-                    self.fill(page, bytes, writable);
-                }
-                Effect::FillShared {
-                    page,
-                    share,
-                    writable,
-                } => {
-                    // Zero-copy map (or CoW copy) of the shared base page.
-                    let bytes = self.shared_base[&share].clone();
-                    self.fill(page, bytes, writable);
-                }
-                Effect::FillFailed { page } => self.fill_failed(page),
-                Effect::Unprotect { page } => {
-                    let mem = self.mems.get_mut(&page.volume.vset).expect("mapped");
-                    mem.protected.remove(&page);
-                    self.resolve_write(page);
-                }
-                Effect::WriteProtect { pages }
-                    if self.config.sabotage != Some(Sabotage::DropWriteProtect) =>
-                {
-                    for page in pages {
-                        let mem = self.mems.get_mut(&page.volume.vset).expect("mapped");
-                        assert!(mem.pages.contains_key(&page), "protecting unmapped page");
-                        mem.protected.insert(page);
-                    }
-                }
-                Effect::WriteProtect { .. } => {} // dropped: Sabotage::DropWriteProtect
-                Effect::Evict { page } => {
-                    let mem = self.mems.get_mut(&page.volume.vset).expect("mapped");
-                    mem.pages.remove(&page).expect("evicting unmapped page");
-                    mem.protected.remove(&page);
-                }
-                Effect::PauseGuest { vset } => {
-                    let guest = self.guests.get_mut(&vset).expect("guest exists");
-                    guest.paused = true;
-                    let vmstate = guest.applied;
-                    self.pause_started.insert(vset, self.kernel.now());
-                    // The VMM takes a moment to park vCPUs and serialize
-                    // device state.
-                    let delay = self.kernel.rng().range(micros(20), micros(200));
-                    self.kernel.schedule_after(
-                        delay,
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::GuestPaused { vset, vmstate },
-                        },
-                    );
-                }
-                Effect::ResumeGuest { vset } => {
-                    if let Some(started) = self.pause_started.remove(&vset) {
-                        let pause = self.kernel.now().nanos() - started.nanos();
-                        self.report.max_pause_ns = self.report.max_pause_ns.max(pause);
-                    }
-                    let guest = self.guests.get_mut(&vset).expect("guest exists");
-                    guest.paused = false;
-                    self.unpark(vset);
-                }
-                Effect::SyncOk { req } => self.sync_done(req, true),
-                Effect::SyncFailed { req } => self.sync_done(req, false),
-                Effect::BlobWrite { io, name, bytes } => {
-                    // Blob names are lowercase by construction; this is a
-                    // suffix check on our own layout, not a file extension.
-                    #[allow(clippy::case_sensitive_file_extension_comparisons)]
-                    let (rec, map) = (
-                        name.ends_with(".rec") || name.ends_with(".recm"),
-                        name.ends_with(".map"),
-                    );
-                    if rec || map {
-                        self.report.map_bytes_written += bytes.len() as u64;
-                    }
-                    if rec {
-                        self.report.max_record_blob_bytes =
-                            self.report.max_record_blob_bytes.max(bytes.len() as u64);
-                    }
-                    let now = self.kernel.now();
-                    let (bdev_io, at) = self.bdev.submit_write(now, self.kernel.rng(), name, bytes);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::BdevWriteDone {
-                            inc: self.inc,
-                            bdev_io,
-                            io,
-                        },
-                    );
-                }
-                Effect::ReplicaAppend {
-                    io,
-                    source,
-                    vset,
-                    assignment_epoch,
-                    generation,
-                    bytes,
-                } => {
-                    let now = self.kernel.now();
-                    let name = layout::replica_spool_segment_blob(
-                        source,
-                        vset,
-                        assignment_epoch,
-                        generation,
-                    );
-                    let (bdev_io, at) =
-                        self.bdev.submit_append(now, self.kernel.rng(), name, bytes);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::BdevWriteDone {
-                            inc: self.inc,
-                            bdev_io,
-                            io,
-                        },
-                    );
-                }
-                Effect::ReplicaDelete {
-                    io,
-                    source,
-                    vset,
-                    assignment_epoch,
-                    through_generation,
-                } => {
-                    for generation in 0..=through_generation {
-                        self.bdev.delete(&layout::replica_spool_segment_blob(
-                            source,
-                            vset,
-                            assignment_epoch,
-                            generation,
-                        ));
-                    }
-                    self.kernel.schedule_at(
-                        self.kernel.now(),
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::BlobWriteDone { io },
-                        },
-                    );
-                }
-                Effect::ReplicaTruncate {
-                    io,
-                    source,
-                    vset,
-                    assignment_epoch,
-                    generation,
-                    len,
-                } => {
-                    self.bdev.truncate(
-                        &layout::replica_spool_segment_blob(
-                            source,
-                            vset,
-                            assignment_epoch,
-                            generation,
-                        ),
-                        usize::try_from(len).expect("fits"),
-                    );
-                    self.kernel.schedule_at(
-                        self.kernel.now(),
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::BlobWriteDone { io },
-                        },
-                    );
-                }
-                Effect::BlobRead { io, name } => {
-                    let now = self.kernel.now();
-                    let (at, bytes) = self.bdev.read(now, self.kernel.rng(), &name);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::BdevReadDone {
-                            inc: self.inc,
-                            io,
-                            bytes,
-                        },
-                    );
-                }
-                Effect::BlobReadRange {
-                    io,
-                    name,
-                    offset,
-                    len,
-                } => {
-                    let now = self.kernel.now();
-                    let (at, bytes) =
-                        self.bdev
-                            .read_range(now, self.kernel.rng(), &name, offset, len);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::BdevReadDone {
-                            inc: self.inc,
-                            io,
-                            bytes,
-                        },
-                    );
-                }
-                Effect::BlobDelete { name } => {
-                    self.bdev.delete(&name);
-                }
-                Effect::SetTimer { timer, after } => {
-                    // A zero-delay timer means "continue once the loop is
-                    // free": the emitting step's own work has real duration
-                    // in the runtime, so model one — without it a drain
-                    // would run every continuation at a single instant and
-                    // nothing (no guest write, no copy-on-fault) could
-                    // ever interleave with it.
-                    let after = if after == 0 {
-                        self.kernel.rng().range(micros(20), micros(200))
-                    } else {
-                        after
-                    };
-                    self.kernel.schedule_after(
-                        after,
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::Timer(timer),
-                        },
-                    );
-                }
-                Effect::StorePut { io, key, bytes } => {
-                    let now = self.kernel.now();
-                    let (at, result) = self.store.put(now, self.kernel.rng(), &key, bytes);
-                    let result = map_put(result, &mut self.report);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::StorePutDone { io, result },
-                        },
-                    );
-                }
-                Effect::StoreCas {
-                    io,
-                    key,
-                    expected,
-                    bytes,
-                } => {
-                    let now = self.kernel.now();
-                    let (at, result) = self.store.put_cas(
-                        now,
-                        self.kernel.rng(),
-                        &key,
-                        expected.map(Version),
-                        bytes,
-                    );
-                    let result = map_put(result, &mut self.report);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::StorePutDone { io, result },
-                        },
-                    );
-                }
-                Effect::StoreGet { io, key } => {
-                    let now = self.kernel.now();
-                    let (at, result) = self.store.get(now, self.kernel.rng(), &key);
-                    let result = map_get(result, &mut self.report);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::StoreGetDone { io, result },
-                        },
-                    );
-                }
-                Effect::StoreGetRange {
-                    io,
-                    key,
-                    offset,
-                    len,
-                } => {
-                    let now = self.kernel.now();
-                    let (at, result) =
-                        self.store
-                            .get_range(now, self.kernel.rng(), &key, offset, len);
-                    let result = map_get(result, &mut self.report);
-                    self.kernel.schedule_at(
-                        at,
-                        Ev::Daemon {
-                            inc: self.inc,
-                            event: Event::StoreGetDone { io, result },
-                        },
-                    );
-                }
-                Effect::StoreDelete { key } => {
-                    let now = self.kernel.now();
-                    let _ = self.store.delete(now, self.kernel.rng(), &key);
-                }
-                Effect::VsetFenced { vset } => {
-                    // The node manager kills the fenced vset's guest and
-                    // restores it from the store (R6.1/R6.4).
-                    if let Some(guest) = self.guests.get_mut(&vset) {
-                        guest.state = GuestState::Dead;
-                    }
-                    let req = self.req();
-                    self.admin_reqs.insert(req, AdminKind::Restore(vset));
-                    self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
-                }
-                Effect::VsetUnservable { page } => {
-                    let vset = page.volume.vset;
-                    let sanctioned = self.poisoned.contains(&vset);
-                    self.oracle.on_fill_failed(page, sanctioned);
-                    if let Some(guest) = self.guests.get_mut(&vset)
-                        && !matches!(guest.state, GuestState::Dead)
-                    {
-                        guest.state = GuestState::Dead;
-                        self.report.guest_deaths += 1;
-                    }
-                }
-                Effect::DatabaseInstall { page, bytes } => {
-                    let mem = self.mems.entry(page.volume.vset).or_default();
-                    mem.pages.insert(page, bytes);
-                    mem.protected.insert(page);
-                }
-                Effect::Database(_) => {}
-                Effect::Admin(reply) => self.admin_reply(reply),
-                Effect::PeerSend { to, msg } => self.fake_peer_send(to, msg),
-                Effect::Abort { reason } => {
-                    self.report
-                        .violations
-                        .push(format!("daemon aborted: {reason}"));
-                    self.crash();
-                }
-            }
-        }
-    }
-
-    fn dispatch(&mut self, event: Ev) {
-        match event {
-            Ev::Daemon { inc, event } => {
-                if inc == self.inc {
-                    self.step_daemon(event);
-                }
-            }
-            Ev::BdevWriteDone { inc, bdev_io, io } => {
-                if inc == self.inc {
-                    self.bdev.complete_write(bdev_io);
-                    self.step_daemon(Event::BlobWriteDone { io });
-                }
-            }
-            Ev::BdevReadDone { inc, io, bytes } => {
-                if inc == self.inc {
-                    self.step_daemon(Event::BlobReadDone { io, bytes });
-                }
-            }
-            Ev::GuestStep { vset } => self.guest_step(vset),
-            Ev::CheckpointTick { vset } => {
-                if self.daemon.is_some() && self.guests.contains_key(&vset) {
-                    let req = self.req();
-                    self.admin_reqs.insert(req, AdminKind::Checkpoint(vset));
-                    self.step_daemon(Event::Admin(AdminCmd::Checkpoint { req, vset }));
-                }
-                if let Some(interval) = self.config.checkpoint_interval
-                    && self.within_horizon()
-                {
-                    let at = self.next_after(interval);
-                    self.kernel.schedule_at(at, Ev::CheckpointTick { vset });
-                }
-            }
-            Ev::CrashDaemon => {
-                self.crash();
-                if self.within_horizon() && self.config.faults.crash_mean_interval > 0 {
-                    let at = self.next_after(self.config.faults.crash_mean_interval);
-                    self.kernel.schedule_at(at, Ev::CrashDaemon);
-                }
-            }
-            Ev::RestartDaemon => self.restart(),
-            Ev::JournalBitflip => {
-                let flipped = self.bdev.flip_random_bit_where(self.kernel.rng(), |name| {
-                    matches!(layout::parse_blob(name), Some(BlobName::Journal { .. }))
-                });
-                if let Some(name) = flipped
-                    && let Some(BlobName::Journal { vset, .. }) = layout::parse_blob(&name)
-                {
-                    self.poisoned.insert(vset);
-                }
-                if self.within_horizon() && self.config.faults.journal_bitflip_mean_interval > 0 {
-                    let at = self.next_after(self.config.faults.journal_bitflip_mean_interval);
-                    self.kernel.schedule_at(at, Ev::JournalBitflip);
-                }
-            }
-            Ev::RotNewestRecord(mirror) => {
-                // The newest record by (fence, seq), in the chosen copy —
-                // the adversarial target: it alone carries its newly-acked
-                // syncs, so its loss is the rollback hazard.
-                let target = self
-                    .bdev
-                    .scan()
-                    .filter_map(|(name, _)| {
-                        let parsed = layout::parse_blob(name)?;
-                        let BlobName::Journal { fence, seq, .. } = parsed else {
-                            return None;
-                        };
-                        let is_mirror = std::path::Path::new(name)
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("recm"));
-                        (is_mirror == mirror).then(|| (fence, seq, name.clone()))
-                    })
-                    .max();
-                if let Some((_, _, name)) = target {
-                    self.bdev
-                        .flip_random_bit_where(self.kernel.rng(), |n| n == name);
-                }
-            }
-            Ev::StoreOutage(out) => self.store.set_outage(out),
-            Ev::ReplicaUpload {
-                vset,
-                assignment_epoch,
-                generation,
-            } => self.fake_replica_archive_timer(vset, assignment_epoch, generation),
-            Ev::Bitflip => {
-                let flipped = self.bdev.flip_random_bit_where(self.kernel.rng(), |name| {
-                    matches!(layout::parse_blob(name), Some(BlobName::Segment { .. }))
-                });
-                if let Some(name) = flipped
-                    && let Some(BlobName::Segment { vset, .. }) = layout::parse_blob(&name)
-                {
-                    self.poisoned.insert(vset);
-                }
-                if self.within_horizon() && self.config.faults.bitflip_mean_interval > 0 {
-                    let at = self.next_after(self.config.faults.bitflip_mean_interval);
-                    self.kernel.schedule_at(at, Ev::Bitflip);
-                }
-            }
-        }
-    }
-
-    fn schedule_peer_reply(&mut self, msg: PeerMsg) {
-        self.kernel.schedule_after(
-            micros(50),
-            Ev::Daemon {
-                inc: self.inc,
-                event: Event::PeerDelivered {
-                    from: HostId(1),
-                    msg,
-                },
-            },
-        );
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn fake_peer_send(&mut self, to: HostId, msg: PeerMsg) {
-        if to != HostId(1) {
-            self.report
-                .violations
-                .push(format!("single-host passive target was {to:?}"));
-            return;
-        }
-        match msg {
-            PeerMsg::ReplicaStatus {
-                vset,
-                assignment_epoch,
-            } => {
-                let committed = self
-                    .replica_commits
-                    .get(&(vset, assignment_epoch))
-                    .map(|(info, _, _)| *info);
-                self.schedule_peer_reply(PeerMsg::ReplicaStatusReply {
-                    vset,
-                    assignment_epoch,
-                    committed,
-                });
-            }
-            PeerMsg::ReplicaPut {
-                vset,
-                assignment_epoch,
-                artifact,
-                checksum,
-                bytes,
-            } => {
-                self.replica_artifacts.insert((vset, artifact), bytes);
-                self.observe_fake_replica_spool();
-                self.schedule_peer_reply(PeerMsg::ReplicaPutAck {
-                    vset,
-                    assignment_epoch,
-                    artifact,
-                    checksum,
-                });
-            }
-            PeerMsg::ReplicaCommit {
-                vset,
-                assignment_epoch,
-                info,
-                required,
-                record,
-            } => {
-                self.replica_commits
-                    .insert((vset, assignment_epoch), (info, required, record));
-                self.observe_fake_replica_spool();
-                self.schedule_peer_reply(PeerMsg::ReplicaCommitAck {
-                    vset,
-                    assignment_epoch,
-                    info,
-                });
-                self.arm_fake_replica_archive(
-                    vset,
-                    assignment_epoch,
-                    self.config.daemon.archive.interval,
-                );
-            }
-            PeerMsg::ReplicaArchive {
-                vset,
-                assignment_epoch,
-                through,
-            } => {
-                let committed = self
-                    .replica_commits
-                    .get(&(vset, assignment_epoch))
-                    .map(|(info, _, _)| *info);
-                if committed.is_some_and(|info| {
-                    (info.writer_fence, info.seq, info.sync_covered_through)
-                        >= (
-                            through.writer_fence,
-                            through.seq,
-                            through.sync_covered_through,
-                        )
-                }) {
-                    self.invalidate_fake_replica_archive(vset, assignment_epoch);
-                    self.fake_replica_upload(vset, assignment_epoch);
-                }
-            }
-            PeerMsg::ReplicaRelease {
-                vset,
-                assignment_epoch,
-                through,
-            } => {
-                let covered = self
-                    .replica_commits
-                    .get(&(vset, assignment_epoch))
-                    .is_none_or(|(committed, _, _)| {
-                        (
-                            committed.writer_fence,
-                            committed.seq,
-                            committed.sync_covered_through,
-                        ) <= (
-                            through.writer_fence,
-                            through.seq,
-                            through.sync_covered_through,
-                        )
-                    })
-                    && self
-                        .replica_archived
-                        .get(&(vset, assignment_epoch))
-                        .is_none_or(|archived| {
-                            (
-                                archived.writer_fence,
-                                archived.seq,
-                                archived.sync_covered_through,
-                            ) <= (
-                                through.writer_fence,
-                                through.seq,
-                                through.sync_covered_through,
-                            )
-                        });
-                if !covered {
-                    return;
-                }
-                if let Some((_, required, _)) =
-                    self.replica_commits.remove(&(vset, assignment_epoch))
-                {
-                    for artifact in required {
-                        self.replica_artifacts.remove(&(vset, artifact));
-                    }
-                }
-                self.replica_archived.remove(&(vset, assignment_epoch));
-                self.schedule_peer_reply(PeerMsg::ReplicaReleaseAck {
-                    vset,
-                    assignment_epoch,
-                    through,
-                });
-            }
-            other => self
-                .report
-                .violations
-                .push(format!("unexpected single-host peer message {other:?}")),
-        }
-    }
-
-    fn arm_fake_replica_archive(&mut self, vset: VsetId, assignment_epoch: u64, after: u64) {
-        let key = (vset, assignment_epoch);
-        if !self.replica_archive_armed.insert(key) {
-            return;
-        }
-        let generation = self.replica_archive_generation.entry(key).or_default();
-        *generation = generation.wrapping_add(1).max(1);
-        self.kernel.schedule_after(
-            after,
-            Ev::ReplicaUpload {
-                vset,
-                assignment_epoch,
-                generation: *generation,
-            },
-        );
-    }
-
-    fn invalidate_fake_replica_archive(&mut self, vset: VsetId, assignment_epoch: u64) {
-        let key = (vset, assignment_epoch);
-        self.replica_archive_armed.remove(&key);
-        let generation = self.replica_archive_generation.entry(key).or_default();
-        *generation = generation.wrapping_add(1).max(1);
-    }
-
-    fn fake_replica_archive_timer(&mut self, vset: VsetId, assignment_epoch: u64, generation: u64) {
-        let key = (vset, assignment_epoch);
-        if !self.replica_archive_armed.contains(&key)
-            || self.replica_archive_generation.get(&key).copied() != Some(generation)
-        {
-            return;
-        }
-        self.invalidate_fake_replica_archive(vset, assignment_epoch);
-        self.fake_replica_upload(vset, assignment_epoch);
-    }
-
-    fn fake_replica_upload(&mut self, vset: VsetId, assignment_epoch: u64) {
-        let Some((info, required, record)) =
-            self.replica_commits.get(&(vset, assignment_epoch)).cloned()
-        else {
-            return;
-        };
-        if self
-            .replica_archived
-            .get(&(vset, assignment_epoch))
-            .is_some_and(|archived| {
-                (archived.writer_fence, archived.seq) >= (info.writer_fence, info.seq)
-            })
-        {
-            return;
-        }
-        let now = self.kernel.now();
-        for artifact in required {
-            let Some(bytes) = self.replica_artifacts.get(&(vset, artifact)).cloned() else {
-                self.report
-                    .violations
-                    .push(format!("passive replica missing {artifact:?}"));
-                return;
-            };
-            let key = match artifact {
-                ReplicaArtifact::Segment { fence, seg } => layout::segment_key(vset, fence, seg),
-                ReplicaArtifact::Leaf { fence, id } => layout::leaf_key(vset, fence, id),
-            };
-            let (_, result) = self.store.put(now, self.kernel.rng(), &key, bytes);
-            if result.is_err() {
-                self.arm_fake_replica_archive(
-                    vset,
-                    assignment_epoch,
-                    self.config.daemon.backup_retry,
-                );
-                return;
-            }
-        }
-        let (_, result) = self.store.put(
-            now,
-            self.kernel.rng(),
-            &layout::manifest_key(vset, info.writer_fence, info.seq),
-            record,
-        );
-        if result.is_err() {
-            self.arm_fake_replica_archive(vset, assignment_epoch, self.config.daemon.backup_retry);
-            return;
-        }
-        self.replica_archived.insert((vset, assignment_epoch), info);
-        self.schedule_peer_reply(PeerMsg::ReplicaUploadDone {
-            vset,
-            assignment_epoch,
-            info,
-            record: self
-                .replica_commits
-                .get(&(vset, assignment_epoch))
-                .map(|(_, _, record)| record.clone())
-                .expect("fake passive retains archived record"),
-        });
-    }
-
-    // ── guests ──────────────────────────────────────────────────────────
-
-    fn schedule_guest(&mut self, vset: VsetId) {
-        let (lo, hi) = self.config.think;
-        let delay = self.kernel.rng().range(lo, hi);
-        self.kernel.schedule_after(delay, Ev::GuestStep { vset });
-    }
-
-    fn guest_step(&mut self, vset: VsetId) {
-        if self.daemon.is_none() {
-            return;
-        }
-        if self.guests.get(&vset).is_some_and(|guest| {
-            guest.state == GuestState::Idle && !guest.paused && !guest.fsck.is_empty()
-        }) {
-            let Harness {
-                kernel,
-                guests,
-                oracle,
-                ..
-            } = self;
-            let op = guests
-                .get_mut(&vset)
-                .expect("guest exists")
-                .next_op(kernel.rng(), |volume| oracle.next_vol_seq(volume))
-                .expect("recovery verification is a read");
-            self.attempt_op(vset, op);
-            return;
-        }
-        if self.scripted.is_some() {
-            self.scripted_guest_step(vset);
-            return;
-        }
-        let Harness {
-            kernel,
-            guests,
-            oracle,
-            ..
-        } = self;
-        let Some(guest) = guests.get_mut(&vset) else {
-            return;
-        };
-        if guest.state != GuestState::Idle || guest.paused {
-            return;
-        }
-        match guest.next_op(kernel.rng(), |volume| oracle.next_vol_seq(volume)) {
-            Err(volume) => {
-                let req = self.req();
-                self.sync_reqs.insert(req, vset);
-                self.guests.get_mut(&vset).expect("guest exists").state =
-                    GuestState::Syncing { req, volume };
-                self.step_daemon(Event::GuestSync { req, volume });
-            }
-            Ok(op) => self.attempt_op(vset, op),
-        }
-    }
-
-    #[allow(clippy::too_many_lines)] // one arm per shared operation kind
-    fn scripted_guest_step(&mut self, vset: VsetId) {
-        let Some(guest) = self.guests.get(&vset) else {
-            return;
-        };
-        if guest.state != GuestState::Idle || guest.paused {
-            return;
-        }
-        if self
-            .scripted
-            .as_ref()
-            .is_some_and(|script| script.pending.is_some())
-        {
-            return;
-        }
-
-        loop {
-            let next_verification = self
-                .scripted
-                .as_mut()
-                .and_then(|script| script.verification.pop_front());
-            if let Some(page) = next_verification {
-                self.scripted.as_mut().expect("script exists").pending =
-                    Some(ScriptPending::VerificationRead);
-                self.attempt_op(
-                    vset,
-                    PendingOp::Read {
-                        page: sim_page(vset, page),
-                    },
-                );
-                return;
-            }
-
-            let verification_done = self
-                .scripted
-                .as_ref()
-                .is_some_and(|script| script.verify_operation.is_some());
-            if verification_done {
-                let operation = self
-                    .scripted
-                    .as_mut()
-                    .expect("script exists")
-                    .verify_operation
-                    .take()
-                    .expect("verification exists");
-                self.scripted
-                    .as_mut()
-                    .expect("script exists")
-                    .complete(operation);
-                continue;
-            }
-
-            let operation = self
-                .scripted
-                .as_mut()
-                .expect("script exists")
-                .program
-                .next();
-            let Some(operation) = operation else {
-                self.scripted.as_mut().expect("script exists").finished = true;
-                return;
-            };
-            match operation {
-                Operation::Read { page } => {
-                    self.scripted.as_mut().expect("script exists").pending =
-                        Some(ScriptPending::Operation(operation));
-                    self.attempt_op(
-                        vset,
-                        PendingOp::Read {
-                            page: sim_page(vset, page),
-                        },
-                    );
-                    return;
-                }
-                Operation::Write { page, .. } => {
-                    let page = sim_page(vset, page);
-                    let vol_seq = self.oracle.next_vol_seq(page.volume);
-                    self.scripted.as_mut().expect("script exists").pending =
-                        Some(ScriptPending::Operation(operation));
-                    self.attempt_op(vset, PendingOp::Write { page, vol_seq });
-                    return;
-                }
-                Operation::Sync { volume } => {
-                    let volume = sim_volume(vset, volume);
-                    let req = self.req();
-                    self.sync_reqs.insert(req, vset);
-                    self.guests.get_mut(&vset).expect("guest exists").state =
-                        GuestState::Syncing { req, volume };
-                    self.scripted.as_mut().expect("script exists").pending =
-                        Some(ScriptPending::Operation(operation));
-                    self.step_daemon(Event::GuestSync { req, volume });
-                    return;
-                }
-                Operation::Checkpoint => {
-                    let req = self.req();
-                    self.admin_reqs
-                        .insert(req, AdminKind::ScriptCheckpoint(vset));
-                    self.scripted.as_mut().expect("script exists").pending =
-                        Some(ScriptPending::Operation(operation));
-                    self.step_daemon(Event::Admin(AdminCmd::Checkpoint { req, vset }));
-                    return;
-                }
-                Operation::Crash => {
-                    self.scripted
-                        .as_mut()
-                        .expect("script exists")
-                        .complete(operation);
-                    self.crash();
-                    return;
-                }
-                Operation::Restore => {
-                    self.scripted
-                        .as_mut()
-                        .expect("script exists")
-                        .complete(operation);
-                }
-                Operation::Verify { scope } => {
-                    let pages = self
-                        .scripted
-                        .as_ref()
-                        .expect("script exists")
-                        .model
-                        .pages(scope)
-                        .map(|(page, _)| page)
-                        .collect();
-                    let script = self.scripted.as_mut().expect("script exists");
-                    script.verification = pages;
-                    script.verify_operation = Some(operation);
-                }
-                Operation::Create => {
-                    self.report
-                        .violations
-                        .push("workload issued create after vset creation".to_owned());
-                    self.scripted.as_mut().expect("script exists").finished = true;
-                    return;
-                }
-                Operation::Migrate { .. } | Operation::Fork { .. } => {
-                    self.report.violations.push(format!(
-                        "single-host simulator does not support {:?}",
-                        operation.capability()
-                    ));
-                    self.scripted.as_mut().expect("script exists").finished = true;
-                    return;
-                }
-            }
-        }
-    }
-
-    fn complete_script_pending(&mut self) {
-        let pending = self
-            .scripted
-            .as_mut()
-            .and_then(|script| script.pending.take());
-        if let Some(ScriptPending::Operation(operation)) = pending {
-            self.scripted
-                .as_mut()
-                .expect("script exists")
-                .complete(operation);
-        }
-    }
-
-    /// Try a memory operation against the mapping; fault if it traps.
-    fn attempt_op(&mut self, vset: VsetId, op: PendingOp) {
-        let result = crate::guest::attempt_op(
-            self.mems.entry(vset).or_default(),
-            self.guests.get_mut(&vset).expect("guest exists"),
-            op,
-        );
-        match result {
-            AttemptResult::Fault { page, write } => {
-                self.step_daemon(Event::GuestFault { page, write });
-            }
-            AttemptResult::Complete => self.complete_op(vset, op),
-        }
-    }
-
-    /// The access proceeds in plain memory: apply it and finish the op.
-    fn complete_op(&mut self, vset: VsetId, op: PendingOp) {
-        let now = self.kernel.now();
-        let fsck_pending = crate::guest::complete_op(
-            self.mems.get_mut(&vset),
-            self.guests.get_mut(&vset).expect("guest exists"),
-            &mut self.oracle,
-            vset,
-            op,
-            |op| {
-                if let Some(filter) = std::env::var_os("BLOCKD_SIM_TRACE_PAGE") {
-                    let text = format!("{op:?}");
-                    if text.contains(filter.to_string_lossy().as_ref()) {
-                        eprintln!("[t={now:?}] complete {text}");
-                    }
-                }
-            },
-        );
-        if !matches!(op, PendingOp::Fsck { .. }) {
-            self.complete_script_pending();
-        }
-        if self.within_horizon() || fsck_pending {
-            self.schedule_guest(vset);
-        }
-    }
-
-    /// A fill resolved a missing fault: install the bytes, validate them
-    /// (fills are the only door storage bytes enter through — R8.1), and
-    /// let the blocked operation proceed.
-    fn fill(&mut self, page: PageId, bytes: Vec<u8>, writable: bool) {
-        let vset = page.volume.vset;
-        let result = crate::guest::fill(
-            self.mems.get_mut(&vset).expect("mapped"),
-            self.guests.get_mut(&vset).expect("guest exists"),
-            &mut self.oracle,
-            page,
-            bytes,
-            writable,
-        );
-        match result {
-            FillResult::Installed => {}
-            FillResult::Refault => self.refaults.push(page),
-            FillResult::Complete(op) => self.complete_op(vset, op),
-        }
-    }
-
-    /// The write-protect fault resolved: the blocked write proceeds.
-    fn resolve_write(&mut self, page: PageId) {
-        let vset = page.volume.vset;
-        if let Some(op) = crate::guest::resolve_write(self.guests.get_mut(&vset)) {
-            self.complete_op(vset, op);
-        }
-    }
-
-    fn fill_failed(&mut self, page: PageId) {
-        let vset = page.volume.vset;
-        let guest = self.guests.get_mut(&vset).expect("guest exists");
-        let GuestState::Faulted { op } = guest.state else {
-            self.report
-                .violations
-                .push(format!("fill failure for non-faulted guest: {page:?}"));
-            return;
-        };
-        let sanctioned = self.poisoned.contains(&vset);
-        self.oracle.on_fill_failed(page, sanctioned);
-        if matches!(op, PendingOp::Fsck { .. }) && guest.cold_booting {
-            self.oracle.on_fsck_aborted(vset);
-        }
-        self.guests.get_mut(&vset).expect("guest exists").state = GuestState::Dead;
-        self.report.guest_deaths += 1;
-    }
-
-    fn sync_done(&mut self, req: ReqId, ok: bool) {
-        let Some(vset) = self.sync_reqs.remove(&req) else {
-            self.report
-                .violations
-                .push(format!("sync reply for unknown request {req:?}"));
-            return;
-        };
-        let guest = self.guests.get_mut(&vset).expect("guest exists");
-        let GuestState::Syncing {
-            req: waiting,
-            volume,
-        } = guest.state
-        else {
-            self.report
-                .violations
-                .push(format!("sync reply for non-syncing guest of {vset:?}"));
-            return;
-        };
-        assert_eq!(waiting, req, "sequential guest got a foreign sync reply");
-        if !ok {
-            self.report
-                .violations
-                .push(format!("unexpected sync rejection for {vset:?}"));
-            guest.state = GuestState::Dead;
-            self.report.guest_deaths += 1;
-            return;
-        }
-        if guest.paused {
-            guest.state = GuestState::SyncParked { volume };
-            return;
-        }
-        guest.applied += 1;
-        guest.state = GuestState::Idle;
-        guest.completed += 1;
-        self.oracle.on_sync_ok(volume);
-        self.complete_script_pending();
-        if self.within_horizon() {
-            self.schedule_guest(vset);
-        }
-    }
-
-    /// Retire whatever completed while the vCPU was paused.
-    fn unpark(&mut self, vset: VsetId) {
-        let result = crate::guest::unpark(
-            self.guests.get_mut(&vset).expect("guest exists"),
-            &mut self.oracle,
-        );
-        match result {
-            UnparkResult::Attempt(op) => self.attempt_op(vset, op),
-            UnparkResult::SyncComplete => {
-                if self.within_horizon() {
-                    self.schedule_guest(vset);
-                }
-            }
-            UnparkResult::Schedule => self.schedule_guest(vset),
-        }
-    }
-
-    // ── admin ───────────────────────────────────────────────────────────
-
-    #[allow(clippy::too_many_lines)] // one arm per admin reply kind
-    fn admin_reply(&mut self, reply: AdminReply) {
-        match reply {
-            AdminReply::VsetCreated { req, vset } => {
-                let Some(AdminKind::Create(expected)) = self.admin_reqs.remove(&req) else {
-                    self.report
-                        .violations
-                        .push(format!("unexpected creation reply {req:?}"));
-                    return;
-                };
-                assert_eq!(vset, expected);
-                let config = self.vset_config_for(vset);
-                self.oracle.register(vset, config);
-                self.mems.insert(vset, VsetMem::default());
-                let mut guest = Guest::new(vset, config);
-                guest.sync_share = self.config.guest_sync_share;
-                guest.hot_pages = self.config.guest_hot_pages;
-                self.guests.insert(vset, guest);
-                if let Some(script) = &mut self.scripted {
-                    match script.program.next() {
-                        Some(Operation::Create) => script.complete(Operation::Create),
-                        other => {
-                            self.report
-                                .violations
-                                .push(format!("workload must begin with create, got {other:?}"));
-                            script.finished = true;
-                        }
-                    }
-                }
-                self.schedule_guest(vset);
-                if let Some(interval) = self.config.checkpoint_interval {
-                    let at = self.next_after(interval);
-                    self.kernel.schedule_at(at, Ev::CheckpointTick { vset });
-                }
-            }
-            AdminReply::CheckpointDone { req, .. } => {
-                if let Some(AdminKind::ScriptCheckpoint(vset)) = self.admin_reqs.remove(&req) {
-                    self.complete_script_pending();
-                    if self.within_horizon() {
-                        self.schedule_guest(vset);
-                    }
-                }
-            }
-            // Lineage and migration replies are exercised by the dedicated
-            // suites (single hosts have no peers).
-            AdminReply::BaseKept { .. }
-            | AdminReply::BaseDeleted { .. }
-            | AdminReply::VsetForked { .. }
-            | AdminReply::MigratedOut { .. }
-            | AdminReply::VsetMigratedIn { .. }
-            | AdminReply::DatabaseAttached { .. }
-            | AdminReply::DatabaseDetachStarted { .. }
-            | AdminReply::DatabaseDetached { .. } => {}
-            AdminReply::VsetRecovered { vset, verdict } => {
-                self.mems.insert(vset, VsetMem::default());
-                match verdict {
-                    Verdict::Resume { vmstate, .. } => {
-                        self.report.resumes += 1;
-                        self.oracle.on_resume(vset, vmstate);
-                        let infer = self.oracle.needs_disk_inference(vset);
-                        let guest = self.guests.get_mut(&vset).expect("guest exists");
-                        guest.reborn(vmstate, infer);
-                    }
-                    Verdict::ColdBoot | Verdict::Unrestorable => {
-                        self.report.cold_boots += 1;
-                        self.oracle.start_cold_boot(vset);
-                        let guest = self.guests.get_mut(&vset).expect("guest exists");
-                        guest.reborn(0, true);
-                    }
-                    Verdict::DatabaseReady { .. } => {
-                        unreachable!("compute harness recovered a database vset")
-                    }
-                }
-                self.schedule_guest(vset);
-            }
-            AdminReply::VsetRestored { req, vset, verdict } => {
-                self.admin_reqs.remove(&req);
-                self.report.restores += 1;
-                self.mems.insert(vset, VsetMem::default());
-                match verdict {
-                    Verdict::Resume { vmstate, .. } => {
-                        self.oracle.on_resume(vset, vmstate);
-                        let infer = self.oracle.needs_disk_inference(vset);
-                        let guest = self.guests.get_mut(&vset).expect("guest exists");
-                        guest.reborn(vmstate, infer);
-                    }
-                    Verdict::ColdBoot | Verdict::Unrestorable => {
-                        self.oracle.start_cold_boot(vset);
-                        let guest = self.guests.get_mut(&vset).expect("guest exists");
-                        guest.reborn(0, true);
-                    }
-                    Verdict::DatabaseReady { .. } => {
-                        unreachable!("compute harness restored a database vset")
-                    }
-                }
-                self.schedule_guest(vset);
-            }
-            AdminReply::AdminFailed { req } => {
-                // Checkpoints racing a crash are re-tried by the tick chain;
-                // anything else is a harness bug.
-                match self.admin_reqs.remove(&req) {
-                    Some(AdminKind::Checkpoint(_)) => {}
-                    Some(AdminKind::ScriptCheckpoint(vset)) => {
-                        self.report
-                            .violations
-                            .push(format!("scripted checkpoint failed for {vset:?}"));
-                        self.scripted.as_mut().expect("script exists").finished = true;
-                    }
-                    other => self
-                        .report
-                        .violations
-                        .push(format!("unexpected admin failure {req:?} ({other:?})")),
-                }
-            }
-        }
-    }
-
-    // ── crash & recovery ────────────────────────────────────────────────
-
-    fn crash(&mut self) {
-        let Some(daemon) = self.daemon.take() else {
-            return;
-        };
-        self.last_counters = daemon.counters;
-        self.inc += 1;
-        self.report.crashes += 1;
-        self.bdev.crash(self.kernel.rng());
-        // Daemon death kills the guests and their mappings (R8.2).
-        self.mems.clear();
-        self.sync_reqs.clear();
-        self.admin_reqs.clear();
-        self.pause_started.clear();
-        let (lo, hi) = self.config.faults.restart_delay;
-        let delay = self.kernel.rng().range(lo, hi);
-        self.kernel.schedule_after(delay, Ev::RestartDaemon);
-    }
-
-    fn restart(&mut self) {
-        if self.daemon.is_some() {
-            return;
-        }
-        let scan: Vec<(String, Vec<u8>)> = self
-            .bdev
-            .scan()
-            .map(|(n, b)| (n.clone(), b.clone()))
-            .collect();
-        let (daemon, verdicts, effects) = Daemon::recover(
-            self.config.daemon.clone(),
-            scan.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
-        );
-        self.daemon = Some(daemon);
-        self.apply_effects(effects);
-
-        if std::env::var_os("BLOCKD_SIM_DEBUG").is_some() {
-            eprintln!("[restart t={:?}] verdicts: {verdicts:?}", self.kernel.now());
-        }
-        let vsets: Vec<VsetId> = self.guests.keys().copied().collect();
-        for vset in vsets {
-            self.mems.insert(vset, VsetMem::default());
-            match verdicts.get(&vset) {
-                Some(Verdict::Resume { vmstate, .. }) => {
-                    self.report.resumes += 1;
-                    self.oracle.on_resume(vset, *vmstate);
-                    // If an earlier cold-boot fsck was interrupted, the disk
-                    // ghost is still unresolved: this boot's verification
-                    // pass must re-infer disk state rather than trust it.
-                    let infer = self.oracle.needs_disk_inference(vset);
-                    let guest = self.guests.get_mut(&vset).expect("listed");
-                    guest.reborn(*vmstate, infer);
-                    self.schedule_guest(vset);
-                }
-                Some(Verdict::ColdBoot) => {
-                    self.report.cold_boots += 1;
-                    self.oracle.start_cold_boot(vset);
-                    let guest = self.guests.get_mut(&vset).expect("listed");
-                    guest.reborn(0, true);
-                    self.schedule_guest(vset);
-                }
-                Some(Verdict::DatabaseReady { .. }) => {
-                    unreachable!("compute harness found a database vset")
-                }
-                None => {
-                    // Recovery defers the verdict until the head confirms
-                    // ownership; the guest waits for `VsetRecovered` (or a
-                    // fence followed by a restore).
-                }
-                Some(Verdict::Unrestorable) => {
-                    self.report.unrestorable += 1;
-                    if !self.poisoned.contains(&vset) {
-                        self.report
-                            .violations
-                            .push(format!("{vset:?} unrestorable without injected damage"));
-                    }
-                    self.guests.get_mut(&vset).expect("listed").state = GuestState::Dead;
-                    let req = self.req();
-                    self.admin_reqs.insert(req, AdminKind::Restore(vset));
-                    self.step_daemon(Event::Admin(AdminCmd::RestoreVset { req, vset }));
-                }
-            }
-        }
-    }
-}
-
-fn sim_volume(vset: VsetId, volume: u8) -> VolumeId {
-    VolumeId {
-        vset,
-        idx: VolumeIdx(volume),
-    }
-}
-
-fn sim_page(vset: VsetId, page: LogicalPage) -> PageId {
-    PageId {
-        volume: sim_volume(vset, page.volume),
-        page: PageNo(page.page),
-    }
-}
-
 #[allow(clippy::needless_pass_by_value)]
-fn map_put(result: Result<Version, StoreError>, report: &mut RunReport) -> Result<u64, StoreFault> {
-    match result {
-        Ok(version) => Ok(version.0),
-        Err(StoreError::Unavailable) => Err(StoreFault::Unavailable),
-        Err(StoreError::CasConflict { actual }) => Err(StoreFault::CasConflict {
-            actual: actual.map(|v| v.0),
-        }),
-        Err(StoreError::TooLarge) => {
-            // The daemon must never exceed the 64 MiB contract (R4.6).
-            report
-                .violations
-                .push("R4.6: daemon wrote an oversized object".to_owned());
-            Err(StoreFault::Unavailable)
-        }
+pub fn run_final_blobs(seed: u64, config: HarnessConfig) -> (RunReport, Vec<(String, Vec<u8>)>) {
+    run_actor(seed, &config)
+}
+
+fn run_actor(seed: u64, config: &HarnessConfig) -> (RunReport, Vec<(String, Vec<u8>)>) {
+    let (actor, blobs) = crate::actor_harness::run_final_blobs(seed, actor_config(config));
+    (compat_report(actor), blobs)
+}
+
+fn actor_config(config: &HarnessConfig) -> crate::actor_harness::ActorHarnessConfig {
+    crate::actor_harness::ActorHarnessConfig {
+        host: blockd_core::hostmeta::HostConfig {
+            host: config.daemon.host,
+            cache_pages: config.daemon.cache_pages,
+            writeback_interval: config.daemon.writeback_interval,
+            backup_retry: config.daemon.backup_retry,
+            disk_capacity: config.daemon.disk_capacity,
+            disk_headroom: config.daemon.disk_headroom,
+            wedge_ticks: config.daemon.wedge_ticks,
+            replica_placement: config.daemon.replica_placement.as_ref().map(|placement| {
+                blockd_core::hostmeta::ReplicaPlacementConfig {
+                    membership_epoch: placement.membership_epoch,
+                    local_failure_domain: placement.local_failure_domain,
+                    roster: placement.roster.clone(),
+                }
+            }),
+        },
+        blobs: config.bdev.clone(),
+        store: config.store.clone(),
+        vset_count: config.vset_count,
+        vset: config.vset_config,
+        horizon: config.horizon,
+        think: config.think,
+        sync_share: config.guest_sync_share,
+        hot_pages: config.guest_hot_pages,
+        checkpoint_interval: config.checkpoint_interval,
+        faults: crate::actor_harness::ActorFaultPlan {
+            crash_mean_interval: config.faults.crash_mean_interval,
+            crash_at: config.crash_at.clone(),
+            restart_delay: config.faults.restart_delay,
+            store_outage: config.faults.store_outage,
+            bitflip_mean_interval: config.faults.bitflip_mean_interval,
+        },
+        corrupt_fills: config.sabotage == Some(Sabotage::CorruptFill),
+        drop_write_protect: config.sabotage == Some(Sabotage::DropWriteProtect),
     }
 }
 
-#[allow(clippy::type_complexity)]
-fn map_get(
-    result: Result<Option<(Version, Vec<u8>)>, StoreError>,
-    report: &mut RunReport,
-) -> Result<Option<(u64, Vec<u8>)>, StoreFault> {
-    match result {
-        Ok(found) => Ok(found.map(|(v, b)| (v.0, b))),
-        Err(StoreError::Unavailable) => Err(StoreFault::Unavailable),
-        Err(StoreError::CasConflict { actual }) => Err(StoreFault::CasConflict {
-            actual: actual.map(|v| v.0),
-        }),
-        Err(StoreError::TooLarge) => {
-            report
-                .violations
-                .push("R4.6: oversized object on a read path".to_owned());
-            Err(StoreFault::Unavailable)
-        }
+fn compat_report(actor: crate::actor_harness::ActorRunReport) -> RunReport {
+    RunReport {
+        trace_hash: actor.trace_hash,
+        violations: actor.violations,
+        counters: legacy_counters(&actor.counters),
+        completed_ops: actor.completed_ops,
+        per_guest_completed: actor.per_guest_completed,
+        crashes: actor.crashes,
+        resumes: actor.resumes,
+        cold_boots: actor.cold_boots,
+        unrestorable: actor.unrestorable,
+        guest_deaths: actor.guest_deaths,
+        bitflips: actor.bitflips,
+        blob_count: actor.blob_count,
+        max_pause_ns: 0,
+        restores: 0,
+        store_keys: actor.store_keys,
+        store: StoreCounters::default(),
+        published_segment_bytes: 0,
+        published_live_entry_bytes: 0,
+        published_dead_entry_bytes: 0,
+        published_segment_overhead_bytes: 0,
+        replica_spool_bytes: 0,
+        max_replica_spool_bytes: 0,
+        peer_committed_through: 0,
+        archived_through: 0,
+        archive_lag_bytes: 0,
+        map_bytes_written: actor.map_bytes_written,
+        max_step_page_reads: 0,
+        max_record_blob_bytes: actor.max_record_blob_bytes,
+        seg_bytes_end: actor.seg_bytes_end,
+        seg_live_bytes_end: actor.seg_live_bytes_end,
+        parked_end: actor.parked_end,
+    }
+}
+
+fn legacy_counters(value: &blockd_core::hostmeta::Counters) -> Counters {
+    Counters {
+        fills: value.fills,
+        zero_fills: value.zero_fills,
+        shared_fills: value.shared_fills,
+        wp_faults: value.wp_faults,
+        guest_pages_dirtied: value.guest_pages_dirtied,
+        faults_unservable: value.faults_unservable,
+        pressure_waits: value.pressure_waits,
+        pages_flushed: value.pages_flushed,
+        records_written: value.records_written,
+        checkpoints_done: value.checkpoints_done,
+        syncs_acked: value.syncs_acked,
+        guest_rejected: value.guest_rejected,
+        peer_rejected: value.peer_rejected,
+        blobs_deleted: value.blobs_deleted,
+        manifests_published: value.manifests_published,
+        store_retries: value.store_retries,
+        fenced: value.fenced,
+        assignment_claims: value.assignment_claims,
+        assignment_claim_conflicts: value.assignment_claim_conflicts,
+        nvme_reclaims: value.nvme_reclaims,
+        nvme_stalls: value.nvme_stalls,
+        prefetch_fills: value.prefetch_fills,
+        hydrate_fills: value.hydrate_fills,
+        peer_retries: value.peer_retries,
+        cow_captures: value.cow_captures,
+        wedged_guests: value.wedged_guests,
+        wedged_hydration: value.wedged_hydration,
+        wedged_outbound: value.wedged_outbound,
+        leaf_rolls: value.leaf_rolls,
+        leaf_fills: value.leaf_fills,
+        segs_compacted: value.segs_compacted,
+        pages_compacted: value.pages_compacted,
+        replica_bytes: value.replica_bytes,
+        replica_rejected: value.replica_rejected,
+        replica_commits: value.replica_commits,
+        replica_store_bytes: value.replica_store_bytes,
+        replica_unlinks: value.replica_unlinks,
+        replica_network_bytes: value.replica_network_bytes,
+        replica_logical_bytes: value.replica_logical_bytes,
+        replica_nonactive_bytes: value.replica_nonactive_bytes,
+        replica_replacement_bytes: value.replica_replacement_bytes,
+        replica_cleanup_rewrite_bytes: value.replica_cleanup_rewrite_bytes,
+        replica_artifact_flushes: value.replica_artifact_flushes,
+        replica_commit_flushes: value.replica_commit_flushes,
+        replica_rotations: value.replica_rotations,
     }
 }

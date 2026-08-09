@@ -1,17 +1,20 @@
 //! Single-host deterministic runs over the async actor core.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::rc::Rc;
 
 use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::hostmeta::{Counters, HostConfig};
-use blockd_core::journal::{DurabilityMode, VsetConfig};
+use blockd_core::journal::VsetConfig;
 use blockd_core::protocol::{AdminCmd, AdminReply, ReqId};
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
 use blockd_exec::rng::Ppm;
 use blockd_exec::{Executor, TaskHandle, delay, now, random_u64, spawn};
+use blockd_workload::{
+    LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
+};
 
 use crate::actor_world::{SimNetwork, SimWorld};
 use crate::guest::page_pattern;
@@ -24,17 +27,20 @@ pub struct ActorHarnessConfig {
     pub blobs: BlobDevConfig,
     pub store: StoreConfig,
     pub vset_count: u16,
-    pub backed_vsets: u16,
     pub vset: VsetConfig,
     pub horizon: u64,
     pub think: (u64, u64),
     pub sync_share: Option<Ppm>,
     pub hot_pages: Option<(Ppm, u32)>,
+    pub checkpoint_interval: Option<u64>,
     pub faults: ActorFaultPlan,
+    pub corrupt_fills: bool,
+    pub drop_write_protect: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ActorFaultPlan {
+    pub crash_mean_interval: u64,
     pub crash_at: Vec<u64>,
     pub restart_delay: (u64, u64),
     pub store_outage: Option<(u64, u64)>,
@@ -68,6 +74,8 @@ struct GuestState {
     completed: Cell<u64>,
     expected: RefCell<BTreeMap<PageId, Vec<u8>>>,
     durable_expected: RefCell<BTreeMap<PageId, Vec<u8>>>,
+    written_sequences: RefCell<BTreeMap<PageId, BTreeSet<u64>>>,
+    recovering_pages: RefCell<BTreeSet<PageId>>,
     volume_sequences: RefCell<BTreeMap<VolumeId, u64>>,
     violations: RefCell<Vec<String>>,
 }
@@ -88,6 +96,14 @@ type GuestSlots = Rc<RefCell<BTreeMap<VsetId, Option<TaskHandle<()>>>>>;
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
+    run_final_blobs(seed, config).0
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+pub fn run_final_blobs(
+    seed: u64,
+    config: ActorHarnessConfig,
+) -> (ActorRunReport, Vec<(String, Vec<u8>)>) {
     let network = Rc::new(SimNetwork::default());
     network.set_latency(1_000, 10_000);
     let world = SimWorld::new(
@@ -96,20 +112,16 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
         config.store.clone(),
         &network,
     );
+    world.set_corrupt_fills(config.corrupt_fills);
+    world.set_drop_write_protect(config.drop_write_protect);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
     let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
     for number in 1..=config.vset_count {
         let vset = VsetId(u64::from(number));
-        let mut vset_config = config.vset;
-        vset_config.durability = if number <= config.backed_vsets {
-            DurabilityMode::Backup
-        } else {
-            DurabilityMode::Local
-        };
         world.enqueue_admin(AdminCmd::CreateVset {
             req: ReqId(u64::from(number)),
             vset,
-            config: vset_config,
+            config: config.vset,
             from_base: None,
         });
     }
@@ -140,6 +152,7 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
             .map(|number| (VsetId(u64::from(number)), Rc::new(GuestState::default())))
             .collect::<BTreeMap<_, _>>(),
     );
+    let events = Rc::new(RunEvents::default());
     let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
     for number in 1..=config.vset_count {
         let vset = VsetId(u64::from(number));
@@ -147,13 +160,13 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
         let guest = executor.spawn(guest_actor(
             Rc::clone(&world),
             Rc::clone(&guest_states[&vset]),
+            Rc::clone(&events),
             vset,
             guest_config,
         ));
         guest_slots.borrow_mut().insert(vset, Some(guest));
     }
 
-    let events = Rc::new(RunEvents::default());
     let mut supervisor = executor.spawn(recovery_supervisor(
         Rc::clone(&world),
         Rc::clone(&guest_states),
@@ -162,7 +175,7 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
         config.clone(),
     ));
     let mut fault_actors = Vec::new();
-    if !config.faults.crash_at.is_empty() {
+    if !config.faults.crash_at.is_empty() || config.faults.crash_mean_interval != 0 {
         fault_actors.push(executor.spawn(crash_schedule(
             Rc::clone(&world),
             Rc::clone(&host_slot),
@@ -171,6 +184,7 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
             Rc::clone(&events),
             config.host.clone(),
             config.faults.clone(),
+            config.horizon,
         )));
     }
     if let Some(window) = config.faults.store_outage {
@@ -181,6 +195,14 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
             Rc::clone(&world),
             config.faults.bitflip_mean_interval,
             config.horizon,
+        )));
+    }
+    if let Some(interval) = config.checkpoint_interval {
+        fault_actors.push(executor.spawn(checkpoint_schedule(
+            Rc::clone(&world),
+            interval,
+            config.horizon,
+            config.vset_count,
         )));
     }
 
@@ -253,6 +275,271 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
         host.cancel();
     }
     executor.run_ready();
+    (report, blobs)
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+pub fn run_workload(
+    seed: u64,
+    config: ActorHarnessConfig,
+    spec: WorkloadSpec,
+) -> Result<(ActorRunReport, WorkloadOutcome), String> {
+    spec.validate().map_err(|error| error.to_string())?;
+    if config.vset_count != 1 {
+        return Err("scripted workloads require exactly one vset".to_owned());
+    }
+    let network = Rc::new(SimNetwork::default());
+    network.set_latency(1_000, 10_000);
+    let world = SimWorld::new(
+        config.host.host,
+        config.blobs.clone(),
+        config.store.clone(),
+        &network,
+    );
+    world.set_corrupt_fills(config.corrupt_fills);
+    world.set_drop_write_protect(config.drop_write_protect);
+    let vset = VsetId(1);
+    let mut vset_config = config.vset;
+    vset_config.durability = if config.backed_vsets == 1 {
+        DurabilityMode::Backup
+    } else {
+        DurabilityMode::Local
+    };
+    world.enqueue_admin(AdminCmd::CreateVset {
+        req: ReqId(1),
+        vset,
+        config: vset_config,
+        from_base: None,
+    });
+    let mut executor = Executor::simulation(seed);
+    let mut state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+    let mut host = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+    let created = executor.block_on({
+        let world = Rc::clone(&world);
+        async move { world.next_admin_reply().await }
+    });
+    if !matches!(
+        created,
+        Some(AdminReply::VsetCreated {
+            vset: VsetId(1),
+            ..
+        })
+    ) {
+        return Err(format!("vset creation failed: {created:?}"));
+    }
+
+    let mut model = WorkloadModel::new(spec.shape);
+    let program = Program::new(spec.clone()).map_err(|error| error.to_string())?;
+    let mut next_req = 2_u64;
+    let mut crashes = 0_u64;
+    let mut resumes = 0_u64;
+    let mut cold_boots = 0_u64;
+    let unrestorable = 0_u64;
+    for operation in program {
+        match operation {
+            Operation::Create => {}
+            Operation::Read { page } => {
+                scripted_read(&mut executor, &world, page, model.expected(page))?;
+            }
+            Operation::Write { page, value } => {
+                scripted_write(&mut executor, &world, page, value)?;
+            }
+            Operation::Sync { volume } => {
+                let ok = executor.block_on({
+                    let world = Rc::clone(&world);
+                    async move {
+                        world
+                            .sync(blockd_core::world::GuestSync {
+                                req: ReqId(next_req),
+                                volume: VolumeId {
+                                    vset,
+                                    idx: VolumeIdx(volume),
+                                },
+                            })
+                            .await
+                    }
+                });
+                next_req = next_req.checked_add(1).expect("script request overflow");
+                if !ok {
+                    return Err("scripted sync failed".to_owned());
+                }
+            }
+            Operation::Checkpoint => {
+                let req = ReqId(next_req);
+                next_req = next_req.checked_add(1).expect("script request overflow");
+                world.enqueue_admin(AdminCmd::Checkpoint { req, vset });
+                let reply = executor.block_on({
+                    let world = Rc::clone(&world);
+                    async move {
+                        loop {
+                            match world.next_admin_reply().await {
+                                Some(AdminReply::CheckpointDone { req: done, .. })
+                                    if done == req =>
+                                {
+                                    return Some(());
+                                }
+                                Some(AdminReply::AdminFailed { req: failed }) if failed == req => {
+                                    return None;
+                                }
+                                Some(_) => {}
+                                None => return None,
+                            }
+                        }
+                    }
+                });
+                if reply.is_none() {
+                    return Err("scripted checkpoint failed".to_owned());
+                }
+            }
+            Operation::Crash => {
+                host.cancel();
+                executor.run_ready();
+                let _ = world.crash_pending();
+                world.crash_guest_io();
+                crashes = crashes.saturating_add(1);
+                state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+                host = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+            }
+            Operation::Restore => {
+                let deadline = executor.now().saturating_add(1_000_000_000);
+                let verdict = loop {
+                    match world.try_next_admin_reply() {
+                        Some(AdminReply::VsetRecovered {
+                            vset: VsetId(1),
+                            verdict,
+                        }) => break Some(verdict),
+                        Some(_) => {}
+                        None if executor.now() >= deadline => break None,
+                        None => executor
+                            .run_until(deadline.min(executor.now().saturating_add(1_000_000))),
+                    }
+                };
+                match verdict {
+                    Some(blockd_core::protocol::Verdict::Resume { .. }) => {
+                        resumes = resumes.saturating_add(1);
+                    }
+                    Some(blockd_core::protocol::Verdict::ColdBoot) => {
+                        cold_boots = cold_boots.saturating_add(1);
+                    }
+                    Some(blockd_core::protocol::Verdict::Unrestorable) => {
+                        return Err("scripted recovery was unrestorable".to_owned());
+                    }
+                    Some(blockd_core::protocol::Verdict::DatabaseReady { .. }) | None => {
+                        return Err(format!(
+                            "scripted recovery returned no compute verdict (abort={:?})",
+                            world.abort_reason()
+                        ));
+                    }
+                }
+            }
+            Operation::Verify { scope } => {
+                for (page, expected) in model.pages(scope) {
+                    scripted_read(&mut executor, &world, page, expected)?;
+                }
+            }
+            Operation::Migrate { .. } | Operation::Fork { .. } => {
+                return Err("scripted migration/fork is not a single-host operation".to_owned());
+            }
+        }
+        model.complete(operation);
+    }
+    let blobs = world.durable_blobs();
+    let mut report = report_from_state(&executor, &world, &state, &blobs);
+    report.crashes = crashes;
+    report.resumes = resumes;
+    report.cold_boots = cold_boots;
+    report.unrestorable = unrestorable;
+    host.cancel();
+    executor.run_ready();
+    Ok((report, model.outcome(&spec.name)))
+}
+
+fn scripted_read(
+    executor: &mut Executor,
+    world: &Rc<SimWorld>,
+    logical: LogicalPage,
+    expected: u64,
+) -> Result<(), String> {
+    let page = scripted_page(logical);
+    let served = executor.block_on({
+        let world = Rc::clone(world);
+        async move { world.fault(page, false).await }
+    });
+    if !served {
+        return Err(format!("scripted read fault failed at {logical:?}"));
+    }
+    let bytes = world
+        .page_bytes(page)
+        .unwrap_or_else(|| vec![0; page_size()]);
+    let actual = crate::guest::claimed_vol_seq(&bytes).saturating_sub(u64::from(expected != 0));
+    if actual != expected {
+        return Err(format!(
+            "scripted read mismatch at {logical:?}: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn scripted_write(
+    executor: &mut Executor,
+    world: &Rc<SimWorld>,
+    logical: LogicalPage,
+    value: u64,
+) -> Result<(), String> {
+    let page = scripted_page(logical);
+    let served = executor.block_on({
+        let world = Rc::clone(world);
+        async move { world.fault(page, true).await }
+    });
+    if !served || !world.write_resident(page, page_pattern(page, value.saturating_add(1))) {
+        return Err(format!("scripted write fault failed at {logical:?}"));
+    }
+    Ok(())
+}
+
+fn scripted_page(logical: LogicalPage) -> PageId {
+    PageId {
+        volume: VolumeId {
+            vset: VsetId(1),
+            idx: VolumeIdx(logical.volume),
+        },
+        page: PageNo(logical.page),
+    }
+}
+
+fn report_from_state(
+    executor: &Executor,
+    world: &SimWorld,
+    state: &SharedHostState,
+    blobs: &[(String, Vec<u8>)],
+) -> ActorRunReport {
+    let mut report = ActorRunReport {
+        trace_hash: executor.trace_hash(),
+        counters: state.borrow().counters,
+        blob_count: blobs.len(),
+        store_keys: world.store_keys(),
+        seg_live_bytes_end: state.borrow().seg_space().0,
+        parked_end: state.borrow().stats().parked_faults,
+        bitflips: world.bitflips(),
+        ..ActorRunReport::default()
+    };
+    for (name, bytes) in blobs {
+        let extension = Path::new(name).extension().and_then(|value| value.to_str());
+        match extension {
+            Some("rec" | "recm" | "map") => {
+                report.map_bytes_written =
+                    report.map_bytes_written.saturating_add(bytes.len() as u64);
+                if matches!(extension, Some("rec" | "recm")) {
+                    report.max_record_blob_bytes =
+                        report.max_record_blob_bytes.max(bytes.len() as u64);
+                }
+            }
+            Some("seg") => {
+                report.seg_bytes_end = report.seg_bytes_end.saturating_add(bytes.len() as u64);
+            }
+            _ => {}
+        }
+    }
     report
 }
 
@@ -298,9 +585,20 @@ async fn recovery_supervisor(
             }
             blockd_core::protocol::Verdict::DatabaseReady { .. } => continue,
         }
+        *guest_states[&vset].recovering_pages.borrow_mut() = config
+            .vset
+            .volumes(vset)
+            .flat_map(|volume| {
+                (0..config.vset.pages_per_volume).map(move |page| PageId {
+                    volume,
+                    page: PageNo(page),
+                })
+            })
+            .collect();
         let handle = spawn(guest_actor(
             Rc::clone(&world),
             Rc::clone(&guest_states[&vset]),
+            Rc::clone(&events),
             vset,
             config.clone(),
         ));
@@ -312,6 +610,7 @@ async fn recovery_supervisor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn crash_schedule(
     world: Rc<SimWorld>,
     host_slot: HostSlot,
@@ -320,8 +619,20 @@ async fn crash_schedule(
     events: Rc<RunEvents>,
     host_config: HostConfig,
     mut faults: ActorFaultPlan,
+    horizon: u64,
 ) {
+    if faults.crash_mean_interval != 0 {
+        let mut crash_at = random_between(1, faults.crash_mean_interval.saturating_mul(2));
+        while crash_at <= horizon {
+            faults.crash_at.push(crash_at);
+            crash_at = crash_at.saturating_add(random_between(
+                1,
+                faults.crash_mean_interval.saturating_mul(2),
+            ));
+        }
+    }
     faults.crash_at.sort_unstable();
+    faults.crash_at.dedup();
     for crash_at in faults.crash_at {
         if now() < crash_at {
             delay(crash_at - now()).await;
@@ -371,9 +682,28 @@ async fn bitflip_schedule(world: Rc<SimWorld>, mean: u64, horizon: u64) {
     }
 }
 
+async fn checkpoint_schedule(world: Rc<SimWorld>, interval: u64, horizon: u64, vset_count: u16) {
+    let mut req = 1_u64 << 63;
+    loop {
+        delay(interval).await;
+        if now() > horizon {
+            return;
+        }
+        for number in 1..=vset_count {
+            world.enqueue_admin(AdminCmd::Checkpoint {
+                req: ReqId(req),
+                vset: VsetId(u64::from(number)),
+            });
+            req = req.checked_add(1).expect("checkpoint request overflow");
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn guest_actor(
     world: Rc<SimWorld>,
     state: Rc<GuestState>,
+    events: Rc<RunEvents>,
     vset: VsetId,
     config: ActorHarnessConfig,
 ) {
@@ -404,6 +734,9 @@ async fn guest_actor(
                 .sync(blockd_core::world::GuestSync { req, volume })
                 .await
             {
+                events
+                    .guest_deaths
+                    .set(events.guest_deaths.get().saturating_add(1));
                 return;
             }
             let current = state.expected.borrow();
@@ -422,6 +755,9 @@ async fn guest_actor(
         let page = choose_page(&config, vset);
         let write = random_u64() % 100 < 60;
         if !world.fault(page, write).await {
+            events
+                .guest_deaths
+                .set(events.guest_deaths.get().saturating_add(1));
             return;
         }
         if write {
@@ -434,10 +770,20 @@ async fn guest_actor(
             let bytes = page_pattern(page, sequence);
             while !world.write_resident(page, bytes.clone()) {
                 if !world.fault(page, true).await {
+                    events
+                        .guest_deaths
+                        .set(events.guest_deaths.get().saturating_add(1));
                     return;
                 }
             }
             state.expected.borrow_mut().insert(page, bytes);
+            state
+                .written_sequences
+                .borrow_mut()
+                .entry(page)
+                .or_default()
+                .insert(sequence);
+            state.recovering_pages.borrow_mut().remove(&page);
         } else {
             let actual = world
                 .page_bytes(page)
@@ -448,12 +794,33 @@ async fn guest_actor(
                 .get(&page)
                 .cloned()
                 .unwrap_or_else(|| vec![0; page_size()]);
-            if actual != expected {
+            let recovering = state.recovering_pages.borrow_mut().remove(&page);
+            let claimed = crate::guest::claimed_vol_seq(&actual);
+            let durable_floor = state
+                .durable_expected
+                .borrow()
+                .get(&page)
+                .map_or(0, |bytes| crate::guest::claimed_vol_seq(bytes));
+            let sequence_is_possible = (claimed == 0
+                && !state.durable_expected.borrow().contains_key(&page))
+                || state
+                    .written_sequences
+                    .borrow()
+                    .get(&page)
+                    .is_some_and(|sequences| sequences.contains(&claimed));
+            let valid_recovery = recovering
+                && sequence_is_possible
+                && claimed >= durable_floor
+                && actual == page_pattern(page, claimed);
+            if actual != expected && !valid_recovery {
                 state
                     .violations
                     .borrow_mut()
                     .push(format!("read returned stale or foreign bytes for {page:?}"));
                 return;
+            }
+            if valid_recovery {
+                state.expected.borrow_mut().insert(page, actual);
             }
         }
         finish_operation(&world, &state, vset);
@@ -529,7 +896,10 @@ mod tests {
             think: (50_000, 100_000),
             sync_share: None,
             hot_pages: None,
+            checkpoint_interval: None,
             faults: ActorFaultPlan::default(),
+            corrupt_fills: false,
+            drop_write_protect: false,
         }
     }
 

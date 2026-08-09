@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use blockd_exec::channel::{OneReceiver, oneshot};
 use blockd_exec::{join2, yield_now};
 
 use super::cleanup_local;
@@ -125,7 +126,7 @@ where
             Missing,
             Invalid,
             Existing(crate::types::Epoch),
-            Busy,
+            Busy(OneReceiver<()>),
             Reserved {
                 incarnation: u64,
                 epoch: crate::types::Epoch,
@@ -140,7 +141,9 @@ where
                 } else if let Some(&epoch) = vset_state.checkpoint_results.get(&req) {
                     Decision::Existing(epoch)
                 } else if vset_state.commit_running || vset_state.checkpoint_running {
-                    Decision::Busy
+                    let (wake, wait) = oneshot();
+                    vset_state.capture_waiters.push(wake);
+                    Decision::Busy(wait)
                 } else {
                     let epoch = crate::types::Epoch(vset_state.epoch.0 + 1);
                     vset_state.commit_running = true;
@@ -167,7 +170,9 @@ where
                 .await;
                 return;
             }
-            Decision::Busy => yield_now().await,
+            Decision::Busy(wait) => {
+                let _ = wait.await;
+            }
             Decision::Reserved { incarnation, epoch } => {
                 break (
                     incarnation,
@@ -416,7 +421,7 @@ where
         return None;
     }
 
-    let syncs = {
+    let (syncs, waiters) = {
         let mut host = state.borrow_mut();
         let vset_state = host
             .vsets
@@ -443,6 +448,7 @@ where
         vset_state.drain = None;
         vset_state.commit_running = false;
         vset_state.checkpoint_running = false;
+        let waiters = std::mem::take(&mut vset_state.capture_waiters);
         if let Some(checkpoint) = checkpoint {
             vset_state.epoch = checkpoint.epoch;
             vset_state.pinned = Some(record.clone());
@@ -453,9 +459,12 @@ where
         host.counters.records_written += 1;
         host.counters.syncs_acked += completed.len() as u64;
         host.counters.checkpoints_done += u64::from(checkpoint.is_some());
-        completed
+        (completed, waiters)
     };
     lease.commit();
+    for waiter in waiters {
+        let _ = waiter.send(());
+    }
     for req in syncs {
         GuestMem::sync_ok(world.as_ref(), req).await;
     }
@@ -491,30 +500,38 @@ where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
     let (incarnation, epoch, lease) = loop {
+        enum Decision {
+            Invalid,
+            Busy(OneReceiver<()>),
+            Reserved(u64, crate::types::Epoch),
+        }
         let reserved = {
             let mut host = state.borrow_mut();
             let vset_state = host.vsets.get_mut(&vset)?;
-            if !vset_state.ready
-                || vset_state.config.kind != crate::journal::VsetKind::Compute
-                || vset_state.commit_running
-                || vset_state.checkpoint_running
-            {
-                None
+            if !vset_state.ready || vset_state.config.kind != crate::journal::VsetKind::Compute {
+                Decision::Invalid
+            } else if vset_state.commit_running || vset_state.checkpoint_running {
+                let (wake, wait) = oneshot();
+                vset_state.capture_waiters.push(wake);
+                Decision::Busy(wait)
             } else {
                 let epoch = crate::types::Epoch(vset_state.epoch.0 + 1);
                 vset_state.commit_running = true;
                 vset_state.checkpoint_running = true;
-                Some((vset_state.incarnation, epoch))
+                Decision::Reserved(vset_state.incarnation, epoch)
             }
         };
-        if let Some((incarnation, epoch)) = reserved {
-            break (
+        match reserved {
+            Decision::Invalid => return None,
+            Decision::Busy(wait) => {
+                let _ = wait.await;
+            }
+            Decision::Reserved(incarnation, epoch) => break (
                 incarnation,
                 epoch,
                 CaptureLease::new(&state, vset, incarnation),
-            );
+            ),
         }
-        yield_now().await;
     };
     let vmstate = GuestMem::pause(world.as_ref(), vset).await;
     capture_record(

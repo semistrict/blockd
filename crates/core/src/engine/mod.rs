@@ -26,7 +26,7 @@ pub use lineage::{create_fork, delete_base, keep_base};
 pub use migration::{
     hydrate_tail, migrate_out, peer_fetch_leaf, peer_fetch_page, peer_source, reoffer_outbound,
 };
-pub use reclaim::cleanup_local;
+pub use reclaim::{cleanup_local, reclaim_backed_segments};
 pub use recovery::recover_local;
 pub use replica::{
     create_peer_stashed, publish_replica_head, replica_message, replicate_latest,

@@ -6,8 +6,9 @@ use super::{
     SharedHost, attach_database, begin_detach_database, capture_local, checkpoint_local,
     create_backed, create_fork, create_fresh_local, create_peer_stashed, database_source,
     delete_base, finish_detach_database, hydrate_tail, keep_base, migrate_out, peer_source,
-    publish_latest, publish_replica_head, reconcile_backed_recovery, recover_local,
-    reoffer_outbound, replicate_latest, restore_vset, retry_replica_releases, serve_fault,
+    publish_latest, publish_replica_head, reclaim_backed_segments, reconcile_backed_recovery,
+    recover_local, reoffer_outbound, replicate_latest, restore_vset, retry_replica_releases,
+    serve_fault,
 };
 use crate::hostmeta::HostConfig;
 use crate::journal::VsetKind;
@@ -60,6 +61,13 @@ pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>
     loop {
         delay(config.writeback_interval).await;
         children.reap();
+        if reclaim_backed_segments(Rc::clone(&state), world.as_ref())
+            .await
+            .is_err()
+        {
+            AdminIo::abort(world.as_ref(), "backed segment reclaim failed").await;
+            return;
+        }
         let vsets = state.borrow().vsets.keys().copied().collect::<Vec<_>>();
         for vset in vsets {
             let _ = capture_local(Rc::clone(&state), Rc::clone(&world), vset).await;
