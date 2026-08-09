@@ -50,6 +50,7 @@ pub struct ActorFaultPlan {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActorRunReport {
     pub trace_hash: u64,
+    pub executor_polls: u64,
     pub violations: Vec<String>,
     pub counters: Counters,
     pub completed_ops: u64,
@@ -57,6 +58,7 @@ pub struct ActorRunReport {
     pub blob_count: usize,
     pub store_keys: Vec<String>,
     pub map_bytes_written: u64,
+    pub max_page_reads_in_poll: u64,
     pub max_record_blob_bytes: u64,
     pub seg_bytes_end: u64,
     pub seg_live_bytes_end: u64,
@@ -99,6 +101,81 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
     run_final_blobs(seed, config).0
 }
 
+/// Drive one deliberately large dirty set through the actor capture pipeline.
+///
+/// This is the bare performance harness: all devices are the deterministic
+/// model implementations and the report exposes executor polls plus the
+/// maximum number of guest-page reads performed by any single poll.
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_capture_profile(
+    seed: u64,
+    mut config: ActorHarnessConfig,
+    dirty_pages: u32,
+) -> ActorRunReport {
+    assert!(dirty_pages != 0, "capture profile needs dirty pages");
+    config.vset_count = 1;
+    config.vset = VsetConfig::compute(1, dirty_pages);
+
+    let network = Rc::new(SimNetwork::default());
+    network.set_latency(1, 1);
+    let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+    let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+    let vset = VsetId(1);
+    world.enqueue_admin(AdminCmd::CreateVset {
+        req: ReqId(1),
+        vset,
+        config: config.vset,
+        from_base: None,
+    });
+
+    let mut executor = Executor::simulation(seed);
+    let mut host = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+    let created = executor.block_on({
+        let world = Rc::clone(&world);
+        async move { world.next_admin_reply().await }
+    });
+    assert!(
+        matches!(
+            created,
+            Some(AdminReply::VsetCreated {
+                vset: VsetId(1),
+                ..
+            })
+        ),
+        "capture-profile vset creation failed: {created:?}"
+    );
+
+    for number in 0..dirty_pages {
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(number),
+        };
+        let served = executor.block_on({
+            let world = Rc::clone(&world);
+            async move { world.fault(page, true).await }
+        });
+        assert!(served, "capture-profile fault failed at {page:?}");
+        assert!(
+            world.write_resident(page, page_pattern(page, u64::from(number) + 1)),
+            "capture-profile write failed at {page:?}"
+        );
+    }
+
+    let drain_deadline = executor
+        .now()
+        .saturating_add(config.host.writeback_interval.saturating_mul(4));
+    executor.run_until(drain_deadline);
+    let blobs = world.durable_blobs();
+    let mut report = report_from_state(&executor, &world, &state, &blobs);
+    report.completed_ops = u64::from(dirty_pages);
+    host.cancel();
+    executor.run_ready();
+    report
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run_final_blobs(
     seed: u64,
@@ -106,12 +183,7 @@ pub fn run_final_blobs(
 ) -> (ActorRunReport, Vec<(String, Vec<u8>)>) {
     let network = Rc::new(SimNetwork::default());
     network.set_latency(1_000, 10_000);
-    let world = SimWorld::new(
-        config.host.host,
-        config.blobs,
-        config.store,
-        &network,
-    );
+    let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
@@ -228,6 +300,7 @@ pub fn run_final_blobs(
     let final_state = Rc::clone(&state_slot.borrow());
     let mut report = ActorRunReport {
         trace_hash: executor.trace_hash(),
+        executor_polls: executor.polls(),
         counters: final_state.borrow().counters,
         completed_ops: guest_states
             .values()
@@ -241,6 +314,7 @@ pub fn run_final_blobs(
         store_keys: world.store_keys(),
         seg_live_bytes_end: final_state.borrow().seg_space().0,
         parked_end: final_state.borrow().stats().parked_faults,
+        max_page_reads_in_poll: world.max_page_reads_in_poll(),
         crashes: events.crashes.get(),
         resumes: events.resumes.get(),
         cold_boots: events.cold_boots.get(),
@@ -290,12 +364,7 @@ pub fn run_workload(
     }
     let network = Rc::new(SimNetwork::default());
     network.set_latency(1_000, 10_000);
-    let world = SimWorld::new(
-        config.host.host,
-        config.blobs,
-        config.store,
-        &network,
-    );
+    let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let vset = VsetId(1);
@@ -509,11 +578,13 @@ fn report_from_state(
 ) -> ActorRunReport {
     let mut report = ActorRunReport {
         trace_hash: executor.trace_hash(),
+        executor_polls: executor.polls(),
         counters: state.borrow().counters,
         blob_count: blobs.len(),
         store_keys: world.store_keys(),
         seg_live_bytes_end: state.borrow().seg_space().0,
         parked_end: state.borrow().stats().parked_faults,
+        max_page_reads_in_poll: world.max_page_reads_in_poll(),
         bitflips: world.bitflips(),
         ..ActorRunReport::default()
     };

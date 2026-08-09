@@ -84,7 +84,7 @@ impl FileBlobs {
         Ok(Self { normal, ordered })
     }
 
-    async fn response<T>(mut receiver: Injected<Result<T, BlobError>>) -> Result<T, BlobError> {
+    async fn response<T>(receiver: Injected<Result<T, BlobError>>) -> Result<T, BlobError> {
         receiver.recv().await.unwrap_or(Err(BlobError::Io))
     }
 }
@@ -108,10 +108,17 @@ fn write_blob(root: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let path = root.join(name);
     let parent = path.parent().expect("blob has parent");
     std::fs::create_dir_all(parent)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return if std::fs::read(&path)? == bytes {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        Err(error) => return Err(error),
+    };
     file.write_all(bytes)?;
     file.sync_all()?;
     fsync_to_root(root, parent)
@@ -329,7 +336,7 @@ impl RuntimeStore {
         Self { handle, store }
     }
 
-    async fn response<T: Send + 'static>(mut response: Injected<T>) -> T {
+    async fn response<T: Send + 'static>(response: Injected<T>) -> T {
         response.recv().await.expect("store runtime stopped")
     }
 }
@@ -443,6 +450,17 @@ mod tests {
                 .write("v/1/record".into(), vec![1, 2, 3])
                 .await
                 .unwrap();
+            blobs
+                .write("v/1/record".into(), vec![1, 2, 3])
+                .await
+                .expect("unknown-outcome retry is idempotent");
+            assert!(
+                blobs
+                    .write("v/1/record".into(), vec![9, 9, 9])
+                    .await
+                    .is_err(),
+                "immutable blob rewrite with different bytes was accepted"
+            );
             blobs.write("v/1/marker".into(), vec![4]).await.unwrap();
             assert_eq!(
                 blobs.read_range("v/1/record", 1, 9).await.unwrap(),

@@ -135,7 +135,7 @@ pub struct PeerNet {
 impl PeerNet {
     /// Start the listener and one lazy sender per configured peer;
     /// verified inbound frames reach `deliver` (the runtime injects them
-    /// as `Event::PeerDelivered`).
+    /// into the actor peer inbox).
     pub fn start(
         config: &PeerConfig,
         self_id: HostId,

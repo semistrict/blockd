@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
@@ -173,13 +173,7 @@ impl Demod {
             .collect();
         roster.sort_by_key(|candidate| candidate.host);
         let runtime_config = RuntimeConfig {
-            daemon: DaemonConfig {
-                archive: blockd_core::daemon::ArchivePolicy {
-                    interval: millis(cfg.archive_interval_ms),
-                    max_unpublished_bytes: cfg.archive_lag_bytes,
-                    spool_capacity_bytes: cfg.peer_spool_capacity_bytes,
-                    spool_headroom_bytes: cfg.peer_spool_headroom_bytes,
-                },
+            daemon: HostConfig {
                 host: cfg.host,
                 cache_pages: cfg.cache_pages,
                 writeback_interval: millis(cfg.writeback_interval_ms),

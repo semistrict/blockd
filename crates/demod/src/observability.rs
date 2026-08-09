@@ -10,8 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use blockd_core::daemon::Counters;
-use blockd_core::daemon::{DaemonStats, VsetOperations, VsetRole};
+use blockd_core::hostmeta::{Counters, DaemonStats, VsetOperations, VsetRole};
 use blockd_runtime::{
     CapacitySignal, CapacityState, FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS,
     LatencySeries,
@@ -1126,7 +1125,7 @@ mod tests {
             daemon: DaemonStats {
                 cache_capacity_pages: 100,
                 dirty_pages: 3,
-                vsets: vec![blockd_core::daemon::VsetStats {
+                vsets: vec![blockd_core::hostmeta::VsetStats {
                     vset: blockd_core::types::VsetId(42),
                     role: VsetRole::Hydrating,
                     fence: 8,

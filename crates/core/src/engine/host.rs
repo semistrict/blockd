@@ -440,7 +440,13 @@ mod tests {
 
         async fn arm_write_protect(&self, _pages: &[PageId]) {}
 
-        async fn fill(&self, page: PageId, bytes: Vec<u8>, _writable: bool) {
+        async fn fill(
+            &self,
+            page: PageId,
+            bytes: Vec<u8>,
+            _writable: bool,
+            _source: crate::world::FillSource,
+        ) {
             self.memory.borrow_mut().insert(page, bytes);
         }
 

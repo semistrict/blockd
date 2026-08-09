@@ -3,7 +3,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
 use blockd_core::types::millis;
@@ -30,8 +30,8 @@ pub(crate) fn temp_root(tag: &str) -> PathBuf {
 }
 
 #[allow(dead_code)]
-pub(crate) fn base_daemon_config(host: u16) -> DaemonConfig {
-    DaemonConfig {
+pub(crate) fn base_daemon_config(host: u16) -> HostConfig {
+    HostConfig {
         host: HostId(host),
         cache_pages: 64,
         writeback_interval: millis(5),

@@ -9,7 +9,7 @@ use crate::journal::VsetKind;
 use crate::layout;
 use crate::segment::{PageLoc, open_entry};
 use crate::types::{Gen, PageId, page_size};
-use crate::world::{Blobs, GuestMem, Peers, Store, StoreError};
+use crate::world::{Blobs, FillSource, GuestMem, Peers, Store, StoreError};
 
 pub async fn serve_fault<W>(state: SharedHost, world: Rc<W>, page: PageId, write: bool)
 where
@@ -217,7 +217,14 @@ async fn serve_missing_fault<W>(
                     .fills += 1;
             }
             reservation.commit();
-            GuestMem::fill(world.as_ref(), page, vec![0; page_size()], write).await;
+            GuestMem::fill(
+                world.as_ref(),
+                page,
+                vec![0; page_size()],
+                write,
+                FillSource::Zero,
+            )
+            .await;
             fill_lease.finish(true);
             return;
         };
@@ -233,7 +240,9 @@ async fn serve_missing_fault<W>(
             retry_delay,
         )
         .await;
-        let Some(raw) = verify_entry(page, generation, bytes) else {
+        let Some((raw, fill_source)) = bytes.and_then(|(bytes, source)| {
+            verify_entry(page, generation, Some(bytes)).map(|raw| (raw, source))
+        }) else {
             let advanced = state
                 .borrow()
                 .vsets
@@ -276,7 +285,7 @@ async fn serve_missing_fault<W>(
                 .fills += 1;
         }
         reservation.commit();
-        GuestMem::fill(world.as_ref(), page, raw, write).await;
+        GuestMem::fill(world.as_ref(), page, raw, write, fill_source).await;
         fill_lease.finish(true);
         return;
     }
@@ -296,7 +305,7 @@ async fn fetch_page<W: Blobs + Store + Peers>(
     backed: bool,
     source: Option<crate::types::HostId>,
     retry_delay: u64,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, FillSource)> {
     let local_name = layout::segment_blob(page.volume.vset, location.fence, location.seg);
     if let Ok(Some(bytes)) = Blobs::read_range(
         world,
@@ -306,13 +315,13 @@ async fn fetch_page<W: Blobs + Store + Peers>(
     )
     .await
     {
-        return Some(bytes);
+        return Some((bytes, FillSource::Local));
     }
     if location.base == 0
         && let Some(source) = source
         && let Some(bytes) = peer_fetch_page(state, world, source, page.volume.vset, location).await
     {
-        return Some(bytes);
+        return Some((bytes, FillSource::Peer));
     }
     if !backed && location.base == 0 {
         return None;
@@ -331,7 +340,7 @@ async fn fetch_page<W: Blobs + Store + Peers>(
         )
         .await
         {
-            Ok(Some((_, bytes))) => return Some(bytes),
+            Ok(Some((_, bytes))) => return Some((bytes, FillSource::Store)),
             Ok(None) | Err(StoreError::TooLarge) => return None,
             Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
                 delay(retry_delay).await;
@@ -385,6 +394,8 @@ where
     verify_entry(
         page,
         generation,
-        fetch_page(state, world, page, location, backed, source, retry).await,
+        fetch_page(state, world, page, location, backed, source, retry)
+            .await
+            .map(|(bytes, _)| bytes),
     )
 }

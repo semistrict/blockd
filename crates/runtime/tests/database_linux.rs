@@ -74,8 +74,7 @@ fn unix_stream_runs_sqlite_shaped_io_through_the_real_daemon() {
     let _ = std::fs::remove_dir_all(&dir);
     let runtime = Arc::new(Runtime::new(
         &RuntimeConfig {
-            daemon: blockd_core::daemon::DaemonConfig {
-                archive: Default::default(),
+            daemon: blockd_core::hostmeta::HostConfig {
                 host: HostId(0),
                 cache_pages: 16,
                 writeback_interval: millis(10),

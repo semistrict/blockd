@@ -40,7 +40,7 @@ pub struct Injected<T> {
 }
 
 pub struct Recv<'a, T> {
-    receiver: &'a mut Injected<T>,
+    receiver: &'a Injected<T>,
 }
 
 pub fn injector<T>() -> (Injector<T>, Injected<T>) {
@@ -83,6 +83,14 @@ impl<T> Injector<T> {
         }
         Ok(())
     }
+
+    /// Current external backlog by priority lane. This is observational
+    /// only; scheduling still applies the fairness valve when values are
+    /// received.
+    pub fn depths(&self) -> (usize, usize) {
+        let state = self.state.lock().expect("injector mutex poisoned");
+        (state.critical.len(), state.background.len())
+    }
 }
 
 impl<T> Clone for Injector<T> {
@@ -113,7 +121,7 @@ impl<T> Drop for Injector<T> {
 }
 
 impl<T> Injected<T> {
-    pub fn recv(&mut self) -> Recv<'_, T> {
+    pub fn recv(&self) -> Recv<'_, T> {
         Recv { receiver: self }
     }
 }
@@ -167,7 +175,7 @@ mod tests {
 
     #[test]
     fn background_lane_cannot_starve() {
-        let (sender, mut receiver) = injector();
+        let (sender, receiver) = injector();
         for value in 0..(BACKGROUND_SHARE + 2) {
             sender.push(Lane::Critical, value).unwrap();
         }

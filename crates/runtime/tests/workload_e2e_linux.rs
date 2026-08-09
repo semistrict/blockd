@@ -8,7 +8,7 @@ mod runtime_workload;
 
 use std::sync::Arc;
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{HostId, VsetId, micros, millis};
 use blockd_runtime::{Runtime, RuntimeConfig, S3Store};
@@ -20,7 +20,7 @@ fn checked_in_steady_io_matches_the_real_runtime() {
     let directory = tempfile::tempdir().expect("temporary blob directory");
     let runtime = Runtime::new(
         &RuntimeConfig {
-            daemon: DaemonConfig {
+            daemon: HostConfig {
                 host: HostId(0),
                 cache_pages: 256,
                 writeback_interval: millis(5),
@@ -53,11 +53,9 @@ fn checked_in_checkpoint_recovery_matches_deterministic_simulation() {
     let spec = load("checkpoint-recovery").expect("checked-in workload");
     let mut sim_config = blockd_sim::presets::single_host_base();
     sim_config.vset_count = 1;
-    sim_config.backed_vsets = u16::from(spec.shape.backed_up);
     sim_config.vset_config = VsetConfig::compute(
         spec.shape.disk_volumes,
         spec.shape.pages_per_volume,
-        spec.shape.backed_up,
     );
     sim_config.horizon = millis(10_000);
     sim_config.think = (micros(1), micros(2));
@@ -71,7 +69,7 @@ fn checked_in_checkpoint_recovery_matches_deterministic_simulation() {
     let directory = tempfile::tempdir().expect("temporary blob directory");
     let store = Arc::new(S3Store::new());
     let config = RuntimeConfig {
-        daemon: DaemonConfig {
+        daemon: HostConfig {
             host: HostId(0),
             cache_pages: 256,
             writeback_interval: millis(5),

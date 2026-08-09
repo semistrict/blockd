@@ -196,7 +196,7 @@ fn compat_report(actor: crate::actor_harness::ActorRunReport) -> RunReport {
         archived_through: 0,
         archive_lag_bytes: 0,
         map_bytes_written: actor.map_bytes_written,
-        max_step_page_reads: 0,
+        max_step_page_reads: actor.max_page_reads_in_poll,
         max_record_blob_bytes: actor.max_record_blob_bytes,
         seg_bytes_end: actor.seg_bytes_end,
         seg_live_bytes_end: actor.seg_live_bytes_end,

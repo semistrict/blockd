@@ -117,6 +117,7 @@ struct RuntimeContext {
     now: Rc<Cell<u64>>,
     scheduler: Arc<Scheduler>,
     current_task: Rc<Cell<Option<TaskId>>>,
+    poll_sequence: Rc<Cell<u64>>,
     timer_sequence: Rc<Cell<u64>>,
     timer_requests: Rc<RefCell<Vec<TimerRequest>>>,
     observations: Rc<RefCell<Vec<String>>>,
@@ -134,6 +135,7 @@ impl Clone for RuntimeContext {
             now: Rc::clone(&self.now),
             scheduler: Arc::clone(&self.scheduler),
             current_task: Rc::clone(&self.current_task),
+            poll_sequence: Rc::clone(&self.poll_sequence),
             timer_sequence: Rc::clone(&self.timer_sequence),
             timer_requests: Rc::clone(&self.timer_requests),
             observations: Rc::clone(&self.observations),
@@ -182,6 +184,15 @@ fn with_context<T>(operation: impl FnOnce(&RuntimeContext) -> T) -> T {
 
 pub fn now() -> u64 {
     with_context(refresh_now)
+}
+
+/// Monotonically increasing identity of the task poll currently in progress.
+///
+/// Simulation worlds use this to account bounded cooperative work without
+/// consulting wall time. Calls made during one future poll return the same
+/// value; a wake and subsequent poll advances it.
+pub fn current_poll() -> u64 {
+    with_context(|context| context.poll_sequence.get())
 }
 
 fn refresh_now(context: &RuntimeContext) -> u64 {
@@ -440,6 +451,7 @@ impl Executor {
                 now: Rc::new(Cell::new(0)),
                 scheduler,
                 current_task: Rc::new(Cell::new(None)),
+                poll_sequence: Rc::new(Cell::new(0)),
                 timer_sequence: Rc::new(Cell::new(0)),
                 timer_requests: Rc::new(RefCell::new(Vec::new())),
                 observations: Rc::new(RefCell::new(Vec::new())),
@@ -560,6 +572,10 @@ impl Executor {
         self.trace.records()
     }
 
+    pub fn polls(&self) -> u64 {
+        self.context.poll_sequence.get()
+    }
+
     fn run_one(&mut self) -> bool {
         if self.poll_ready() {
             return true;
@@ -594,6 +610,9 @@ impl Executor {
             source: ready.source,
         };
         self.trace.record(&record);
+        self.context
+            .poll_sequence
+            .set(self.context.poll_sequence.get().saturating_add(1));
         self.context.current_task.set(Some(ready.task));
         let waker = Waker::from(Arc::new(TaskWake {
             task: ready.task,

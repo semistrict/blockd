@@ -3,7 +3,7 @@
 //! local durable state is destroyed (R6.1 on one host). Exact assertions —
 //! runs are deterministic.
 
-use blockd_core::daemon::{ArchivePolicy, DaemonConfig};
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::types::{HostId, VsetId, millis, secs};
@@ -14,11 +14,7 @@ use blockd_sim::world::store::{StoreConfig, StoreObjectKind};
 
 fn base_config() -> HarnessConfig {
     HarnessConfig {
-        daemon: DaemonConfig {
-            archive: ArchivePolicy {
-                interval: secs(1),
-                ..Default::default()
-            },
+        daemon: HostConfig {
             host: HostId(0),
             cache_pages: 256,
             writeback_interval: millis(20),

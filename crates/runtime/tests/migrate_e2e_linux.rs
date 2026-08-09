@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
@@ -50,8 +50,7 @@ fn free_addr() -> SocketAddr {
 
 fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
     RuntimeConfig {
-        daemon: DaemonConfig {
-            archive: Default::default(),
+        daemon: HostConfig {
             host: HostId(host),
             cache_pages: 256,
             writeback_interval: millis(5),

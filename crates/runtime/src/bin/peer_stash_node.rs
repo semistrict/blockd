@@ -20,7 +20,7 @@ mod linux {
     use std::sync::Arc;
 
     use base64::Engine;
-    use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
+    use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
     use blockd_core::journal::VsetConfig;
     use blockd_core::placement::PeerCandidate;
     use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
@@ -156,8 +156,7 @@ mod linux {
             })
             .collect();
         RuntimeConfig {
-            daemon: DaemonConfig {
-                archive: Default::default(),
+            daemon: HostConfig {
                 host: config.host,
                 cache_pages: 256,
                 writeback_interval: millis(5),

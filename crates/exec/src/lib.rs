@@ -18,8 +18,8 @@ mod runtime;
 
 pub use fault::{FaultConfig, FaultPoint};
 pub use runtime::{
-    Cancelled, Delay, Executor, Mode, MonotonicClock, TaskHandle, TaskId, WakeSource, delay,
-    fault_point, now, observe, random_u64, spawn, yield_now,
+    Cancelled, Delay, Executor, Mode, MonotonicClock, TaskHandle, TaskId, WakeSource, current_poll,
+    delay, fault_point, now, observe, random_u64, spawn, yield_now,
 };
 pub use select::{
     Either, Join2, OneOf3, Select2, Select3, Timeout, join2, select2, select3, timeout,

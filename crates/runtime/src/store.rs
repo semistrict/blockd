@@ -1,7 +1,5 @@
-//! The asynchronous object-store boundary of the runtime: exactly the five
-//! operations the daemon's `Effect::Store*` arms need. The effect interpreter
-//! remains synchronous, but it only enqueues requests; network completion is
-//! driven by Tokio and returns to the interpreter as an event. Versions are
+//! The asynchronous object-store boundary of the runtime. Network operations
+//! run on Tokio and their completions wake the shared actor executor. Versions are
 //! opaque u64s the store itself derives — a version must survive process
 //! restarts and be comparable across hosts, because the head CAS (R6.3) is the
 //! cluster's single-writer authority.

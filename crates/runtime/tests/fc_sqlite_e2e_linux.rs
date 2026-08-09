@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::protocol::{DetachMode, StoreFault, Verdict};
 use blockd_core::types::{HostId, VmId, VsetId, millis};
@@ -78,8 +78,7 @@ fn artifacts() -> Artifacts {
 
 fn runtime_config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
-        daemon: DaemonConfig {
-            archive: Default::default(),
+        daemon: HostConfig {
             host: HostId(0),
             cache_pages: 64,
             writeback_interval: millis(5),

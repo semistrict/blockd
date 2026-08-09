@@ -3,7 +3,7 @@
 //! verdicts, pressure, bit rot. Every run is deterministic, so assertions
 //! are exact; any drift is a real behavior change.
 
-use blockd_core::daemon::{ArchivePolicy, DaemonConfig};
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{micros, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
@@ -338,8 +338,7 @@ fn chaos_seed_corpus_stays_consistent() {
 #[test]
 fn big_maps_cost_deltas_not_size() {
     let config = HarnessConfig {
-        daemon: DaemonConfig {
-            archive: ArchivePolicy::default(),
+        daemon: HostConfig {
             // A warm cache: the test measures the map's cost, not thrash.
             cache_pages: 32_768,
             ..base_config().daemon
@@ -402,8 +401,7 @@ fn big_maps_cost_deltas_not_size() {
 #[test]
 fn steady_overwrites_dont_amplify_disk_space() {
     let config = HarnessConfig {
-        daemon: DaemonConfig {
-            archive: ArchivePolicy::default(),
+        daemon: HostConfig {
             cache_pages: 8_192,
             ..base_config().daemon
         },

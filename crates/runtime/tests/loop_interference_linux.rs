@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{Runtime, RuntimeConfig, S3Store};
@@ -81,8 +81,7 @@ struct PhaseResult {
 
 fn run_phase(noisy: usize) -> PhaseResult {
     let config = RuntimeConfig {
-        daemon: DaemonConfig {
-            archive: Default::default(),
+        daemon: HostConfig {
             host: HostId(0),
             cache_pages: 1 << 20, // no eviction pressure: isolate loop contention
             writeback_interval: millis(5),

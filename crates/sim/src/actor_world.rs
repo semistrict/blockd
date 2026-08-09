@@ -9,12 +9,11 @@ use blockd_core::database::{DatabaseReply, DatabaseRequest};
 use blockd_core::protocol::{AdminCmd, AdminReply, PeerMsg, ReqId, StoreFault};
 use blockd_core::types::{HostId, PageId, VsetId};
 use blockd_core::world::{
-    AdminIo, BlobEntry, BlobError, Blobs, GuestFault, GuestMem, GuestSync, Peers, Store, StoreError,
+    AdminIo, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem, GuestSync, Peers,
+    Store, StoreError,
 };
-use blockd_exec::channel::{
-    OneSender, Receiver, UnboundedSender, oneshot, unbounded,
-};
-use blockd_exec::{delay, now, random_u64, spawn};
+use blockd_exec::channel::{OneSender, Receiver, UnboundedSender, oneshot, unbounded};
+use blockd_exec::{current_poll, delay, now, random_u64, spawn};
 
 use crate::world::blobdev::{BlobDevConfig, CrashFate};
 use crate::world::store::{MAX_OBJECT_BYTES, StoreConfig};
@@ -226,6 +225,9 @@ pub(crate) struct SimWorld {
     corrupt_fills: Cell<bool>,
     drop_write_protect: Cell<bool>,
     drop_handoff_writes: Cell<bool>,
+    page_read_poll: Cell<Option<u64>>,
+    page_reads_in_poll: Cell<u64>,
+    max_page_reads_in_poll: Cell<u64>,
 }
 
 impl SimWorld {
@@ -242,6 +244,10 @@ impl SimWorld {
             network,
             Rc::new(RefCell::new(StoreState::default())),
         )
+    }
+
+    pub(crate) fn max_page_reads_in_poll(&self) -> u64 {
+        self.max_page_reads_in_poll.get()
     }
 
     pub(crate) fn cluster(
@@ -294,6 +300,9 @@ impl SimWorld {
             corrupt_fills: Cell::new(false),
             drop_write_protect: Cell::new(false),
             drop_handoff_writes: Cell::new(false),
+            page_read_poll: Cell::new(None),
+            page_reads_in_poll: Cell::new(0),
+            max_page_reads_in_poll: Cell::new(0),
         });
         network
             .inboxes
@@ -820,9 +829,13 @@ impl Peers for SimWorld {
         let from = self.host;
         let network = Rc::clone(&self.network);
         let sent_at = now();
-        if network.targeted_drop.get().is_some_and(|(kind, begin, end)| {
-            kind == peer_tag(&message) && (begin..end).contains(&sent_at)
-        }) {
+        if network
+            .targeted_drop
+            .get()
+            .is_some_and(|(kind, begin, end)| {
+                kind == peer_tag(&message) && (begin..end).contains(&sent_at)
+            })
+        {
             network
                 .targeted_drops
                 .set(network.targeted_drops.get().saturating_add(1));
@@ -910,6 +923,16 @@ fn peer_tag(message: &PeerMsg) -> u8 {
 #[async_trait(?Send)]
 impl GuestMem for SimWorld {
     async fn read_page(&self, page: PageId) -> Vec<u8> {
+        let poll = current_poll();
+        let reads = if self.page_read_poll.get() == Some(poll) {
+            self.page_reads_in_poll.get().saturating_add(1)
+        } else {
+            self.page_read_poll.set(Some(poll));
+            1
+        };
+        self.page_reads_in_poll.set(reads);
+        self.max_page_reads_in_poll
+            .set(self.max_page_reads_in_poll.get().max(reads));
         self.memory
             .borrow()
             .pages
@@ -925,7 +948,7 @@ impl GuestMem for SimWorld {
         self.memory.borrow_mut().protected.extend(pages);
     }
 
-    async fn fill(&self, page: PageId, mut bytes: Vec<u8>, writable: bool) {
+    async fn fill(&self, page: PageId, mut bytes: Vec<u8>, writable: bool, _source: FillSource) {
         if self.corrupt_fills.get() && !bytes.is_empty() {
             bytes[0] ^= 1;
         }
@@ -947,8 +970,13 @@ impl GuestMem for SimWorld {
         _share: (u64, u64, blockd_core::types::SegId, u32),
         writable: bool,
     ) {
-        self.fill(page, vec![0; blockd_core::types::page_size()], writable)
-            .await;
+        self.fill(
+            page,
+            vec![0; blockd_core::types::page_size()],
+            writable,
+            FillSource::Zero,
+        )
+        .await;
     }
 
     async fn fail(&self, page: PageId) {
@@ -1100,7 +1128,7 @@ mod tests {
         world.enqueue_admin(AdminCmd::CreateVset {
             req: ReqId(1),
             vset: VsetId(2),
-            config: VsetConfig::compute(1, 4, false),
+            config: VsetConfig::compute(1, 4),
             from_base: None,
         });
         let mut executor = Executor::simulation(4);

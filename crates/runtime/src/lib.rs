@@ -13,6 +13,8 @@
 // time are the implementation, not a hazard.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+#[cfg(target_os = "linux")]
+mod actor_host;
 mod blobscan;
 mod capacity;
 #[cfg(target_os = "linux")]
@@ -23,8 +25,6 @@ pub mod fakegcs;
 pub mod fc;
 mod gcs;
 #[cfg(target_os = "linux")]
-mod host;
-#[cfg(target_os = "linux")]
 mod loopstats;
 mod metrics;
 mod peer;
@@ -32,17 +32,17 @@ mod replica_recovery;
 #[cfg(target_os = "linux")]
 mod s3;
 mod store;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "vsetfs"))]
 pub mod vsetfs;
 pub mod world;
 
+#[cfg(target_os = "linux")]
+pub use actor_host::{Runtime, RuntimeConfig};
 pub use blobscan::scan_blob_dir;
 pub use capacity::{
     CapacityController, CapacityInputs, CapacityReason, CapacitySignal, CapacityState,
 };
 pub use gcs::{GcsConfig, GcsStats, GcsStore};
-#[cfg(target_os = "linux")]
-pub use host::{Runtime, RuntimeConfig};
 #[cfg(target_os = "linux")]
 pub use loopstats::LoopStats;
 pub use metrics::{

@@ -124,11 +124,19 @@ pub trait Peers {
     async fn recv(&self) -> Option<(HostId, PeerMsg)>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillSource {
+    Zero,
+    Local,
+    Peer,
+    Store,
+}
+
 #[async_trait(?Send)]
 pub trait GuestMem {
     async fn read_page(&self, page: PageId) -> Vec<u8>;
     async fn arm_write_protect(&self, pages: &[PageId]);
-    async fn fill(&self, page: PageId, bytes: Vec<u8>, writable: bool);
+    async fn fill(&self, page: PageId, bytes: Vec<u8>, writable: bool, source: FillSource);
     async fn fill_shared(
         &self,
         page: PageId,

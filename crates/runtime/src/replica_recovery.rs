@@ -194,7 +194,7 @@ mod tests {
 
     use blockd_core::head::StashAssignment;
     use blockd_core::journal::{RecordKind, VsetConfig};
-    use blockd_core::seam::{ReplicaCommitInfo, StoreFault};
+    use blockd_core::protocol::{ReplicaCommitInfo, StoreFault};
     use blockd_core::types::JournalSeq;
 
     use super::*;
