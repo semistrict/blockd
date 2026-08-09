@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 use crate::channel::{OneReceiver, oneshot};
 use crate::fault::{FaultConfig, FaultPoint};
@@ -77,7 +78,18 @@ impl Scheduler {
                 .expect("ready mutex poisoned"),
         );
     }
+
+    fn wait_timeout(&self, duration: Duration) {
+        let ready = self.ready.lock().expect("ready mutex poisoned");
+        drop(
+            self.changed
+                .wait_timeout_while(ready, duration, |ready| ready.queue.is_empty())
+                .expect("ready mutex poisoned"),
+        );
+    }
 }
+
+pub type MonotonicClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 struct TaskWake {
     task: TaskId,
@@ -111,6 +123,7 @@ struct RuntimeContext {
     rng: Rc<RefCell<Option<Pcg64>>>,
     faults: Rc<RefCell<FaultConfig>>,
     fault_hits: Rc<RefCell<BTreeMap<FaultPoint, u64>>>,
+    clock: Option<MonotonicClock>,
     next_task: Rc<Cell<TaskId>>,
     spawn_requests: Rc<RefCell<Vec<SpawnRequest>>>,
 }
@@ -127,6 +140,7 @@ impl Clone for RuntimeContext {
             rng: Rc::clone(&self.rng),
             faults: Rc::clone(&self.faults),
             fault_hits: Rc::clone(&self.fault_hits),
+            clock: self.clock.clone(),
             next_task: Rc::clone(&self.next_task),
             spawn_requests: Rc::clone(&self.spawn_requests),
         }
@@ -167,7 +181,14 @@ fn with_context<T>(operation: impl FnOnce(&RuntimeContext) -> T) -> T {
 }
 
 pub fn now() -> u64 {
-    with_context(|context| context.now.get())
+    with_context(refresh_now)
+}
+
+fn refresh_now(context: &RuntimeContext) -> u64 {
+    if let Some(clock) = &context.clock {
+        context.now.set(clock());
+    }
+    context.now.get()
 }
 
 pub(crate) struct Waiter {
@@ -400,14 +421,18 @@ pub struct Executor {
 
 impl Executor {
     pub fn simulation(seed: u64) -> Self {
-        Self::new(Mode::Simulation, Some(Pcg64::new(seed, 0)))
+        Self::new(Mode::Simulation, Some(Pcg64::new(seed, 0)), None)
     }
 
     pub fn production() -> Self {
-        Self::new(Mode::Production, None)
+        Self::new(Mode::Production, None, None)
     }
 
-    fn new(mode: Mode, rng: Option<Pcg64>) -> Self {
+    pub fn production_with_clock(clock: MonotonicClock) -> Self {
+        Self::new(Mode::Production, None, Some(clock))
+    }
+
+    fn new(mode: Mode, rng: Option<Pcg64>, clock: Option<MonotonicClock>) -> Self {
         let scheduler = Arc::new(Scheduler::new());
         Self {
             mode,
@@ -421,6 +446,7 @@ impl Executor {
                 rng: Rc::new(RefCell::new(rng)),
                 faults: Rc::new(RefCell::new(FaultConfig::default())),
                 fault_hits: Rc::new(RefCell::new(BTreeMap::new())),
+                clock,
                 next_task: Rc::new(Cell::new(0)),
                 spawn_requests: Rc::new(RefCell::new(Vec::new())),
             },
@@ -435,7 +461,7 @@ impl Executor {
     }
 
     pub fn now(&self) -> u64 {
-        self.context.now.get()
+        refresh_now(&self.context)
     }
 
     pub fn set_fault_config(&mut self, config: FaultConfig) {
@@ -512,7 +538,14 @@ impl Executor {
     }
 
     pub fn wait_for_wake(&self) {
-        self.context.scheduler.wait();
+        if let Some((&(deadline, _), _)) = self.timers.first_key_value() {
+            let remaining = deadline.saturating_sub(self.now());
+            self.context
+                .scheduler
+                .wait_timeout(Duration::from_nanos(remaining));
+        } else {
+            self.context.scheduler.wait();
+        }
     }
 
     pub fn task_count(&self) -> usize {
@@ -530,6 +563,13 @@ impl Executor {
     fn run_one(&mut self) -> bool {
         if self.poll_ready() {
             return true;
+        }
+        if self.mode == Mode::Production {
+            refresh_now(&self.context);
+            self.fire_due_timers();
+            if self.poll_ready() {
+                return true;
+            }
         }
         if self.mode == Mode::Simulation && !self.timers.is_empty() {
             self.fire_next_timers();
