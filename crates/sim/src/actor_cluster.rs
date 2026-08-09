@@ -322,7 +322,8 @@ async fn reply_actor(
                     .borrow()
                     .clone();
                 *control.borrow().guest_state[&vset].durable.borrow_mut() = migrated;
-                prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
+                let runnable =
+                    prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
                 let started = {
                     let mut control = control.borrow_mut();
                     let request =
@@ -350,9 +351,52 @@ async fn reply_actor(
                     request.map(|(_, started)| started)
                 };
                 let _ = started;
-                start_guest(vset, host, &control, &worlds, &config);
+                if runnable {
+                    start_guest(vset, host, &control, &worlds, &config);
+                }
             }
             AdminReply::VsetRecovered { vset, verdict } => {
+                let pending_migration =
+                    control
+                        .borrow()
+                        .requests
+                        .iter()
+                        .find_map(|(&req, request)| match request {
+                            Request::Migrate {
+                                vset: pending,
+                                to,
+                                started,
+                                ..
+                            } if *pending == vset && *to == host => Some((req, *started)),
+                            _ => None,
+                        });
+                if let Some((req, started)) = pending_migration {
+                    let migrated = control.borrow().guest_state[&vset]
+                        .expected
+                        .borrow()
+                        .clone();
+                    *control.borrow().guest_state[&vset].durable.borrow_mut() = migrated;
+                    let runnable = prepare_recovered(
+                        &control.borrow().guest_state[&vset],
+                        vset,
+                        &config,
+                        verdict,
+                    );
+                    {
+                        let mut control = control.borrow_mut();
+                        control.requests.remove(&req);
+                        control.placement.insert(vset, host);
+                        control.report.migrations = control.report.migrations.saturating_add(1);
+                        control.report.max_migration_pause_ns = control
+                            .report
+                            .max_migration_pause_ns
+                            .max(now().saturating_sub(started));
+                    }
+                    if runnable {
+                        start_guest(vset, host, &control, &worlds, &config);
+                    }
+                    continue;
+                }
                 let already_elsewhere =
                     control
                         .borrow()
@@ -362,22 +406,28 @@ async fn reply_actor(
                             placed != host && control.borrow().live[usize::from(placed)]
                         });
                 if already_elsewhere {
-                    control
-                        .borrow_mut()
-                        .report
-                        .violations
-                        .push(format!("two runners recovered for {vset:?}"));
+                    if !matches!(verdict, Verdict::Unrestorable) {
+                        control
+                            .borrow_mut()
+                            .report
+                            .violations
+                            .push(format!("two runners recovered for {vset:?}"));
+                    }
                     continue;
                 }
-                prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
+                let runnable =
+                    prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
                 {
                     let mut control = control.borrow_mut();
                     control.report.recoveries = control.report.recoveries.saturating_add(1);
                 }
-                start_guest(vset, host, &control, &worlds, &config);
+                if runnable {
+                    start_guest(vset, host, &control, &worlds, &config);
+                }
             }
             AdminReply::VsetRestored { req, vset, verdict } => {
-                prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
+                let runnable =
+                    prepare_recovered(&control.borrow().guest_state[&vset], vset, &config, verdict);
                 let sent = match control.borrow_mut().requests.remove(&req) {
                     Some(Request::Restore { sent }) => sent,
                     _ => now(),
@@ -393,7 +443,9 @@ async fn reply_actor(
                         .max_restore_ns
                         .max(now().saturating_sub(sent));
                 }
-                start_guest(vset, host, &control, &worlds, &config);
+                if runnable {
+                    start_guest(vset, host, &control, &worlds, &config);
+                }
             }
             AdminReply::AdminFailed { req } => {
                 let request = control.borrow_mut().requests.remove(&req);
@@ -449,7 +501,12 @@ fn cancel_guest(vset: VsetId, control: &Rc<RefCell<Control>>) {
     }
 }
 
-fn prepare_recovered(state: &GuestState, vset: VsetId, config: &ClusterConfig, verdict: Verdict) {
+fn prepare_recovered(
+    state: &GuestState,
+    vset: VsetId,
+    config: &ClusterConfig,
+    verdict: Verdict,
+) -> bool {
     match verdict {
         Verdict::Resume { vmstate, .. } => {
             state.completed.set(vmstate);
@@ -471,8 +528,9 @@ fn prepare_recovered(state: &GuestState, vset: VsetId, config: &ClusterConfig, v
                 .violations
                 .borrow_mut()
                 .push(format!("vset {vset:?} became unrestorable"));
+            return false;
         }
-        Verdict::DatabaseReady { .. } => return,
+        Verdict::DatabaseReady { .. } => return false,
     }
     *state.recovering.borrow_mut() = config
         .vset_config
@@ -484,6 +542,7 @@ fn prepare_recovered(state: &GuestState, vset: VsetId, config: &ClusterConfig, v
             })
         })
         .collect();
+    true
 }
 
 #[allow(clippy::too_many_lines)]

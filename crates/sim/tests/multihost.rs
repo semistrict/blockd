@@ -110,6 +110,23 @@ fn return_migration_and_crash_preserve_every_page() {
 }
 
 #[test]
+fn released_source_residue_never_starts_a_second_guest() {
+    for seed in [103, 607] {
+        let RealizedScenario::Cluster(config) = load("migration")
+            .expect("scenario")
+            .realize(seed)
+            .expect("realization")
+        else {
+            panic!("migration is a cluster scenario");
+        };
+        let report = run(seed, config);
+        assert_clean(&report);
+        assert!(report.migrations >= 2);
+        assert!(report.releases >= 2);
+    }
+}
+
+#[test]
 fn passive_replica_commits_uploads_and_unlinks_without_rewrite() {
     let mut config = blockd_sim::presets::peer_stash_chaos();
     config.peer_drop = (0, 1);
