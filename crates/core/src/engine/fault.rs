@@ -160,7 +160,7 @@ async fn serve_missing_fault<W>(
             {
                 let location = vset.page_locs.get(&page).copied();
                 let memory = vset.config.is_memory(page.volume.idx);
-                let backed = vset.config.durability.uses_store();
+                let backed = true;
                 let source = vset.peer_source;
                 let shared = location
                     .map(|(_, location)| location)
@@ -499,7 +499,7 @@ where
             .filter(|vset| vset.incarnation == incarnation && vset.ready)?;
         (
             vset.page_locs.get(&page).copied(),
-            vset.config.durability.uses_store(),
+            true,
             vset.peer_source,
             host.config.backup_retry,
         )

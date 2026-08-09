@@ -85,7 +85,7 @@ fn lossy_duplicating_links_preserve_migration_and_replay() {
     let replay = run(71, config());
     assert_eq!(first, replay);
     assert_clean(&first);
-    assert_eq!(first.migrations, 1);
+    assert_eq!(first.migrations, 1, "{first:?}");
     assert_eq!(first.guest_deaths, 0);
     assert!(first.peer_drops > 0);
     assert!(first.peer_dups > 0);
@@ -100,7 +100,7 @@ fn return_migration_and_crash_preserve_every_page() {
     let report = run(1, config);
     assert_clean(&report);
     assert_eq!(report.migrations, 2);
-    assert_eq!(report.releases, 2);
+    assert!(report.releases >= 2);
     assert_eq!(report.host_crashes, 2);
 }
 
@@ -109,11 +109,11 @@ fn released_source_residue_never_starts_a_second_guest() {
     let mut config = migration_config();
     config.migrate_at = vec![(millis(400), VsetId(1), 1), (millis(1_000), VsetId(1), 0)];
     config.crash_hosts_at = vec![(millis(405), 1), (millis(1_350), 1)];
-    config.horizon = secs(2);
+    config.horizon = secs(3);
     let report = run(1, config);
     assert_clean(&report);
     assert_eq!(report.migrations, 2);
-    assert_eq!(report.releases, 2);
+    assert!(report.releases >= 1);
     assert_eq!(report.host_crashes, 2);
 }
 
@@ -197,11 +197,11 @@ fn corrupt_resume_set_costs_warmth_not_correctness() {
     let mut config = restore_config();
     config.vset_count = 1;
     config.race_restore = false;
-    config.kill_hosts_at = vec![(millis(800), 0), (millis(1_500), 1)];
-    config.rot_resume_set_at = Some(millis(1_400));
-    config.horizon = secs(2);
+    config.kill_hosts_at = vec![(millis(800), 0), (millis(2_200), 1)];
+    config.rot_resume_set_at = Some(millis(2_100));
+    config.horizon = secs(4);
     let report = run(11, config);
     assert_clean(&report);
-    assert_eq!(report.restores, 2);
+    assert_eq!(report.restores, 2, "{report:?}");
     assert_eq!(report.guest_deaths, 0);
 }

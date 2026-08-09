@@ -3,6 +3,7 @@ use crate::types::{HostId, VsetId};
 
 #[derive(Clone, Debug)]
 pub struct HostConfig {
+    pub archive: ArchivePolicy,
     pub host: HostId,
     pub cache_pages: usize,
     pub writeback_interval: u64,
@@ -11,6 +12,25 @@ pub struct HostConfig {
     pub disk_headroom: u64,
     pub wedge_ticks: u64,
     pub replica_placement: Option<ReplicaPlacementConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchivePolicy {
+    pub interval: u64,
+    pub max_unpublished_bytes: u64,
+    pub spool_capacity_bytes: u64,
+    pub spool_headroom_bytes: u64,
+}
+
+impl Default for ArchivePolicy {
+    fn default() -> Self {
+        Self {
+            interval: crate::types::secs(10),
+            max_unpublished_bytes: 32 * 1024 * 1024,
+            spool_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            spool_headroom_bytes: 256 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +87,9 @@ pub struct Counters {
     pub replica_artifact_flushes: u64,
     pub replica_commit_flushes: u64,
     pub replica_rotations: u64,
+    pub archive_cycles: u64,
+    pub archive_commits_coalesced: u64,
+    pub replica_capacity_backpressure: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,16 +114,16 @@ pub struct ReplicaSpoolMetrics {
     pub vset: VsetId,
     pub assignment_epoch: u64,
     pub stored_bytes: u64,
-    pub source_capacity_bytes: u64,
+    pub host_capacity_bytes: u64,
     pub current_generation: u64,
     pub committed_through: u64,
     pub uploaded_through: u64,
+    pub unarchived_age_ns: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VsetStats {
     pub vset: VsetId,
-    pub backed_up: bool,
     pub role: VsetRole,
     pub fence: u64,
     pub dirty_pages: usize,
@@ -109,8 +132,8 @@ pub struct VsetStats {
     pub pending_syncs: usize,
     pub pending_leaf_spans: usize,
     pub hydration_remaining_pages: usize,
-    pub backup_lag_captures: Option<u64>,
-    pub backup_lag_bytes: Option<u64>,
+    pub archive_lag_captures: Option<u64>,
+    pub archive_lag_bytes: Option<u64>,
     pub operations: VsetOperations,
     pub live_segment_bytes: u64,
     pub local_segment_bytes: u64,

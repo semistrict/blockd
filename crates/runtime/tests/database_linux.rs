@@ -75,6 +75,7 @@ fn unix_stream_runs_sqlite_shaped_io_through_the_real_daemon() {
     let runtime = Arc::new(Runtime::new(
         &RuntimeConfig {
             daemon: blockd_core::hostmeta::HostConfig {
+                archive: Default::default(),
                 host: HostId(0),
                 cache_pages: 16,
                 writeback_interval: millis(10),

@@ -30,8 +30,8 @@ pub use migration::{
 pub use reclaim::{cleanup_local, reclaim_backed_segments};
 pub use recovery::recover_local;
 pub use replica::{
-    create_peer_stashed, publish_replica_head, replica_message, replicate_latest,
-    retry_replica_releases,
+    advance_archive_age, archive_latest, archives_ready, create_peer_stashed, publish_replica_head,
+    replica_message, replicate_latest, retry_archive_notices, retry_replica_releases,
 };
 pub use restore::restore_vset;
 pub use state::{HostState, SharedHost, VsetState};

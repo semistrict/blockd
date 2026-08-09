@@ -21,6 +21,7 @@ fn checked_in_steady_io_matches_the_real_runtime() {
     let runtime = Runtime::new(
         &RuntimeConfig {
             daemon: HostConfig {
+                archive: Default::default(),
                 host: HostId(0),
                 cache_pages: 256,
                 writeback_interval: millis(5),
@@ -53,10 +54,8 @@ fn checked_in_checkpoint_recovery_matches_deterministic_simulation() {
     let spec = load("checkpoint-recovery").expect("checked-in workload");
     let mut sim_config = blockd_sim::presets::single_host_base();
     sim_config.vset_count = 1;
-    sim_config.vset_config = VsetConfig::compute(
-        spec.shape.disk_volumes,
-        spec.shape.pages_per_volume,
-    );
+    sim_config.vset_config =
+        VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
     sim_config.horizon = millis(10_000);
     sim_config.think = (micros(1), micros(2));
     sim_config.checkpoint_interval = None;
@@ -70,6 +69,7 @@ fn checked_in_checkpoint_recovery_matches_deterministic_simulation() {
     let store = Arc::new(S3Store::new());
     let config = RuntimeConfig {
         daemon: HostConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 256,
             writeback_interval: millis(5),

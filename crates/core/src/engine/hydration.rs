@@ -106,7 +106,7 @@ where
                 let pointer = vset.leaf_table[&span];
                 HydrateAction::Load {
                     pointer,
-                    backed: vset.config.durability.uses_store() || pointer.base != 0,
+                    backed: true,
                     retry,
                 }
             }

@@ -19,7 +19,6 @@ use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
 pub type SharedHost = Rc<RefCell<HostState>>;
 type ReplicaStatusSender = OneSender<(HostId, Option<crate::protocol::ReplicaCommitInfo>)>;
 type PeerBytesSender = (HostId, OneSender<Option<Vec<u8>>>);
-type ReplicaUploadSender = (HostId, OneSender<()>);
 
 pub struct HostState {
     pub config: HostConfig,
@@ -41,7 +40,6 @@ pub struct HostState {
     pub replica_put_waiters:
         BTreeMap<(VsetId, u64, crate::protocol::ReplicaArtifact, u32), OneSender<HostId>>,
     pub replica_commit_waiters: BTreeMap<(VsetId, u64, u64, JournalSeq, u64), OneSender<HostId>>,
-    pub replica_upload_waiters: BTreeMap<(VsetId, u64, u64, JournalSeq, u64), ReplicaUploadSender>,
     pub replica_releases: Vec<(HostId, VsetId, u64, crate::protocol::ReplicaCommitInfo)>,
     next_peer_request: u64,
     next_attachment_generation: u64,
@@ -50,6 +48,14 @@ pub struct HostState {
 
 impl HostState {
     pub fn new(config: HostConfig) -> Self {
+        assert!(
+            config.archive.interval > 0,
+            "archive interval must be positive"
+        );
+        assert!(
+            config.archive.spool_headroom_bytes < config.archive.spool_capacity_bytes,
+            "archive spool headroom must be smaller than capacity"
+        );
         Self {
             cache: Cache::new(config.cache_pages),
             config,
@@ -69,7 +75,6 @@ impl HostState {
             replica_status_waiters: BTreeMap::new(),
             replica_put_waiters: BTreeMap::new(),
             replica_commit_waiters: BTreeMap::new(),
-            replica_upload_waiters: BTreeMap::new(),
             replica_releases: Vec::new(),
             next_peer_request: 0,
             next_attachment_generation: 0,
@@ -312,7 +317,6 @@ impl HostState {
                     .as_ref()
                     .map_or(0, |record| record.capture_seq);
                 let backed = state.backed.map_or(0, |pointer| pointer.capture_seq);
-                let backed_up = state.config.durability.uses_store();
                 let pending_leaf_spans = state
                     .leaf_table
                     .keys()
@@ -329,7 +333,6 @@ impl HostState {
                 };
                 VsetStats {
                     vset,
-                    backed_up,
                     role,
                     fence: state.fence,
                     dirty_pages: self.cache.dirty_pages_of(vset).len(),
@@ -338,8 +341,8 @@ impl HostState {
                     pending_syncs: state.pending_syncs.len(),
                     pending_leaf_spans,
                     hydration_remaining_pages,
-                    backup_lag_captures: backed_up.then_some(best.saturating_sub(backed)),
-                    backup_lag_bytes: backed_up.then_some(state.backup_lag_bytes()),
+                    archive_lag_captures: Some(best.saturating_sub(backed)),
+                    archive_lag_bytes: Some(state.backup_lag_bytes()),
                     operations: VsetOperations(operations),
                     live_segment_bytes: state.live_segment_bytes(),
                     local_segment_bytes: state
@@ -379,7 +382,6 @@ impl HostState {
     pub fn replica_metrics(&self) -> Vec<ReplicaVsetMetrics> {
         self.vsets
             .iter()
-            .filter(|(_, state)| state.config.durability.requires_peer_sync())
             .map(|(&vset, state)| {
                 let store_published_through = state.backed.map_or(0, |head| head.capture_seq);
                 ReplicaVsetMetrics {
@@ -416,7 +418,7 @@ impl HostState {
                 vset: key.vset,
                 assignment_epoch: key.assignment_epoch,
                 stored_bytes: replica.bytes,
-                source_capacity_bytes: super::replica::MAX_REPLICA_SOURCE_BYTES,
+                host_capacity_bytes: self.config.archive.spool_capacity_bytes,
                 current_generation: replica.current_generation,
                 committed_through: replica
                     .committed
@@ -424,23 +426,37 @@ impl HostState {
                 uploaded_through: replica
                     .uploaded
                     .map_or(0, |commit| commit.sync_covered_through),
+                unarchived_age_ns: replica.unarchived_age,
             })
             .collect()
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReplicaKey {
     pub source: HostId,
     pub vset: VsetId,
     pub assignment_epoch: u64,
 }
 
+#[derive(Clone)]
+pub struct ReplicaArchiveCut {
+    pub info: crate::protocol::ReplicaCommitInfo,
+    pub required: Vec<crate::protocol::ReplicaArtifact>,
+    pub record: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct ReplicaState {
     pub artifacts: BTreeMap<crate::protocol::ReplicaArtifact, (u32, Vec<u8>)>,
     pub committed: Option<crate::protocol::ReplicaCommitInfo>,
+    pub committed_record: Option<Vec<u8>>,
     pub uploaded: Option<crate::protocol::ReplicaCommitInfo>,
+    pub uploaded_record: Option<Vec<u8>>,
+    pub archive_pending: Option<ReplicaArchiveCut>,
+    pub archive_inflight: bool,
+    pub archive_due: Option<u64>,
+    pub unarchived_age: u64,
     pub bytes: u64,
     pub current_generation: u64,
     pub current_file_bytes: u64,
@@ -542,6 +558,7 @@ pub struct VsetState {
     pub backed: Option<ManifestPtr>,
     pub backed_segments: BTreeSet<(u64, SegId)>,
     pub backed_leaves: BTreeSet<(u64, u64)>,
+    pub store_manifests: BTreeSet<(u64, JournalSeq)>,
     pub publishing: bool,
     pub pending_verdict: Option<crate::protocol::Verdict>,
     pub outbound: Option<HostId>,
@@ -553,6 +570,7 @@ pub struct VsetState {
     pub replicating: bool,
     pub peer_committed_through: u64,
     pub peer_upload_done: Option<crate::protocol::ReplicaCommitInfo>,
+    pub peer_upload_record: Option<JournalRecord>,
     pub wedge: WedgeState,
     pub database_runtime: DatabaseRuntime,
 }
@@ -594,6 +612,7 @@ impl VsetState {
             backed: None,
             backed_segments: BTreeSet::new(),
             backed_leaves: BTreeSet::new(),
+            store_manifests: BTreeSet::new(),
             publishing: false,
             pending_verdict: None,
             outbound: None,
@@ -605,6 +624,7 @@ impl VsetState {
             replicating: false,
             peer_committed_through: 0,
             peer_upload_done: None,
+            peer_upload_record: None,
             wedge: WedgeState::default(),
             database_runtime: DatabaseRuntime::default(),
         }

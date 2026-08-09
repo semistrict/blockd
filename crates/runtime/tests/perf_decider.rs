@@ -20,6 +20,7 @@ const DRAIN_PAGES_PER_POLL: u64 = 64;
 fn config(vsets: u16, pages: u32) -> ActorHarnessConfig {
     ActorHarnessConfig {
         host: HostConfig {
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
             cache_pages: usize::from(vsets)
                 .saturating_mul(pages as usize)

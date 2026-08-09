@@ -470,7 +470,7 @@ where
             vset_state.local_covered_through,
             vset_state.sync_ack_through,
             vset_state.database,
-            vset_state.config.durability.requires_peer_sync(),
+            true,
         )
     };
     if acknowledged < barrier && covered < barrier {
@@ -883,10 +883,6 @@ where
         vset_state.leaf_table = record_leaves;
         vset_state.best_record = Some(record.clone());
         vset_state.local_covered_through = record.sync_covered_through;
-        if !vset_state.config.durability.requires_peer_sync() {
-            vset_state.sync_ack_through =
-                vset_state.sync_ack_through.max(record.sync_covered_through);
-        }
         vset_state
             .record_writes
             .insert(seq, (fence, record.sync_covered_through));
@@ -1040,6 +1036,7 @@ const fn failed(req: ReqId, error: DatabaseError) -> DatabaseReply {
 }
 
 #[cfg(test)]
+#[allow(clippy::default_trait_access)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
@@ -1117,6 +1114,7 @@ mod tests {
             page: PageNo(0),
         };
         let mut host = super::super::state::HostState::new(HostConfig {
+            archive: Default::default(),
             host: HostId(1),
             cache_pages: 1,
             writeback_interval: 1,
@@ -1126,7 +1124,7 @@ mod tests {
             wedge_ticks: 0,
             replica_placement: None,
         });
-        let incarnation = host.insert_fresh(vset, VsetConfig::database(4, false));
+        let incarnation = host.insert_fresh(vset, VsetConfig::database(4));
         host.vsets.get_mut(&vset).expect("vset").ready = true;
         let state = Rc::new(RefCell::new(host));
         let world = Rc::new(TestWorld::default());

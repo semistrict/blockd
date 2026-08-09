@@ -3,7 +3,7 @@
 //! local durable state is destroyed (R6.1 on one host). Exact assertions —
 //! runs are deterministic.
 
-use blockd_core::hostmeta::HostConfig;
+use blockd_core::hostmeta::{ArchivePolicy, HostConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::types::{HostId, VsetId, millis, secs};
@@ -15,6 +15,10 @@ use blockd_sim::world::store::{StoreConfig, StoreObjectKind};
 fn base_config() -> HarnessConfig {
     HarnessConfig {
         daemon: HostConfig {
+            archive: ArchivePolicy {
+                interval: secs(1),
+                ..Default::default()
+            },
             host: HostId(0),
             cache_pages: 256,
             writeback_interval: millis(20),
@@ -62,7 +66,9 @@ fn every_vset_publishes_through_its_passive_peer() {
                 .filter(|key| key.starts_with(&format!("{prefix}m/")))
                 .count(),
             1,
-            "superseded manifests are reclaimed"
+            "superseded manifests are reclaimed: counters={:?} keys={:?}",
+            report.counters,
+            report.store_keys
         );
     }
 }
@@ -107,7 +113,12 @@ fn hot_working_set_reports_archive_amplification_baseline() {
     assert!(attempted_bytes >= successful_bytes);
     assert!(report.store.unique_bytes <= report.store.bytes_put);
     assert!(report.store.retry_bytes <= attempted_bytes);
-    assert!(report.store.puts_by_kind[StoreObjectKind::Manifest as usize].successes > 0);
+    assert!(
+        report.store.puts_by_kind[StoreObjectKind::Manifest as usize].successes > 0,
+        "counters={:?} keys={:?}",
+        report.counters,
+        report.store_keys
+    );
     assert!(report.store.logical_changed_bytes > 0);
     assert!(report.published_segment_bytes > 0);
     eprintln!(

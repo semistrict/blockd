@@ -5,9 +5,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use blockd_core::engine::{HostState, host_actor_with_state};
+use blockd_core::head::{HeadRecord, ManifestPtr};
 use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
+use blockd_core::layout;
+use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{AdminCmd, AdminReply, ReqId, Verdict};
+use blockd_core::replica_recovery::{
+    ReplicaResidue, export_replica_recovery, refence_replica_export,
+};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
+use blockd_core::world::{Store, StoreError};
 use blockd_exec::rng::Ppm;
 use blockd_exec::{Executor, FaultConfig, TaskHandle, delay, now, random_u64, spawn};
 
@@ -73,8 +80,22 @@ impl Control {
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-pub(crate) fn run(seed: u64, config: ClusterConfig) -> ClusterReport {
+pub(crate) fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
     assert!(config.hosts > 0, "cluster requires at least one host");
+    if config.daemon.replica_placement.is_none() {
+        config.daemon.replica_placement = Some(ReplicaPlacementConfig {
+            membership_epoch: 1,
+            local_failure_domain: 0,
+            roster: (0..config.hosts)
+                .map(|host| PeerCandidate {
+                    host: HostId(host),
+                    weight: 1,
+                    failure_domain: host,
+                    drained: false,
+                })
+                .collect(),
+        });
+    }
     let (network, worlds) = SimWorld::cluster(config.hosts, config.bdev, config.store);
     let worlds = Rc::new(worlds);
     if config.sabotage == Some(crate::harness::Sabotage::EagerHandoffAck) {
@@ -267,6 +288,7 @@ async fn abort_monitor(
 
 fn host_config(config: &ClusterConfig, host: u16) -> HostConfig {
     HostConfig {
+        archive: config.daemon.archive,
         host: HostId(host),
         cache_pages: config.daemon.cache_pages,
         writeback_interval: config.daemon.writeback_interval,
@@ -904,16 +926,240 @@ async fn at_kill(
         .iter()
         .filter_map(|(&vset, &placed)| (placed == host).then_some(vset))
         .collect::<Vec<_>>();
+    let orphaned_at = now();
     for vset in affected {
         cancel_guest(vset, &control);
+        if !promote_orphan(host, vset, &config, &worlds, &control).await {
+            control
+                .borrow_mut()
+                .report
+                .violations
+                .push(format!("unable to promote orphan {vset:?}"));
+            continue;
+        }
         prepare_backed_loss(&control.borrow().guest_state[&vset], vset, &worlds[0]);
         let candidates = (0..config.hosts)
             .filter(|&candidate| candidate != host && control.borrow().live[usize::from(candidate)])
             .take(if config.race_restore { 2 } else { 1 })
             .collect::<Vec<_>>();
         for candidate in candidates {
-            let req = control.borrow_mut().req(Request::Restore { sent: now() });
+            let req = control
+                .borrow_mut()
+                .req(Request::Restore { sent: orphaned_at });
             worlds[usize::from(candidate)].enqueue_admin(AdminCmd::RestoreVset { req, vset });
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn promote_orphan(
+    source: u16,
+    vset: VsetId,
+    config: &ClusterConfig,
+    worlds: &[Rc<SimWorld>],
+    control: &Rc<RefCell<Control>>,
+) -> bool {
+    let (observed_version, head) = loop {
+        match Store::get(worlds[0].as_ref(), &layout::head_key(vset)).await {
+            Ok(Some((version, bytes))) => {
+                let Ok(head) = HeadRecord::decode(vset, &bytes) else {
+                    return false;
+                };
+                break (version, head);
+            }
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                delay(config.daemon.backup_retry).await;
+            }
+            Ok(None) | Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
+        }
+    };
+    if head.holder != HostId(source) {
+        return false;
+    }
+
+    let mut allowed = BTreeSet::new();
+    if let Some(stash) = head.stash {
+        allowed.insert((stash.active_peer, stash.active_assignment_epoch));
+        if let Some(peer) = stash.transition_peer {
+            allowed.insert((peer, stash.assignment_epoch));
+        }
+    }
+    allowed.extend(
+        head.retired_stashes
+            .iter()
+            .map(|retired| (retired.peer, retired.assignment_epoch)),
+    );
+    let live = control.borrow().live.clone();
+    let mut owned = Vec::new();
+    for (peer, world) in worlds.iter().enumerate() {
+        if !live[peer] {
+            continue;
+        }
+        let peer = HostId(u16::try_from(peer).expect("host index fits"));
+        let mut generations: BTreeMap<u64, BTreeMap<u64, Vec<u8>>> = BTreeMap::new();
+        for (name, bytes) in world.durable_blobs() {
+            if let Some(layout::BlobName::ReplicaSpool {
+                source: found_source,
+                vset: found_vset,
+                assignment_epoch,
+                generation,
+            }) = layout::parse_blob(&name)
+                && (found_source, found_vset) == (HostId(source), vset)
+                && (allowed.contains(&(peer, assignment_epoch))
+                    || head
+                        .stash
+                        .is_some_and(|stash| assignment_epoch > stash.assignment_epoch))
+            {
+                generations
+                    .entry(assignment_epoch)
+                    .or_default()
+                    .insert(generation, bytes);
+            }
+        }
+        for (assignment_epoch, generations) in generations {
+            owned.push((
+                peer,
+                assignment_epoch,
+                generations.into_values().flatten().collect::<Vec<_>>(),
+            ));
+        }
+    }
+    let residues = owned
+        .iter()
+        .map(|(peer, assignment_epoch, bytes)| ReplicaResidue {
+            peer: *peer,
+            assignment_epoch: *assignment_epoch,
+            bytes,
+        })
+        .collect::<Vec<_>>();
+    let export = if residues.is_empty() {
+        None
+    } else {
+        match export_replica_recovery(
+            HostId(source),
+            vset,
+            observed_version,
+            &head,
+            &residues,
+            &worlds[0].store_snapshot(),
+        ) {
+            Ok(export) => Some(export),
+            Err(_) => return false,
+        }
+    };
+    if export.is_none() && head.manifest.is_none() {
+        return false;
+    }
+
+    let retired = HeadRecord {
+        vset,
+        holder: HostId(source),
+        fence: head.fence,
+        manifest: head.manifest,
+        stash: None,
+        retired_stashes: Vec::new(),
+    };
+    let retired_version = loop {
+        match Store::put_cas(
+            worlds[0].as_ref(),
+            layout::head_key(vset),
+            Some(observed_version),
+            retired.encode(),
+        )
+        .await
+        {
+            Ok(version) => break version,
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                delay(config.daemon.backup_retry).await;
+            }
+            Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
+        }
+    };
+    let Some(export) = export else {
+        return true;
+    };
+    let Ok(export) = refence_replica_export(vset, &export, retired_version) else {
+        return false;
+    };
+    let Some(record) = export
+        .blobs
+        .iter()
+        .find_map(|(name, bytes)| {
+            matches!(
+                layout::parse_blob(name),
+                Some(layout::BlobName::Journal { fence, .. }) if fence == retired_version
+            )
+            .then_some(bytes)
+        })
+        .and_then(|bytes| blockd_core::journal::JournalRecord::decode(vset, bytes).ok())
+    else {
+        return false;
+    };
+    for (name, bytes) in &export.blobs {
+        let key = match layout::parse_blob(name) {
+            Some(layout::BlobName::Segment { fence, seg, .. }) => {
+                Some(layout::segment_key(vset, fence, seg))
+            }
+            Some(layout::BlobName::Leaf { fence, id, .. }) => {
+                Some(layout::leaf_key(vset, fence, id))
+            }
+            _ => None,
+        };
+        let Some(key) = key else {
+            continue;
+        };
+        loop {
+            match Store::put(worlds[0].as_ref(), key.clone(), bytes.clone()).await {
+                Ok(_) => break,
+                Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                    delay(config.daemon.backup_retry).await;
+                }
+                Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
+            }
+        }
+    }
+    let manifest = ManifestPtr {
+        fence: retired_version,
+        seq: record.seq,
+        capture_seq: record.capture_seq,
+    };
+    loop {
+        match Store::put(
+            worlds[0].as_ref(),
+            layout::manifest_key(vset, manifest.fence, manifest.seq),
+            record.encode(vset),
+        )
+        .await
+        {
+            Ok(_) => break,
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                delay(config.daemon.backup_retry).await;
+            }
+            Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
+        }
+    }
+    let promoted = HeadRecord {
+        vset,
+        holder: HostId(source),
+        fence: retired_version,
+        manifest: Some(manifest),
+        stash: None,
+        retired_stashes: Vec::new(),
+    };
+    loop {
+        match Store::put_cas(
+            worlds[0].as_ref(),
+            layout::head_key(vset),
+            Some(retired_version),
+            promoted.encode(),
+        )
+        .await
+        {
+            Ok(_) => return true,
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                delay(config.daemon.backup_retry).await;
+            }
+            Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
         }
     }
 }

@@ -6,7 +6,7 @@ use blockd_exec::delay;
 use super::SharedHost;
 use super::capture::finish_creation;
 use crate::head::{HeadRecord, ManifestPtr, StashAssignment};
-use crate::journal::{DurabilityMode, VsetConfig};
+use crate::journal::VsetConfig;
 use crate::layout;
 use crate::mapleaf::MapLeaf;
 use crate::protocol::{AdminReply, ReqId, StoreFault};
@@ -161,12 +161,10 @@ where
         let mut host = state.borrow_mut();
         let retry = host.config.backup_retry;
         host.vsets.get_mut(&vset).and_then(|vset_state| {
-            (vset_state.config.durability == DurabilityMode::Backup && !vset_state.publishing).then(
-                || {
-                    vset_state.publishing = true;
-                    (vset_state.incarnation, retry)
-                },
-            )
+            (!vset_state.publishing).then(|| {
+                vset_state.publishing = true;
+                (vset_state.incarnation, retry)
+            })
         })
     }) else {
         return;
@@ -301,10 +299,17 @@ where
     lease.commit();
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn reconcile_backed_recovery<W>(state: SharedHost, world: Rc<W>, vset: VsetId)
 where
     W: Store + GuestMem + AdminIo + 'static,
 {
+    enum RecoveryDecision {
+        Fence,
+        Outbound,
+        Ready(crate::protocol::Verdict),
+    }
+
     let retry = state.borrow().config.backup_retry;
     loop {
         match Store::get(world.as_ref(), &layout::head_key(vset)).await {
@@ -313,6 +318,97 @@ where
                     fence_vset(&state, world.as_ref(), vset, None).await;
                     return;
                 };
+                if head.stash.is_none() {
+                    let local_host = state.borrow().config.host;
+                    let Some(stash) = super::replica::initial_stash(&state, vset) else {
+                        fence_vset(&state, world.as_ref(), vset, None).await;
+                        return;
+                    };
+                    if head.holder != local_host {
+                        fence_vset(&state, world.as_ref(), vset, None).await;
+                        return;
+                    }
+                    let Some((incarnation, fence)) = state
+                        .borrow()
+                        .vsets
+                        .get(&vset)
+                        .map(|vset_state| (vset_state.incarnation, vset_state.fence))
+                    else {
+                        return;
+                    };
+                    let upgraded = HeadRecord {
+                        vset,
+                        holder: local_host,
+                        fence,
+                        manifest: head.manifest,
+                        stash: Some(stash),
+                        retired_stashes: Vec::new(),
+                    };
+                    match Store::put_cas(
+                        world.as_ref(),
+                        layout::head_key(vset),
+                        Some(version),
+                        upgraded.encode(),
+                    )
+                    .await
+                    {
+                        Ok(upgraded_version) => {
+                            let verdict = {
+                                let mut host = state.borrow_mut();
+                                let Some(vset_state) = host
+                                    .vsets
+                                    .get_mut(&vset)
+                                    .filter(|vset_state| vset_state.incarnation == incarnation)
+                                else {
+                                    return;
+                                };
+                                vset_state.head_version = Some(upgraded_version);
+                                vset_state.backed = upgraded.manifest;
+                                if let Some(manifest) = upgraded.manifest {
+                                    vset_state
+                                        .store_manifests
+                                        .insert((manifest.fence, manifest.seq));
+                                }
+                                vset_state.stash_assignment = upgraded.stash;
+                                vset_state.retired_stashes.clear();
+                                if vset_state.outbound.is_some() {
+                                    None
+                                } else {
+                                    vset_state.ready = true;
+                                    vset_state.pending_verdict.take()
+                                }
+                            };
+                            if let Some(verdict) = verdict {
+                                AdminIo::reply_admin(
+                                    world.as_ref(),
+                                    AdminReply::VsetRecovered { vset, verdict },
+                                )
+                                .await;
+                            }
+                            return;
+                        }
+                        Err(StoreError::Fault(StoreFault::CasConflict { .. })) => continue,
+                        Err(StoreError::Fault(StoreFault::Unavailable)) => {
+                            state.borrow_mut().counters.store_retries += 1;
+                            delay(retry).await;
+                            continue;
+                        }
+                        Err(StoreError::TooLarge) => {
+                            fence_vset(&state, world.as_ref(), vset, None).await;
+                            return;
+                        }
+                    }
+                }
+                let expected_membership = state
+                    .borrow()
+                    .config
+                    .replica_placement
+                    .as_ref()
+                    .map(|placement| placement.membership_epoch);
+                if head.stash.map(|stash| stash.membership_epoch) != expected_membership {
+                    fence_vset(&state, world.as_ref(), vset, None).await;
+                    return;
+                }
                 let decision = {
                     let mut host = state.borrow_mut();
                     let local_host = host.config.host;
@@ -328,31 +424,115 @@ where
                     let behind = head
                         .manifest
                         .is_some_and(|manifest| (manifest.capture_seq, manifest.seq) > local);
-                    if head.holder != local_host || head.fence != vset_state.fence || behind {
-                        None
+                    if head.holder != local_host
+                        || (head.fence != 0 && head.fence != vset_state.fence)
+                        || behind
+                    {
+                        RecoveryDecision::Fence
                     } else {
                         vset_state.head_version = Some(version);
                         vset_state.backed = head.manifest;
+                        if let Some(manifest) = head.manifest {
+                            vset_state
+                                .store_manifests
+                                .insert((manifest.fence, manifest.seq));
+                        }
                         vset_state.stash_assignment = head.stash;
                         vset_state.retired_stashes = head.retired_stashes;
-                        vset_state.ready = true;
-                        vset_state.pending_verdict.take()
+                        if vset_state.outbound.is_some() {
+                            RecoveryDecision::Outbound
+                        } else {
+                            vset_state.ready = true;
+                            RecoveryDecision::Ready(
+                                vset_state
+                                    .pending_verdict
+                                    .take()
+                                    .expect("recovery verdict retained"),
+                            )
+                        }
                     }
                 };
-                let Some(verdict) = decision else {
-                    fence_vset(&state, world.as_ref(), vset, None).await;
-                    return;
-                };
-                AdminIo::reply_admin(world.as_ref(), AdminReply::VsetRecovered { vset, verdict })
-                    .await;
+                match decision {
+                    RecoveryDecision::Fence => {
+                        fence_vset(&state, world.as_ref(), vset, None).await;
+                    }
+                    RecoveryDecision::Outbound => {}
+                    RecoveryDecision::Ready(verdict) => {
+                        AdminIo::reply_admin(
+                            world.as_ref(),
+                            AdminReply::VsetRecovered { vset, verdict },
+                        )
+                        .await;
+                    }
+                }
                 return;
             }
             Err(StoreError::Fault(StoreFault::Unavailable)) => {
                 state.borrow_mut().counters.store_retries += 1;
                 delay(retry).await;
             }
-            Ok(None)
-            | Err(StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge) => {
+            Ok(None) => {
+                let local_host = state.borrow().config.host;
+                let Some(stash) = super::replica::initial_stash(&state, vset) else {
+                    fence_vset(&state, world.as_ref(), vset, None).await;
+                    return;
+                };
+                let head = HeadRecord {
+                    vset,
+                    holder: local_host,
+                    fence: 0,
+                    manifest: None,
+                    stash: Some(stash),
+                    retired_stashes: Vec::new(),
+                };
+                match Store::put_cas(world.as_ref(), layout::head_key(vset), None, head.encode())
+                    .await
+                {
+                    Ok(version) => {
+                        let verdict = {
+                            let mut host = state.borrow_mut();
+                            let verdict = {
+                                let Some(vset_state) = host.vsets.get_mut(&vset) else {
+                                    return;
+                                };
+                                vset_state.fence = version;
+                                vset_state.head_version = Some(version);
+                                vset_state.backed = None;
+                                vset_state.stash_assignment = Some(stash);
+                                vset_state.retired_stashes.clear();
+                                if vset_state.outbound.is_some() {
+                                    None
+                                } else {
+                                    vset_state.ready = true;
+                                    vset_state.pending_verdict.take()
+                                }
+                            };
+                            host.counters.assignment_claims += 1;
+                            verdict
+                        };
+                        if let Some(verdict) = verdict {
+                            AdminIo::reply_admin(
+                                world.as_ref(),
+                                AdminReply::VsetRecovered { vset, verdict },
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    Err(StoreError::Fault(StoreFault::CasConflict { .. })) => {
+                        state.borrow_mut().counters.assignment_claim_conflicts += 1;
+                    }
+                    Err(StoreError::Fault(StoreFault::Unavailable)) => {
+                        state.borrow_mut().counters.store_retries += 1;
+                        delay(retry).await;
+                    }
+                    Err(StoreError::TooLarge) => {
+                        fence_vset(&state, world.as_ref(), vset, None).await;
+                        return;
+                    }
+                }
+            }
+            Err(StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge) => {
                 fence_vset(&state, world.as_ref(), vset, None).await;
                 return;
             }

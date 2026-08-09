@@ -229,7 +229,7 @@ mod tests {
             len: 1,
         };
         let record = JournalRecord {
-            config: VsetConfig::compute(1, 4, true),
+            config: VsetConfig::compute(1, 4),
             seq,
             fence,
             kind: RecordKind::Commit,

@@ -251,6 +251,8 @@ where
                     Decision::Invalid
                 } else if let Some(&epoch) = vset_state.checkpoint_results.get(&req) {
                     Decision::Existing(epoch)
+                } else if vset_state.migration_running {
+                    Decision::Invalid
                 } else if vset_state.commit_running || vset_state.checkpoint_running {
                     let (wake, wait) = oneshot();
                     vset_state.capture_waiters.push(wake);
@@ -365,7 +367,10 @@ where
                 .any(|(_, barrier)| *barrier > vset_state.local_covered_through);
         if !vset_state.ready
             || (!pre_reserved
-                && (vset_state.commit_running || vset_state.checkpoint_running || !needs_commit))
+                && (vset_state.commit_running
+                    || vset_state.checkpoint_running
+                    || vset_state.migration_running
+                    || !needs_commit))
             || reserved_incarnation.is_some_and(|incarnation| {
                 vset_state.incarnation != incarnation
                     || !vset_state.commit_running
@@ -615,10 +620,6 @@ where
             .filter(|state| state.incarnation == incarnation)?;
         vset_state.best_record = Some(record.clone());
         vset_state.local_covered_through = record.sync_covered_through;
-        if !vset_state.config.durability.requires_peer_sync() {
-            vset_state.sync_ack_through =
-                vset_state.sync_ack_through.max(record.sync_covered_through);
-        }
         let mut completed = Vec::new();
         vset_state.pending_syncs.retain(|(req, barrier)| {
             if *barrier <= vset_state.sync_ack_through {

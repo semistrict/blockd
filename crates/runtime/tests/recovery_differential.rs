@@ -14,12 +14,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use blockd_core::database::{DatabaseReply, DatabaseRequest};
 use blockd_core::engine::{HostState, reconcile_backed_recovery, recover_local};
-use blockd_core::hostmeta::{DaemonStats, HostConfig};
+use blockd_core::hostmeta::{DaemonStats, HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::JournalRecord;
 use blockd_core::layout::{self, BlobName};
+use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{AdminCmd, AdminReply, Verdict};
 use blockd_core::segment::open_entry;
-use blockd_core::types::{PageId, VsetId, page_size};
+use blockd_core::types::{HostId, PageId, VsetId, page_size};
 use blockd_core::world::{
     AdminIo, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem, GuestSync, Store,
     StoreError,
@@ -137,7 +138,7 @@ async fn recovered_content_hash(
         .vsets
         .values()
         .flat_map(|vset| {
-            let backed = vset.config.durability.uses_store();
+            let backed = true;
             vset.page_locs
                 .iter()
                 .map(move |(&page, &(generation, location))| (page, generation, location, backed))
@@ -368,7 +369,27 @@ fn main_branch_fixture_recovers_under_the_actor_runtime() {
         REVISION
     );
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/main-recovery-104");
-    let config = presets::single_host_base().daemon;
+    let mut config = presets::single_host_base().daemon;
+    let local = config.host;
+    let passive = HostId(local.0 ^ u16::MAX);
+    config.replica_placement = Some(ReplicaPlacementConfig {
+        membership_epoch: 1,
+        local_failure_domain: local.0,
+        roster: vec![
+            PeerCandidate {
+                host: local,
+                weight: 1,
+                failure_domain: local.0,
+                drained: false,
+            },
+            PeerCandidate {
+                host: passive,
+                weight: 1,
+                failure_domain: passive.0,
+                drained: false,
+            },
+        ],
+    });
     let state = Rc::new(RefCell::new(HostState::new(config)));
     let mut executor = Executor::production();
     let blobs = Rc::new(FileBlobs::new(&fixture.join("blobs")).expect("fixture blobs"));
@@ -381,8 +402,10 @@ fn main_branch_fixture_recovers_under_the_actor_runtime() {
         .expect("fixture local recovery");
 
     let tokio = tokio::runtime::Runtime::new().expect("fixture store runtime");
-    let store: Arc<dyn ObjectStore> =
-        Arc::new(DirectoryStore::new(fixture.join("store")).expect("fixture directory store"));
+    let store_root = tempfile::tempdir().expect("fixture object store");
+    let store: Arc<dyn ObjectStore> = Arc::new(
+        DirectoryStore::new(store_root.path().to_path_buf()).expect("fixture directory store"),
+    );
     let world = Rc::new(FixtureWorld {
         store: RuntimeStore::new(tokio.handle().clone(), store),
         replies: RefCell::new(Vec::new()),

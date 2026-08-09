@@ -157,6 +157,7 @@ mod linux {
             .collect();
         RuntimeConfig {
             daemon: HostConfig {
+                archive: Default::default(),
                 host: config.host,
                 cache_pages: 256,
                 writeback_interval: millis(5),

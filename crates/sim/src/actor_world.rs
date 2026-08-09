@@ -6,8 +6,12 @@ use std::rc::Rc;
 
 use async_trait::async_trait;
 use blockd_core::database::{DatabaseReply, DatabaseRequest};
+use blockd_core::head::HeadRecord;
+use blockd_core::journal::JournalRecord;
+use blockd_core::layout;
+use blockd_core::mapleaf::MapLeaf;
 use blockd_core::protocol::{AdminCmd, AdminReply, PeerMsg, ReqId, StoreFault};
-use blockd_core::types::{HostId, PageId, VsetId};
+use blockd_core::types::{Gen, HostId, PageId, VolumeId, VsetId, page_size};
 use blockd_core::world::{
     AdminIo, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem, GuestSync, Peers,
     Store, StoreError,
@@ -16,7 +20,7 @@ use blockd_exec::channel::{OneSender, Receiver, UnboundedSender, oneshot, unboun
 use blockd_exec::{current_poll, delay, now, random_u64, spawn};
 
 use crate::world::blobdev::{BlobDevConfig, CrashFate};
-use crate::world::store::{MAX_OBJECT_BYTES, StoreConfig};
+use crate::world::store::{MAX_OBJECT_BYTES, StoreConfig, StoreCounters, StoreObjectKind};
 
 fn random_between(low: u64, high: u64) -> u64 {
     assert!(low <= high);
@@ -126,8 +130,149 @@ struct StoreState {
     objects: BTreeMap<String, (u64, Vec<u8>)>,
     next_version: u64,
     outage: bool,
-    unavailable: u64,
-    cas_conflicts: u64,
+    attempted_payloads: BTreeSet<(String, usize, u32)>,
+    seen_payloads: BTreeSet<(String, usize, u32)>,
+    archived_generations: BTreeMap<VsetId, BTreeMap<PageId, Gen>>,
+    counters: StoreCounters,
+}
+
+impl StoreState {
+    fn object_kind(key: &str) -> StoreObjectKind {
+        if key.ends_with("/head") {
+            StoreObjectKind::Head
+        } else if key.contains("/m/") {
+            StoreObjectKind::Manifest
+        } else if key.starts_with("b/") {
+            StoreObjectKind::Base
+        } else if key.ends_with("/rs") {
+            StoreObjectKind::ResumeSet
+        } else if key.contains("/s/") {
+            StoreObjectKind::Segment
+        } else if key.contains("/l/") || key.contains("/lb/") {
+            StoreObjectKind::Leaf
+        } else {
+            StoreObjectKind::Other
+        }
+    }
+
+    fn write_attempt(&mut self, key: &str, bytes: &[u8], cas: bool) -> StoreObjectKind {
+        let kind = Self::object_kind(key);
+        self.counters.put_attempts += 1;
+        self.counters.puts_by_kind[kind as usize].attempts += 1;
+        self.counters.puts_by_kind[kind as usize].attempted_bytes += bytes.len() as u64;
+        if cas {
+            self.counters.cas_attempts += 1;
+        }
+        let identity = (
+            key.to_owned(),
+            bytes.len(),
+            blockd_core::format::crc32c(bytes),
+        );
+        if !self.attempted_payloads.insert(identity) {
+            self.counters.retry_bytes += bytes.len() as u64;
+        }
+        kind
+    }
+
+    fn write_success(&mut self, key: &str, bytes: &[u8], kind: StoreObjectKind, cas: bool) {
+        self.counters.puts += 1;
+        self.counters.put_successes += 1;
+        self.counters.bytes_put += bytes.len() as u64;
+        self.counters.puts_by_kind[kind as usize].successes += 1;
+        self.counters.puts_by_kind[kind as usize].successful_bytes += bytes.len() as u64;
+        if cas {
+            self.counters.cas_successes += 1;
+        }
+        let identity = (
+            key.to_owned(),
+            bytes.len(),
+            blockd_core::format::crc32c(bytes),
+        );
+        if self.seen_payloads.insert(identity) {
+            self.counters.unique_bytes += bytes.len() as u64;
+        }
+        let bucket = match bytes.len() {
+            0..=4096 => 0,
+            4097..=65_536 => 1,
+            65_537..=1_048_576 => 2,
+            1_048_577..=8_388_608 => 3,
+            8_388_609..=33_554_432 => 4,
+            33_554_433..=67_108_864 => 5,
+            _ => 6,
+        };
+        self.counters.object_size_histogram[bucket] += 1;
+    }
+
+    fn observe_archive_head(&mut self, key: &str, bytes: &[u8]) {
+        let Some(encoded_vset) = key
+            .strip_prefix("v/")
+            .and_then(|rest| rest.split('/').next())
+        else {
+            return;
+        };
+        let Ok(raw_vset) = u64::from_str_radix(encoded_vset, 16) else {
+            return;
+        };
+        let vset = VsetId(raw_vset);
+        let Ok(head) = HeadRecord::decode(vset, bytes) else {
+            return;
+        };
+        let Some(pointer) = head.manifest else {
+            return;
+        };
+        let Some((_, record_bytes)) =
+            self.objects
+                .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
+        else {
+            return;
+        };
+        let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
+            return;
+        };
+        let mut current = BTreeMap::new();
+        for leaf_pointer in record.leaves.values() {
+            let (owner, leaf_key) = if leaf_pointer.base == 0 {
+                (
+                    vset,
+                    layout::leaf_key(vset, leaf_pointer.fence, leaf_pointer.id),
+                )
+            } else {
+                (
+                    VsetId(leaf_pointer.base),
+                    layout::base_leaf_key(leaf_pointer.base, leaf_pointer.fence, leaf_pointer.id),
+                )
+            };
+            let Some((_, leaf_bytes)) = self.objects.get(&leaf_key) else {
+                continue;
+            };
+            let Ok(leaf) = MapLeaf::decode(owner, leaf_pointer.fence, leaf_pointer.id, leaf_bytes)
+            else {
+                continue;
+            };
+            for (idx, page, generation, _) in leaf.entries {
+                current.insert(
+                    PageId {
+                        volume: VolumeId { vset, idx },
+                        page,
+                    },
+                    generation,
+                );
+            }
+        }
+        current.extend(
+            record
+                .overlay
+                .iter()
+                .map(|(&page, &(generation, _))| (page, generation)),
+        );
+        let previous = self.archived_generations.entry(vset).or_default();
+        let changed = current
+            .iter()
+            .filter(|(page, generation)| previous.get(page) != Some(generation))
+            .count() as u64;
+        self.counters.logical_changed_bytes += changed * page_size() as u64;
+        *previous = current;
+    }
 }
 
 #[derive(Default)]
@@ -261,6 +406,7 @@ impl SimWorld {
         self.host
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         host: HostId,
         blob_config: BlobDevConfig,
@@ -302,6 +448,19 @@ impl SimWorld {
                 )
             })
             .collect();
+        (network, worlds)
+    }
+
+    pub(crate) fn pair(
+        hosts: [HostId; 2],
+        blob_config: BlobDevConfig,
+        store_config: StoreConfig,
+    ) -> (Rc<SimNetwork>, [Rc<Self>; 2]) {
+        let network = Rc::new(SimNetwork::default());
+        let store = Rc::new(RefCell::new(StoreState::default()));
+        let worlds = hosts.map(|host| {
+            Self::with_store(host, blob_config, store_config, &network, Rc::clone(&store))
+        });
         (network, worlds)
     }
 
@@ -398,7 +557,126 @@ impl SimWorld {
 
     pub(crate) fn store_counters(&self) -> (u64, u64) {
         let store = self.store.borrow();
-        (store.unavailable, store.cas_conflicts)
+        (store.counters.unavailable, store.counters.cas_conflicts)
+    }
+
+    pub(crate) fn store_metrics(&self) -> StoreCounters {
+        self.store.borrow().counters
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn published_archive_metrics(&self) -> (u64, u64, u64, u64) {
+        let store = self.store.borrow();
+        let mut segments = BTreeSet::new();
+        let mut live_locations = BTreeSet::new();
+        for (key, (_, head_bytes)) in &store.objects {
+            let Some(encoded_vset) = key
+                .strip_prefix("v/")
+                .and_then(|rest| rest.strip_suffix("/head"))
+            else {
+                continue;
+            };
+            let Ok(vset) = u64::from_str_radix(encoded_vset, 16).map(VsetId) else {
+                continue;
+            };
+            let Ok(head) = HeadRecord::decode(vset, head_bytes) else {
+                continue;
+            };
+            let Some(pointer) = head.manifest else {
+                continue;
+            };
+            let Some((_, record_bytes)) =
+                store
+                    .objects
+                    .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
+            else {
+                continue;
+            };
+            let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
+                continue;
+            };
+            for (_, location) in record.overlay.values() {
+                segments.insert((vset, location.base, location.fence, location.seg));
+                live_locations.insert((
+                    vset,
+                    location.base,
+                    location.fence,
+                    location.seg,
+                    location.offset,
+                    location.len,
+                ));
+            }
+            for leaf_pointer in record.leaves.values() {
+                let (owner, leaf_key) = if leaf_pointer.base == 0 {
+                    (
+                        vset,
+                        layout::leaf_key(vset, leaf_pointer.fence, leaf_pointer.id),
+                    )
+                } else {
+                    (
+                        VsetId(leaf_pointer.base),
+                        layout::base_leaf_key(
+                            leaf_pointer.base,
+                            leaf_pointer.fence,
+                            leaf_pointer.id,
+                        ),
+                    )
+                };
+                let Some((_, leaf_bytes)) = store.objects.get(&leaf_key) else {
+                    continue;
+                };
+                let Ok(leaf) =
+                    MapLeaf::decode(owner, leaf_pointer.fence, leaf_pointer.id, leaf_bytes)
+                else {
+                    continue;
+                };
+                for (_, _, _, location) in leaf.entries {
+                    segments.insert((vset, location.base, location.fence, location.seg));
+                    live_locations.insert((
+                        vset,
+                        location.base,
+                        location.fence,
+                        location.seg,
+                        location.offset,
+                        location.len,
+                    ));
+                }
+            }
+        }
+
+        let mut total = 0_u64;
+        let mut live = 0_u64;
+        let mut dead = 0_u64;
+        for (vset, base, fence, segment) in segments {
+            let key = if base == 0 {
+                layout::segment_key(vset, fence, segment)
+            } else {
+                layout::base_segment_key(base, fence, segment)
+            };
+            let Some((_, bytes)) = store.objects.get(&key) else {
+                continue;
+            };
+            let Ok((_, _, _, entries)) = blockd_core::segment::scan_segment(bytes) else {
+                continue;
+            };
+            total = total.saturating_add(bytes.len() as u64);
+            for (_, _, location) in entries {
+                let size = u64::from(location.len);
+                if live_locations.contains(&(
+                    vset,
+                    base,
+                    fence,
+                    segment,
+                    location.offset,
+                    location.len,
+                )) {
+                    live = live.saturating_add(size);
+                } else {
+                    dead = dead.saturating_add(size);
+                }
+            }
+        }
+        (total, live, dead, total.saturating_sub(live + dead))
     }
 
     pub(crate) fn store_bytes(&self, key: &str) -> Option<Vec<u8>> {
@@ -407,6 +685,15 @@ impl SimWorld {
             .objects
             .get(key)
             .map(|(_, bytes)| bytes.clone())
+    }
+
+    pub(crate) fn store_snapshot(&self) -> BTreeMap<String, Vec<u8>> {
+        self.store
+            .borrow()
+            .objects
+            .iter()
+            .map(|(key, (_, bytes))| (key.clone(), bytes.clone()))
+            .collect()
     }
 
     pub(crate) fn blob_count(&self) -> usize {
@@ -907,17 +1194,19 @@ impl Blobs for SimWorld {
 #[async_trait(?Send)]
 impl Store for SimWorld {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
-        if bytes.len() > MAX_OBJECT_BYTES {
-            return Err(StoreError::TooLarge);
-        }
         let result = {
             let mut store = self.store.borrow_mut();
+            let kind = store.write_attempt(&key, &bytes, false);
             if store.outage {
-                store.unavailable = store.unavailable.saturating_add(1);
+                store.counters.unavailable = store.counters.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
+            } else if bytes.len() > MAX_OBJECT_BYTES {
+                store.counters.too_large = store.counters.too_large.saturating_add(1);
+                Err(StoreError::TooLarge)
             } else {
                 store.next_version = store.next_version.saturating_add(1);
                 let version = store.next_version;
+                store.write_success(&key, &bytes, kind, false);
                 store.objects.insert(key, (version, bytes.clone()));
                 Ok(version)
             }
@@ -932,23 +1221,28 @@ impl Store for SimWorld {
         expected: Option<u64>,
         bytes: Vec<u8>,
     ) -> Result<u64, StoreError> {
-        if bytes.len() > MAX_OBJECT_BYTES {
-            return Err(StoreError::TooLarge);
-        }
         let result = {
             let mut store = self.store.borrow_mut();
+            let kind = store.write_attempt(&key, &bytes, true);
             if store.outage {
-                store.unavailable = store.unavailable.saturating_add(1);
+                store.counters.unavailable = store.counters.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
+            } else if bytes.len() > MAX_OBJECT_BYTES {
+                store.counters.too_large = store.counters.too_large.saturating_add(1);
+                Err(StoreError::TooLarge)
             } else {
                 let actual = store.objects.get(&key).map(|(version, _)| *version);
                 if actual == expected {
                     store.next_version = store.next_version.saturating_add(1);
                     let version = store.next_version;
+                    store.write_success(&key, &bytes, kind, true);
+                    if kind == StoreObjectKind::Head {
+                        store.observe_archive_head(&key, &bytes);
+                    }
                     store.objects.insert(key, (version, bytes.clone()));
                     Ok(version)
                 } else {
-                    store.cas_conflicts = store.cas_conflicts.saturating_add(1);
+                    store.counters.cas_conflicts = store.counters.cas_conflicts.saturating_add(1);
                     Err(StoreError::Fault(StoreFault::CasConflict { actual }))
                 }
             }
@@ -961,10 +1255,16 @@ impl Store for SimWorld {
         let result = {
             let mut store = self.store.borrow_mut();
             if store.outage {
-                store.unavailable = store.unavailable.saturating_add(1);
+                store.counters.unavailable = store.counters.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
-                Ok(store.objects.get(key).cloned())
+                let found = store.objects.get(key).cloned();
+                store.counters.gets = store.counters.gets.saturating_add(1);
+                store.counters.bytes_got = store
+                    .counters
+                    .bytes_got
+                    .saturating_add(found.as_ref().map_or(0, |(_, bytes)| bytes.len() as u64));
+                Ok(found)
             }
         };
         let len = result
@@ -985,16 +1285,22 @@ impl Store for SimWorld {
         let result = {
             let mut store = self.store.borrow_mut();
             if store.outage {
-                store.unavailable = store.unavailable.saturating_add(1);
+                store.counters.unavailable = store.counters.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
-                Ok(store.objects.get(key).map(|(version, bytes)| {
+                let found = store.objects.get(key).map(|(version, bytes)| {
                     let start =
                         usize::try_from(offset.min(bytes.len() as u64)).expect("offset fits");
                     let end = usize::try_from(offset.saturating_add(len).min(bytes.len() as u64))
                         .expect("end fits");
                     (*version, bytes[start..end].to_vec())
-                }))
+                });
+                store.counters.gets = store.counters.gets.saturating_add(1);
+                store.counters.bytes_got = store
+                    .counters
+                    .bytes_got
+                    .saturating_add(found.as_ref().map_or(0, |(_, bytes)| bytes.len() as u64));
+                Ok(found)
             }
         };
         let got = result
@@ -1010,9 +1316,10 @@ impl Store for SimWorld {
         let result = {
             let mut store = self.store.borrow_mut();
             if store.outage {
-                store.unavailable = store.unavailable.saturating_add(1);
+                store.counters.unavailable = store.counters.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
+                store.counters.deletes = store.counters.deletes.saturating_add(1);
                 Ok(store.objects.remove(key).is_some())
             }
         };
@@ -1024,7 +1331,7 @@ impl Store for SimWorld {
         let result = {
             let mut store = self.store.borrow_mut();
             if store.outage {
-                store.unavailable = store.unavailable.saturating_add(1);
+                store.counters.unavailable = store.counters.unavailable.saturating_add(1);
                 Err(StoreError::Fault(StoreFault::Unavailable))
             } else {
                 Ok(store
@@ -1132,8 +1439,9 @@ fn peer_tag(message: &PeerMsg) -> u8 {
         PeerMsg::ReplicaStatus { .. } => 12,
         PeerMsg::ReplicaStatusReply { .. } => 13,
         PeerMsg::ReplicaUploadDone { .. } => 14,
-        PeerMsg::ReplicaRelease { .. } => 15,
-        PeerMsg::ReplicaReleaseAck { .. } => 16,
+        PeerMsg::ReplicaArchive { .. } => 15,
+        PeerMsg::ReplicaRelease { .. } => 16,
+        PeerMsg::ReplicaReleaseAck { .. } => 17,
     }
 }
 
@@ -1150,12 +1458,15 @@ impl GuestMem for SimWorld {
         self.page_reads_in_poll.set(reads);
         self.max_page_reads_in_poll
             .set(self.max_page_reads_in_poll.get().max(reads));
-        self.memory
+        let bytes = self
+            .memory
             .borrow()
             .pages
             .get(&page)
             .cloned()
-            .unwrap_or_else(|| vec![0; blockd_core::types::page_size()])
+            .unwrap_or_else(|| vec![0; blockd_core::types::page_size()]);
+        delay(100).await;
+        bytes
     }
 
     async fn arm_write_protect(&self, pages: &[PageId]) {
@@ -1359,10 +1670,12 @@ impl AdminIo for SimWorld {
 }
 
 #[cfg(test)]
+#[allow(clippy::default_trait_access)]
 mod tests {
     use blockd_core::engine::{HostState, host_actor_with_state};
-    use blockd_core::hostmeta::HostConfig;
+    use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
     use blockd_core::journal::VsetConfig;
+    use blockd_core::placement::PeerCandidate;
     use blockd_core::protocol::AdminReply;
     use blockd_core::types::VsetId;
     use blockd_exec::Executor;
@@ -1372,7 +1685,22 @@ mod tests {
     #[test]
     fn actor_world_runs_creation_through_the_real_async_host() {
         let host = HostId(1);
+        let passive_host = HostId(2);
+        let placement = |local: HostId| ReplicaPlacementConfig {
+            membership_epoch: 1,
+            local_failure_domain: local.0,
+            roster: [host, passive_host]
+                .into_iter()
+                .map(|candidate| PeerCandidate {
+                    host: candidate,
+                    weight: 1,
+                    failure_domain: candidate.0,
+                    drained: false,
+                })
+                .collect(),
+        };
         let config = HostConfig {
+            archive: Default::default(),
             host,
             cache_pages: 8,
             writeback_interval: 10,
@@ -1380,26 +1708,34 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: Some(placement(host)),
         };
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            host,
-            BlobDevConfig {
-                read_latency_min: 1,
-                read_latency_max: 1,
-                write_latency_min: 1,
-                write_latency_max: 1,
-                ns_per_byte: 0,
-            },
-            StoreConfig {
-                latency_min: 1,
-                latency_max: 1,
-                ns_per_byte: 0,
-            },
-            &network,
-        );
+        let blob_config = BlobDevConfig {
+            read_latency_min: 1,
+            read_latency_max: 1,
+            write_latency_min: 1,
+            write_latency_max: 1,
+            ns_per_byte: 0,
+        };
+        let store_config = StoreConfig {
+            latency_min: 1,
+            latency_max: 1,
+            ns_per_byte: 0,
+        };
+        let (_, [world, passive_world]) =
+            SimWorld::pair([host, passive_host], blob_config, store_config);
         let state = Rc::new(RefCell::new(HostState::new(config)));
+        let passive_state = Rc::new(RefCell::new(HostState::new(HostConfig {
+            archive: Default::default(),
+            host: passive_host,
+            cache_pages: 8,
+            writeback_interval: 10,
+            backup_retry: 5,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: Some(placement(passive_host)),
+        })));
         world.enqueue_admin(AdminCmd::CreateVset {
             req: ReqId(1),
             vset: VsetId(2),
@@ -1407,6 +1743,7 @@ mod tests {
             from_base: None,
         });
         let mut executor = Executor::simulation(4);
+        let passive = executor.spawn(host_actor_with_state(passive_state, passive_world));
         let actor = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
         let reply = executor.block_on({
             let world = Rc::clone(&world);
@@ -1421,6 +1758,7 @@ mod tests {
         );
         assert!(state.borrow().vsets[&VsetId(2)].ready);
         drop(actor);
+        drop(passive);
         executor.run_ready();
     }
 

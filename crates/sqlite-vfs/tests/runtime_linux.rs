@@ -46,6 +46,7 @@ impl ObjectStore for EmptyStore {
 fn config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
         daemon: HostConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 32,
             writeback_interval: millis(5),

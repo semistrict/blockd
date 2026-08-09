@@ -581,14 +581,15 @@ impl Executor {
             refresh_now(&self.context);
             self.fire_due_timers();
         }
-        if self.poll_ready() {
-            return true;
-        }
-        if self.mode == Mode::Simulation && !self.timers.is_empty() {
+        loop {
+            if self.poll_ready() {
+                return true;
+            }
+            if self.mode != Mode::Simulation || self.timers.is_empty() {
+                return false;
+            }
             self.fire_next_timers();
-            return self.poll_ready();
         }
-        false
     }
 
     fn poll_ready(&mut self) -> bool {
@@ -783,6 +784,19 @@ mod tests {
         executor.run_ready();
         assert!(dropped.get());
         assert_eq!(executor.task_count(), 0);
+    }
+
+    #[test]
+    fn cancelled_timer_does_not_hide_a_later_live_timer() {
+        let mut executor = Executor::simulation(1);
+        let handle = executor.spawn(async { delay(10).await });
+        executor.run_ready();
+        drop(handle);
+        executor.run_ready();
+
+        executor.block_on(async { delay(20).await });
+
+        assert_eq!(executor.now(), 20);
     }
 
     #[test]

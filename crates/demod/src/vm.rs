@@ -174,6 +174,12 @@ impl Demod {
         roster.sort_by_key(|candidate| candidate.host);
         let runtime_config = RuntimeConfig {
             daemon: HostConfig {
+                archive: blockd_core::hostmeta::ArchivePolicy {
+                    interval: millis(cfg.archive_interval_ms),
+                    max_unpublished_bytes: cfg.archive_lag_bytes,
+                    spool_capacity_bytes: cfg.peer_spool_capacity_bytes,
+                    spool_headroom_bytes: cfg.peer_spool_headroom_bytes,
+                },
                 host: cfg.host,
                 cache_pages: cfg.cache_pages,
                 writeback_interval: millis(cfg.writeback_interval_ms),

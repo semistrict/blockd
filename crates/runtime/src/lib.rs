@@ -26,7 +26,7 @@ mod replica_recovery;
 #[cfg(target_os = "linux")]
 mod s3;
 mod store;
-#[cfg(all(target_os = "linux", feature = "vsetfs"))]
+#[cfg(target_os = "linux")]
 pub mod vsetfs;
 pub mod world;
 

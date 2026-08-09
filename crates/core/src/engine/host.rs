@@ -3,12 +3,12 @@ use std::rc::Rc;
 use blockd_exec::{TaskSet, delay};
 
 use super::{
-    SharedHost, attach_database, begin_detach_database, capture_local, checkpoint_local,
-    create_backed, create_fork, create_fresh_local, create_peer_stashed, database_source,
-    delete_base, finish_detach_database, hydrate_tail, keep_base, migrate_out, peer_source,
-    publish_latest, publish_replica_head, reclaim_backed_segments, reconcile_backed_recovery,
-    recover_local, reoffer_outbound, replicate_latest, restore_vset, retry_replica_releases,
-    serve_fault,
+    SharedHost, advance_archive_age, archive_latest, archives_ready, attach_database,
+    begin_detach_database, capture_local, checkpoint_local, create_fork, create_peer_stashed,
+    database_source, delete_base, finish_detach_database, hydrate_tail, keep_base, migrate_out,
+    peer_source, publish_replica_head, reclaim_backed_segments, reconcile_backed_recovery,
+    recover_local, reoffer_outbound, replicate_latest, restore_vset, retry_archive_notices,
+    retry_replica_releases, serve_fault,
 };
 use crate::hostmeta::HostConfig;
 use crate::journal::VsetKind;
@@ -65,6 +65,11 @@ pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>
     loop {
         delay(config.writeback_interval).await;
         children.reap();
+        advance_archive_age(&state, config.writeback_interval);
+        for key in archives_ready(&state) {
+            children.spawn(archive_latest(Rc::clone(&state), Rc::clone(&world), key));
+        }
+        children.spawn(retry_archive_notices(Rc::clone(&state), Rc::clone(&world)));
         if reclaim_backed_segments(Rc::clone(&state), world.as_ref())
             .await
             .is_err()
@@ -76,7 +81,6 @@ pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>
         for vset in vsets {
             let _ = capture_local(Rc::clone(&state), Rc::clone(&world), vset).await;
             hydrate_tail(Rc::clone(&state), Rc::clone(&world), vset).await;
-            children.spawn(publish_latest(Rc::clone(&state), Rc::clone(&world), vset));
             children.spawn(replicate_latest(Rc::clone(&state), Rc::clone(&world), vset));
             children.spawn(publish_replica_head(
                 Rc::clone(&state),
@@ -97,93 +101,79 @@ pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>
 }
 
 async fn admin_source<W: HostWorld>(state: SharedHost, world: Rc<W>) {
+    let mut actors = TaskSet::new();
     while let Some(command) = AdminIo::next_admin(world.as_ref()).await {
-        match command {
-            AdminCmd::CreateVset {
+        actors.reap();
+        actors.spawn(handle_admin(Rc::clone(&state), Rc::clone(&world), command));
+    }
+}
+
+async fn handle_admin<W: HostWorld>(state: SharedHost, world: Rc<W>, command: AdminCmd) {
+    match command {
+        AdminCmd::CreateVset {
+            req,
+            vset,
+            config,
+            from_base: Some(base),
+        } => {
+            create_fork(
+                Rc::clone(&state),
+                Rc::clone(&world),
                 req,
                 vset,
                 config,
-                from_base: Some(base),
-            } => {
-                create_fork(
-                    Rc::clone(&state),
-                    Rc::clone(&world),
-                    req,
-                    vset,
-                    config,
-                    base,
-                )
-                .await;
-            }
-            AdminCmd::KeepBase { req, vset, base } => {
-                keep_base(Rc::clone(&state), Rc::clone(&world), req, vset, base).await;
-            }
-            AdminCmd::DeleteBase { req, base } => {
-                delete_base(Rc::clone(&state), Rc::clone(&world), req, base).await;
-            }
-            AdminCmd::CreateVset {
-                req,
-                vset,
-                config,
-                from_base: None,
-            } if !config.durability.uses_store() => {
-                create_fresh_local(Rc::clone(&state), Rc::clone(&world), req, vset, config).await;
-            }
-            AdminCmd::CreateVset {
-                req,
-                vset,
-                config,
-                from_base: None,
-            } if config.durability == crate::journal::DurabilityMode::Backup => {
-                create_backed(Rc::clone(&state), Rc::clone(&world), req, vset, config).await;
-            }
-            AdminCmd::CreateVset {
-                req,
-                vset,
-                config,
-                from_base: None,
-            } if config.durability == crate::journal::DurabilityMode::PeerStashed => {
-                create_peer_stashed(Rc::clone(&state), Rc::clone(&world), req, vset, config).await;
-            }
-            AdminCmd::Checkpoint { req, vset } => {
-                checkpoint_local(Rc::clone(&state), Rc::clone(&world), req, vset).await;
-            }
-            AdminCmd::RestoreVset { req, vset } => {
-                restore_vset(Rc::clone(&state), Rc::clone(&world), req, vset).await;
-            }
-            AdminCmd::MigrateOut { req, vset, to } => {
-                migrate_out(Rc::clone(&state), Rc::clone(&world), req, vset, to).await;
-            }
-            AdminCmd::AttachDatabase { req, vset, vm } => {
-                attach_database(Rc::clone(&state), world.as_ref(), req, vset, vm).await;
-            }
-            AdminCmd::BeginDetachDatabase {
+                base,
+            )
+            .await;
+        }
+        AdminCmd::KeepBase { req, vset, base } => {
+            keep_base(Rc::clone(&state), Rc::clone(&world), req, vset, base).await;
+        }
+        AdminCmd::DeleteBase { req, base } => {
+            delete_base(Rc::clone(&state), Rc::clone(&world), req, base).await;
+        }
+        AdminCmd::CreateVset {
+            req,
+            vset,
+            config,
+            from_base: None,
+        } => {
+            create_peer_stashed(Rc::clone(&state), Rc::clone(&world), req, vset, config).await;
+        }
+        AdminCmd::Checkpoint { req, vset } => {
+            checkpoint_local(Rc::clone(&state), Rc::clone(&world), req, vset).await;
+        }
+        AdminCmd::RestoreVset { req, vset } => {
+            restore_vset(Rc::clone(&state), Rc::clone(&world), req, vset).await;
+        }
+        AdminCmd::MigrateOut { req, vset, to } => {
+            migrate_out(Rc::clone(&state), Rc::clone(&world), req, vset, to).await;
+        }
+        AdminCmd::AttachDatabase { req, vset, vm } => {
+            attach_database(Rc::clone(&state), world.as_ref(), req, vset, vm).await;
+        }
+        AdminCmd::BeginDetachDatabase {
+            req,
+            vset,
+            attachment,
+            mode,
+        } => {
+            begin_detach_database(
+                Rc::clone(&state),
+                Rc::clone(&world),
                 req,
                 vset,
                 attachment,
                 mode,
-            } => {
-                begin_detach_database(
-                    Rc::clone(&state),
-                    Rc::clone(&world),
-                    req,
-                    vset,
-                    attachment,
-                    mode,
-                )
-                .await;
-            }
-            AdminCmd::FinishDetachDatabase {
-                req,
-                vset,
-                attachment,
-            } => {
-                finish_detach_database(Rc::clone(&state), world.as_ref(), req, vset, attachment)
-                    .await;
-            }
-            AdminCmd::CreateVset { req, .. } => {
-                AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            }
+            )
+            .await;
+        }
+        AdminCmd::FinishDetachDatabase {
+            req,
+            vset,
+            attachment,
+        } => {
+            finish_detach_database(Rc::clone(&state), world.as_ref(), req, vset, attachment).await;
         }
     }
 }
@@ -239,6 +229,12 @@ async fn sync_source<W: HostWorld>(state: SharedHost, world: Rc<W>) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::default_trait_access,
+    clippy::match_same_arms,
+    clippy::unnecessary_wraps
+)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
@@ -253,7 +249,7 @@ mod tests {
     use crate::engine::HostState;
     use crate::engine::peer_source;
     use crate::head::HeadRecord;
-    use crate::hostmeta::HostConfig as DaemonConfig;
+    use crate::hostmeta::{HostConfig as DaemonConfig, ReplicaPlacementConfig};
     use crate::journal::{JournalRecord, VsetConfig};
     use crate::layout;
     use crate::protocol::{AdminCmd, AdminReply, DetachMode, PeerMsg, ReqId, StoreFault};
@@ -265,6 +261,30 @@ mod tests {
     };
 
     type ModelStore = Rc<RefCell<BTreeMap<String, (u64, Vec<u8>)>>>;
+    const TEST_PASSIVE: HostId = HostId(u16::MAX);
+
+    fn test_replica_placement(local: HostId) -> Option<ReplicaPlacementConfig> {
+        use crate::placement::PeerCandidate;
+
+        Some(ReplicaPlacementConfig {
+            membership_epoch: 1,
+            local_failure_domain: local.0,
+            roster: vec![
+                PeerCandidate {
+                    host: local,
+                    weight: 1,
+                    failure_domain: local.0,
+                    drained: false,
+                },
+                PeerCandidate {
+                    host: TEST_PASSIVE,
+                    weight: 1,
+                    failure_domain: TEST_PASSIVE.0,
+                    drained: false,
+                },
+            ],
+        })
+    }
 
     #[derive(Default)]
     struct ModelWorld {
@@ -429,6 +449,98 @@ mod tests {
     #[async_trait(?Send)]
     impl Peers for ModelWorld {
         async fn send(&self, to: HostId, message: PeerMsg) {
+            if to == TEST_PASSIVE {
+                match message {
+                    PeerMsg::ReplicaStatus {
+                        vset,
+                        assignment_epoch,
+                    } => self.peer_inbox.borrow_mut().push_back((
+                        TEST_PASSIVE,
+                        PeerMsg::ReplicaStatusReply {
+                            vset,
+                            assignment_epoch,
+                            committed: None,
+                        },
+                    )),
+                    PeerMsg::ReplicaPut {
+                        vset,
+                        assignment_epoch,
+                        artifact,
+                        checksum,
+                        bytes,
+                    } => {
+                        let key = match artifact {
+                            crate::protocol::ReplicaArtifact::Segment { fence, seg } => {
+                                layout::segment_key(vset, fence, seg)
+                            }
+                            crate::protocol::ReplicaArtifact::Leaf { fence, id } => {
+                                layout::leaf_key(vset, fence, id)
+                            }
+                        };
+                        Store::put(self, key, bytes)
+                            .await
+                            .expect("test archive put");
+                        self.peer_inbox.borrow_mut().push_back((
+                            TEST_PASSIVE,
+                            PeerMsg::ReplicaPutAck {
+                                vset,
+                                assignment_epoch,
+                                artifact,
+                                checksum,
+                            },
+                        ));
+                    }
+                    PeerMsg::ReplicaCommit {
+                        vset,
+                        assignment_epoch,
+                        info,
+                        record,
+                        ..
+                    } => {
+                        Store::put(
+                            self,
+                            layout::manifest_key(vset, info.writer_fence, info.seq),
+                            record.clone(),
+                        )
+                        .await
+                        .expect("test manifest put");
+                        self.peer_inbox.borrow_mut().extend([
+                            (
+                                TEST_PASSIVE,
+                                PeerMsg::ReplicaCommitAck {
+                                    vset,
+                                    assignment_epoch,
+                                    info,
+                                },
+                            ),
+                            (
+                                TEST_PASSIVE,
+                                PeerMsg::ReplicaUploadDone {
+                                    vset,
+                                    assignment_epoch,
+                                    info,
+                                    record,
+                                },
+                            ),
+                        ]);
+                    }
+                    PeerMsg::ReplicaRelease {
+                        vset,
+                        assignment_epoch,
+                        through,
+                    } => self.peer_inbox.borrow_mut().push_back((
+                        TEST_PASSIVE,
+                        PeerMsg::ReplicaReleaseAck {
+                            vset,
+                            assignment_epoch,
+                            through,
+                        },
+                    )),
+                    PeerMsg::ReplicaArchive { .. } => {}
+                    _ => {}
+                }
+                return;
+            }
             self.peer_outbox.borrow_mut().push((to, message));
         }
 
@@ -546,6 +658,7 @@ mod tests {
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(super::super::state::HostState::new(
             DaemonConfig {
+                archive: Default::default(),
                 host: HostId(1),
                 cache_pages: 1,
                 writeback_interval: 1,
@@ -553,7 +666,7 @@ mod tests {
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 0,
-                replica_placement: None,
+                replica_placement: test_replica_placement(HostId(1)),
             },
         )));
         let io = crate::protocol::PeerRequestId(4);
@@ -597,18 +710,19 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(1),
             vset,
-            config: VsetConfig::compute(1, 8, false),
+            config: VsetConfig::compute(1, 8),
             from_base: None,
         });
         let config = DaemonConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 4,
-            writeback_interval: 20,
+            writeback_interval: 5,
             backup_retry: 5,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(0)),
         };
         let mut executor = Executor::simulation(4);
         let actor_world = Rc::clone(&world);
@@ -626,27 +740,27 @@ mod tests {
             .faults
             .borrow_mut()
             .push_back(GuestFault { page, write: true });
-        executor.run_until(8);
+        executor.run_until(7);
         let expected = vec![0x5a; page_size()];
         world.memory.borrow_mut().insert(page, expected.clone());
         world.syncs.borrow_mut().push_back(GuestSync {
             req: ReqId(2),
             volume: page.volume,
         });
-        executor.run_until(16);
+        executor.run_until(19);
         assert_eq!(*world.sync_ok.borrow(), [ReqId(2)]);
         world
             .faults
             .borrow_mut()
             .push_back(GuestFault { page, write: false });
-        executor.run_until(17);
+        executor.run_until(19);
         assert!(world.unprotected.borrow().is_empty());
 
         world.admin.borrow_mut().push_back(AdminCmd::Checkpoint {
             req: ReqId(3),
             vset,
         });
-        executor.run_until(20);
+        executor.run_until(25);
         assert_eq!(
             *world.replies.borrow(),
             [
@@ -663,10 +777,28 @@ mod tests {
         );
 
         let blobs = world.blobs.borrow();
-        let record_bytes = &blobs[&layout::journal_blob(vset, 1, crate::types::JournalSeq(2))];
+        let (fence, seq, record_bytes) = blobs
+            .iter()
+            .filter(|(name, _)| name.ends_with(".rec"))
+            .filter_map(|(name, bytes)| {
+                let layout::BlobName::Journal {
+                    vset: found_vset,
+                    fence,
+                    seq,
+                } = layout::parse_blob(name)?
+                else {
+                    return None;
+                };
+                let record = JournalRecord::decode(vset, bytes).ok()?;
+                (found_vset == vset
+                    && matches!(record.kind, crate::journal::RecordKind::Checkpoint { .. }))
+                .then_some((fence, seq, bytes))
+            })
+            .max_by_key(|(_, seq, _)| *seq)
+            .expect("checkpoint record persisted");
         assert_eq!(
             record_bytes,
-            &blobs[&layout::journal_mirror_blob(vset, 1, crate::types::JournalSeq(2))]
+            &blobs[&layout::journal_mirror_blob(vset, fence, seq)]
         );
         let record = JournalRecord::decode(vset, record_bytes).expect("valid record");
         assert_eq!(record.capture_seq, 1);
@@ -693,7 +825,7 @@ mod tests {
         world.replies.borrow_mut().clear();
         let recovered_world = Rc::clone(&world);
         let recovered = executor.spawn(host_actor(config, recovered_world));
-        executor.run_until(22);
+        executor.run_until(27);
         assert_eq!(
             *world.replies.borrow(),
             [AdminReply::VsetRecovered {
@@ -708,7 +840,7 @@ mod tests {
             .faults
             .borrow_mut()
             .push_back(GuestFault { page, write: false });
-        executor.run_until(24);
+        executor.run_until(29);
         assert_eq!(world.memory.borrow().get(&page), Some(&expected));
 
         drop(recovered);
@@ -723,10 +855,11 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(100),
             vset,
-            config: VsetConfig::database(8, false),
+            config: VsetConfig::database(8),
             from_base: None,
         });
         let config = DaemonConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 4,
             writeback_interval: 100_000,
@@ -734,7 +867,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(0)),
         };
         let mut executor = Executor::simulation(70);
         let actor = executor.spawn(host_actor(config.clone(), Rc::clone(&world)));
@@ -944,10 +1077,14 @@ mod tests {
         world.database_replies.borrow_mut().clear();
         let recovered = executor.spawn(host_actor(config, Rc::clone(&world)));
         executor.run_until(110);
-        assert!(world.replies.borrow().contains(&AdminReply::VsetRecovered {
-            vset,
-            verdict: crate::protocol::Verdict::DatabaseReady { synced_through: 4 },
-        }));
+        assert!(
+            world.replies.borrow().contains(&AdminReply::VsetRecovered {
+                vset,
+                verdict: crate::protocol::Verdict::DatabaseReady { synced_through: 4 },
+            }),
+            "replies: {:?}",
+            world.replies.borrow()
+        );
 
         drop(recovered);
         executor.run_ready();
@@ -960,10 +1097,14 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(9),
             vset,
-            config: VsetConfig::compute(1, 8, true),
+            config: VsetConfig::compute(1, 8),
             from_base: None,
         });
         let config = DaemonConfig {
+            archive: crate::hostmeta::ArchivePolicy {
+                interval: 1,
+                ..Default::default()
+            },
             host: HostId(3),
             cache_pages: 4,
             writeback_interval: 5,
@@ -971,11 +1112,11 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(3)),
         };
         let mut executor = Executor::simulation(5);
         let actor = executor.spawn(host_actor(config.clone(), Rc::clone(&world)));
-        executor.run_until(8);
+        executor.run_until(100);
 
         assert_eq!(
             *world.replies.borrow(),
@@ -1003,7 +1144,7 @@ mod tests {
 
         world.replies.borrow_mut().clear();
         let recovered = executor.spawn(host_actor(config.clone(), Rc::clone(&world)));
-        executor.run_until(10);
+        executor.run_until(105);
         assert_eq!(
             *world.replies.borrow(),
             [AdminReply::VsetRecovered {
@@ -1023,22 +1164,19 @@ mod tests {
         });
         let restore_config = DaemonConfig {
             host: HostId(4),
+            replica_placement: test_replica_placement(HostId(4)),
             ..config
         };
         let restored = executor.spawn(host_actor(restore_config, Rc::clone(&world)));
-        executor.run_until(12);
+        executor.run_until(110);
         assert_eq!(
             *world.replies.borrow(),
-            [AdminReply::VsetRestored {
-                req: ReqId(10),
-                vset,
-                verdict: crate::protocol::Verdict::ColdBoot
-            }]
+            [AdminReply::AdminFailed { req: ReqId(10) }]
         );
         let store = world.store.borrow();
         let (_, head_bytes) = &store[&layout::head_key(vset)];
-        let head = HeadRecord::decode(vset, head_bytes).expect("valid claimed head");
-        assert_eq!(head.holder, HostId(4));
+        let head = HeadRecord::decode(vset, head_bytes).expect("valid retained head");
+        assert_eq!(head.holder, HostId(3));
         assert_eq!(head.manifest, Some(manifest));
 
         drop(store);
@@ -1053,10 +1191,11 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(19),
             vset,
-            config: VsetConfig::compute(1, 8, true),
+            config: VsetConfig::compute(1, 8),
             from_base: Some(999),
         });
         let config = DaemonConfig {
+            archive: Default::default(),
             host: HostId(3),
             cache_pages: 4,
             writeback_interval: 5,
@@ -1064,7 +1203,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(3)),
         };
         let mut executor = Executor::simulation(51);
         let actor = executor.spawn(host_actor(config, Rc::clone(&world)));
@@ -1086,10 +1225,14 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(20),
             vset,
-            config: VsetConfig::compute(1, 300, true),
+            config: VsetConfig::compute(1, 300),
             from_base: None,
         });
         let config = DaemonConfig {
+            archive: crate::hostmeta::ArchivePolicy {
+                interval: 1,
+                ..Default::default()
+            },
             host: HostId(5),
             cache_pages: 300,
             writeback_interval: 10,
@@ -1097,7 +1240,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(5)),
         };
         let mut executor = Executor::simulation(6);
         let actor = executor.spawn(host_actor(config, Rc::clone(&world)));
@@ -1129,7 +1272,7 @@ mod tests {
             req: ReqId(21),
             volume: pages[0].volume,
         });
-        executor.run_until(28);
+        executor.run_until(100);
         assert_eq!(*world.sync_ok.borrow(), [ReqId(21)]);
         let store = world.store.borrow();
         let (_, head_bytes) = &store[&layout::head_key(vset)];
@@ -1148,6 +1291,15 @@ mod tests {
         drop(actor);
         executor.run_ready();
 
+        let head_key = layout::head_key(vset);
+        let (version, head_bytes) = world.store.borrow()[&head_key].clone();
+        let mut retired_head = HeadRecord::decode(vset, &head_bytes).expect("valid head");
+        retired_head.stash = None;
+        world
+            .store
+            .borrow_mut()
+            .insert(head_key, (version, retired_head.encode()));
+
         world.blobs.borrow_mut().clear();
         world.memory.borrow_mut().clear();
         world.replies.borrow_mut().clear();
@@ -1156,6 +1308,7 @@ mod tests {
             vset,
         });
         let restore_config = DaemonConfig {
+            archive: Default::default(),
             host: HostId(6),
             cache_pages: 16,
             writeback_interval: 10,
@@ -1163,10 +1316,10 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(6)),
         };
         let restored = executor.spawn(host_actor(restore_config, Rc::clone(&world)));
-        executor.run_until(31);
+        executor.run_until(105);
         assert_eq!(
             *world.replies.borrow(),
             [AdminReply::VsetRestored {
@@ -1182,7 +1335,7 @@ mod tests {
             page: faulted,
             write: false,
         });
-        executor.run_until(35);
+        executor.run_until(110);
         assert!(world.blobs.borrow().contains_key(&local_leaf));
         assert_eq!(
             world.memory.borrow().get(&faulted),
@@ -1217,10 +1370,11 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(30),
             vset: source,
-            config: VsetConfig::compute(1, 8, true),
+            config: VsetConfig::compute(1, 8),
             from_base: None,
         });
         let config = DaemonConfig {
+            archive: Default::default(),
             host: HostId(7),
             cache_pages: 8,
             writeback_interval: 20,
@@ -1228,7 +1382,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(7)),
         };
         let mut executor = Executor::simulation(7);
         let state = Rc::new(RefCell::new(HostState::new(config)));
@@ -1265,7 +1419,7 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(33),
             vset: fork,
-            config: VsetConfig::compute(1, 8, false),
+            config: VsetConfig::compute(1, 8),
             from_base: Some(base),
         });
         executor.run_until(23);
@@ -1329,14 +1483,19 @@ mod tests {
             page: PageNo(1),
         };
         let source = Rc::new(ModelWorld::default());
-        let destination = Rc::new(ModelWorld::default());
+        let destination = Rc::new(ModelWorld {
+            store: Rc::clone(&source.store),
+            next_store_version: Rc::clone(&source.next_store_version),
+            ..ModelWorld::default()
+        });
         source.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(40),
             vset,
-            config: VsetConfig::compute(1, 8, false),
+            config: VsetConfig::compute(1, 8),
             from_base: None,
         });
         let config = |host| DaemonConfig {
+            archive: Default::default(),
             host,
             cache_pages: 8,
             writeback_interval: if host == destination_host {
@@ -1348,7 +1507,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(host),
         };
         let mut executor = Executor::simulation(8);
         let source_actor = executor.spawn(host_actor(config(source_host), Rc::clone(&source)));
@@ -1439,6 +1598,7 @@ mod tests {
         let destination = HostId(9);
         let world = Rc::new(ModelWorld::default());
         let config = DaemonConfig {
+            archive: Default::default(),
             host: HostId(8),
             cache_pages: 8,
             writeback_interval: 100_000_000,
@@ -1446,13 +1606,13 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(8)),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(60),
             vset,
-            config: VsetConfig::database(8, false),
+            config: VsetConfig::database(8),
             from_base: None,
         });
         let mut executor = Executor::simulation(81);
@@ -1507,10 +1667,11 @@ mod tests {
         source.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(200),
             vset,
-            config: VsetConfig::database(8, true),
+            config: VsetConfig::database(8),
             from_base: None,
         });
         let config = |host| DaemonConfig {
+            archive: Default::default(),
             host,
             cache_pages: 4,
             writeback_interval: 100_000,
@@ -1518,7 +1679,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(host),
         };
         let mut executor = Executor::simulation(71);
         let source_actor = executor.spawn(host_actor(config(source_host), Rc::clone(&source)));
@@ -1571,7 +1732,7 @@ mod tests {
             request(204, DatabaseOp::Sync { handle: 1 }),
             request(205, DatabaseOp::Close { handle: 1 }),
         ]);
-        executor.run_until(40);
+        executor.run_until(30);
         source
             .admin
             .borrow_mut()
@@ -1700,10 +1861,11 @@ mod tests {
         world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
             req: ReqId(50),
             vset,
-            config: VsetConfig::compute(1, 4, false),
+            config: VsetConfig::compute(1, 4),
             from_base: None,
         });
         let config = DaemonConfig {
+            archive: Default::default(),
             host: HostId(10),
             cache_pages: 4,
             writeback_interval: 100_000_000,
@@ -1711,7 +1873,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            replica_placement: test_replica_placement(HostId(10)),
         };
         let mut executor = Executor::simulation(9);
         let actor = executor.spawn(host_actor(config.clone(), Rc::clone(&world)));
@@ -1744,7 +1906,11 @@ mod tests {
         world.replies.borrow_mut().clear();
         let recovered = executor.spawn(host_actor(config, Rc::clone(&world)));
         executor.run_until(18);
-        assert!(world.replies.borrow().is_empty());
+        assert!(
+            world.replies.borrow().is_empty(),
+            "unexpected recovery replies: {:?}",
+            *world.replies.borrow()
+        );
         assert!(world.peer_outbox.borrow().iter().any(|(to, message)| {
             *to == HostId(11)
                 && matches!(message, PeerMsg::MigrateOffer { vset: offered, .. } if *offered == vset)
@@ -1758,7 +1924,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn passive_replica_acks_only_after_artifact_and_commit_appends() {
         use crate::format::crc32c;
-        use crate::journal::{DatabaseMeta, DurabilityMode, RecordKind, VsetKind};
+        use crate::journal::{DatabaseMeta, RecordKind, VsetKind};
         use crate::placement::PeerCandidate;
         use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
         use crate::segment::SegmentBatchBuilder;
@@ -1787,7 +1953,6 @@ mod tests {
                 kind: VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 4,
-                durability: DurabilityMode::PeerStashed,
             },
             seq: crate::types::JournalSeq(1),
             fence: 3,
@@ -1808,6 +1973,7 @@ mod tests {
         };
         let world = Rc::new(ModelWorld::default());
         let config = DaemonConfig {
+            archive: Default::default(),
             host: receiver,
             cache_pages: 4,
             writeback_interval: 100,
@@ -1881,7 +2047,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn peer_stashed_sync_waits_for_the_exact_passive_commit() {
-        use crate::journal::{DurabilityMode, VsetKind};
+        use crate::journal::VsetKind;
         use crate::placement::PeerCandidate;
 
         let primary_host = HostId(30);
@@ -1909,6 +2075,10 @@ mod tests {
             },
         ];
         let config = |host, domain| DaemonConfig {
+            archive: crate::hostmeta::ArchivePolicy {
+                interval: 1,
+                ..Default::default()
+            },
             host,
             cache_pages: 8,
             writeback_interval: 10,
@@ -1931,7 +2101,6 @@ mod tests {
                 kind: VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
-                durability: DurabilityMode::PeerStashed,
             },
             from_base: None,
         });
@@ -2003,7 +2172,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn unreachable_stash_is_seeded_and_activated_before_sync_ack() {
-        use crate::journal::{DurabilityMode, VsetKind};
+        use crate::journal::VsetKind;
         use crate::placement::{PeerCandidate, rank_stash_candidates};
 
         let primary_host = HostId(50);
@@ -2045,6 +2214,7 @@ mod tests {
             .expect("replacement in roster")
             .failure_domain;
         let config = |host, local_failure_domain| DaemonConfig {
+            archive: Default::default(),
             host,
             cache_pages: 8,
             writeback_interval: 10,
@@ -2071,7 +2241,6 @@ mod tests {
                 kind: VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 8,
-                durability: DurabilityMode::PeerStashed,
             },
             from_base: None,
         });

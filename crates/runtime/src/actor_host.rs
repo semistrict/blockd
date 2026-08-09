@@ -18,7 +18,7 @@ use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::hostmeta::{
     Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVsetMetrics, VsetOperations,
 };
-use blockd_core::journal::{DurabilityMode, VsetConfig, VsetKind};
+use blockd_core::journal::{VsetConfig, VsetKind};
 use blockd_core::protocol::{AdminCmd, AdminReply, PeerMsg, ReqId, Verdict};
 use blockd_core::types::{HostId, PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
 use blockd_core::world::{
@@ -44,9 +44,10 @@ pub struct RuntimeConfig {
 }
 
 fn assert_peer_stash_transport(config: VsetConfig, authenticated: bool) {
+    let _ = config;
     assert!(
-        config.durability != DurabilityMode::PeerStashed || authenticated,
-        "peer-stashed durability requires mutually authenticated TLS"
+        authenticated,
+        "passive durability requires mutually authenticated TLS"
     );
 }
 
@@ -1000,20 +1001,7 @@ impl Runtime {
             hosts.insert(vset, VsetHost::new(vset_config));
         }
         let runtime = Self::start(hosts, config, store);
-        let mut verdicts = BTreeMap::new();
-        for (&vset, vset_config) in vset_configs {
-            if !vset_config.durability.uses_store() {
-                let verdict = runtime.wait_admin(|reply| match reply {
-                    AdminReply::VsetRecovered {
-                        vset: found,
-                        verdict,
-                    } if *found == vset => Some(*verdict),
-                    _ => None,
-                });
-                verdicts.insert(vset, verdict);
-            }
-        }
-        (runtime, verdicts)
+        (runtime, BTreeMap::new())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1885,7 +1873,7 @@ fn update_backup_lag(shared: &Shared, stats: &DaemonStats) {
     let lagging = stats
         .vsets
         .iter()
-        .filter(|vset| vset.backup_lag_captures.is_some_and(|lag| lag > 0))
+        .filter(|vset| vset.archive_lag_captures.is_some_and(|lag| lag > 0))
         .map(|vset| vset.vset)
         .collect::<BTreeSet<_>>();
     let mut started = shared.backup_lag_started.lock().expect("lag lock");
@@ -1942,13 +1930,13 @@ fn update_capacity_signal(shared: &Shared, daemon: &DaemonStats, actor_inputs: &
         .expect("replica spool metric lock");
     let (peer_spool_used_bytes, peer_spool_capacity_bytes) = spool_metrics
         .iter()
-        .filter(|metric| metric.source_capacity_bytes > 0)
+        .filter(|metric| metric.host_capacity_bytes > 0)
         .max_by(|left, right| {
-            (u128::from(left.stored_bytes) * u128::from(right.source_capacity_bytes))
-                .cmp(&(u128::from(right.stored_bytes) * u128::from(left.source_capacity_bytes)))
+            (u128::from(left.stored_bytes) * u128::from(right.host_capacity_bytes))
+                .cmp(&(u128::from(right.stored_bytes) * u128::from(left.host_capacity_bytes)))
         })
         .map_or((0, 0), |metric| {
-            (metric.stored_bytes, metric.source_capacity_bytes)
+            (metric.stored_bytes, metric.host_capacity_bytes)
         });
     drop(spool_metrics);
     let (critical_queue_depth, background_queue_depth) = actor_inputs.depths();

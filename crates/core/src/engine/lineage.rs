@@ -3,10 +3,10 @@ use std::rc::Rc;
 
 use blockd_exec::delay;
 
-use super::backup::{claim_new_head, claim_new_head_with_stash};
+use super::backup::claim_new_head_with_stash;
 use super::capture::write_record_copies;
 use super::replica::initial_stash;
-use super::{SharedHost, hydrate_mapping, publish_latest, publish_replica_head, replicate_latest};
+use super::{SharedHost, hydrate_mapping};
 use crate::journal::{JournalRecord, RecordKind, VsetConfig, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_is_memory};
@@ -48,7 +48,8 @@ where
     let Some((incarnation, mut record, retry)) = ({
         let host = state.borrow();
         host.vsets.get(&vset).and_then(|vset_state| {
-            (vset_state.ready && vset_state.config.durability.uses_store())
+            vset_state
+                .ready
                 .then(|| {
                     Some((
                         vset_state.incarnation,
@@ -197,32 +198,24 @@ pub async fn create_fork<W>(
         AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
         return;
     };
-    let stash = if config.durability == crate::journal::DurabilityMode::PeerStashed {
-        let Some(stash) = initial_stash(&state, vset) else {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
-        };
-        Some(stash)
-    } else {
-        None
+    let Some(stash) = initial_stash(&state, vset) else {
+        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
+        return;
     };
     let incarnation = state.borrow_mut().insert_fresh(vset, config);
-    if config.durability.uses_store() {
-        let claimed = if stash.is_some() {
-            claim_new_head_with_stash(&state, world.as_ref(), vset, incarnation, stash).await
-        } else {
-            claim_new_head(&state, world.as_ref(), vset, incarnation).await
-        };
-        let Some(fence) = claimed else {
-            state.borrow_mut().vsets.remove(&vset);
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
-        };
+    let Some(fence) =
+        claim_new_head_with_stash(&state, world.as_ref(), vset, incarnation, Some(stash)).await
+    else {
+        state.borrow_mut().vsets.remove(&vset);
+        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
+        return;
+    };
+    {
         let mut host = state.borrow_mut();
         let vset_state = host.vsets.get_mut(&vset).expect("fork insertion retained");
         vset_state.fence = fence;
         vset_state.head_version = Some(fence);
-        vset_state.stash_assignment = stash;
+        vset_state.stash_assignment = Some(stash);
         host.counters.assignment_claims += 1;
     }
     let (verdict, kind, overlay, leaves) = adopt_base(vset, base, config, &base_record);
@@ -283,33 +276,6 @@ pub async fn create_fork<W>(
             vset_state.pinned = Some(record.clone());
         }
         host.counters.records_written += 1;
-    }
-    if config.durability.uses_store() {
-        loop {
-            match config.durability {
-                crate::journal::DurabilityMode::Backup => {
-                    publish_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
-                }
-                crate::journal::DurabilityMode::PeerStashed => {
-                    replicate_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
-                    publish_replica_head(Rc::clone(&state), Rc::clone(&world), vset).await;
-                }
-                crate::journal::DurabilityMode::Local => unreachable!(),
-            }
-            let published = state.borrow().vsets.get(&vset).is_some_and(|vset_state| {
-                vset_state.backed.is_some_and(|pointer| {
-                    (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
-                })
-            });
-            if published {
-                break;
-            }
-            if !state.borrow().vsets.contains_key(&vset) {
-                AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-                return;
-            }
-            delay(retry).await;
-        }
     }
     AdminIo::reply_admin(
         world.as_ref(),

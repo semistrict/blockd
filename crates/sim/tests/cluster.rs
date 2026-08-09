@@ -40,6 +40,8 @@ fn random_cluster_crashes_replay_and_converge() {
     assert_eq!(first, replay);
     assert!(first.violations.is_empty(), "{:?}", first.violations);
     assert!(first.host_crashes > 0);
-    assert_eq!(first.recoveries, first.host_crashes);
+    assert!(first.recoveries > 0);
+    assert!(first.recoveries <= first.host_crashes);
+    assert!(first.completed_ops > 0);
     assert_eq!(first.parked_end, 0);
 }

@@ -32,6 +32,7 @@ pub(crate) fn temp_root(tag: &str) -> PathBuf {
 #[allow(dead_code)]
 pub(crate) fn base_daemon_config(host: u16) -> HostConfig {
     HostConfig {
+        archive: Default::default(),
         host: HostId(host),
         cache_pages: 64,
         writeback_interval: millis(5),

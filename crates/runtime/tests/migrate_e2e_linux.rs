@@ -51,6 +51,7 @@ fn free_addr() -> SocketAddr {
 fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
     RuntimeConfig {
         daemon: HostConfig {
+            archive: Default::default(),
             host: HostId(host),
             cache_pages: 256,
             writeback_interval: millis(5),

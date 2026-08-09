@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use blockd_exec::{FaultPoint, fault_point, yield_now};
+use blockd_exec::{FaultPoint, fault_point, now, yield_now};
 
 use super::state::ReplicaKey;
 use super::{SharedHost, VsetState};
@@ -132,11 +132,11 @@ pub async fn recover_local<W: Blobs>(
             Verdict::ColdBoot
         };
 
-        let backed = chosen.config.durability.uses_store();
+        let backed = true;
         let mut host = state.borrow_mut();
         let incarnation = host.allocate_incarnation();
         let mut recovered = VsetState::fresh(chosen.config, incarnation);
-        recovered.ready = !backed && found.handoff.is_none();
+        recovered.ready = false;
         recovered.database = chosen.database;
         recovered.peer_source = chosen.migrated_from;
         recovered.fence = chosen.fence;
@@ -151,9 +151,6 @@ pub async fn recover_local<W: Blobs>(
             .max()
             .unwrap_or(0);
         recovered.local_covered_through = watermark.max(chosen.sync_covered_through);
-        if !recovered.config.durability.requires_peer_sync() {
-            recovered.sync_ack_through = recovered.local_covered_through;
-        }
         recovered.overlay = chosen.overlay.clone();
         recovered.leaf_table = chosen.leaves.clone();
         recovered.hydrated_spans = chosen.leaves.keys().copied().collect();
@@ -250,11 +247,20 @@ async fn recover_replica_blobs<W: Blobs>(
     } else {
         current_blob.bytes.len() as u64
     };
-    let committed = scan.commits.last().and_then(|commit| {
-        ((commit.source, commit.vset, commit.assignment_epoch)
-            == (key.source, key.vset, key.assignment_epoch))
-            .then_some(commit.info)
+    let committed_cut = scan.commits.last().filter(|commit| {
+        (commit.source, commit.vset, commit.assignment_epoch)
+            == (key.source, key.vset, key.assignment_epoch)
     });
+    let committed = committed_cut.map(|commit| commit.info);
+    let committed_record = committed_cut.map(|commit| commit.record.clone());
+    let archive_pending = committed_cut.map(|commit| super::state::ReplicaArchiveCut {
+        info: commit.info,
+        required: commit.required.clone(),
+        record: commit.record.clone(),
+    });
+    let archive_due = archive_pending
+        .as_ref()
+        .map(|_| now().saturating_add(state.borrow().config.archive.interval));
     let artifacts = scan
         .artifacts
         .into_iter()
@@ -267,7 +273,13 @@ async fn recover_replica_blobs<W: Blobs>(
     let replica = super::state::ReplicaState {
         artifacts,
         committed,
+        committed_record,
         uploaded: None,
+        uploaded_record: None,
+        archive_pending,
+        archive_inflight: false,
+        archive_due,
+        unarchived_age: 0,
         bytes: scan.valid_len as u64,
         current_generation,
         current_file_bytes,
@@ -406,6 +418,7 @@ fn materialize(
 }
 
 #[cfg(test)]
+#[allow(clippy::default_trait_access)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -417,7 +430,7 @@ mod tests {
     use super::*;
     use crate::format::crc32c;
     use crate::hostmeta::HostConfig;
-    use crate::journal::{DatabaseMeta, DurabilityMode, RecordKind, VsetConfig, VsetKind};
+    use crate::journal::{DatabaseMeta, RecordKind, VsetConfig, VsetKind};
     use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
     use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
     use crate::segment::SegmentBuilder;
@@ -539,6 +552,7 @@ mod tests {
     fn test_state() -> SharedHost {
         Rc::new(RefCell::new(super::super::state::HostState::new(
             HostConfig {
+                archive: Default::default(),
                 host: HostId(8),
                 cache_pages: 1,
                 writeback_interval: 1,
@@ -565,7 +579,7 @@ mod tests {
         builder.add(page, Gen(1), &vec![7; page_size()]);
         let (_, locations) = builder.finish();
         let record = JournalRecord {
-            config: VsetConfig::compute(1, 4, false),
+            config: VsetConfig::compute(1, 4),
             seq: JournalSeq(0),
             fence: 1,
             kind: RecordKind::Commit,
@@ -606,7 +620,7 @@ mod tests {
         builder.add(page, Gen(1), &vec![7; page_size()]);
         let (segment, locations) = builder.finish();
         let record = JournalRecord {
-            config: VsetConfig::compute(1, 4, false),
+            config: VsetConfig::compute(1, 4),
             seq: JournalSeq(0),
             fence: 1,
             kind: RecordKind::Commit,
@@ -629,14 +643,17 @@ mod tests {
         let world = Rc::new(MetadataOnlyBlobs(blobs));
         let mut executor = Executor::simulation(2);
 
+        let state = test_state();
         let verdicts = executor
             .block_on({
+                let state = Rc::clone(&state);
                 let world = Rc::clone(&world);
-                async move { recover_local(test_state(), world.as_ref()).await }
+                async move { recover_local(state, world.as_ref()).await }
             })
             .expect("scan succeeds");
 
-        assert_eq!(verdicts.get(&vset), Some(&Verdict::ColdBoot));
+        assert_eq!(verdicts.get(&vset), None);
+        assert_eq!(state.borrow().vsets[&vset].local_covered_through, 1);
     }
 
     #[test]
@@ -685,7 +702,7 @@ mod tests {
         let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
         builder.add(page, Gen(1), &vec![3; page_size()]);
         let (segment, locations) = builder.finish();
-        let config = VsetConfig::compute(1, 4, false);
+        let config = VsetConfig::compute(1, 4);
         let checkpoint = JournalRecord {
             config,
             seq: JournalSeq(1),
@@ -732,13 +749,7 @@ mod tests {
                 async move { recover_local(state, world.as_ref()).await }
             })
             .expect("scan succeeds");
-        assert_eq!(
-            verdicts.get(&vset),
-            Some(&Verdict::Resume {
-                epoch: crate::types::Epoch(1),
-                vmstate: 5,
-            })
-        );
+        assert_eq!(verdicts.get(&vset), None);
         assert_eq!(state.borrow().vsets[&vset].local_covered_through, 5);
 
         let mut sane_unusable = unusable;
@@ -794,7 +805,6 @@ mod tests {
                 kind: VsetKind::Compute,
                 disk_volumes: 1,
                 pages_per_volume: 4,
-                durability: DurabilityMode::PeerStashed,
             },
             seq: info.seq,
             fence: info.writer_fence,
@@ -825,6 +835,7 @@ mod tests {
         world.0.borrow_mut().insert(generation_one.clone(), torn);
         let state = Rc::new(RefCell::new(super::super::state::HostState::new(
             HostConfig {
+                archive: Default::default(),
                 host: HostId(8),
                 cache_pages: 1,
                 writeback_interval: 1,

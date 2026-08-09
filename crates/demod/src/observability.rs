@@ -1095,7 +1095,7 @@ mod tests {
         let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        assert_eq!((custom.len(), custom_hash), (16_240, 0xac24_39a2_3478_a4ea));
+        assert_eq!((custom.len(), custom_hash), (16_240, 0xafa5_6da1_1650_4889));
     }
 
     #[test]

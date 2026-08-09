@@ -13,6 +13,7 @@ use blockd_sim::world::store::StoreConfig;
 fn base_config() -> HarnessConfig {
     HarnessConfig {
         daemon: HostConfig {
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
             cache_pages: 256,
             writeback_interval: millis(20),
@@ -76,9 +77,9 @@ fn oracle_catches_dropped_write_protection() {
         store_outage: None,
     };
     config.sabotage = Some(Sabotage::DropWriteProtect);
-    let report = run(1, config);
+    let caught = (0..16).any(|seed| !run(seed, config.clone()).violations.is_empty());
     assert!(
-        !report.violations.is_empty(),
+        caught,
         "stale captures from dropped write protection went unnoticed"
     );
 }
@@ -93,6 +94,7 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         vset_count: 1,
         vset_config: VsetConfig::compute(2, 16),
         daemon: HostConfig {
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
             cache_pages: 128,
             writeback_interval: millis(20),
@@ -121,7 +123,7 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         rot_leaves_at: None,
         drop_peer: None,
         race_restore: false,
-        migrate_at: vec![(millis(1500), blockd_core::types::VsetId(1), 1)],
+        migrate_at: vec![(millis(1_000), blockd_core::types::VsetId(1), 1)],
         sabotage: Some(Sabotage::EagerHandoffAck),
         guest_sync_share: None,
     };

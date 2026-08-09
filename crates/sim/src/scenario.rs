@@ -11,7 +11,7 @@
 use std::fmt;
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::{VsetConfig, VsetKind};
+use blockd_core::journal::VsetConfig;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
 use blockd_core::types::{HostId, VsetId};
 use serde::Deserialize;
@@ -360,6 +360,10 @@ impl Scenario {
         }
         Ok(Common {
             daemon: HostConfig {
+                archive: blockd_core::hostmeta::ArchivePolicy {
+                    interval: blockd_core::types::secs(1),
+                    ..Default::default()
+                },
                 host: HostId(0),
                 cache_pages,
                 writeback_interval,

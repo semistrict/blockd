@@ -4,14 +4,13 @@ use std::rc::Rc;
 use blockd_exec::channel::oneshot;
 use blockd_exec::{TaskSet, delay, timeout, yield_now};
 
-use super::backup::publish_latest;
 use super::capture::{capture_migration, shard_map, write_record_copies};
 use super::replica::publish_replica_head;
 use super::state::CommitFlagLease;
-use super::{SharedHost, VsetState, replica_message};
+use super::{SharedHost, VsetState, replica_message, replicate_latest};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::head::{HeadRecord, ManifestPtr};
-use crate::journal::{DurabilityMode, JournalRecord, RecordKind, VsetKind};
+use crate::head::HeadRecord;
+use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf};
 use crate::protocol::{AdminReply, PeerMsg, ReqId, Verdict};
@@ -109,6 +108,7 @@ pub(super) fn encode_handoff(vset: VsetId, to: HostId) -> Vec<u8> {
     Handoff { vset, to }.encode()
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn migrate_out<W>(state: SharedHost, world: Rc<W>, req: ReqId, vset: VsetId, to: HostId)
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
@@ -117,8 +117,6 @@ where
         let mut host = state.borrow_mut();
         host.vsets.get_mut(&vset).and_then(|vset_state| {
             let allowed = vset_state.ready
-                && (vset_state.config.kind == VsetKind::Database
-                    || !vset_state.config.durability.uses_store())
                 && vset_state.peer_source.is_none()
                 && vset_state.outbound.is_none()
                 && !vset_state.migration_running
@@ -153,28 +151,45 @@ where
         };
         record
     };
-    if record.config.durability.uses_store() {
-        loop {
-            match record.config.durability {
-                DurabilityMode::Backup => {
-                    publish_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
-                }
-                DurabilityMode::PeerStashed => {
-                    publish_replica_head(Rc::clone(&state), Rc::clone(&world), vset).await;
-                }
-                DurabilityMode::Local => unreachable!(),
-            }
-            let published = state.borrow().vsets.get(&vset).is_some_and(|vset_state| {
-                vset_state.backed.is_some_and(|pointer| {
-                    (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
-                })
-            });
-            if published {
-                break;
-            }
-            let retry = state.borrow().config.backup_retry;
-            delay(retry).await;
+    replicate_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
+    let archive = state.borrow().vsets.get(&vset).and_then(|vset_state| {
+        let stash = vset_state.stash_assignment?;
+        Some((
+            stash.transition_peer.unwrap_or(stash.active_peer),
+            stash.assignment_epoch,
+            crate::protocol::ReplicaCommitInfo {
+                writer_fence: record.fence,
+                seq: record.seq,
+                sync_covered_through: record.sync_covered_through,
+            },
+        ))
+    });
+    let Some((archive_peer, assignment_epoch, through)) = archive else {
+        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
+        return;
+    };
+    loop {
+        Peers::send(
+            world.as_ref(),
+            archive_peer,
+            PeerMsg::ReplicaArchive {
+                vset,
+                assignment_epoch,
+                through,
+            },
+        )
+        .await;
+        publish_replica_head(Rc::clone(&state), Rc::clone(&world), vset).await;
+        let published = state.borrow().vsets.get(&vset).is_some_and(|vset_state| {
+            vset_state.backed.is_some_and(|pointer| {
+                (pointer.capture_seq, pointer.seq) >= (record.capture_seq, record.seq)
+            })
+        });
+        if published {
+            break;
         }
+        let retry = state.borrow().config.backup_retry;
+        delay(retry).await;
     }
     let handoff_name = layout::handoff_blob(vset);
     let handoff_bytes = encode_handoff(vset, to);
@@ -378,6 +393,7 @@ where
             | PeerMsg::ReplicaStatus { .. }
             | PeerMsg::ReplicaStatusReply { .. }
             | PeerMsg::ReplicaUploadDone { .. }
+            | PeerMsg::ReplicaArchive { .. }
             | PeerMsg::ReplicaRelease { .. }
             | PeerMsg::ReplicaReleaseAck { .. }) => {
                 replica_message(Rc::clone(&state), world.as_ref(), from, message).await;
@@ -476,7 +492,7 @@ where
             return;
         }
         let mut incoming = VsetState::fresh(record.config, incarnation);
-        incoming.ready = !record.config.durability.uses_store();
+        incoming.ready = false;
         incoming.peer_source = Some(from);
         incoming.fence = fence;
         if let Verdict::Resume { epoch, .. } = verdict {
@@ -519,9 +535,8 @@ where
         host.vsets.insert(vset, incoming);
         host.counters.records_written += 1;
     }
-    if record.config.durability.uses_store()
-        && !claim_migrated_database_head(&state, world.as_ref(), from, vset, incarnation, &offered)
-            .await
+    if !claim_migrated_database_head(&state, world.as_ref(), from, vset, incarnation, &offered)
+        .await
     {
         state.borrow_mut().vsets.remove(&vset);
         return;
@@ -547,12 +562,10 @@ where
 {
     let local = state.borrow().config.host;
     let retry = state.borrow().config.backup_retry;
-    let expected_manifest = Some(ManifestPtr {
-        fence: offered.fence,
-        seq: offered.seq,
-        capture_seq: offered.capture_seq,
-    });
-    let (claim_fence, stash, retired_stashes) = loop {
+    let Some(local_stash) = super::replica::initial_stash(state, vset) else {
+        return false;
+    };
+    let (claim_fence, manifest, stash, retired_stashes) = loop {
         let current = match Store::get(world, &layout::head_key(vset)).await {
             Ok(Some(current)) => current,
             Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
@@ -569,13 +582,13 @@ where
         let Ok(head) = HeadRecord::decode(vset, &current.1) else {
             return false;
         };
-        if head.holder == local && head.manifest == expected_manifest {
+        if head.holder == local {
             if head.fence == 0 {
-                break (current.0, head.stash, head.retired_stashes);
+                break (current.0, head.manifest, head.stash, head.retired_stashes);
             }
-            break (head.fence, head.stash, head.retired_stashes);
+            break (head.fence, head.manifest, head.stash, head.retired_stashes);
         }
-        if head.holder != source || head.manifest != expected_manifest {
+        if head.holder != source {
             return false;
         }
         let claim = HeadRecord {
@@ -583,8 +596,8 @@ where
             holder: local,
             fence: 0,
             manifest: head.manifest,
-            stash: head.stash,
-            retired_stashes: head.retired_stashes.clone(),
+            stash: Some(local_stash),
+            retired_stashes: Vec::new(),
         };
         match Store::put_cas(
             world,
@@ -594,7 +607,7 @@ where
         )
         .await
         {
-            Ok(version) => break (version, head.stash, head.retired_stashes),
+            Ok(version) => break (version, head.manifest, Some(local_stash), Vec::new()),
             Err(StoreError::Fault(
                 crate::protocol::StoreFault::Unavailable
                 | crate::protocol::StoreFault::CasConflict { .. },
@@ -631,7 +644,7 @@ where
         };
         vset_state.fence = claim_fence;
         vset_state.head_version = Some(claim_fence);
-        vset_state.backed = expected_manifest;
+        vset_state.backed = manifest;
         vset_state.stash_assignment = stash;
         vset_state.retired_stashes.clone_from(&retired_stashes);
         vset_state.next_seq = claimed.seq.0 + 1;
@@ -646,7 +659,7 @@ where
         vset,
         holder: local,
         fence: claim_fence,
-        manifest: expected_manifest,
+        manifest,
         stash,
         retired_stashes,
     };
@@ -672,7 +685,7 @@ where
         }
         if head.holder != local
             || head.fence != 0
-            || head.manifest != expected_manifest
+            || head.manifest != manifest
             || head.stash != stash
         {
             return false;

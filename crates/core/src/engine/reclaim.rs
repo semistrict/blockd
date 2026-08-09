@@ -31,21 +31,14 @@ pub async fn reclaim_backed_segments<W: Blobs>(
             }
             host.vsets.iter().find_map(|(&vset, vset_state)| {
                 vset_state
-                    .config
-                    .durability
-                    .uses_store()
-                    .then(|| {
+                    .segment_blobs
+                    .iter()
+                    .find_map(|&(fence, segment, bytes)| {
                         vset_state
-                            .segment_blobs
-                            .iter()
-                            .find_map(|&(fence, segment, bytes)| {
-                                vset_state
-                                    .backed_segments
-                                    .contains(&(fence, segment))
-                                    .then_some((vset, fence, segment, bytes))
-                            })
+                            .backed_segments
+                            .contains(&(fence, segment))
+                            .then_some((vset, fence, segment, bytes))
                     })
-                    .flatten()
             })
         };
         let Some((vset, fence, segment, _bytes)) = candidate else {

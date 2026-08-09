@@ -82,6 +82,7 @@ struct PhaseResult {
 fn run_phase(noisy: usize) -> PhaseResult {
     let config = RuntimeConfig {
         daemon: HostConfig {
+            archive: Default::default(),
             host: HostId(0),
             cache_pages: 1 << 20, // no eviction pressure: isolate loop contention
             writeback_interval: millis(5),

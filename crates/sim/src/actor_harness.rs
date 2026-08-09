@@ -6,20 +6,21 @@ use std::path::Path;
 use std::rc::Rc;
 
 use blockd_core::engine::{HostState, host_actor_with_state};
-use blockd_core::hostmeta::{Counters, HostConfig};
+use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
+use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{AdminCmd, AdminReply, ReqId};
-use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
 use blockd_exec::rng::Ppm;
-use blockd_exec::{Executor, TaskHandle, delay, now, random_u64, spawn};
+use blockd_exec::{Executor, OneOf3, TaskHandle, delay, now, random_u64, select3, spawn};
 use blockd_workload::{
     LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
 };
 
-use crate::actor_world::{OracleSnapshot, SimNetwork, SimWorld};
+use crate::actor_world::{OracleSnapshot, SimWorld};
 use crate::guest::page_pattern;
 use crate::world::blobdev::BlobDevConfig;
-use crate::world::store::StoreConfig;
+use crate::world::store::{StoreConfig, StoreCounters};
 
 #[derive(Clone, Debug)]
 pub struct ActorHarnessConfig {
@@ -59,6 +60,11 @@ pub struct ActorRunReport {
     pub per_guest_completed: BTreeMap<u64, u64>,
     pub blob_count: usize,
     pub store_keys: Vec<String>,
+    pub store: StoreCounters,
+    pub published_segment_bytes: u64,
+    pub published_live_entry_bytes: u64,
+    pub published_dead_entry_bytes: u64,
+    pub published_segment_overhead_bytes: u64,
     pub map_bytes_written: u64,
     pub max_page_reads_in_poll: u64,
     pub max_pause_ns: u64,
@@ -152,6 +158,9 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
         replica_artifact_flushes,
         replica_commit_flushes,
         replica_rotations,
+        archive_cycles,
+        archive_commits_coalesced,
+        replica_capacity_backpressure,
     );
 }
 
@@ -180,10 +189,16 @@ pub fn run_capture_profile(
     config.vset_count = 1;
     config.vset = VsetConfig::compute(1, dirty_pages);
 
-    let network = Rc::new(SimNetwork::default());
+    let passive_host = HostId(config.host.host.0 ^ u16::MAX);
+    config.host.replica_placement = harness_placement(config.host.host, passive_host);
+    let (network, [world, passive_world]) =
+        SimWorld::pair([config.host.host, passive_host], config.blobs, config.store);
     network.set_latency(1, 1);
-    let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+    let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
+        &config.host,
+        passive_host,
+    ))));
     let vset = VsetId(1);
     world.enqueue_admin(AdminCmd::CreateVset {
         req: ReqId(1),
@@ -194,9 +209,26 @@ pub fn run_capture_profile(
 
     let mut executor = Executor::simulation(seed);
     let mut host = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+    let mut passive = executor.spawn(host_actor_with_state(
+        Rc::clone(&passive_state),
+        Rc::clone(&passive_world),
+    ));
     let created = executor.block_on({
         let world = Rc::clone(&world);
-        async move { world.next_admin_reply().await }
+        let passive_world = Rc::clone(&passive_world);
+        async move {
+            match select3(
+                world.next_admin_reply(),
+                world.next_abort(),
+                passive_world.next_abort(),
+            )
+            .await
+            {
+                OneOf3::First(reply) => reply,
+                OneOf3::Second(reason) => panic!("primary aborted during creation: {reason:?}"),
+                OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
+            }
+        }
     });
     assert!(
         matches!(
@@ -234,8 +266,10 @@ pub fn run_capture_profile(
     executor.run_until(drain_deadline);
     let blobs = world.durable_blobs();
     let mut report = report_from_state(&executor, &world, &state, &blobs);
+    merge_counters(&mut report.counters, &passive_state.borrow().counters);
     report.completed_ops = u64::from(dirty_pages);
     host.cancel();
+    passive.cancel();
     executor.run_ready();
     report
 }
@@ -243,41 +277,71 @@ pub fn run_capture_profile(
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run_final_blobs(
     seed: u64,
-    config: ActorHarnessConfig,
+    mut config: ActorHarnessConfig,
 ) -> (ActorRunReport, Vec<(String, Vec<u8>)>) {
-    let network = Rc::new(SimNetwork::default());
+    let passive_host = HostId(config.host.host.0 ^ u16::MAX);
+    config.host.replica_placement = harness_placement(config.host.host, passive_host);
+    let (network, [world, passive_world]) =
+        SimWorld::pair([config.host.host, passive_host], config.blobs, config.store);
     network.set_latency(1_000, 10_000);
-    let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
     let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
+    let mut executor = Executor::simulation(seed);
+    let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
+        &config.host,
+        passive_host,
+    ))));
+    let mut passive = executor.spawn(host_actor_with_state(
+        Rc::clone(&passive_state),
+        Rc::clone(&passive_world),
+    ));
+    let host_slot = Rc::new(RefCell::new(Some(
+        executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world))),
+    )));
     for number in 1..=config.vset_count {
         let vset = VsetId(u64::from(number));
+        let req = ReqId(u64::from(number));
         world.enqueue_admin(AdminCmd::CreateVset {
-            req: ReqId(u64::from(number)),
+            req,
             vset,
             config: config.vset,
             from_base: None,
         });
     }
-
-    let mut executor = Executor::simulation(seed);
-    let host_slot = Rc::new(RefCell::new(Some(
-        executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world))),
-    )));
     executor.block_on({
         let world = Rc::clone(&world);
+        let passive_world = Rc::clone(&passive_world);
         async move {
-            let mut remaining = usize::from(config.vset_count);
-            while remaining != 0 {
-                match world.next_admin_reply().await {
-                    Some(AdminReply::VsetCreated { .. }) => remaining -= 1,
-                    Some(AdminReply::AdminFailed { req }) => {
+            let mut created = BTreeSet::new();
+            while created.len() < usize::from(config.vset_count) {
+                match select3(
+                    world.next_admin_reply(),
+                    world.next_abort(),
+                    passive_world.next_abort(),
+                )
+                .await
+                {
+                    OneOf3::First(Some(AdminReply::VsetCreated { req, vset }))
+                        if req.0 == vset.0
+                            && (1..=u64::from(config.vset_count)).contains(&vset.0) =>
+                    {
+                        created.insert(vset);
+                    }
+                    OneOf3::First(Some(AdminReply::AdminFailed { req })) => {
                         panic!("vset creation failed for {req:?}")
                     }
-                    Some(_) => {}
-                    None => panic!("admin reply stream closed during creation"),
+                    OneOf3::First(Some(_)) => {}
+                    OneOf3::First(None) => {
+                        panic!("admin reply stream closed during creation")
+                    }
+                    OneOf3::Second(reason) => {
+                        panic!("primary aborted during creation: {reason:?}")
+                    }
+                    OneOf3::Third(reason) => {
+                        panic!("passive aborted during creation: {reason:?}")
+                    }
                 }
             }
         }
@@ -399,6 +463,13 @@ pub fn run_final_blobs(
     let final_state = Rc::clone(&state_slot.borrow());
     let mut counters = *events.retired_counters.borrow();
     merge_counters(&mut counters, &final_state.borrow().counters);
+    merge_counters(&mut counters, &passive_state.borrow().counters);
+    let (
+        published_segment_bytes,
+        published_live_entry_bytes,
+        published_dead_entry_bytes,
+        published_segment_overhead_bytes,
+    ) = world.published_archive_metrics();
     let mut report = ActorRunReport {
         trace_hash: executor.trace_hash(),
         executor_polls: executor.polls(),
@@ -413,6 +484,11 @@ pub fn run_final_blobs(
             .collect(),
         blob_count: blobs.len(),
         store_keys: world.store_keys(),
+        store: world.store_metrics(),
+        published_segment_bytes,
+        published_live_entry_bytes,
+        published_dead_entry_bytes,
+        published_segment_overhead_bytes,
         seg_live_bytes_end: final_state.borrow().seg_space().0,
         parked_end: final_state.borrow().stats().parked_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
@@ -441,23 +517,55 @@ pub fn run_final_blobs(
     if let Some(mut host) = host_slot.borrow_mut().take() {
         host.cancel();
     }
+    passive.cancel();
     executor.run_ready();
     (report, blobs)
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn harness_placement(primary: HostId, passive: HostId) -> Option<ReplicaPlacementConfig> {
+    Some(ReplicaPlacementConfig {
+        membership_epoch: 1,
+        local_failure_domain: primary.0,
+        roster: vec![
+            PeerCandidate {
+                host: primary,
+                weight: 1,
+                failure_domain: primary.0,
+                drained: false,
+            },
+            PeerCandidate {
+                host: passive,
+                weight: 1,
+                failure_domain: passive.0,
+                drained: false,
+            },
+        ],
+    })
+}
+
+fn harness_passive_config(primary: &HostConfig, passive: HostId) -> HostConfig {
+    let mut config = primary.clone();
+    config.host = passive;
+    config.replica_placement = harness_placement(passive, primary.host);
+    config
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run_workload(
     seed: u64,
-    config: ActorHarnessConfig,
+    mut config: ActorHarnessConfig,
     spec: WorkloadSpec,
 ) -> Result<(ActorRunReport, WorkloadOutcome), String> {
     spec.validate().map_err(|error| error.to_string())?;
     if config.vset_count != 1 {
         return Err("scripted workloads require exactly one vset".to_owned());
     }
-    let network = Rc::new(SimNetwork::default());
+    let passive_host = HostId(config.host.host.0 ^ u16::MAX);
+    config.host.replica_placement = harness_placement(config.host.host, passive_host);
+    let (network, [world, passive_world]) =
+        SimWorld::pair([config.host.host, passive_host], config.blobs, config.store);
     network.set_latency(1_000, 10_000);
-    let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let vset = VsetId(1);
@@ -470,12 +578,33 @@ pub fn run_workload(
     let mut executor = Executor::simulation(seed);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
     let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
+    let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
+        &config.host,
+        passive_host,
+    ))));
+    let mut passive = executor.spawn(host_actor_with_state(
+        Rc::clone(&passive_state),
+        Rc::clone(&passive_world),
+    ));
     let host_slot = Rc::new(RefCell::new(Some(
         executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world))),
     )));
     let created = executor.block_on({
         let world = Rc::clone(&world);
-        async move { world.next_admin_reply().await }
+        let passive_world = Rc::clone(&passive_world);
+        async move {
+            match select3(
+                world.next_admin_reply(),
+                world.next_abort(),
+                passive_world.next_abort(),
+            )
+            .await
+            {
+                OneOf3::First(reply) => reply,
+                OneOf3::Second(reason) => panic!("primary aborted during creation: {reason:?}"),
+                OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
+            }
+        }
     });
     if !matches!(
         created,
@@ -716,6 +845,7 @@ pub fn run_workload(
     let mut report = report_from_state(&executor, &world, &final_state, &blobs);
     let mut counters = *events.retired_counters.borrow();
     merge_counters(&mut counters, &report.counters);
+    merge_counters(&mut counters, &passive_state.borrow().counters);
     report.counters = counters;
     report.crashes = events.crashes.get();
     report.resumes = resumes;
@@ -727,6 +857,7 @@ pub fn run_workload(
     if let Some(mut host) = host_slot.borrow_mut().take() {
         host.cancel();
     }
+    passive.cancel();
     executor.run_ready();
     Ok((report, outcome))
 }
@@ -790,12 +921,23 @@ fn report_from_state(
     state: &SharedHostState,
     blobs: &[(String, Vec<u8>)],
 ) -> ActorRunReport {
+    let (
+        published_segment_bytes,
+        published_live_entry_bytes,
+        published_dead_entry_bytes,
+        published_segment_overhead_bytes,
+    ) = world.published_archive_metrics();
     let mut report = ActorRunReport {
         trace_hash: executor.trace_hash(),
         executor_polls: executor.polls(),
         counters: state.borrow().counters,
         blob_count: blobs.len(),
         store_keys: world.store_keys(),
+        store: world.store_metrics(),
+        published_segment_bytes,
+        published_live_entry_bytes,
+        published_dead_entry_bytes,
+        published_segment_overhead_bytes,
         seg_live_bytes_end: state.borrow().seg_space().0,
         parked_end: state.borrow().stats().parked_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
@@ -879,7 +1021,7 @@ async fn recovery_supervisor(
                 events
                     .unrestorable
                     .set(events.unrestorable.get().saturating_add(1));
-                if local_recovery && vset.0 <= u64::from(config.backed_vsets) {
+                if local_recovery {
                     world.enqueue_admin(AdminCmd::RestoreVset {
                         req: ReqId(u64::MAX.saturating_sub(vset.0)),
                         vset,
@@ -1296,15 +1438,18 @@ fn hit(probability: Ppm) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::default_trait_access)]
 mod tests {
     use blockd_core::types::millis;
     use blockd_core::world::AdminIo;
 
     use super::*;
+    use crate::actor_world::SimNetwork;
 
     fn config() -> ActorHarnessConfig {
         ActorHarnessConfig {
             host: HostConfig {
+                archive: Default::default(),
                 host: blockd_core::types::HostId(1),
                 cache_pages: 24,
                 writeback_interval: millis(20),
@@ -1410,7 +1555,6 @@ mod tests {
     fn horizon_cleanup_restarts_a_host_cancelled_mid_restart() {
         let mut config = config();
         config.vset_count = 1;
-        config.backed_vsets = 0;
         config.horizon = millis(100);
         config.faults.crash_at = vec![millis(99)];
         config.faults.restart_delay = (millis(50), millis(50));
