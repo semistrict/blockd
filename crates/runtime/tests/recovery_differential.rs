@@ -1,107 +1,157 @@
-//! Differential recovery (1b): the simulation proves `Daemon::recover`
-//! against thousands of crash schedules — but it feeds recovery from an
-//! in-memory blob map, while production feeds it from a directory walk.
-//! If the two scans could hand recovery different worlds (a name mangled
-//! by the path round-trip, a file the walk misses, an ordering the
-//! decoder silently depends on), every simulated recovery proof would be
-//! about a path production never runs.
-//!
-//! So: run real chaos schedules to completion, take the blob device's
-//! final contents verbatim — torn tails and bit rot included — and
-//! demand that recovery over the simulation's scan and recovery over the
-//! runtime's `scan_blob_dir` of the same bytes written to a real
-//! directory produce identical verdicts, identical effects. The walk
-//! returns files in whatever order `read_dir` feels like, which makes
-//! order-insensitivity part of what a pass proves. Runs on any OS.
+//! Differential recovery across the simulator's in-memory blob snapshot and
+//! the production directory-backed actor world. Both paths call the same
+//! async recovery actor; this test guards the remaining world boundary:
+//! directory enumeration, name round-tripping, short/torn bytes, and scan
+//! ordering.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 
-use blockd_core::daemon::Daemon;
+use async_trait::async_trait;
+use blockd_core::engine::{HostState, recover_local};
+use blockd_core::hostmeta::{DaemonStats, HostConfig};
 use blockd_core::journal::JournalRecord;
 use blockd_core::layout::{self, BlobName};
 use blockd_core::protocol::Verdict;
-use blockd_core::seam::Effect;
 use blockd_core::types::VsetId;
-use blockd_runtime::scan_blob_dir;
+use blockd_core::world::{BlobEntry, BlobError, Blobs};
+use blockd_exec::Executor;
+use blockd_runtime::world::FileBlobs;
 use blockd_sim::harness::run_final_blobs;
 use blockd_sim::presets;
 
-/// Recover from a scan, keeping only what the comparison needs.
-fn recover(
-    config: &blockd_core::daemon::DaemonConfig,
-    blobs: &[(String, Vec<u8>)],
-) -> (BTreeMap<VsetId, Verdict>, Vec<Effect>) {
-    let (_, verdicts, effects) = Daemon::recover(
-        config.clone(),
-        blobs
+struct MemoryBlobs {
+    blobs: RefCell<BTreeMap<String, Vec<u8>>>,
+}
+
+impl MemoryBlobs {
+    fn new(blobs: &[(String, Vec<u8>)]) -> Self {
+        Self {
+            blobs: RefCell::new(blobs.iter().cloned().collect()),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl Blobs for MemoryBlobs {
+    async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
+        Ok(self
+            .blobs
+            .borrow()
             .iter()
-            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
-    );
-    (verdicts, effects)
+            .map(|(name, bytes)| BlobEntry {
+                name: name.clone(),
+                bytes: bytes.clone(),
+                len: bytes.len() as u64,
+            })
+            .collect())
+    }
+
+    async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
+        self.blobs.borrow_mut().insert(name, bytes);
+        Ok(())
+    }
+
+    async fn append(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
+        self.blobs.borrow_mut().entry(name).or_default().extend(bytes);
+        Ok(())
+    }
+
+    async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError> {
+        if let Some(bytes) = self.blobs.borrow_mut().get_mut(name) {
+            bytes.truncate(usize::try_from(len).map_err(|_| BlobError::Io)?);
+        }
+        Ok(())
+    }
+
+    async fn read(&self, name: &str) -> Result<Option<Vec<u8>>, BlobError> {
+        Ok(self.blobs.borrow().get(name).cloned())
+    }
+
+    async fn read_range(
+        &self,
+        name: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, BlobError> {
+        Ok(self.blobs.borrow().get(name).map(|bytes| {
+            let start = usize::try_from(offset.min(bytes.len() as u64)).expect("offset fits");
+            let end = usize::try_from(offset.saturating_add(len).min(bytes.len() as u64))
+                .expect("end fits");
+            bytes[start..end].to_vec()
+        }))
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), BlobError> {
+        self.blobs.borrow_mut().remove(name);
+        Ok(())
+    }
+}
+
+fn recover<W: Blobs + 'static>(
+    config: HostConfig,
+    world: Rc<W>,
+) -> (BTreeMap<VsetId, Verdict>, DaemonStats) {
+    let state = Rc::new(RefCell::new(HostState::new(config)));
+    let mut executor = Executor::production();
+    let verdicts = executor
+        .block_on({
+            let state = Rc::clone(&state);
+            async move { recover_local(state, world.as_ref()).await }
+        })
+        .expect("recovery succeeds");
+    let observability = state.borrow().stats();
+    (verdicts, observability)
 }
 
 fn write_blobs(root: &Path, blobs: &[(String, Vec<u8>)]) {
     for (name, bytes) in blobs {
         let path = root.join(name);
-        fs::create_dir_all(path.parent().expect("blob names have a parent")).expect("mkdir");
-        fs::write(path, bytes).expect("write blob");
+        std::fs::create_dir_all(path.parent().expect("blob names have a parent"))
+            .expect("mkdir");
+        std::fs::write(path, bytes).expect("write blob");
     }
 }
 
 #[test]
-fn disk_scans_recover_exactly_like_the_simulated_scan() {
+fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
     let mut nontrivial = 0u64;
     for seed in [3, 29, 104] {
         let config = presets::single_host_chaos();
-        let daemon_config = config.daemon.clone();
+        let host_config = config.daemon.clone();
         let (report, blobs) = run_final_blobs(seed, config);
         assert_eq!(report.violations, Vec::<String>::new());
         assert!(!blobs.is_empty(), "seed {seed} left no blobs to recover");
 
-        let sim_side = recover(&daemon_config, &blobs);
-
-        let root = std::env::temp_dir().join(format!(
-            "blockd-recovery-diff-{}-{seed}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        write_blobs(&root, &blobs);
-        // Files a real host accumulates that the blob device never holds:
-        // recovery must ignore anything `parse_blob` does not claim.
-        fs::create_dir_all(root.join("lost+found")).expect("mkdir");
-        fs::write(root.join("lost+found/fsck.0000"), b"noise").expect("write");
-        fs::write(root.join("daemon.pid"), b"12345").expect("write");
-
-        let scanned = scan_blob_dir(&root);
-        assert_eq!(
-            scanned.len(),
-            blobs.len() + 2,
-            "seed {seed}: the walk lost or invented files"
-        );
-        let disk_side = recover(&daemon_config, &scanned);
-
-        assert_eq!(
-            sim_side.0, disk_side.0,
-            "seed {seed}: verdicts diverged between the scans"
-        );
-        assert_eq!(
-            sim_side.1, disk_side.1,
-            "seed {seed}: recovery effects diverged between the scans"
+        let memory_side = recover(
+            host_config.clone(),
+            Rc::new(MemoryBlobs::new(&blobs)),
         );
 
-        // The order axis, adversarially: the same set fed in reversed
-        // order must recover identically. Scan order used to leak into
-        // recovered state (`seg_blobs` order, the cold-record tiebreak,
-        // duplicate-seq `record_ws` winners) — remove the canonicalizing
-        // sort in `Daemon::recover` and this is the assert that fails.
+        let root = tempfile::tempdir().expect("recovery fixture");
+        write_blobs(root.path(), &blobs);
+        std::fs::create_dir_all(root.path().join("lost+found")).expect("mkdir");
+        std::fs::write(root.path().join("lost+found/fsck.0000"), b"noise").expect("write");
+        std::fs::write(root.path().join("daemon.pid"), b"12345").expect("write");
+
+        let disk_side = recover(
+            host_config.clone(),
+            Rc::new(FileBlobs::new(root.path()).expect("file world")),
+        );
+        assert_eq!(
+            memory_side, disk_side,
+            "seed {seed}: actor recovery diverged across world implementations"
+        );
+
         let mut reversed = blobs.clone();
         reversed.reverse();
-        let rev_side = recover(&daemon_config, &reversed);
+        let reversed_side = recover(host_config, Rc::new(MemoryBlobs::new(&reversed)));
         assert_eq!(
-            sim_side, rev_side,
-            "seed {seed}: recovery depends on scan order"
+            memory_side, reversed_side,
+            "seed {seed}: actor recovery depends on scan order"
         );
         // Backed recovery now defers its verdict until the fenced head read,
         // which this scan-only differential deliberately does not drive.

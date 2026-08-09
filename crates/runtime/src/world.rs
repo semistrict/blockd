@@ -410,8 +410,15 @@ impl Store for RuntimeStore {
         Ok(true)
     }
 
-    async fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>, StoreError> {
-        Err(StoreError::Fault(StoreFault::Unavailable))
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        let (reply, response) = injector();
+        let store = Arc::clone(&self.store);
+        let prefix = prefix.to_owned();
+        self.handle.spawn(async move {
+            let result = store.list_prefix(prefix).await;
+            let _ = reply.push(Lane::Background, result);
+        });
+        map_fault(Self::response(response).await)
     }
 }
 

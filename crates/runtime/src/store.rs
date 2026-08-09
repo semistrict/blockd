@@ -39,4 +39,15 @@ pub trait ObjectStore: Send + Sync + 'static {
 
     /// Fire-and-forget delete (R4.5 reclamation); idempotent.
     async fn delete(self: Arc<Self>, key: String);
+
+    /// Enumerate keys below a prefix for actor-driven GC. A backend that
+    /// cannot provide a complete snapshot must fail closed: an empty
+    /// successful result would make a collector mistake live objects for an
+    /// empty namespace.
+    async fn list_prefix(
+        self: Arc<Self>,
+        _prefix: String,
+    ) -> Result<Vec<String>, StoreFault> {
+        Err(StoreFault::Unavailable)
+    }
 }
