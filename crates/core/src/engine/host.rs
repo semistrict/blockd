@@ -280,6 +280,7 @@ mod tests {
         peer_outbox: RefCell<Vec<(HostId, PeerMsg)>>,
         database_requests: RefCell<VecDeque<DatabaseRequest>>,
         database_replies: RefCell<Vec<DatabaseReply>>,
+        unprotected: RefCell<Vec<PageId>>,
     }
 
     async fn next<T>(queue: &RefCell<VecDeque<T>>) -> T {
@@ -474,7 +475,9 @@ mod tests {
             panic!("unexpected failed fault: {page:?}")
         }
 
-        async fn unprotect(&self, _page: PageId) {}
+        async fn unprotect(&self, page: PageId) {
+            self.unprotected.borrow_mut().push(page);
+        }
 
         async fn evict(&self, page: PageId) {
             self.memory.borrow_mut().remove(&page);
@@ -589,6 +592,12 @@ mod tests {
         });
         executor.run_until(16);
         assert_eq!(*world.sync_ok.borrow(), [ReqId(2)]);
+        world
+            .faults
+            .borrow_mut()
+            .push_back(GuestFault { page, write: false });
+        executor.run_until(17);
+        assert!(world.unprotected.borrow().is_empty());
 
         world.admin.borrow_mut().push_back(AdminCmd::Checkpoint {
             req: ReqId(3),

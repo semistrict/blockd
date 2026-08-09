@@ -215,6 +215,14 @@ impl<T> UnboundedSender<T> {
         }
         Ok(())
     }
+
+    /// Drop every value that has been sent but not yet received.
+    pub fn discard_pending(&self) -> usize {
+        let mut state = self.inner.state.borrow_mut();
+        let discarded = state.queue.len();
+        state.queue.clear();
+        discarded
+    }
 }
 
 impl<T> Clone for UnboundedSender<T> {

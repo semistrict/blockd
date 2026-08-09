@@ -658,13 +658,15 @@ async fn recovery_supervisor(
                 events
                     .cold_boots
                     .set(events.cold_boots.get().saturating_add(1));
-                *guest_states[&vset].expected.borrow_mut() = guest_states[&vset]
+                let cold = guest_states[&vset]
                     .durable_expected
                     .borrow()
                     .iter()
                     .filter(|(page, _)| page.volume.idx.0 != 0)
                     .map(|(page, bytes)| (*page, bytes.clone()))
-                    .collect();
+                    .collect::<BTreeMap<_, _>>();
+                guest_states[&vset].expected.borrow_mut().clone_from(&cold);
+                *guest_states[&vset].durable_expected.borrow_mut() = cold;
             }
             blockd_core::protocol::Verdict::Unrestorable => {
                 events
@@ -964,7 +966,12 @@ async fn guest_actor(
                 state
                     .violations
                     .borrow_mut()
-                    .push(format!("read returned stale or foreign bytes for {page:?}"));
+                    .push(format!(
+                        "read returned stale or foreign bytes for {page:?}: actual sequence {claimed}, expected sequence {}, durable floor {durable_floor}, recovering {recovering}, possible {sequence_is_possible}, vmstate {} at {}",
+                        crate::guest::claimed_vol_seq(&expected),
+                        state.completed.get(),
+                        now(),
+                    ));
                 return;
             }
             if valid_recovery {

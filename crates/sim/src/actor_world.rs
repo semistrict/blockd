@@ -90,6 +90,10 @@ impl<T> Stream<T> {
             .try_recv()
             .ok()
     }
+
+    fn discard_pending(&self) -> usize {
+        self.sender.discard_pending()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -453,6 +457,8 @@ impl SimWorld {
         for waiter in sync_waiters.into_values() {
             let _ = waiter.send(false);
         }
+        self.faults.discard_pending();
+        self.syncs.discard_pending();
         *self.memory.borrow_mut() = MemoryState::default();
     }
 
@@ -1283,5 +1289,33 @@ mod tests {
             .detach();
         assert_eq!(executor.block_on(client), Ok(true));
         assert_eq!(seen_at.get(), Some(10));
+    }
+
+    #[test]
+    fn crash_discards_stale_guest_events() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let page = PageId {
+            volume: blockd_core::types::VolumeId {
+                vset: VsetId(1),
+                idx: blockd_core::types::VolumeIdx(1),
+            },
+            page: blockd_core::types::PageNo(3),
+        };
+        assert!(world.faults.send(GuestFault { page, write: false }));
+        assert!(world.syncs.send(GuestSync {
+            req: ReqId(7),
+            volume: page.volume,
+        }));
+
+        world.crash_guest_io();
+
+        assert!(world.faults.try_recv().is_none());
+        assert!(world.syncs.try_recv().is_none());
     }
 }

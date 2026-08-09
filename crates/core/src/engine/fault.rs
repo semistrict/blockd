@@ -90,25 +90,27 @@ async fn serve_resident_fault<W: GuestMem>(
     }
 
     if write {
-        let mut host = state.borrow_mut();
-        let valid = host
-            .vsets
-            .get(&page.volume.vset)
-            .is_some_and(|vset| vset.incarnation == incarnation && vset.ready);
-        if !valid || !host.cache.is_resident(page) {
-            return;
+        {
+            let mut host = state.borrow_mut();
+            let valid = host
+                .vsets
+                .get(&page.volume.vset)
+                .is_some_and(|vset| vset.incarnation == incarnation && vset.ready);
+            if !valid || !host.cache.is_resident(page) {
+                return;
+            }
+            if !host.cache.is_dirty(page) {
+                host.cache.mark_dirty(page);
+                host.vsets
+                    .get_mut(&page.volume.vset)
+                    .expect("validated vset")
+                    .mutation_seq += 1;
+                host.counters.wp_faults += 1;
+                host.counters.guest_pages_dirtied += 1;
+            }
         }
-        if !host.cache.is_dirty(page) {
-            host.cache.mark_dirty(page);
-            host.vsets
-                .get_mut(&page.volume.vset)
-                .expect("validated vset")
-                .mutation_seq += 1;
-            host.counters.wp_faults += 1;
-            host.counters.guest_pages_dirtied += 1;
-        }
+        GuestMem::unprotect(world, page).await;
     }
-    GuestMem::unprotect(world, page).await;
 }
 
 #[allow(clippy::too_many_lines)]
