@@ -739,7 +739,7 @@ fn spawn_schedules(
             ))
             .detach();
     }
-    if let Some((at, vset, to)) = config.migrate_at {
+    for &(at, vset, to) in &config.migrate_at {
         executor
             .spawn(at_migrate(
                 at,

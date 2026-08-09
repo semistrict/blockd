@@ -121,7 +121,7 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         rot_leaves_at: None,
         drop_peer: None,
         race_restore: false,
-        migrate_at: Some((millis(1500), blockd_core::types::VsetId(1), 1)),
+        migrate_at: vec![(millis(1500), blockd_core::types::VsetId(1), 1)],
         sabotage: Some(Sabotage::EagerHandoffAck),
         guest_sync_share: None,
     };

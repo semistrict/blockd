@@ -545,7 +545,7 @@ impl Scenario {
                 })
                 .transpose()?,
             race_restore: nemeses.race_restore,
-            migrate_at: None,
+            migrate_at: Vec::new(),
             sabotage: None,
             guest_sync_share: common.guest_sync_share,
         };
@@ -586,7 +586,9 @@ impl Scenario {
                     resolve_host(&config, r, &migrate.to, "nemeses.migrate-at.to")?,
                 ))
             })
-            .transpose()?;
+            .transpose()?
+            .into_iter()
+            .collect();
         Ok(config)
     }
 

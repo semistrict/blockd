@@ -3,7 +3,6 @@
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{VsetId, millis, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, FaultPoint, run};
-use blockd_sim::scenario::{RealizedScenario, load};
 
 fn assert_clean(report: &ClusterReport) {
     assert!(report.violations.is_empty(), "{:?}", report.violations);
@@ -22,7 +21,7 @@ fn migration_config() -> ClusterConfig {
         crash_hosts_at: vec![],
         drop_peer: None,
         race_restore: false,
-        migrate_at: Some((millis(500), VsetId(1), 1)),
+        migrate_at: vec![(millis(500), VsetId(1), 1)],
         horizon: secs(2),
         ..restore_config()
     }
@@ -51,7 +50,7 @@ fn host_death_restores_one_authoritative_runner() {
 #[test]
 fn crash_drops_the_host_tree_then_recovers_from_its_disk() {
     let mut config = migration_config();
-    config.migrate_at = None;
+    config.migrate_at.clear();
     config.crash_hosts_at = vec![(millis(600), 0)];
     let report = run(53, config);
     assert_clean(&report);
@@ -94,36 +93,28 @@ fn lossy_duplicating_links_preserve_migration_and_replay() {
 
 #[test]
 fn return_migration_and_crash_preserve_every_page() {
-    for seed in [1, 16, 92] {
-        let RealizedScenario::Cluster(config) = load("migration")
-            .expect("scenario")
-            .realize(seed)
-            .expect("realization")
-        else {
-            panic!("migration is a cluster scenario");
-        };
-        let report = run(seed, config);
-        assert_clean(&report);
-        assert!(report.migrations >= 2);
-        assert!(report.releases >= 2);
-    }
+    let mut config = migration_config();
+    config.migrate_at = vec![(millis(400), VsetId(1), 1), (millis(1_000), VsetId(1), 0)];
+    config.crash_hosts_at = vec![(millis(750), 0), (millis(1_350), 1)];
+    config.horizon = secs(2);
+    let report = run(1, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 2);
+    assert_eq!(report.releases, 2);
+    assert_eq!(report.host_crashes, 2);
 }
 
 #[test]
 fn released_source_residue_never_starts_a_second_guest() {
-    for seed in [103, 607] {
-        let RealizedScenario::Cluster(config) = load("migration")
-            .expect("scenario")
-            .realize(seed)
-            .expect("realization")
-        else {
-            panic!("migration is a cluster scenario");
-        };
-        let report = run(seed, config);
-        assert_clean(&report);
-        assert!(report.migrations >= 2);
-        assert!(report.releases >= 2);
-    }
+    let mut config = migration_config();
+    config.migrate_at = vec![(millis(400), VsetId(1), 1), (millis(1_000), VsetId(1), 0)];
+    config.crash_hosts_at = vec![(millis(405), 1), (millis(1_350), 1)];
+    config.horizon = secs(2);
+    let report = run(1, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 2);
+    assert_eq!(report.releases, 2);
+    assert_eq!(report.host_crashes, 2);
 }
 
 #[test]

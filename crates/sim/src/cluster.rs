@@ -62,7 +62,7 @@ pub struct ClusterConfig {
     pub rot_leaves_at: Option<u64>,
     pub drop_peer: Option<(PeerKind, u64, u64)>,
     pub race_restore: bool,
-    pub migrate_at: Option<(u64, VsetId, u16)>,
+    pub migrate_at: Vec<(u64, VsetId, u16)>,
     pub sabotage: Option<Sabotage>,
     pub guest_sync_share: Option<crate::rng::Ppm>,
 }
