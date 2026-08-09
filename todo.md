@@ -37,6 +37,8 @@ Status legend: `[ ]` pending, `[~]` validated/in progress, `[x]` fixed and verif
 
 ## Review fixes
 
+- [x] Remove the retired event/effect interpreter vocabulary from runtime telemetry.
+  - Attribute loop time to actor polls and async world operations, including exported metric phase labels.
 - [x] Preserve local blobs for unrestorable vsets that have an intact outbound handoff marker.
   - Added recovery coverage for an unusable source plus durable handoff.
 - [x] Prevent production timers from starving behind continuously ready actors.

@@ -954,7 +954,7 @@ pub fn upload_mem_parts(
 /// Asynchronous production uploader. File reading stays on Tokio's blocking
 /// pool because regular files have no portable readiness API; object-store
 /// requests themselves are async and capped at the same eight-way concurrency
-/// as daemon store effects.
+/// as daemon store operations.
 pub async fn upload_mem_parts_async(
     store: Arc<dyn crate::store::ObjectStore>,
     mem_path: PathBuf,

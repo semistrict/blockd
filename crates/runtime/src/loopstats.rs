@@ -5,14 +5,14 @@
 //!
 //! Recording happens only on the loop thread; reads may come from
 //! anywhere, so cells are relaxed atomics. Costs two `Instant::now()`
-//! calls per event and two per effect — noise next to a syscall, cheap
-//! enough to leave on always.
+//! calls per actor poll and two per world operation — noise next to a syscall,
+//! cheap enough to leave on always.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const EVENT_KINDS: [&str; 1] = ["ActorPoll"];
+pub(crate) const POLL_KINDS: [&str; 1] = ["ActorPoll"];
 
-pub(crate) const EFFECT_KINDS: [&str; 30] = [
+pub(crate) const WORLD_KINDS: [&str; 30] = [
     "Fill",
     "FillShared",
     "FillFailed",
@@ -98,29 +98,29 @@ impl Cell {
 
 #[derive(Default)]
 pub struct LoopStats {
-    decide: [Cell; EVENT_KINDS.len()],
-    effect: [Cell; EFFECT_KINDS.len()],
+    poll: [Cell; POLL_KINDS.len()],
+    world: [Cell; WORLD_KINDS.len()],
     idle_ns: AtomicU64,
 }
 
 impl LoopStats {
     pub(crate) fn record_actor_poll(&self, ns: u64) {
-        self.decide[0].add(ns);
+        self.poll[0].add(ns);
     }
 
     pub(crate) fn record_world(&self, kind: usize, ns: u64) {
-        self.effect[kind].add(ns);
+        self.world[kind].add(ns);
     }
 
     pub(crate) fn record_idle(&self, ns: u64) {
         self.idle_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
-    /// (name, count, total ns) per event kind, decide time only.
-    pub fn decide_totals(&self) -> Vec<(&'static str, u64, u64)> {
-        EVENT_KINDS
+    /// (name, count, total ns) per actor-poll kind.
+    pub fn poll_totals(&self) -> Vec<(&'static str, u64, u64)> {
+        POLL_KINDS
             .iter()
-            .zip(&self.decide)
+            .zip(&self.poll)
             .map(|(name, cell)| {
                 let (count, ns) = cell.read();
                 (*name, count, ns)
@@ -128,11 +128,11 @@ impl LoopStats {
             .collect()
     }
 
-    /// (name, count, total ns) per effect kind, execution time on the loop.
-    pub fn effect_totals(&self) -> Vec<(&'static str, u64, u64)> {
-        EFFECT_KINDS
+    /// (name, count, total ns) per async world-operation kind.
+    pub fn world_totals(&self) -> Vec<(&'static str, u64, u64)> {
+        WORLD_KINDS
             .iter()
-            .zip(&self.effect)
+            .zip(&self.world)
             .map(|(name, cell)| {
                 let (count, ns) = cell.read();
                 (*name, count, ns)
@@ -140,9 +140,9 @@ impl LoopStats {
             .collect()
     }
 
-    /// Loop time spent deciding plus executing effects.
+    /// Loop time spent polling actors plus completing world operations.
     pub fn busy_ns(&self) -> u64 {
-        let cells = self.decide.iter().chain(&self.effect);
+        let cells = self.poll.iter().chain(&self.world);
         cells.map(|cell| cell.ns.load(Ordering::Relaxed)).sum()
     }
 
@@ -186,8 +186,8 @@ impl LoopStats {
                 );
             }
         };
-        section("actor polls:", self.decide_totals());
-        section("production world operations:", self.effect_totals());
+        section("actor polls:", self.poll_totals());
+        section("production world operations:", self.world_totals());
         let _ = writeln!(
             out,
             "  occupancy {:.1}% (busy {:.1}ms, idle {:.1}ms)",

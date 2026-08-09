@@ -155,7 +155,7 @@ fn run_phase(noisy: usize) -> PhaseResult {
             .find(|(row, _, _)| *row == name)
             .map_or(0, |(_, count, _)| *count)
     };
-    let effects = stats.effect_totals();
+    let world_operations = stats.world_totals();
     let total_of = |rows: &[(&'static str, u64, u64)], name: &str| {
         rows.iter()
             .find(|(row, _, _)| *row == name)
@@ -165,9 +165,9 @@ fn run_phase(noisy: usize) -> PhaseResult {
         probe_micros,
         noisy_ops: noisy_ops.load(Ordering::Relaxed),
         occupancy: stats.occupancy(),
-        fills: count_of(&effects, "Fill"),
-        fill_ns: total_of(&effects, "Fill"),
-        blob_writes: count_of(&effects, "BlobWrite"),
+        fills: count_of(&world_operations, "Fill"),
+        fill_ns: total_of(&world_operations, "Fill"),
+        blob_writes: count_of(&world_operations, "BlobWrite"),
         report: stats.report(),
     }
 }
