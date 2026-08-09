@@ -245,11 +245,13 @@ mod tests {
     use std::rc::Rc;
 
     use async_trait::async_trait;
+    use blockd_exec::channel::oneshot;
     use blockd_exec::{Executor, delay};
 
     use super::{host_actor, host_actor_with_state};
     use crate::database::{DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest};
     use crate::engine::HostState;
+    use crate::engine::peer_source;
     use crate::head::HeadRecord;
     use crate::hostmeta::HostConfig as DaemonConfig;
     use crate::journal::{JournalRecord, VsetConfig};
@@ -537,6 +539,47 @@ mod tests {
         async fn abort(&self, reason: &'static str) {
             panic!("actor aborted: {reason}")
         }
+    }
+
+    #[test]
+    fn peer_fetch_replies_only_wake_the_expected_source_waiter() {
+        let world = Rc::new(ModelWorld::default());
+        let state = Rc::new(RefCell::new(super::super::state::HostState::new(
+            DaemonConfig {
+                host: HostId(1),
+                cache_pages: 1,
+                writeback_interval: 1,
+                backup_retry: 1,
+                disk_capacity: None,
+                disk_headroom: 0,
+                wedge_ticks: 0,
+                replica_placement: None,
+            },
+        )));
+        let io = crate::protocol::PeerRequestId(4);
+        let (send, receive) = oneshot();
+        state.borrow_mut().peer_pages.insert(io, (HostId(9), send));
+        world.peer_inbox.borrow_mut().extend([
+            (
+                HostId(8),
+                PeerMsg::Page {
+                    io,
+                    bytes: Some(vec![8]),
+                },
+            ),
+            (
+                HostId(9),
+                PeerMsg::Page {
+                    io,
+                    bytes: Some(vec![9]),
+                },
+            ),
+        ]);
+        let mut executor = Executor::simulation(91);
+        let source = executor.spawn(peer_source(Rc::clone(&state), Rc::clone(&world)));
+        assert_eq!(executor.block_on(receive), Ok(Some(vec![9])));
+        drop(source);
+        executor.run_ready();
     }
 
     #[test]
@@ -1004,6 +1047,38 @@ mod tests {
     }
 
     #[test]
+    fn failed_backed_fork_does_not_leave_a_head_claim() {
+        let vset = VsetId(111);
+        let world = Rc::new(ModelWorld::default());
+        world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
+            req: ReqId(19),
+            vset,
+            config: VsetConfig::compute(1, 8, true),
+            from_base: Some(999),
+        });
+        let config = DaemonConfig {
+            host: HostId(3),
+            cache_pages: 4,
+            writeback_interval: 5,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: None,
+        };
+        let mut executor = Executor::simulation(51);
+        let actor = executor.spawn(host_actor(config, Rc::clone(&world)));
+        executor.run_until(8);
+        assert_eq!(
+            *world.replies.borrow(),
+            [AdminReply::AdminFailed { req: ReqId(19) }]
+        );
+        assert!(!world.store.borrow().contains_key(&layout::head_key(vset)));
+        drop(actor);
+        executor.run_ready();
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn restore_hydrates_only_the_faulted_map_leaf() {
         let vset = VsetId(12);
@@ -1295,6 +1370,15 @@ mod tests {
             to: destination_host,
         });
         executor.run_until(15);
+        source
+            .peer_inbox
+            .borrow_mut()
+            .push_back((HostId(77), PeerMsg::MigrateAccept { vset }));
+        executor.run_until(16);
+        assert!(!source.replies.borrow().contains(&AdminReply::MigratedOut {
+            req: ReqId(41),
+            vset,
+        }));
         deliver(source_host, &source, &destination, destination_host);
         executor.run_until(20);
         assert!(
@@ -1346,6 +1430,65 @@ mod tests {
 
         drop(source_actor);
         drop(destination_actor);
+        executor.run_ready();
+    }
+
+    #[test]
+    fn migration_reservation_failure_releases_the_operation_for_retry() {
+        let vset = VsetId(151);
+        let destination = HostId(9);
+        let world = Rc::new(ModelWorld::default());
+        let config = DaemonConfig {
+            host: HostId(8),
+            cache_pages: 8,
+            writeback_interval: 100_000_000,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: None,
+        };
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        world.admin.borrow_mut().push_back(AdminCmd::CreateVset {
+            req: ReqId(60),
+            vset,
+            config: VsetConfig::database(8, false),
+            from_base: None,
+        });
+        let mut executor = Executor::simulation(81);
+        let actor = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+        executor.run_until(15);
+        assert!(world.replies.borrow().contains(&AdminReply::VsetCreated {
+            req: ReqId(60),
+            vset,
+        }));
+        state.borrow_mut().config.disk_capacity = Some(0);
+        world.admin.borrow_mut().push_back(AdminCmd::MigrateOut {
+            req: ReqId(61),
+            vset,
+            to: destination,
+        });
+        executor.run_until(20);
+        assert!(
+            world
+                .replies
+                .borrow()
+                .contains(&AdminReply::AdminFailed { req: ReqId(61) })
+        );
+        assert!(!state.borrow().vsets[&vset].migration_running);
+
+        state.borrow_mut().config.disk_capacity = None;
+        world.admin.borrow_mut().push_back(AdminCmd::MigrateOut {
+            req: ReqId(62),
+            vset,
+            to: destination,
+        });
+        executor.run_until(30);
+        assert!(world.peer_outbox.borrow().iter().any(|(to, message)| {
+            *to == destination
+                && matches!(message, PeerMsg::MigrateOffer { vset: found, .. } if *found == vset)
+        }));
+        drop(actor);
         executor.run_ready();
     }
 

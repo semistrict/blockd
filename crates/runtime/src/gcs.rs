@@ -174,6 +174,29 @@ fn encode_key(key: &str) -> String {
     out
 }
 
+fn xml_text(body: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        let Some(end) = rest.find(&close) else {
+            break;
+        };
+        values.push(
+            rest[..end]
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'"),
+        );
+        rest = &rest[end + close.len()..];
+    }
+    values
+}
+
 /// One request's distilled outcome.
 struct GcsResponse {
     status: u16,
@@ -299,6 +322,16 @@ impl GcsStore {
         body: Option<&Bytes>,
     ) -> Result<GcsResponse, StoreFault> {
         let url = self.object_url(key);
+        self.request_url(method, url, headers, body).await
+    }
+
+    async fn request_url(
+        &self,
+        method: &str,
+        url: String,
+        headers: &[(&str, String)],
+        body: Option<&Bytes>,
+    ) -> Result<GcsResponse, StoreFault> {
         let mut refreshed = false;
         let mut transient_retries = 0;
         loop {
@@ -455,6 +488,13 @@ impl ObjectStore for GcsStore {
     async fn delete(self: std::sync::Arc<Self>, key: String) {
         GcsStore::delete(&self, &key).await;
     }
+
+    async fn list_prefix(
+        self: std::sync::Arc<Self>,
+        prefix: String,
+    ) -> Result<Vec<String>, StoreFault> {
+        GcsStore::list_prefix(&self, &prefix).await
+    }
 }
 
 impl GcsStore {
@@ -503,6 +543,50 @@ impl GcsStore {
         let result = self.request("DELETE", key, &[], None).await.map(|_| ());
         self.stats
             .observe(4, outcome_of(&result), started.elapsed());
+    }
+
+    pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreFault> {
+        let full_prefix = format!("{}{prefix}", self.cfg.prefix);
+        let mut continuation = None::<String>;
+        let mut keys = Vec::new();
+        loop {
+            let mut url = format!(
+                "{}/{}?list-type=2&max-keys=1000&prefix={}",
+                self.cfg.endpoint,
+                self.cfg.bucket,
+                encode_key(&full_prefix)
+            );
+            if let Some(token) = continuation.as_deref() {
+                url.push_str("&continuation-token=");
+                url.push_str(&encode_key(token));
+            }
+            let response = self.request_url("GET", url, &[], None).await?;
+            if response.status != 200 {
+                return Err(StoreFault::Unavailable);
+            }
+            let body = String::from_utf8(response.body).map_err(|_| StoreFault::Unavailable)?;
+            for key in xml_text(&body, "Key") {
+                let Some(key) = key.strip_prefix(&self.cfg.prefix) else {
+                    return Err(StoreFault::Unavailable);
+                };
+                if key.starts_with(prefix) {
+                    keys.push(key.to_owned());
+                }
+            }
+            let truncated = xml_text(&body, "IsTruncated")
+                .first()
+                .is_some_and(|value| value == "true");
+            if !truncated {
+                break;
+            }
+            continuation = xml_text(&body, "NextContinuationToken").into_iter().next();
+            if continuation.is_none() {
+                return Err(StoreFault::Unavailable);
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
     }
 
     async fn put_inner(&self, key: &str, bytes: Bytes) -> Result<u64, StoreFault> {

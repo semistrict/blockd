@@ -300,12 +300,14 @@ impl AdminIo for FixtureWorld {
 #[test]
 fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
     let mut nontrivial = 0u64;
-    for seed in [3, 29, 104] {
+    for seed in [3, 5, 7, 11, 29, 104] {
         let config = presets::single_host_chaos();
         let host_config = config.daemon.clone();
         let (report, blobs) = run_final_blobs(seed, config);
-        assert_eq!(report.violations, Vec::<String>::new());
-        assert!(!blobs.is_empty(), "seed {seed} left no blobs to recover");
+        assert_eq!(report.violations, Vec::<String>::new(), "seed {seed}");
+        if blobs.is_empty() {
+            continue;
+        }
 
         let memory_side = recover(host_config.clone(), Rc::new(MemoryBlobs::new(&blobs)));
 

@@ -25,6 +25,7 @@ struct Waiter {
 struct State<T> {
     critical: VecDeque<T>,
     background: VecDeque<T>,
+    capacity: Option<usize>,
     streak: u32,
     senders: usize,
     receiver_alive: bool,
@@ -44,9 +45,19 @@ pub struct Recv<'a, T> {
 }
 
 pub fn injector<T>() -> (Injector<T>, Injected<T>) {
+    injector_with_capacity(None)
+}
+
+pub fn bounded_injector<T>(capacity: usize) -> (Injector<T>, Injected<T>) {
+    assert!(capacity != 0, "injector capacity must be nonzero");
+    injector_with_capacity(Some(capacity))
+}
+
+fn injector_with_capacity<T>(capacity: Option<usize>) -> (Injector<T>, Injected<T>) {
     let state = Arc::new(Mutex::new(State {
         critical: VecDeque::new(),
         background: VecDeque::new(),
+        capacity,
         streak: 0,
         senders: 1,
         receiver_alive: true,
@@ -65,6 +76,12 @@ impl<T> Injector<T> {
         let waiter = {
             let mut state = self.state.lock().expect("injector mutex poisoned");
             if !state.receiver_alive {
+                return Err(value);
+            }
+            if state
+                .capacity
+                .is_some_and(|capacity| state.critical.len() + state.background.len() >= capacity)
+            {
                 return Err(value);
             }
             match lane {
@@ -171,7 +188,7 @@ impl<T> Future for Recv<'_, T> {
 mod tests {
     use crate::Executor;
 
-    use super::{BACKGROUND_SHARE, Lane, injector};
+    use super::{BACKGROUND_SHARE, Lane, bounded_injector, injector};
 
     #[test]
     fn background_lane_cannot_starve() {
@@ -190,5 +207,24 @@ mod tests {
             values
         });
         assert_eq!(values[BACKGROUND_SHARE as usize], u32::MAX);
+    }
+
+    #[test]
+    fn bounded_injector_rejects_excess_backlog_and_recovers_capacity() {
+        let (sender, stream) = bounded_injector(2);
+        assert_eq!(sender.push(Lane::Critical, 1), Ok(()));
+        assert_eq!(sender.push(Lane::Background, 2), Ok(()));
+        assert_eq!(sender.push(Lane::Critical, 3), Err(3));
+
+        let mut executor = Executor::production();
+        let task_sender = sender.clone();
+        let (item, pushed, depths) = executor.block_on(async move {
+            let item = stream.recv().await;
+            let pushed = task_sender.push(Lane::Critical, 3);
+            (item, pushed, task_sender.depths())
+        });
+        assert_eq!(item, Some(1));
+        assert_eq!(pushed, Ok(()));
+        assert_eq!(depths, (1, 1));
     }
 }

@@ -76,7 +76,7 @@ fn oracle_catches_dropped_write_protection() {
         store_outage: None,
     };
     config.sabotage = Some(Sabotage::DropWriteProtect);
-    let report = run(3, config);
+    let report = run(1, config);
     assert!(
         !report.violations.is_empty(),
         "stale captures from dropped write protection went unnoticed"

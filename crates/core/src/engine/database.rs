@@ -7,6 +7,7 @@ use super::capture::{shard_map, write_record_copies};
 use super::fault::load_page_for_database;
 use super::reclaim::cleanup_local;
 use super::replica::replicate_latest;
+use super::state::CommitFlagLease;
 use super::state::{AttachmentPhase, SharedHost};
 use crate::database::{
     AttachmentId, DatabaseError, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest,
@@ -725,53 +726,107 @@ async fn persist_database<W>(
 where
     W: Blobs + AdminIo,
 {
-    let (incarnation, fence, seq, capture_seq, first_segment, generations) = {
+    let (
+        incarnation,
+        config,
+        fence,
+        seq,
+        capture_seq,
+        first_segment,
+        generations,
+        mut staged,
+        covered,
+        peer_source,
+    ) = {
         let mut host = state.borrow_mut();
         let vset_state = host.vsets.get_mut(&vset).ok_or(())?;
         if !vset_state.ready || vset_state.commit_running {
             return Err(());
         }
         vset_state.commit_running = true;
-        if mutation {
-            vset_state.mutation_seq = vset_state.mutation_seq.checked_add(1).ok_or(())?;
-        }
-        let capture_seq = vset_state.mutation_seq;
+        let capture_seq = if mutation {
+            vset_state.mutation_seq.checked_add(1).ok_or(())?
+        } else {
+            vset_state.mutation_seq
+        };
         let seq = JournalSeq(vset_state.next_seq);
-        vset_state.next_seq = vset_state.next_seq.checked_add(1).ok_or(())?;
         let first_segment = SegId(vset_state.next_seg);
-        let generations = updates
-            .iter()
-            .map(|_| {
-                let generation = Gen(vset_state.next_gen);
-                vset_state.next_gen = vset_state
-                    .next_gen
-                    .checked_add(1)
-                    .expect("generation overflow");
-                generation
+        let generations = (0..updates.len())
+            .map(|offset| {
+                let offset = u64::try_from(offset).expect("update count fits u64");
+                vset_state.next_gen.checked_add(offset).map(Gen).ok_or(())
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut staged = super::state::VsetState::fresh(vset_state.config, vset_state.incarnation);
+        staged.fence = vset_state.fence;
+        staged.page_locs = vset_state.page_locs.clone();
+        staged.overlay = vset_state.overlay.clone();
+        staged.leaf_table = vset_state.leaf_table.clone();
+        staged.next_leaf = vset_state.next_leaf;
+        let covered = sync_barrier.map_or(vset_state.local_covered_through, |barrier| {
+            vset_state.local_covered_through.max(barrier)
+        });
         (
             vset_state.incarnation,
+            vset_state.config,
             vset_state.fence,
             seq,
             capture_seq,
             first_segment,
             generations,
+            staged,
+            covered,
+            vset_state.peer_source,
         )
     };
+    let lease = CommitFlagLease::new(state, vset, incarnation);
     let mut builder = SegmentBatchBuilder::new(vset, fence, first_segment);
     for ((page, bytes), generation) in updates.iter().zip(&generations) {
         builder.add(*page, *generation, bytes);
     }
     let segments = builder.finish();
+    for (_, _, entries) in &segments {
+        for &(page, generation, location) in entries {
+            staged.page_locs.insert(page, (generation, location));
+            staged.overlay.insert(page, (generation, location));
+        }
+    }
+    if let Some((file, first_removed)) = prune {
+        prune_file(&mut staged, file, first_removed);
+    }
+    let (record_overlay, record_leaves, leaf_writes) = shard_map(&mut staged, vset);
+    let record = JournalRecord {
+        config,
+        seq,
+        fence,
+        kind: RecordKind::Commit,
+        capture_seq,
+        sync_covered_through: covered,
+        database,
+        overlay: record_overlay.clone(),
+        leaves: record_leaves.clone(),
+        migrated_from: peer_source,
+    };
+    let reservations = segments
+        .iter()
+        .map(|(segment, bytes, _)| {
+            (
+                layout::segment_blob(vset, fence, *segment),
+                bytes.len() as u64,
+            )
+        })
+        .chain(leaf_writes.iter().map(|(pointer, bytes, _)| {
+            (
+                layout::leaf_blob(vset, pointer.fence, pointer.id),
+                bytes.len() as u64,
+            )
+        }))
+        .collect::<Vec<_>>();
+    if !state.borrow_mut().try_reserve_blobs(&reservations) {
+        return Err(());
+    }
     for (segment, bytes, _) in &segments {
         let name = layout::segment_blob(vset, fence, *segment);
-        if !state
-            .borrow_mut()
-            .try_reserve_blob(name.clone(), bytes.len() as u64)
-        {
-            return Err(());
-        }
         if Blobs::write(world, name.clone(), bytes.clone())
             .await
             .is_err()
@@ -781,58 +836,9 @@ where
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
     }
-    let (record_overlay, record_leaves, leaf_writes, record) = {
-        let mut host = state.borrow_mut();
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
-            .filter(|vset_state| vset_state.incarnation == incarnation)
-            .ok_or(())?;
-        vset_state.next_seg = vset_state
-            .next_seg
-            .checked_add(u64::try_from(segments.len()).expect("segment count fits u64"))
-            .expect("segment id overflow");
-        for (segment, bytes, entries) in &segments {
-            for &(page, generation, location) in entries {
-                vset_state.page_locs.insert(page, (generation, location));
-                vset_state.overlay.insert(page, (generation, location));
-            }
-            vset_state
-                .segment_blobs
-                .push((fence, *segment, bytes.len() as u64));
-        }
-        if let Some((file, first_removed)) = prune {
-            prune_file(vset_state, file, first_removed);
-        }
-        vset_state.database = database;
-        let (overlay, leaves, leaf_writes) = shard_map(vset_state, vset);
-        vset_state.overlay.clone_from(&overlay);
-        vset_state.leaf_table.clone_from(&leaves);
-        let covered = sync_barrier.map_or(vset_state.local_covered_through, |barrier| {
-            vset_state.local_covered_through.max(barrier)
-        });
-        let record = JournalRecord {
-            config: vset_state.config,
-            seq,
-            fence,
-            kind: RecordKind::Commit,
-            capture_seq,
-            sync_covered_through: covered,
-            database,
-            overlay: overlay.clone(),
-            leaves: leaves.clone(),
-            migrated_from: vset_state.peer_source,
-        };
-        (overlay, leaves, leaf_writes, record)
-    };
+    let mut new_leaf_blobs = Vec::new();
     for (pointer, bytes, segments) in &leaf_writes {
         let name = layout::leaf_blob(vset, pointer.fence, pointer.id);
-        if !state
-            .borrow_mut()
-            .try_reserve_blob(name.clone(), bytes.len() as u64)
-        {
-            return Err(());
-        }
         if Blobs::write(world, name.clone(), bytes.clone())
             .await
             .is_err()
@@ -840,13 +846,8 @@ where
             AdminIo::abort(world, "database map-leaf write failed").await;
             return Err(());
         }
-        let mut host = state.borrow_mut();
-        host.record_blob(name, bytes.len() as u64);
-        let vset_state = host.vsets.get_mut(&vset).ok_or(())?;
-        vset_state
-            .leaf_blobs
-            .insert(*pointer, (bytes.len() as u64, segments.clone()));
-        host.counters.leaf_rolls += 1;
+        state.borrow_mut().record_blob(name, bytes.len() as u64);
+        new_leaf_blobs.push((*pointer, (bytes.len() as u64, segments.clone())));
     }
     if !write_record_copies(state, world, vset, &record).await {
         AdminIo::abort(world, "database journal write failed").await;
@@ -859,6 +860,25 @@ where
             .get_mut(&vset)
             .filter(|vset_state| vset_state.incarnation == incarnation)
             .ok_or(())?;
+        vset_state.mutation_seq = capture_seq;
+        vset_state.next_seq = seq.0.checked_add(1).ok_or(())?;
+        vset_state.next_seg = first_segment
+            .0
+            .checked_add(u64::try_from(segments.len()).expect("segment count fits u64"))
+            .ok_or(())?;
+        vset_state.next_gen = vset_state
+            .next_gen
+            .checked_add(u64::try_from(generations.len()).expect("generation count fits u64"))
+            .ok_or(())?;
+        vset_state.next_leaf = staged.next_leaf;
+        vset_state.page_locs = staged.page_locs;
+        vset_state.database = database;
+        vset_state.segment_blobs.extend(
+            segments
+                .iter()
+                .map(|(segment, bytes, _)| (fence, *segment, bytes.len() as u64)),
+        );
+        vset_state.leaf_blobs.extend(new_leaf_blobs);
         vset_state.overlay = record_overlay;
         vset_state.leaf_table = record_leaves;
         vset_state.best_record = Some(record.clone());
@@ -873,7 +893,9 @@ where
         vset_state.commit_running = false;
         host.counters.pages_flushed += updates.len() as u64;
         host.counters.records_written += 1;
+        host.counters.leaf_rolls += leaf_writes.len() as u64;
     }
+    lease.commit();
     if cleanup_local(Rc::clone(state), world, vset, incarnation)
         .await
         .is_err()
@@ -1015,4 +1037,146 @@ fn file_meta_mut(
 
 const fn failed(req: ReqId, error: DatabaseError) -> DatabaseReply {
     DatabaseReply::Failed { req, error }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, VecDeque};
+    use std::rc::Rc;
+
+    use async_trait::async_trait;
+    use blockd_exec::Executor;
+
+    use super::*;
+    use crate::hostmeta::HostConfig;
+    use crate::journal::{DatabaseMeta, VsetConfig};
+    use crate::protocol::AdminCmd;
+    use crate::types::{HostId, VolumeId, VolumeIdx};
+    use crate::world::{BlobEntry, BlobError};
+
+    #[derive(Default)]
+    struct TestWorld {
+        blobs: RefCell<BTreeMap<String, Vec<u8>>>,
+        replies: RefCell<Vec<AdminReply>>,
+        admin: RefCell<VecDeque<AdminCmd>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Blobs for TestWorld {
+        async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
+            Ok(Vec::new())
+        }
+        async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
+            self.blobs.borrow_mut().insert(name, bytes);
+            Ok(())
+        }
+        async fn append(&self, _: String, _: Vec<u8>) -> Result<(), BlobError> {
+            unreachable!()
+        }
+        async fn truncate(&self, _: &str, _: u64) -> Result<(), BlobError> {
+            unreachable!()
+        }
+        async fn read(&self, name: &str) -> Result<Option<Vec<u8>>, BlobError> {
+            Ok(self.blobs.borrow().get(name).cloned())
+        }
+        async fn read_range(&self, _: &str, _: u64, _: u64) -> Result<Option<Vec<u8>>, BlobError> {
+            unreachable!()
+        }
+        async fn delete(&self, name: &str) -> Result<(), BlobError> {
+            self.blobs.borrow_mut().remove(name);
+            Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl AdminIo for TestWorld {
+        async fn next_admin(&self) -> Option<AdminCmd> {
+            self.admin.borrow_mut().pop_front()
+        }
+        async fn reply_admin(&self, reply: AdminReply) {
+            self.replies.borrow_mut().push(reply);
+        }
+        async fn next_database(&self) -> Option<DatabaseRequest> {
+            None
+        }
+        async fn reply_database(&self, _: DatabaseReply) {}
+        async fn abort(&self, reason: &'static str) {
+            panic!("unexpected abort: {reason}")
+        }
+    }
+
+    #[test]
+    fn failed_capacity_reservation_releases_database_commit_state_for_retry() {
+        let vset = VsetId(1);
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(0),
+            },
+            page: PageNo(0),
+        };
+        let mut host = super::super::state::HostState::new(HostConfig {
+            host: HostId(1),
+            cache_pages: 1,
+            writeback_interval: 1,
+            backup_retry: 1,
+            disk_capacity: Some(1),
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: None,
+        });
+        let incarnation = host.insert_fresh(vset, VsetConfig::database(4, false));
+        host.vsets.get_mut(&vset).expect("vset").ready = true;
+        let state = Rc::new(RefCell::new(host));
+        let world = Rc::new(TestWorld::default());
+        let mut executor = Executor::simulation(1);
+        let failed = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    vec![(page, vec![1; page_size()])],
+                    None,
+                    DatabaseMeta::default(),
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(failed, Err(()));
+        {
+            let host = state.borrow();
+            let vset_state = &host.vsets[&vset];
+            assert_eq!(vset_state.incarnation, incarnation);
+            assert!(!vset_state.commit_running);
+            assert_eq!(vset_state.mutation_seq, 0);
+            assert_eq!(vset_state.next_seq, 0);
+            assert!(vset_state.page_locs.is_empty());
+        }
+        state.borrow_mut().config.disk_capacity = None;
+        let retried = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    vec![(page, vec![1; page_size()])],
+                    None,
+                    DatabaseMeta::default(),
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(retried, Ok(1));
+        assert!(!state.borrow().vsets[&vset].commit_running);
+    }
 }

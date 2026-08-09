@@ -4,6 +4,7 @@ use std::rc::Rc;
 use blockd_exec::{delay, now};
 
 use super::SharedHost;
+use crate::layout::StoreKey;
 use crate::types::SimTime;
 use crate::world::Store;
 
@@ -46,9 +47,24 @@ async fn store_gc_pass<W: Store>(
     let observed_now = SimTime(now());
     let mut objects = Vec::with_capacity(keys.len());
     for key in keys {
-        let Some((_, bytes)) = Store::get(world, &key).await.map_err(|_| ())? else {
-            observed_at.remove(&key);
-            continue;
+        let needs_body = matches!(
+            crate::layout::parse_key(&key),
+            Some(
+                StoreKey::Head { .. }
+                    | StoreKey::Manifest { .. }
+                    | StoreKey::Leaf { .. }
+                    | StoreKey::BaseRecord { .. }
+                    | StoreKey::BaseLeaf { .. }
+            )
+        );
+        let bytes = if needs_body {
+            let Some((_, bytes)) = Store::get(world, &key).await.map_err(|_| ())? else {
+                observed_at.remove(&key);
+                continue;
+            };
+            bytes
+        } else {
+            Vec::new()
         };
         let put_at = *observed_at.entry(key.clone()).or_insert(observed_now);
         objects.push((key, put_at, bytes));
@@ -79,6 +95,7 @@ mod tests {
     #[derive(Default)]
     struct TestStore {
         objects: RefCell<BTreeMap<String, (u64, Vec<u8>)>>,
+        fetched: RefCell<Vec<String>>,
     }
 
     #[async_trait(?Send)]
@@ -98,6 +115,7 @@ mod tests {
         }
 
         async fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+            self.fetched.borrow_mut().push(key.to_owned());
             Ok(self.objects.borrow().get(key).cloned())
         }
 
@@ -160,6 +178,7 @@ mod tests {
 
         let store = Rc::new(store);
         let task_store = Rc::clone(&store);
+        let expected_orphan = orphan.clone();
         let mut executor = Executor::simulation(1);
         let result = executor.block_on(async move {
             let mut observed = BTreeMap::new();
@@ -178,6 +197,10 @@ mod tests {
             )
         });
         assert_eq!(result, (true, false));
+        assert!(
+            !store.fetched.borrow().contains(&expected_orphan),
+            "segment payloads must not be fetched during GC"
+        );
     }
 
     #[test]

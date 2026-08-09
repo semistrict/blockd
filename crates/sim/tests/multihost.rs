@@ -128,7 +128,7 @@ fn passive_replica_commits_uploads_and_unlinks_without_rewrite() {
     config.think = (millis(2), millis(4));
     let report = run(91, config);
     assert_clean(&report);
-    assert!(report.replica_logical_bytes > 0);
+    assert!(report.replica_logical_bytes > 0, "{report:?}");
     assert!(report.replica_network_bytes >= report.replica_logical_bytes);
     assert!(report.replica_store_bytes > 0);
     assert!(report.replica_artifact_flushes > 0);

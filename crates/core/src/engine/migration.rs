@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use blockd_exec::channel::oneshot;
-use blockd_exec::{TaskSet, delay, timeout};
+use blockd_exec::{TaskSet, delay, timeout, yield_now};
 
 use super::backup::publish_latest;
 use super::capture::{capture_migration, shard_map, write_record_copies};
 use super::replica::publish_replica_head;
+use super::state::CommitFlagLease;
 use super::{SharedHost, VsetState, replica_message};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::head::{HeadRecord, ManifestPtr};
@@ -31,6 +32,43 @@ struct Handoff {
 struct InboundLease {
     state: SharedHost,
     vset: VsetId,
+}
+
+struct MigrationLease {
+    state: SharedHost,
+    vset: VsetId,
+    incarnation: u64,
+    active: bool,
+}
+
+impl MigrationLease {
+    fn new(state: &SharedHost, vset: VsetId, incarnation: u64) -> Self {
+        Self {
+            state: Rc::clone(state),
+            vset,
+            incarnation,
+            active: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for MigrationLease {
+    fn drop(&mut self) {
+        if self.active
+            && let Some(vset_state) = self
+                .state
+                .borrow_mut()
+                .vsets
+                .get_mut(&self.vset)
+                .filter(|vset_state| vset_state.incarnation == self.incarnation)
+        {
+            vset_state.migration_running = false;
+        }
+    }
 }
 
 impl Drop for InboundLease {
@@ -71,9 +109,9 @@ pub async fn migrate_out<W>(state: SharedHost, world: Rc<W>, req: ReqId, vset: V
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
-    let allowed = {
+    let incarnation = {
         let mut host = state.borrow_mut();
-        host.vsets.get_mut(&vset).is_some_and(|vset_state| {
+        host.vsets.get_mut(&vset).and_then(|vset_state| {
             let allowed = vset_state.ready
                 && (vset_state.config.kind == VsetKind::Database
                     || !vset_state.config.durability.uses_store())
@@ -88,29 +126,24 @@ where
             if allowed {
                 vset_state.migration_running = true;
             }
-            allowed
+            allowed.then_some(vset_state.incarnation)
         })
     };
-    if !allowed {
+    let Some(incarnation) = incarnation else {
         AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
         return;
-    }
+    };
+    let lease = MigrationLease::new(&state, vset, incarnation);
     let kind = state.borrow().vsets[&vset].config.kind;
     let record = if kind == VsetKind::Compute {
         let Some(record) = capture_migration(Rc::clone(&state), Rc::clone(&world), vset).await
         else {
-            if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                vset_state.migration_running = false;
-            }
             AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
             return;
         };
         record
     } else {
         let Some(record) = state.borrow().vsets[&vset].best_record.clone() else {
-            if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                vset_state.migration_running = false;
-            }
             AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
             return;
         };
@@ -166,6 +199,7 @@ where
         vset_state.outbound = Some(to);
     }
     offer_until_accepted(&state, world.as_ref(), vset, to, record.encode(vset)).await;
+    lease.commit();
     AdminIo::reply_admin(world.as_ref(), AdminReply::MigratedOut { req, vset }).await;
 }
 
@@ -234,16 +268,18 @@ where
                 ));
             }
             PeerMsg::MigrateAccept { vset } => {
-                if let Some(vset_state) = state
-                    .borrow_mut()
+                let accepted = state
+                    .borrow()
                     .vsets
-                    .get_mut(&vset)
-                    .filter(|vset_state| vset_state.outbound == Some(from))
-                {
-                    vset_state.migration_accepted = true;
-                }
-                if let Some(waiter) = state.borrow_mut().migration_accepts.remove(&vset) {
-                    let _ = waiter.send(());
+                    .get(&vset)
+                    .is_some_and(|vset_state| vset_state.outbound == Some(from));
+                if accepted {
+                    if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
+                        vset_state.migration_accepted = true;
+                    }
+                    if let Some(waiter) = state.borrow_mut().migration_accepts.remove(&vset) {
+                        let _ = waiter.send(());
+                    }
                 }
             }
             PeerMsg::FetchRange {
@@ -278,7 +314,12 @@ where
                 Peers::send(world.as_ref(), from, PeerMsg::Page { io, bytes }).await;
             }
             PeerMsg::Page { io, bytes } => {
-                if let Some(waiter) = state.borrow_mut().peer_pages.remove(&io) {
+                let expected = state
+                    .borrow()
+                    .peer_pages
+                    .get(&io)
+                    .is_some_and(|(expected, _)| *expected == from);
+                if expected && let Some((_, waiter)) = state.borrow_mut().peer_pages.remove(&io) {
                     let _ = waiter.send(bytes);
                 }
             }
@@ -310,7 +351,12 @@ where
                 Peers::send(world.as_ref(), from, PeerMsg::Leaf { io, bytes }).await;
             }
             PeerMsg::Leaf { io, bytes } => {
-                if let Some(waiter) = state.borrow_mut().peer_leaves.remove(&io) {
+                let expected = state
+                    .borrow()
+                    .peer_leaves
+                    .get(&io)
+                    .is_some_and(|(expected, _)| *expected == from);
+                if expected && let Some((_, waiter)) = state.borrow_mut().peer_leaves.remove(&io) {
                     let _ = waiter.send(bytes);
                 }
             }
@@ -672,7 +718,7 @@ pub async fn peer_fetch_page<W: Peers>(
         let io = {
             let mut host = state.borrow_mut();
             let io = host.allocate_peer_request();
-            host.peer_pages.insert(io, send);
+            host.peer_pages.insert(io, (source, send));
             io
         };
         Peers::send(
@@ -743,6 +789,7 @@ where
         Peers::send(world.as_ref(), source, PeerMsg::Released { vset }).await;
         return;
     }
+    let lease = CommitFlagLease::new(&state, vset, incarnation);
     let mut fetched = Vec::new();
     for (page, (generation, location)) in pages {
         let Some(bytes) = peer_fetch_page(&state, world.as_ref(), source, vset, location).await
@@ -761,37 +808,92 @@ where
         };
         fetched.push((page, raw));
     }
-    let generations = {
-        let mut host = state.borrow_mut();
-        let Some(vset_state) = host
-            .vsets
-            .get_mut(&vset)
+    let Some((generations, mut staged, seq, kind, capture_seq, covered, config, database)) = ({
+        let host = state.borrow();
+        host.vsets
+            .get(&vset)
             .filter(|vset_state| vset_state.incarnation == incarnation)
-        else {
-            return;
-        };
-        fetched
-            .iter()
-            .map(|(page, _)| {
-                let generation = crate::types::Gen(vset_state.next_gen);
-                vset_state.next_gen += 1;
-                (*page, generation)
+            .map(|vset_state| {
+                let generations = fetched
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (page, _))| {
+                        (
+                            *page,
+                            crate::types::Gen(
+                                vset_state.next_gen
+                                    + u64::try_from(offset).expect("hydration batch fits u64"),
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let mut staged = VsetState::fresh(vset_state.config, incarnation);
+                staged.fence = vset_state.fence;
+                staged.page_locs = vset_state.page_locs.clone();
+                staged.overlay = vset_state.overlay.clone();
+                staged.leaf_table = vset_state.leaf_table.clone();
+                staged.next_leaf = vset_state.next_leaf;
+                (
+                    generations,
+                    staged,
+                    crate::types::JournalSeq(vset_state.next_seq),
+                    vset_state
+                        .best_record
+                        .as_ref()
+                        .map_or(RecordKind::Commit, |record| record.kind),
+                    vset_state.mutation_seq,
+                    vset_state.local_covered_through,
+                    vset_state.config,
+                    vset_state.database,
+                )
             })
-            .collect::<BTreeMap<_, _>>()
+    }) else {
+        return;
     };
     let mut builder = SegmentBatchBuilder::new(vset, fence, first_segment);
     for (page, raw) in &fetched {
         builder.add(*page, generations[page], raw);
     }
     let segments = builder.finish();
+    for (_, _, entries) in &segments {
+        for &(page, generation, location) in entries {
+            staged.page_locs.insert(page, (generation, location));
+            staged.overlay.insert(page, (generation, location));
+        }
+    }
+    let (overlay, leaves, leaf_writes) = shard_map(&mut staged, vset);
+    let record = JournalRecord {
+        config,
+        seq,
+        fence,
+        kind,
+        capture_seq,
+        sync_covered_through: covered,
+        database,
+        overlay: overlay.clone(),
+        leaves: leaves.clone(),
+        migrated_from: Some(source),
+    };
+    let reservations = segments
+        .iter()
+        .map(|(segment, bytes, _)| {
+            (
+                layout::segment_blob(vset, fence, *segment),
+                bytes.len() as u64,
+            )
+        })
+        .chain(leaf_writes.iter().map(|(pointer, bytes, _)| {
+            (
+                layout::leaf_blob(vset, pointer.fence, pointer.id),
+                bytes.len() as u64,
+            )
+        }))
+        .collect::<Vec<_>>();
+    if !state.borrow_mut().try_reserve_blobs(&reservations) {
+        return;
+    }
     for (segment, bytes, _) in &segments {
         let name = layout::segment_blob(vset, fence, *segment);
-        if !state
-            .borrow_mut()
-            .try_reserve_blob(name.clone(), bytes.len() as u64)
-        {
-            return;
-        }
         if Blobs::write(world.as_ref(), name.clone(), bytes.clone())
             .await
             .is_err()
@@ -801,58 +903,9 @@ where
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
     }
-    let (record, leaf_writes) = {
-        let mut host = state.borrow_mut();
-        let Some(vset_state) = host
-            .vsets
-            .get_mut(&vset)
-            .filter(|vset_state| vset_state.incarnation == incarnation)
-        else {
-            return;
-        };
-        for (segment, bytes, entries) in &segments {
-            for &(page, generation, location) in entries {
-                vset_state.page_locs.insert(page, (generation, location));
-                vset_state.overlay.insert(page, (generation, location));
-            }
-            vset_state
-                .segment_blobs
-                .push((fence, *segment, bytes.len() as u64));
-            vset_state.next_seg = vset_state.next_seg.max(segment.0 + 1);
-        }
-        vset_state.wedge.hydration += fetched.len() as u64;
-        let seq = crate::types::JournalSeq(vset_state.next_seq);
-        vset_state.next_seq += 1;
-        let kind = vset_state
-            .best_record
-            .as_ref()
-            .map_or(RecordKind::Commit, |record| record.kind);
-        let (overlay, leaves, leaf_writes) = shard_map(vset_state, vset);
-        vset_state.overlay.clone_from(&overlay);
-        vset_state.leaf_table.clone_from(&leaves);
-        let record = JournalRecord {
-            config: vset_state.config,
-            seq,
-            fence,
-            kind,
-            capture_seq: vset_state.mutation_seq,
-            sync_covered_through: vset_state.local_covered_through,
-            database: vset_state.database,
-            overlay,
-            leaves,
-            migrated_from: Some(source),
-        };
-        host.counters.hydrate_fills += fetched.len() as u64;
-        (record, leaf_writes)
-    };
+    let mut new_leaf_blobs = Vec::new();
     for (pointer, bytes, segments) in &leaf_writes {
         let name = layout::leaf_blob(vset, pointer.fence, pointer.id);
-        if !state
-            .borrow_mut()
-            .try_reserve_blob(name.clone(), bytes.len() as u64)
-        {
-            return;
-        }
         if Blobs::write(world.as_ref(), name.clone(), bytes.clone())
             .await
             .is_err()
@@ -860,19 +913,8 @@ where
             AdminIo::abort(world.as_ref(), "hydrated map-leaf write failed").await;
             return;
         }
-        let mut host = state.borrow_mut();
-        host.record_blob(name, bytes.len() as u64);
-        let Some(vset_state) = host
-            .vsets
-            .get_mut(&vset)
-            .filter(|vset_state| vset_state.incarnation == incarnation)
-        else {
-            return;
-        };
-        vset_state
-            .leaf_blobs
-            .insert(*pointer, (bytes.len() as u64, segments.clone()));
-        host.counters.leaf_rolls += 1;
+        state.borrow_mut().record_blob(name, bytes.len() as u64);
+        new_leaf_blobs.push((*pointer, (bytes.len() as u64, segments.clone())));
     }
     if !write_record_copies(&state, world.as_ref(), vset, &record).await {
         AdminIo::abort(world.as_ref(), "hydration journal write failed").await;
@@ -887,13 +929,37 @@ where
         else {
             return;
         };
+        vset_state.next_gen = vset_state
+            .next_gen
+            .saturating_add(u64::try_from(fetched.len()).expect("hydration batch fits u64"));
+        vset_state.next_seq = seq.0.saturating_add(1);
+        vset_state.next_seg = segments
+            .iter()
+            .map(|(segment, _, _)| segment.0.saturating_add(1))
+            .max()
+            .unwrap_or(vset_state.next_seg)
+            .max(vset_state.next_seg);
+        vset_state.next_leaf = staged.next_leaf;
+        vset_state.page_locs = staged.page_locs;
+        vset_state.overlay = overlay;
+        vset_state.leaf_table = leaves;
+        vset_state.segment_blobs.extend(
+            segments
+                .iter()
+                .map(|(segment, bytes, _)| (fence, *segment, bytes.len() as u64)),
+        );
+        vset_state.leaf_blobs.extend(new_leaf_blobs);
+        vset_state.wedge.hydration += fetched.len() as u64;
         vset_state.best_record = Some(record.clone());
         vset_state
             .record_writes
             .insert(record.seq, (record.fence, record.sync_covered_through));
         vset_state.commit_running = false;
         host.counters.records_written += 1;
+        host.counters.hydrate_fills += fetched.len() as u64;
+        host.counters.leaf_rolls += leaf_writes.len() as u64;
     }
+    lease.commit();
 }
 
 fn finish_hydration(state: &SharedHost, vset: VsetId, incarnation: u64) {
@@ -919,7 +985,7 @@ pub async fn peer_fetch_leaf<W: Peers>(
         let io = {
             let mut host = state.borrow_mut();
             let io = host.allocate_peer_request();
-            host.peer_leaves.insert(io, send);
+            host.peer_leaves.insert(io, (source, send));
             io
         };
         Peers::send(
@@ -984,8 +1050,11 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
         state.borrow_mut().forget_blobs(&names);
     }
     if authorized {
-        for page in resident {
+        for (index, page) in resident.into_iter().enumerate() {
             GuestMem::evict(world, page).await;
+            if (index + 1) % HYDRATE_BATCH == 0 {
+                yield_now().await;
+            }
         }
         Peers::send(world, from, PeerMsg::ReleasedAck { vset }).await;
     }

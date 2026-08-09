@@ -18,6 +18,8 @@ use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
 
 pub type SharedHost = Rc<RefCell<HostState>>;
 type ReplicaStatusSender = OneSender<(HostId, Option<crate::protocol::ReplicaCommitInfo>)>;
+type PeerBytesSender = (HostId, OneSender<Option<Vec<u8>>>);
+type ReplicaUploadSender = (HostId, OneSender<()>);
 
 pub struct HostState {
     pub config: HostConfig,
@@ -29,8 +31,8 @@ pub struct HostState {
     pub pressure_waiters: VecDeque<OneSender<()>>,
     pub filling_pages: BTreeSet<PageId>,
     pub page_fill_waiters: BTreeMap<PageId, Vec<OneSender<bool>>>,
-    pub peer_pages: BTreeMap<crate::protocol::PeerRequestId, OneSender<Option<Vec<u8>>>>,
-    pub peer_leaves: BTreeMap<crate::protocol::PeerRequestId, OneSender<Option<Vec<u8>>>>,
+    pub peer_pages: BTreeMap<crate::protocol::PeerRequestId, PeerBytesSender>,
+    pub peer_leaves: BTreeMap<crate::protocol::PeerRequestId, PeerBytesSender>,
     pub inbound_migrations: BTreeSet<VsetId>,
     pub migration_accepts: BTreeMap<VsetId, OneSender<()>>,
     pub replicas: BTreeMap<ReplicaKey, ReplicaState>,
@@ -39,6 +41,7 @@ pub struct HostState {
     pub replica_put_waiters:
         BTreeMap<(VsetId, u64, crate::protocol::ReplicaArtifact, u32), OneSender<HostId>>,
     pub replica_commit_waiters: BTreeMap<(VsetId, u64, u64, JournalSeq, u64), OneSender<HostId>>,
+    pub replica_upload_waiters: BTreeMap<(VsetId, u64, u64, JournalSeq, u64), ReplicaUploadSender>,
     pub replica_releases: Vec<(HostId, VsetId, u64, crate::protocol::ReplicaCommitInfo)>,
     next_peer_request: u64,
     next_attachment_generation: u64,
@@ -66,6 +69,7 @@ impl HostState {
             replica_status_waiters: BTreeMap::new(),
             replica_put_waiters: BTreeMap::new(),
             replica_commit_waiters: BTreeMap::new(),
+            replica_upload_waiters: BTreeMap::new(),
             replica_releases: Vec::new(),
             next_peer_request: 0,
             next_attachment_generation: 0,
@@ -689,6 +693,43 @@ pub struct CaptureLease {
     vset: VsetId,
     incarnation: u64,
     active: bool,
+}
+
+pub struct CommitFlagLease {
+    state: SharedHost,
+    vset: VsetId,
+    incarnation: u64,
+    active: bool,
+}
+
+impl CommitFlagLease {
+    pub fn new(state: &SharedHost, vset: VsetId, incarnation: u64) -> Self {
+        Self {
+            state: Rc::clone(state),
+            vset,
+            incarnation,
+            active: true,
+        }
+    }
+
+    pub fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for CommitFlagLease {
+    fn drop(&mut self) {
+        if self.active
+            && let Some(vset) = self
+                .state
+                .borrow_mut()
+                .vsets
+                .get_mut(&self.vset)
+                .filter(|vset| vset.incarnation == self.incarnation)
+        {
+            vset.commit_running = false;
+        }
+    }
 }
 
 impl CaptureLease {

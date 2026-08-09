@@ -47,8 +47,23 @@ pub async fn create_backed<W>(
         vset_state.head_version = Some(version);
         host.counters.assignment_claims += 1;
     }
-    if !finish_creation(Rc::clone(&state), world.as_ref(), req, vset, incarnation).await {
+    if !finish_creation(Rc::clone(&state), world.as_ref(), vset, incarnation).await {
         AdminIo::abort(world.as_ref(), "backed journal creation failed").await;
+        return;
+    }
+    publish_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
+    let published = state.borrow().vsets.get(&vset).is_some_and(|vset_state| {
+        let Some(record) = vset_state.best_record.as_ref() else {
+            return false;
+        };
+        vset_state.backed.is_some_and(|pointer| {
+            (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
+        })
+    });
+    if published {
+        AdminIo::reply_admin(world.as_ref(), AdminReply::VsetCreated { req, vset }).await;
+    } else {
+        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
     }
 }
 
@@ -82,6 +97,24 @@ pub(super) async fn claim_new_head_with_stash<W: Store>(
             Ok(version) => return Some(version),
             Err(StoreError::Fault(StoreFault::CasConflict { .. })) => {
                 state.borrow_mut().counters.assignment_claim_conflicts += 1;
+                match Store::get(world, &layout::head_key(vset)).await {
+                    Ok(Some((version, bytes))) => {
+                        let ours = HeadRecord::decode(vset, &bytes).is_ok_and(|found| {
+                            found.holder == state.borrow().config.host
+                                && found.fence == 0
+                                && found.manifest.is_none()
+                                && found.stash == stash
+                        });
+                        if ours {
+                            return Some(version);
+                        }
+                    }
+                    Ok(None)
+                    | Err(
+                        StoreError::Fault(StoreFault::Unavailable | StoreFault::CasConflict { .. })
+                        | StoreError::TooLarge,
+                    ) => {}
+                }
                 return None;
             }
             Err(StoreError::TooLarge) => return None,

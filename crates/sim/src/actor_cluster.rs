@@ -964,6 +964,8 @@ fn start_migration(
         return false;
     }
     cancel_guest(vset, control);
+    let vmstate = control.borrow().guest_state[&vset].completed.get();
+    worlds[usize::from(from)].set_vmstate(vset, vmstate);
     let req = control.borrow_mut().req(Request::Migrate {
         vset,
         from,

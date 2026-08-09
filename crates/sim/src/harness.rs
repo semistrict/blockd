@@ -185,7 +185,7 @@ fn compat_report(actor: crate::actor_harness::ActorRunReport) -> RunReport {
         bitflips: actor.bitflips,
         blob_count: actor.blob_count,
         max_pause_ns: actor.max_pause_ns,
-        restores: 0,
+        restores: actor.restores,
         store_keys: actor.store_keys,
         store: StoreCounters::default(),
         published_segment_bytes: 0,

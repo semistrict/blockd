@@ -117,6 +117,8 @@ struct BlobState {
     bytes_written: u64,
     bytes_read: u64,
     bitflips: u64,
+    map_bytes_written: u64,
+    max_record_blob_bytes: u64,
 }
 
 #[derive(Default)]
@@ -135,11 +137,23 @@ struct MemoryState {
     protected: BTreeSet<PageId>,
     accessed: BTreeSet<PageId>,
     paused: BTreeSet<VsetId>,
+    in_ops: BTreeSet<VsetId>,
     vmstate: BTreeMap<VsetId, u64>,
     failed: BTreeSet<PageId>,
 }
 
 type PeerInbox = UnboundedSender<(HostId, PeerMsg)>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OracleSnapshot {
+    pub(crate) pages: BTreeMap<PageId, Vec<u8>>,
+    pub(crate) unknown: BTreeSet<PageId>,
+}
+
+type OracleState = (
+    Rc<RefCell<BTreeMap<PageId, Vec<u8>>>>,
+    Rc<RefCell<BTreeSet<PageId>>>,
+);
 
 #[derive(Default)]
 pub(crate) struct SimNetwork {
@@ -235,6 +249,10 @@ pub(crate) struct SimWorld {
     page_reads_in_poll: Cell<u64>,
     max_page_reads_in_poll: Cell<u64>,
     pause_started: RefCell<BTreeMap<VsetId, u64>>,
+    pause_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
+    operation_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
+    oracle_pages: RefCell<BTreeMap<VsetId, OracleState>>,
+    checkpoint_snapshots: RefCell<BTreeMap<(VsetId, u64), Vec<OracleSnapshot>>>,
     max_pause_ns: Cell<u64>,
 }
 
@@ -321,6 +339,10 @@ impl SimWorld {
             page_reads_in_poll: Cell::new(0),
             max_page_reads_in_poll: Cell::new(0),
             pause_started: RefCell::new(BTreeMap::new()),
+            pause_waiters: RefCell::new(BTreeMap::new()),
+            operation_waiters: RefCell::new(BTreeMap::new()),
+            oracle_pages: RefCell::new(BTreeMap::new()),
+            checkpoint_snapshots: RefCell::new(BTreeMap::new()),
             max_pause_ns: Cell::new(0),
         });
         network
@@ -332,6 +354,25 @@ impl SimWorld {
 
     pub(crate) fn enqueue_admin(&self, command: AdminCmd) {
         assert!(self.admin.send(command), "admin actor is alive");
+    }
+
+    pub(crate) fn register_oracle_pages(
+        &self,
+        vset: VsetId,
+        pages: Rc<RefCell<BTreeMap<PageId, Vec<u8>>>>,
+        unknown: Rc<RefCell<BTreeSet<PageId>>>,
+    ) {
+        self.oracle_pages
+            .borrow_mut()
+            .insert(vset, (pages, unknown));
+    }
+
+    pub(crate) fn checkpoint_snapshots(&self, vset: VsetId, vmstate: u64) -> Vec<OracleSnapshot> {
+        self.checkpoint_snapshots
+            .borrow()
+            .get(&(vset, vmstate))
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) async fn next_admin_reply(&self) -> Option<AdminReply> {
@@ -459,6 +500,15 @@ impl SimWorld {
         }
         self.faults.discard_pending();
         self.syncs.discard_pending();
+        let pause_waiters = std::mem::take(&mut *self.pause_waiters.borrow_mut());
+        let operation_waiters = std::mem::take(&mut *self.operation_waiters.borrow_mut());
+        for waiter in pause_waiters
+            .into_values()
+            .flatten()
+            .chain(operation_waiters.into_values().flatten())
+        {
+            let _ = waiter.send(());
+        }
         *self.memory.borrow_mut() = MemoryState::default();
     }
 
@@ -471,16 +521,43 @@ impl SimWorld {
     }
 
     pub(crate) fn bitflip_record(&self, mirror: Option<bool>) -> bool {
-        self.bitflip_local(|name| {
-            let extension = std::path::Path::new(name)
-                .extension()
-                .and_then(|extension| extension.to_str());
-            match mirror {
-                Some(false) => extension == Some("rec"),
-                Some(true) => extension == Some("recm"),
-                None => matches!(extension, Some("rec" | "recm")),
-            }
-        })
+        let selected = self
+            .blobs
+            .borrow()
+            .durable
+            .iter()
+            .filter_map(|(name, bytes)| {
+                if bytes.is_empty() {
+                    return None;
+                }
+                let extension = std::path::Path::new(name)
+                    .extension()
+                    .and_then(|extension| extension.to_str());
+                let copy_matches = match mirror {
+                    Some(false) => extension == Some("rec"),
+                    Some(true) => extension == Some("recm"),
+                    None => matches!(extension, Some("rec" | "recm")),
+                };
+                if !copy_matches {
+                    return None;
+                }
+                match blockd_core::layout::parse_blob(name) {
+                    Some(blockd_core::layout::BlobName::Journal { fence, seq, .. }) => {
+                        Some((fence, seq, name.clone()))
+                    }
+                    _ => None,
+                }
+            })
+            .max_by_key(|(fence, seq, _)| (*fence, *seq));
+        let Some((_, _, name)) = selected else {
+            return false;
+        };
+        let mut blobs = self.blobs.borrow_mut();
+        let bytes = blobs.durable.get_mut(&name).expect("selected blob exists");
+        let bit = usize::try_from(random_u64() % (bytes.len() as u64 * 8)).expect("bit fits");
+        bytes[bit / 8] ^= 1 << (bit % 8);
+        blobs.bitflips += 1;
+        true
     }
 
     fn bitflip_local(&self, matches: impl Fn(&str) -> bool) -> bool {
@@ -508,12 +585,57 @@ impl SimWorld {
         self.blobs.borrow().bitflips
     }
 
+    pub(crate) fn write_metrics(&self) -> (u64, u64) {
+        let blobs = self.blobs.borrow();
+        (blobs.map_bytes_written, blobs.max_record_blob_bytes)
+    }
+
     pub(crate) fn set_vmstate(&self, vset: VsetId, vmstate: u64) {
-        self.memory.borrow_mut().vmstate.insert(vset, vmstate);
+        {
+            let mut memory = self.memory.borrow_mut();
+            memory.vmstate.insert(vset, vmstate);
+            memory.in_ops.remove(&vset);
+        }
+        for waiter in self
+            .pause_waiters
+            .borrow_mut()
+            .remove(&vset)
+            .unwrap_or_default()
+        {
+            let _ = waiter.send(());
+        }
+    }
+
+    async fn begin_guest_op(&self, vset: VsetId) {
+        loop {
+            let wait = {
+                let mut memory = self.memory.borrow_mut();
+                if memory.paused.contains(&vset) {
+                    let (send, receive) = oneshot();
+                    self.operation_waiters
+                        .borrow_mut()
+                        .entry(vset)
+                        .or_default()
+                        .push(send);
+                    Some(receive)
+                } else {
+                    memory.in_ops.insert(vset);
+                    None
+                }
+            };
+            let Some(wait) = wait else {
+                return;
+            };
+            let _ = wait.await;
+        }
     }
 
     pub(crate) fn is_paused(&self, vset: VsetId) -> bool {
         self.memory.borrow().paused.contains(&vset)
+    }
+
+    pub(crate) fn vmstate_ready(&self, vset: VsetId) -> bool {
+        self.memory.borrow().vmstate.contains_key(&vset)
     }
 
     pub(crate) fn page_bytes(&self, page: PageId) -> Option<Vec<u8>> {
@@ -540,6 +662,7 @@ impl SimWorld {
     }
 
     pub(crate) async fn fault(&self, page: PageId, write: bool) -> bool {
+        self.begin_guest_op(page.volume.vset).await;
         loop {
             let (ready, paused) = {
                 let memory = self.memory.borrow();
@@ -575,6 +698,7 @@ impl SimWorld {
     }
 
     pub(crate) async fn sync(&self, sync: GuestSync) -> bool {
+        self.begin_guest_op(sync.volume.vset).await;
         let (send, receive) = oneshot();
         self.sync_waiters.borrow_mut().insert(sync.req, send);
         if !self.syncs.send(sync) {
@@ -613,6 +737,15 @@ impl SimWorld {
     fn apply_blob(&self, name: String, bytes: Vec<u8>, kind: BlobWriteKind) {
         let mut blobs = self.blobs.borrow_mut();
         blobs.bytes_written = blobs.bytes_written.saturating_add(bytes.len() as u64);
+        let extension = std::path::Path::new(&name)
+            .extension()
+            .and_then(|extension| extension.to_str());
+        if matches!(extension, Some("rec" | "recm" | "map")) {
+            blobs.map_bytes_written = blobs.map_bytes_written.saturating_add(bytes.len() as u64);
+        }
+        if matches!(extension, Some("rec" | "recm")) {
+            blobs.max_record_blob_bytes = blobs.max_record_blob_bytes.max(bytes.len() as u64);
+        }
         match kind {
             BlobWriteKind::New => {
                 blobs.durable.insert(name, bytes);
@@ -705,6 +838,10 @@ impl Blobs for SimWorld {
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
         let latency = self.blob_latency(bytes.len(), true);
         if self.drop_handoff_writes.get() && name.ends_with("/handoff") {
+            delay(latency).await;
+            return Ok(());
+        }
+        if self.blobs.borrow().durable.get(&name) == Some(&bytes) {
             delay(latency).await;
             return Ok(());
         }
@@ -1080,9 +1217,54 @@ impl GuestMem for SimWorld {
 
     async fn pause(&self, vset: VsetId) -> u64 {
         self.pause_started.borrow_mut().entry(vset).or_insert(now());
-        let mut memory = self.memory.borrow_mut();
-        memory.paused.insert(vset);
-        memory.vmstate.get(&vset).copied().unwrap_or(0)
+        loop {
+            let decision = {
+                let mut memory = self.memory.borrow_mut();
+                if memory.in_ops.contains(&vset) || !memory.vmstate.contains_key(&vset) {
+                    let (send, receive) = oneshot();
+                    self.pause_waiters
+                        .borrow_mut()
+                        .entry(vset)
+                        .or_default()
+                        .push(send);
+                    Err(receive)
+                } else {
+                    memory.paused.insert(vset);
+                    Ok(memory.vmstate.get(&vset).copied().unwrap_or(0))
+                }
+            };
+            match decision {
+                Ok(vmstate) => {
+                    if let Some((pages, unknown)) = self.oracle_pages.borrow().get(&vset) {
+                        let snapshot = OracleSnapshot {
+                            pages: pages.borrow().clone(),
+                            unknown: unknown.borrow().clone(),
+                        };
+                        let memory = self.memory.borrow();
+                        let zero = vec![0; blockd_core::types::page_size()];
+                        for (page, actual) in memory.pages.iter().filter(|(page, _)| {
+                            page.volume.vset == vset && !snapshot.unknown.contains(page)
+                        }) {
+                            assert_eq!(
+                                actual,
+                                snapshot.pages.get(page).unwrap_or(&zero),
+                                "guest model diverged before checkpoint at vmstate {vmstate} for {page:?}"
+                            );
+                        }
+                        drop(memory);
+                        let mut snapshots = self.checkpoint_snapshots.borrow_mut();
+                        let candidates = snapshots.entry((vset, vmstate)).or_default();
+                        if candidates.last() != Some(&snapshot) {
+                            candidates.push(snapshot);
+                        }
+                    }
+                    return vmstate;
+                }
+                Err(wait) => {
+                    let _ = wait.await;
+                }
+            }
+        }
     }
 
     async fn resume(&self, vset: VsetId) {
@@ -1091,6 +1273,14 @@ impl GuestMem for SimWorld {
                 .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
         }
         self.memory.borrow_mut().paused.remove(&vset);
+        for waiter in self
+            .operation_waiters
+            .borrow_mut()
+            .remove(&vset)
+            .unwrap_or_default()
+        {
+            let _ = waiter.send(());
+        }
         let pages = self
             .fault_waiters
             .borrow()
@@ -1252,6 +1442,7 @@ mod tests {
         };
         let seen_at = Rc::new(Cell::new(None));
         let mut executor = Executor::simulation(9);
+        world.set_vmstate(VsetId(1), 0);
         executor.block_on({
             let world = Rc::clone(&world);
             async move { GuestMem::pause(world.as_ref(), VsetId(1)).await }
@@ -1292,6 +1483,41 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_pause_waits_for_an_inflight_guest_operation() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let vset = VsetId(1);
+        world.memory.borrow_mut().in_ops.insert(vset);
+        let mut executor = Executor::simulation(10);
+        let paused_at = Rc::new(Cell::new(None));
+        let pause = executor.spawn({
+            let world = Rc::clone(&world);
+            let paused_at = Rc::clone(&paused_at);
+            async move {
+                let vmstate = GuestMem::pause(world.as_ref(), vset).await;
+                paused_at.set(Some(now()));
+                vmstate
+            }
+        });
+        executor
+            .spawn({
+                let world = Rc::clone(&world);
+                async move {
+                    delay(10).await;
+                    world.set_vmstate(vset, 7);
+                }
+            })
+            .detach();
+        assert_eq!(executor.block_on(pause), Ok(7));
+        assert_eq!(paused_at.get(), Some(10));
+    }
+
+    #[test]
     fn crash_discards_stale_guest_events() {
         let network = Rc::new(SimNetwork::default());
         let world = SimWorld::new(
@@ -1317,5 +1543,70 @@ mod tests {
 
         assert!(world.faults.try_recv().is_none());
         assert!(world.syncs.try_recv().is_none());
+    }
+
+    #[test]
+    fn scheduled_record_rot_targets_the_newest_requested_copy() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let older =
+            blockd_core::layout::journal_blob(VsetId(1), 2, blockd_core::types::JournalSeq(3));
+        let newer =
+            blockd_core::layout::journal_blob(VsetId(1), 2, blockd_core::types::JournalSeq(4));
+        world
+            .blobs
+            .borrow_mut()
+            .durable
+            .insert(older.clone(), vec![0; 8]);
+        world
+            .blobs
+            .borrow_mut()
+            .durable
+            .insert(newer.clone(), vec![0; 8]);
+
+        let mut executor = Executor::simulation(19);
+        let task_world = Rc::clone(&world);
+        let (flipped, older_bytes, newer_bytes) = executor.block_on(async move {
+            let flipped = task_world.bitflip_record(Some(false));
+            let blobs = task_world.blobs.borrow();
+            (
+                flipped,
+                blobs.durable[&older].clone(),
+                blobs.durable[&newer].clone(),
+            )
+        });
+        assert!(flipped);
+        assert_eq!(older_bytes, vec![0; 8]);
+        assert_ne!(newer_bytes, vec![0; 8]);
+    }
+
+    #[test]
+    fn write_metrics_include_blobs_deleted_before_the_report() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let name =
+            blockd_core::layout::journal_blob(VsetId(1), 1, blockd_core::types::JournalSeq(0));
+        let mut executor = Executor::simulation(21);
+        let task_world = Rc::clone(&world);
+        executor.block_on(async move {
+            Blobs::write(task_world.as_ref(), name.clone(), vec![1; 32])
+                .await
+                .expect("write record");
+            Blobs::delete(task_world.as_ref(), &name)
+                .await
+                .expect("delete record");
+        });
+        assert_eq!(world.write_metrics(), (32, 32));
+        assert_eq!(world.blob_count(), 0);
     }
 }

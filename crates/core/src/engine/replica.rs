@@ -157,8 +157,17 @@ where
                 })
             });
             if valid {
-                if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                    vset_state.peer_upload_done = Some(info);
+                let waiter = {
+                    let mut host = state.borrow_mut();
+                    if let Some(vset_state) = host.vsets.get_mut(&vset) {
+                        retain_latest_upload(vset_state, info);
+                    }
+                    host.replica_upload_waiters
+                        .remove(&commit_wait_key(vset, assignment_epoch, info))
+                        .filter(|(expected, _)| *expected == from)
+                };
+                if let Some((_, waiter)) = waiter {
+                    let _ = waiter.send(());
                 }
             } else {
                 state.borrow_mut().counters.replica_rejected += 1;
@@ -217,6 +226,15 @@ where
             }
         }
         _ => unreachable!("non-replica message"),
+    }
+}
+
+fn retain_latest_upload(vset_state: &mut super::state::VsetState, info: ReplicaCommitInfo) {
+    if vset_state
+        .peer_upload_done
+        .is_none_or(|current| commit_rank(info) >= commit_rank(current))
+    {
+        vset_state.peer_upload_done = Some(info);
     }
 }
 
@@ -357,10 +375,12 @@ async fn replica_commit<W>(
         vset,
         assignment_epoch,
     };
-    let complete = state.borrow().replicas.get(&key).is_some_and(|replica| {
-        required
-            .iter()
-            .all(|artifact| replica.artifacts.contains_key(artifact))
+    let complete = required.iter().all(|artifact| {
+        state
+            .borrow()
+            .replicas
+            .get(&key)
+            .is_some_and(|replica| replica.artifacts.contains_key(artifact))
     });
     let Ok(frame) = seal_replica_commit(source, vset, assignment_epoch, info, &required, &record)
     else {
@@ -702,13 +722,20 @@ where
     W: Store + Peers + AdminIo + 'static,
 {
     let Some((incarnation, expected, pointer, head, retry, record)) = ({
-        let host = state.borrow();
-        host.vsets.get(&vset).and_then(|vset_state| {
+        let mut host = state.borrow_mut();
+        let holder = host.config.host;
+        let retry = host.config.backup_retry;
+        host.vsets.get_mut(&vset).and_then(|vset_state| {
+            if vset_state.publishing {
+                return None;
+            }
             let info = vset_state.peer_upload_done?;
             let record = vset_state.best_record.clone()?;
             if commit_info(&record) != info {
                 return None;
             }
+            let expected = vset_state.head_version?;
+            vset_state.publishing = true;
             let pointer = ManifestPtr {
                 fence: info.writer_fence,
                 seq: info.seq,
@@ -716,23 +743,24 @@ where
             };
             Some((
                 vset_state.incarnation,
-                vset_state.head_version?,
+                expected,
                 pointer,
                 HeadRecord {
                     vset,
-                    holder: host.config.host,
+                    holder,
                     fence: vset_state.fence,
                     manifest: Some(pointer),
                     stash: vset_state.stash_assignment,
                     retired_stashes: vset_state.retired_stashes.clone(),
                 },
-                host.config.backup_retry,
+                retry,
                 record,
             ))
         })
     }) else {
         return;
     };
+    let _lease = ReplicaPublishLease::new(&state, vset, incarnation);
     let mut expected = expected;
     let version = loop {
         match Store::put_cas(
@@ -921,7 +949,7 @@ pub async fn create_peer_stashed<W>(
     vset: VsetId,
     config: VsetConfig,
 ) where
-    W: Blobs + Store + GuestMem + AdminIo + 'static,
+    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
     if config.durability != DurabilityMode::PeerStashed || state.borrow().vsets.contains_key(&vset)
     {
@@ -949,15 +977,97 @@ pub async fn create_peer_stashed<W>(
         vset_state.stash_assignment = Some(stash);
         host.counters.assignment_claims += 1;
     }
-    if !finish_creation(Rc::clone(&state), world.as_ref(), req, vset, incarnation).await {
+    if !finish_creation(Rc::clone(&state), world.as_ref(), vset, incarnation).await {
         AdminIo::abort(world.as_ref(), "peer-stashed journal creation failed").await;
+        return;
     }
+    loop {
+        replicate_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
+        wait_for_latest_upload(&state, vset).await;
+        publish_replica_head(Rc::clone(&state), Rc::clone(&world), vset).await;
+        let published = state.borrow().vsets.get(&vset).is_some_and(|vset_state| {
+            let Some(record) = vset_state.best_record.as_ref() else {
+                return false;
+            };
+            vset_state.backed.is_some_and(|pointer| {
+                (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
+            })
+        });
+        if published {
+            AdminIo::reply_admin(world.as_ref(), AdminReply::VsetCreated { req, vset }).await;
+            return;
+        }
+        if !state.borrow().vsets.contains_key(&vset) {
+            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
+            return;
+        }
+        let retry = state.borrow().config.backup_retry;
+        delay(retry).await;
+    }
+}
+
+async fn wait_for_latest_upload(state: &SharedHost, vset: VsetId) {
+    let Some((target, assignment_epoch, info, retry)) = (|| {
+        let host = state.borrow();
+        let vset_state = host.vsets.get(&vset)?;
+        let stash = vset_state.stash_assignment?;
+        let info = commit_info(vset_state.best_record.as_ref()?);
+        vset_state
+            .peer_upload_done
+            .is_none_or(|uploaded| commit_rank(uploaded) < commit_rank(info))
+            .then_some((
+                stash.transition_peer.unwrap_or(stash.active_peer),
+                stash.assignment_epoch,
+                info,
+                host.config.backup_retry,
+            ))
+    })() else {
+        return;
+    };
+    let key = commit_wait_key(vset, assignment_epoch, info);
+    let (send, receive) = oneshot();
+    state
+        .borrow_mut()
+        .replica_upload_waiters
+        .insert(key, (target, send));
+    let _ = timeout(retry, receive).await;
+    state.borrow_mut().replica_upload_waiters.remove(&key);
 }
 
 struct ReplicationLease {
     state: SharedHost,
     vset: VsetId,
     incarnation: u64,
+}
+
+struct ReplicaPublishLease {
+    state: SharedHost,
+    vset: VsetId,
+    incarnation: u64,
+}
+
+impl ReplicaPublishLease {
+    fn new(state: &SharedHost, vset: VsetId, incarnation: u64) -> Self {
+        Self {
+            state: Rc::clone(state),
+            vset,
+            incarnation,
+        }
+    }
+}
+
+impl Drop for ReplicaPublishLease {
+    fn drop(&mut self) {
+        if let Some(vset_state) = self
+            .state
+            .borrow_mut()
+            .vsets
+            .get_mut(&self.vset)
+            .filter(|vset_state| vset_state.incarnation == self.incarnation)
+        {
+            vset_state.publishing = false;
+        }
+    }
 }
 
 impl Drop for ReplicationLease {
@@ -985,9 +1095,12 @@ where
         host.vsets.get_mut(&vset).and_then(|vset_state| {
             let record = vset_state.best_record.clone()?;
             let stash = vset_state.stash_assignment?;
+            let record_is_backed = vset_state.backed.is_some_and(|pointer| {
+                (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
+            });
             let needed = vset_state.config.durability.requires_peer_sync()
                 && !vset_state.replicating
-                && record.sync_covered_through > vset_state.sync_ack_through;
+                && (!record_is_backed || record.sync_covered_through > vset_state.sync_ack_through);
             needed.then(|| {
                 vset_state.replicating = true;
                 (
@@ -1388,7 +1501,7 @@ fn adopt_assignment_from_head(
     true
 }
 
-fn initial_stash(state: &SharedHost, vset: VsetId) -> Option<StashAssignment> {
+pub(super) fn initial_stash(state: &SharedHost, vset: VsetId) -> Option<StashAssignment> {
     let host = state.borrow();
     let placement = host.config.replica_placement.as_ref()?;
     let target = rank_stash_candidates(
@@ -1754,6 +1867,7 @@ mod tests {
     use super::*;
     use crate::hostmeta::{HostConfig, ReplicaPlacementConfig};
     use crate::placement::PeerCandidate;
+    use crate::types::JournalSeq;
 
     fn test_state(host: HostId) -> SharedHost {
         Rc::new(RefCell::new(super::super::state::HostState::new(
@@ -1787,6 +1901,24 @@ mod tests {
             },
         );
         assert_eq!(replica_append_plan(&state, key, 1), Some((1, true)));
+    }
+
+    #[test]
+    fn older_upload_completion_cannot_replace_the_latest_commit() {
+        let mut state = super::super::state::VsetState::fresh(VsetConfig::compute(1, 4, true), 1);
+        let newer = ReplicaCommitInfo {
+            writer_fence: 3,
+            seq: JournalSeq(7),
+            sync_covered_through: 9,
+        };
+        let older = ReplicaCommitInfo {
+            writer_fence: 3,
+            seq: JournalSeq(6),
+            sync_covered_through: 8,
+        };
+        retain_latest_upload(&mut state, newer);
+        retain_latest_upload(&mut state, older);
+        assert_eq!(state.peer_upload_done, Some(newer));
     }
 
     #[test]

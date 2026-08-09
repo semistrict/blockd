@@ -5,6 +5,7 @@
 //! durability, no auth, one process's memory.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -161,6 +162,87 @@ impl FakeGcs {
             _ => response(405, &[], b"method not allowed".to_vec()),
         }
     }
+
+    fn list_response(&self, bucket_path: &str, query: &str) -> Response {
+        let prefix = query
+            .split('&')
+            .find_map(|part| part.strip_prefix("prefix="))
+            .map(percent_decode)
+            .unwrap_or_default();
+        let token = query
+            .split('&')
+            .find_map(|part| part.strip_prefix("continuation-token="))
+            .map(percent_decode);
+        let root = format!("{}/", bucket_path.trim_start_matches('/'));
+        let mut names = self
+            .objects
+            .lock()
+            .expect("lock")
+            .keys()
+            .filter_map(|key| key.strip_prefix(&root))
+            .filter(|key| key.starts_with(&prefix))
+            .filter(|key| token.as_deref().is_none_or(|token| *key > token))
+            .take(1_001)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let truncated = names.len() > 1_000;
+        names.truncate(1_000);
+        let next = truncated
+            .then(|| names.last().cloned())
+            .flatten()
+            .map(|key| {
+                format!(
+                    "<NextContinuationToken>{}</NextContinuationToken>",
+                    xml_escape(&key)
+                )
+            })
+            .unwrap_or_default();
+        let contents = names.iter().fold(String::new(), |mut contents, key| {
+            write!(
+                contents,
+                "<Contents><Key>{}</Key></Contents>",
+                xml_escape(key)
+            )
+            .expect("writing XML into a string cannot fail");
+            contents
+        });
+        response(
+            200,
+            &[],
+            format!(
+                "<ListBucketResult><IsTruncated>{truncated}</IsTruncated>{next}{contents}</ListBucketResult>"
+            )
+            .into_bytes(),
+        )
+    }
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16)
+        {
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 async fn handle(
@@ -229,6 +311,13 @@ async fn handle(
             response_for(&seen.method, status, &[], b"scripted".to_vec())
         }
         Some(Fault::DropConnection) => dropped_connection_response(),
+        None if method == Method::GET
+            && uri
+                .query()
+                .is_some_and(|query| query.contains("list-type=2")) =>
+        {
+            server.list_response(uri.path(), uri.query().unwrap_or_default())
+        }
         None => server.object_response(&seen, body.to_vec()),
     }
 }

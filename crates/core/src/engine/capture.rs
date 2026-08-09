@@ -157,10 +157,12 @@ pub async fn create_fresh_local<W>(
         let mut host = state.borrow_mut();
         host.insert_fresh(vset, config)
     };
-    if !finish_creation(Rc::clone(&state), world.as_ref(), req, vset, incarnation).await {
+    if !finish_creation(Rc::clone(&state), world.as_ref(), vset, incarnation).await {
         state.borrow_mut().vsets.remove(&vset);
         AdminIo::abort(world.as_ref(), "local journal write failed").await;
+        return;
     }
+    AdminIo::reply_admin(world.as_ref(), AdminReply::VsetCreated { req, vset }).await;
 }
 
 fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
@@ -178,10 +180,9 @@ fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
     }
 }
 
-pub(super) async fn finish_creation<W: Blobs + AdminIo>(
+pub(super) async fn finish_creation<W: Blobs>(
     state: SharedHost,
     world: &W,
-    req: ReqId,
     vset: VsetId,
     incarnation: u64,
 ) -> bool {
@@ -213,7 +214,6 @@ pub(super) async fn finish_creation<W: Blobs + AdminIo>(
         vset_state.record_writes.insert(record.seq, (fence, 0));
         host.counters.records_written += 1;
     }
-    AdminIo::reply_admin(world, AdminReply::VsetCreated { req, vset }).await;
     true
 }
 
@@ -434,29 +434,42 @@ where
     if !protect.is_empty() {
         GuestMem::arm_write_protect(world.as_ref(), &protect).await;
     }
-    if checkpoint.is_some_and(|checkpoint| checkpoint.req.is_some()) {
-        GuestMem::resume(world.as_ref(), vset).await;
-    }
 
-    let mut builder = SegmentBatchBuilder::new(vset, fence, first_seg);
+    let resume_after_capture = checkpoint.is_some_and(|checkpoint| checkpoint.req.is_some());
+    let mut captured_pages = Vec::with_capacity(pages.len());
+    let mut capture_valid = true;
     for (index, page) in pages.iter().copied().enumerate() {
         let observed = GuestMem::read_page(world.as_ref(), page).await;
-        let (generation, bytes) = {
+        let captured = {
             let mut host = state.borrow_mut();
-            let vset_state = host
-                .vsets
+            host.vsets
                 .get_mut(&vset)
-                .filter(|state| state.incarnation == incarnation)?;
-            let drain = vset_state.drain.as_mut()?;
-            match drain.unread.remove(&page) {
-                Some(generation) => (generation, observed),
-                None => drain.copied_on_fault.remove(&page)?,
-            }
+                .filter(|state| state.incarnation == incarnation)
+                .and_then(|vset_state| vset_state.drain.as_mut())
+                .and_then(|drain| match drain.unread.remove(&page) {
+                    Some(generation) => Some((generation, observed)),
+                    None => drain.copied_on_fault.remove(&page),
+                })
         };
-        builder.add(page, generation, &bytes);
+        let Some((generation, bytes)) = captured else {
+            capture_valid = false;
+            break;
+        };
+        captured_pages.push((page, generation, bytes));
         if (index + 1) % DRAIN_PAGES_PER_POLL == 0 {
             yield_now().await;
         }
+    }
+    if resume_after_capture {
+        GuestMem::resume(world.as_ref(), vset).await;
+    }
+    if !capture_valid {
+        return None;
+    }
+
+    let mut builder = SegmentBatchBuilder::new(vset, fence, first_seg);
+    for (page, generation, bytes) in captured_pages {
+        builder.add(page, generation, &bytes);
     }
     let rescues = {
         let mut host = state.borrow_mut();

@@ -16,7 +16,7 @@ use blockd_workload::{
     LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
 };
 
-use crate::actor_world::{SimNetwork, SimWorld};
+use crate::actor_world::{OracleSnapshot, SimNetwork, SimWorld};
 use crate::guest::page_pattern;
 use crate::world::blobdev::BlobDevConfig;
 use crate::world::store::StoreConfig;
@@ -70,6 +70,7 @@ pub struct ActorRunReport {
     pub resumes: u64,
     pub cold_boots: u64,
     pub unrestorable: u64,
+    pub restores: u64,
     pub guest_deaths: u64,
     pub bitflips: u64,
 }
@@ -77,10 +78,13 @@ pub struct ActorRunReport {
 #[derive(Default)]
 struct GuestState {
     completed: Cell<u64>,
-    expected: RefCell<BTreeMap<PageId, Vec<u8>>>,
+    total_completed: Cell<u64>,
+    expected: Rc<RefCell<BTreeMap<PageId, Vec<u8>>>>,
     durable_expected: RefCell<BTreeMap<PageId, Vec<u8>>>,
     written_sequences: RefCell<BTreeMap<PageId, BTreeSet<u64>>>,
-    recovering_pages: RefCell<BTreeSet<PageId>>,
+    recovering_pages: Rc<RefCell<BTreeSet<PageId>>>,
+    exact_recovery: Cell<bool>,
+    exact_candidates: RefCell<Vec<OracleSnapshot>>,
     volume_sequences: RefCell<BTreeMap<VolumeId, u64>>,
     violations: RefCell<Vec<String>>,
 }
@@ -91,7 +95,64 @@ struct RunEvents {
     resumes: Cell<u64>,
     cold_boots: Cell<u64>,
     unrestorable: Cell<u64>,
+    restores: Cell<u64>,
     guest_deaths: Cell<u64>,
+    retired_counters: RefCell<Counters>,
+}
+
+fn merge_counters(total: &mut Counters, current: &Counters) {
+    macro_rules! add {
+        ($($field:ident),+ $(,)?) => {
+            $(total.$field = total.$field.saturating_add(current.$field);)+
+        };
+    }
+    add!(
+        fills,
+        zero_fills,
+        shared_fills,
+        wp_faults,
+        guest_pages_dirtied,
+        faults_unservable,
+        pressure_waits,
+        pages_flushed,
+        records_written,
+        checkpoints_done,
+        syncs_acked,
+        guest_rejected,
+        peer_rejected,
+        blobs_deleted,
+        manifests_published,
+        store_retries,
+        fenced,
+        assignment_claims,
+        assignment_claim_conflicts,
+        nvme_reclaims,
+        nvme_stalls,
+        prefetch_fills,
+        hydrate_fills,
+        peer_retries,
+        cow_captures,
+        wedged_guests,
+        wedged_hydration,
+        wedged_outbound,
+        leaf_rolls,
+        leaf_fills,
+        segs_compacted,
+        pages_compacted,
+        replica_bytes,
+        replica_rejected,
+        replica_commits,
+        replica_store_bytes,
+        replica_unlinks,
+        replica_network_bytes,
+        replica_logical_bytes,
+        replica_nonactive_bytes,
+        replica_replacement_bytes,
+        replica_cleanup_rewrite_bytes,
+        replica_artifact_flushes,
+        replica_commit_flushes,
+        replica_rotations,
+    );
 }
 
 type SharedHostState = Rc<RefCell<HostState>>;
@@ -227,6 +288,14 @@ pub fn run_final_blobs(
             .map(|number| (VsetId(u64::from(number)), Rc::new(GuestState::default())))
             .collect::<BTreeMap<_, _>>(),
     );
+    for (&vset, guest) in guest_states.iter() {
+        world.register_oracle_pages(
+            vset,
+            Rc::clone(&guest.expected),
+            Rc::clone(&guest.recovering_pages),
+        );
+        world.set_vmstate(vset, 0);
+    }
     let events = Rc::new(RunEvents::default());
     let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
     for number in 1..=config.vset_count {
@@ -308,29 +377,39 @@ pub fn run_final_blobs(
             guest.cancel();
         }
     }
-    supervisor.cancel();
     for mut actor in fault_actors {
         actor.cancel();
+    }
+    world.set_store_outage(false);
+    if host_slot.borrow().is_none() {
+        let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+        *state_slot.borrow_mut() = Rc::clone(&state);
+        *host_slot.borrow_mut() =
+            Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
     }
     executor.run_ready();
     let drain = executor
         .now()
         .saturating_add(config.host.writeback_interval.saturating_mul(4));
     executor.run_until(drain);
+    supervisor.cancel();
+    executor.run_ready();
 
     let blobs = world.durable_blobs();
     let final_state = Rc::clone(&state_slot.borrow());
+    let mut counters = *events.retired_counters.borrow();
+    merge_counters(&mut counters, &final_state.borrow().counters);
     let mut report = ActorRunReport {
         trace_hash: executor.trace_hash(),
         executor_polls: executor.polls(),
-        counters: final_state.borrow().counters,
+        counters,
         completed_ops: guest_states
             .values()
-            .map(|guest| guest.completed.get())
+            .map(|guest| guest.total_completed.get())
             .sum(),
         per_guest_completed: guest_states
             .iter()
-            .map(|(vset, guest)| (vset.0, guest.completed.get()))
+            .map(|(vset, guest)| (vset.0, guest.total_completed.get()))
             .collect(),
         blob_count: blobs.len(),
         store_keys: world.store_keys(),
@@ -342,6 +421,7 @@ pub fn run_final_blobs(
         resumes: events.resumes.get(),
         cold_boots: events.cold_boots.get(),
         unrestorable: events.unrestorable.get(),
+        restores: events.restores.get(),
         guest_deaths: events.guest_deaths.get(),
         bitflips: world.bitflips(),
         ..ActorRunReport::default()
@@ -351,21 +431,11 @@ pub fn run_final_blobs(
             .violations
             .extend(std::mem::take(&mut *guest.violations.borrow_mut()));
     }
+    (report.map_bytes_written, report.max_record_blob_bytes) = world.write_metrics();
     for (name, bytes) in &blobs {
         let extension = Path::new(name).extension().and_then(|value| value.to_str());
-        match extension {
-            Some("rec" | "recm" | "map") => {
-                report.map_bytes_written =
-                    report.map_bytes_written.saturating_add(bytes.len() as u64);
-                if matches!(extension, Some("rec" | "recm")) {
-                    report.max_record_blob_bytes =
-                        report.max_record_blob_bytes.max(bytes.len() as u64);
-                }
-            }
-            Some("seg") => {
-                report.seg_bytes_end = report.seg_bytes_end.saturating_add(bytes.len() as u64);
-            }
-            _ => {}
+        if let Some("seg") = extension {
+            report.seg_bytes_end = report.seg_bytes_end.saturating_add(bytes.len() as u64);
         }
     }
     if let Some(mut host) = host_slot.borrow_mut().take() {
@@ -398,8 +468,11 @@ pub fn run_workload(
         from_base: None,
     });
     let mut executor = Executor::simulation(seed);
-    let mut state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
-    let mut host = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+    let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+    let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
+    let host_slot = Rc::new(RefCell::new(Some(
+        executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world))),
+    )));
     let created = executor.block_on({
         let world = Rc::clone(&world);
         async move { world.next_admin_reply().await }
@@ -413,15 +486,79 @@ pub fn run_workload(
     ) {
         return Err(format!("vset creation failed: {created:?}"));
     }
+    world.set_vmstate(vset, 0);
+
+    let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+    let events = Rc::new(RunEvents::default());
+    let mut fault_actors = vec![executor.spawn(abort_schedule(
+        Rc::clone(&world),
+        Rc::clone(&host_slot),
+        Rc::clone(&state_slot),
+        Rc::clone(&guest_slots),
+        Rc::clone(&events),
+        config.host.clone(),
+        config.faults.restart_delay,
+    ))];
+    if !config.faults.crash_at.is_empty() || config.faults.crash_mean_interval != 0 {
+        fault_actors.push(executor.spawn(crash_schedule(
+            Rc::clone(&world),
+            Rc::clone(&host_slot),
+            Rc::clone(&state_slot),
+            Rc::clone(&guest_slots),
+            Rc::clone(&events),
+            config.host.clone(),
+            config.faults.clone(),
+            config.horizon,
+        )));
+    }
+    if let Some(window) = config.faults.store_outage {
+        fault_actors.push(executor.spawn(store_outage(Rc::clone(&world), window)));
+    }
+    if config.faults.bitflip_mean_interval != 0 {
+        fault_actors.push(executor.spawn(bitflip_schedule(
+            Rc::clone(&world),
+            config.faults.bitflip_mean_interval,
+            config.horizon,
+        )));
+    }
+    if config.faults.journal_bitflip_mean_interval != 0 {
+        fault_actors.push(executor.spawn(record_bitflip_schedule(
+            Rc::clone(&world),
+            config.faults.journal_bitflip_mean_interval,
+            config.horizon,
+        )));
+    }
+    for &(at, mirror) in &config.faults.rot_records_at {
+        fault_actors.push(executor.spawn(record_bitflip_at(Rc::clone(&world), at, mirror)));
+    }
+    if let Some(interval) = config.checkpoint_interval {
+        fault_actors.push(executor.spawn(checkpoint_schedule(
+            Rc::clone(&world),
+            interval,
+            config.horizon,
+            1,
+        )));
+    }
 
     let mut model = WorkloadModel::new(spec.shape);
     let program = Program::new(spec.clone()).map_err(|error| error.to_string())?;
     let mut next_req = 2_u64;
-    let mut crashes = 0_u64;
+    let mut vmstate = 0_u64;
     let mut resumes = 0_u64;
     let mut cold_boots = 0_u64;
     let unrestorable = 0_u64;
     for operation in program {
+        let think = config.think;
+        executor.block_on(async move {
+            delay(random_between(think.0, think.1)).await;
+        });
+        if executor.now() > config.horizon {
+            return Err(format!(
+                "workload {} did not finish before the simulation horizon (completed={})",
+                spec.name,
+                model.outcome(&spec.name).completed
+            ));
+        }
         match operation {
             Operation::Create => {}
             Operation::Read { page } => {
@@ -478,13 +615,27 @@ pub fn run_workload(
                 }
             }
             Operation::Crash => {
-                host.cancel();
-                executor.run_ready();
-                let _ = world.crash_pending();
-                world.crash_guest_io();
-                crashes = crashes.saturating_add(1);
-                state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
-                host = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+                let running = host_slot.borrow_mut().take();
+                if let Some(mut host) = running {
+                    host.cancel();
+                    executor.run_ready();
+                    merge_counters(
+                        &mut events.retired_counters.borrow_mut(),
+                        &state_slot.borrow().borrow().counters,
+                    );
+                    let _ = world.crash_pending();
+                    world.crash_guest_io();
+                    events.crashes.set(events.crashes.get().saturating_add(1));
+                    let restart_delay = config.faults.restart_delay;
+                    let wait = executor
+                        .block_on(async move { random_between(restart_delay.0, restart_delay.1) });
+                    executor.run_until(executor.now().saturating_add(wait));
+                    world.clear_abort();
+                    let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+                    *state_slot.borrow_mut() = Rc::clone(&state);
+                    *host_slot.borrow_mut() =
+                        Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
+                }
             }
             Operation::Restore => {
                 let deadline = executor.now().saturating_add(1_000_000_000);
@@ -501,11 +652,17 @@ pub fn run_workload(
                     }
                 };
                 match verdict {
-                    Some(blockd_core::protocol::Verdict::Resume { .. }) => {
+                    Some(blockd_core::protocol::Verdict::Resume {
+                        vmstate: recovered, ..
+                    }) => {
                         resumes = resumes.saturating_add(1);
+                        vmstate = recovered;
+                        world.set_vmstate(vset, vmstate);
                     }
                     Some(blockd_core::protocol::Verdict::ColdBoot) => {
                         cold_boots = cold_boots.saturating_add(1);
+                        vmstate = 0;
+                        world.set_vmstate(vset, vmstate);
                     }
                     Some(blockd_core::protocol::Verdict::Unrestorable) => {
                         return Err("scripted recovery was unrestorable".to_owned());
@@ -528,16 +685,50 @@ pub fn run_workload(
             }
         }
         model.complete(operation);
+        if matches!(
+            operation,
+            Operation::Read { .. }
+                | Operation::Write { .. }
+                | Operation::Sync { .. }
+                | Operation::Verify { .. }
+        ) {
+            vmstate = vmstate.saturating_add(1);
+            world.set_vmstate(vset, vmstate);
+        }
     }
+    for mut actor in fault_actors {
+        actor.cancel();
+    }
+    world.set_store_outage(false);
+    if host_slot.borrow().is_none() {
+        let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+        *state_slot.borrow_mut() = Rc::clone(&state);
+        *host_slot.borrow_mut() =
+            Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
+    }
+    executor.run_ready();
+    let drain = executor
+        .now()
+        .saturating_add(config.host.writeback_interval.saturating_mul(4));
+    executor.run_until(drain);
     let blobs = world.durable_blobs();
-    let mut report = report_from_state(&executor, &world, &state, &blobs);
-    report.crashes = crashes;
+    let final_state = Rc::clone(&state_slot.borrow());
+    let mut report = report_from_state(&executor, &world, &final_state, &blobs);
+    let mut counters = *events.retired_counters.borrow();
+    merge_counters(&mut counters, &report.counters);
+    report.counters = counters;
+    report.crashes = events.crashes.get();
     report.resumes = resumes;
     report.cold_boots = cold_boots;
     report.unrestorable = unrestorable;
-    host.cancel();
+    let outcome = model.outcome(&spec.name);
+    report.completed_ops = outcome.completed;
+    report.per_guest_completed.insert(vset.0, outcome.completed);
+    if let Some(mut host) = host_slot.borrow_mut().take() {
+        host.cancel();
+    }
     executor.run_ready();
-    Ok((report, model.outcome(&spec.name)))
+    Ok((report, outcome))
 }
 
 fn scripted_read(
@@ -612,21 +803,11 @@ fn report_from_state(
         bitflips: world.bitflips(),
         ..ActorRunReport::default()
     };
+    (report.map_bytes_written, report.max_record_blob_bytes) = world.write_metrics();
     for (name, bytes) in blobs {
         let extension = Path::new(name).extension().and_then(|value| value.to_str());
-        match extension {
-            Some("rec" | "recm" | "map") => {
-                report.map_bytes_written =
-                    report.map_bytes_written.saturating_add(bytes.len() as u64);
-                if matches!(extension, Some("rec" | "recm")) {
-                    report.max_record_blob_bytes =
-                        report.max_record_blob_bytes.max(bytes.len() as u64);
-                }
-            }
-            Some("seg") => {
-                report.seg_bytes_end = report.seg_bytes_end.saturating_add(bytes.len() as u64);
-            }
-            _ => {}
+        if let Some("seg") = extension {
+            report.seg_bytes_end = report.seg_bytes_end.saturating_add(bytes.len() as u64);
         }
     }
     report
@@ -640,24 +821,50 @@ async fn recovery_supervisor(
     config: ActorHarnessConfig,
 ) {
     while let Some(reply) = world.next_admin_reply().await {
-        let (AdminReply::VsetRecovered { vset, verdict }
-        | AdminReply::VsetRestored { vset, verdict, .. }
-        | AdminReply::VsetMigratedIn { vset, verdict }
-        | AdminReply::VsetForked { vset, verdict, .. }) = reply
-        else {
-            continue;
+        let (vset, verdict, local_recovery, restored) = match reply {
+            AdminReply::VsetRecovered { vset, verdict } => (vset, verdict, true, false),
+            AdminReply::VsetRestored { vset, verdict, .. } => (vset, verdict, false, true),
+            AdminReply::VsetMigratedIn { vset, verdict }
+            | AdminReply::VsetForked { vset, verdict, .. } => (vset, verdict, false, false),
+            _ => continue,
         };
+        if restored {
+            events.restores.set(events.restores.get().saturating_add(1));
+        }
         match verdict {
             blockd_core::protocol::Verdict::Resume { vmstate, .. } => {
+                guest_states[&vset].exact_recovery.set(true);
                 events.resumes.set(events.resumes.get().saturating_add(1));
                 guest_states[&vset].completed.set(vmstate);
-                *guest_states[&vset].expected.borrow_mut() =
-                    guest_states[&vset].durable_expected.borrow().clone();
+                world.set_vmstate(vset, vmstate);
+                let mut candidates = world.checkpoint_snapshots(vset, vmstate);
+                if candidates.is_empty() {
+                    candidates.push(OracleSnapshot {
+                        pages: guest_states[&vset].durable_expected.borrow().clone(),
+                        unknown: guest_states[&vset].recovering_pages.borrow().clone(),
+                    });
+                }
+                let expected = candidates
+                    .last()
+                    .map(|snapshot| snapshot.pages.clone())
+                    .unwrap_or_default();
+                *guest_states[&vset].exact_candidates.borrow_mut() = candidates;
+                guest_states[&vset]
+                    .expected
+                    .borrow_mut()
+                    .clone_from(&expected);
             }
             blockd_core::protocol::Verdict::ColdBoot => {
+                guest_states[&vset].exact_recovery.set(false);
+                guest_states[&vset].exact_candidates.borrow_mut().clear();
+                guest_states[&vset].completed.set(0);
+                world.set_vmstate(vset, 0);
                 events
                     .cold_boots
                     .set(events.cold_boots.get().saturating_add(1));
+                if restored {
+                    guest_states[&vset].durable_expected.borrow_mut().clear();
+                }
                 let cold = guest_states[&vset]
                     .durable_expected
                     .borrow()
@@ -672,6 +879,12 @@ async fn recovery_supervisor(
                 events
                     .unrestorable
                     .set(events.unrestorable.get().saturating_add(1));
+                if local_recovery && vset.0 <= u64::from(config.backed_vsets) {
+                    world.enqueue_admin(AdminCmd::RestoreVset {
+                        req: ReqId(u64::MAX.saturating_sub(vset.0)),
+                        vset,
+                    });
+                }
                 continue;
             }
             blockd_core::protocol::Verdict::DatabaseReady { .. } => continue,
@@ -775,13 +988,23 @@ async fn crash_and_restart(
     host_config: &HostConfig,
     restart_delay: (u64, u64),
 ) {
-    if let Some(mut host) = host_slot.borrow_mut().take() {
-        host.cancel();
-    }
-    for guest in guest_slots.borrow_mut().values_mut() {
-        if let Some(mut guest) = guest.take() {
-            guest.cancel();
-        }
+    let Some(mut host) = host_slot.borrow_mut().take() else {
+        return;
+    };
+    host.cancel();
+    let _ = host.await;
+    merge_counters(
+        &mut events.retired_counters.borrow_mut(),
+        &state_slot.borrow().borrow().counters,
+    );
+    let guests = guest_slots
+        .borrow_mut()
+        .values_mut()
+        .filter_map(Option::take)
+        .collect::<Vec<_>>();
+    for mut guest in guests {
+        guest.cancel();
+        let _ = guest.await;
     }
     let _ = world.crash_pending();
     world.crash_guest_io();
@@ -840,9 +1063,13 @@ async fn checkpoint_schedule(world: Rc<SimWorld>, interval: u64, horizon: u64, v
             return;
         }
         for number in 1..=vset_count {
+            let vset = VsetId(u64::from(number));
+            if !world.vmstate_ready(vset) {
+                continue;
+            }
             world.enqueue_admin(AdminCmd::Checkpoint {
                 req: ReqId(req),
-                vset: VsetId(u64::from(number)),
+                vset,
             });
             req = req.checked_add(1).expect("checkpoint request overflow");
         }
@@ -926,7 +1153,7 @@ async fn guest_actor(
                     return;
                 }
             }
-            state.expected.borrow_mut().insert(page, bytes);
+            state.expected.borrow_mut().insert(page, bytes.clone());
             state
                 .written_sequences
                 .borrow_mut()
@@ -958,23 +1185,38 @@ async fn guest_actor(
                     .borrow()
                     .get(&page)
                     .is_some_and(|sequences| sequences.contains(&claimed));
-            let valid_recovery = recovering
-                && sequence_is_possible
-                && claimed >= durable_floor
-                && actual == page_pattern(page, claimed);
-            if actual != expected && !valid_recovery {
+            let exact = state.exact_recovery.get();
+            let exact_match = if recovering && exact {
+                narrow_exact_candidates(&mut state.exact_candidates.borrow_mut(), page, &actual)
+            } else {
+                actual == expected
+            };
+            let recovery = if !recovering {
+                RecoveryExpectation::NotRecovering
+            } else if exact {
+                RecoveryExpectation::Exact
+            } else {
+                RecoveryExpectation::Crash {
+                    sequence_is_possible,
+                    durable_floor,
+                    pattern_matches: actual == page_pattern(page, claimed),
+                }
+            };
+            let valid_recovery = recovery_read_is_valid(exact_match, recovery, claimed);
+            if !valid_recovery {
+                let expected_sequence = crate::guest::claimed_vol_seq(&expected);
                 state
                     .violations
                     .borrow_mut()
                     .push(format!(
-                        "read returned stale or foreign bytes for {page:?}: actual sequence {claimed}, expected sequence {}, durable floor {durable_floor}, recovering {recovering}, possible {sequence_is_possible}, vmstate {} at {}",
-                        crate::guest::claimed_vol_seq(&expected),
+                        "read returned stale or foreign bytes for {page:?}: actual sequence {claimed}, expected sequence {expected_sequence}, durable floor {durable_floor}, recovering {recovering}, exact {}, possible {sequence_is_possible}, vmstate {} at {}",
+                        exact,
                         state.completed.get(),
                         now(),
                     ));
                 return;
             }
-            if valid_recovery {
+            if actual != expected {
                 state.expected.borrow_mut().insert(page, actual);
             }
         }
@@ -982,9 +1224,48 @@ async fn guest_actor(
     }
 }
 
+#[derive(Clone, Copy)]
+enum RecoveryExpectation {
+    NotRecovering,
+    Exact,
+    Crash {
+        sequence_is_possible: bool,
+        durable_floor: u64,
+        pattern_matches: bool,
+    },
+}
+
+fn recovery_read_is_valid(exact_match: bool, recovery: RecoveryExpectation, claimed: u64) -> bool {
+    exact_match
+        || matches!(
+            recovery,
+            RecoveryExpectation::Crash {
+                sequence_is_possible: true,
+                durable_floor,
+                pattern_matches: true,
+            } if claimed >= durable_floor
+        )
+}
+
+fn narrow_exact_candidates(
+    candidates: &mut Vec<OracleSnapshot>,
+    page: PageId,
+    actual: &[u8],
+) -> bool {
+    let zero = vec![0; page_size()];
+    candidates.retain(|snapshot| {
+        snapshot.unknown.contains(&page)
+            || snapshot.pages.get(&page).unwrap_or(&zero).as_slice() == actual
+    });
+    !candidates.is_empty()
+}
+
 fn finish_operation(world: &SimWorld, state: &GuestState, vset: VsetId) {
     let completed = state.completed.get().saturating_add(1);
     state.completed.set(completed);
+    state
+        .total_completed
+        .set(state.total_completed.get().saturating_add(1));
     world.set_vmstate(vset, completed);
 }
 
@@ -1017,6 +1298,7 @@ fn hit(probability: Ppm) -> bool {
 #[cfg(test)]
 mod tests {
     use blockd_core::types::millis;
+    use blockd_core::world::AdminIo;
 
     use super::*;
 
@@ -1083,5 +1365,140 @@ mod tests {
         assert_eq!(first.unrestorable, 0);
         assert!(first.cold_boots + first.resumes > 0);
         assert!(first.violations.is_empty(), "{:?}", first.violations);
+    }
+
+    #[test]
+    fn backed_local_unrestorable_verdict_requests_store_restore() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(29);
+        let command = executor.block_on({
+            let world = Rc::clone(&world);
+            async move {
+                let supervisor = spawn(recovery_supervisor(
+                    Rc::clone(&world),
+                    guest_states,
+                    guest_slots,
+                    events,
+                    config,
+                ));
+                AdminIo::reply_admin(
+                    world.as_ref(),
+                    AdminReply::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                )
+                .await;
+                let command = AdminIo::next_admin(world.as_ref()).await;
+                drop(supervisor);
+                command
+            }
+        });
+        assert!(matches!(
+            command,
+            Some(AdminCmd::RestoreVset { vset: found, .. }) if found == vset
+        ));
+    }
+
+    #[test]
+    fn horizon_cleanup_restarts_a_host_cancelled_mid_restart() {
+        let mut config = config();
+        config.vset_count = 1;
+        config.backed_vsets = 0;
+        config.horizon = millis(100);
+        config.faults.crash_at = vec![millis(99)];
+        config.faults.restart_delay = (millis(50), millis(50));
+        let report = run(33, config);
+        assert_eq!(report.crashes, 1);
+        assert!(report.cold_boots + report.resumes > 0);
+        assert!(report.violations.is_empty(), "{:?}", report.violations);
+    }
+
+    #[test]
+    fn overlapping_restart_requests_create_only_one_replacement_host() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
+        let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
+        let host_slot = Rc::new(RefCell::new(None));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(35);
+        *host_slot.borrow_mut() =
+            Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
+        for _ in 0..2 {
+            let world = Rc::clone(&world);
+            let host_slot = Rc::clone(&host_slot);
+            let state_slot = Rc::clone(&state_slot);
+            let guest_slots = Rc::clone(&guest_slots);
+            let events = Rc::clone(&events);
+            let host_config = config.host.clone();
+            executor
+                .spawn(async move {
+                    crash_and_restart(
+                        &world,
+                        &host_slot,
+                        &state_slot,
+                        &guest_slots,
+                        events.as_ref(),
+                        &host_config,
+                        (1, 1),
+                    )
+                    .await;
+                })
+                .detach();
+        }
+        executor.run_until(10);
+        assert_eq!(events.crashes.get(), 1);
+        assert!(host_slot.borrow().is_some());
+    }
+
+    #[test]
+    fn resume_oracle_rejects_a_different_historical_page_version() {
+        assert!(!recovery_read_is_valid(
+            false,
+            RecoveryExpectation::Exact,
+            7,
+        ));
+        assert!(recovery_read_is_valid(
+            false,
+            RecoveryExpectation::Crash {
+                sequence_is_possible: true,
+                durable_floor: 5,
+                pattern_matches: true,
+            },
+            7,
+        ));
+    }
+
+    #[test]
+    fn resume_oracle_accepts_only_pages_unknown_at_the_checkpoint_boundary() {
+        let page = PageId {
+            volume: VolumeId {
+                vset: VsetId(1),
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(2),
+        };
+        let expected = page_pattern(page, 3);
+        let actual = page_pattern(page, 4);
+        let known = OracleSnapshot {
+            pages: BTreeMap::from([(page, expected.clone())]),
+            unknown: BTreeSet::new(),
+        };
+        let unknown = OracleSnapshot {
+            pages: BTreeMap::from([(page, expected)]),
+            unknown: BTreeSet::from([page]),
+        };
+
+        assert!(!narrow_exact_candidates(&mut vec![known], page, &actual));
+        assert!(narrow_exact_candidates(&mut vec![unknown], page, &actual));
     }
 }

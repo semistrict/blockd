@@ -25,7 +25,7 @@ use blockd_core::world::{
     AdminIo, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem, GuestSync, Peers,
     Store, StoreError,
 };
-use blockd_exec::inject::{Injected, Injector, Lane, injector};
+use blockd_exec::inject::{Injected, Injector, Lane, bounded_injector, injector};
 use blockd_exec::{Executor, delay};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 use tokio::io::unix::AsyncFd;
@@ -946,6 +946,8 @@ struct Inputs {
     stop: Injector<()>,
 }
 
+const PEER_INPUT_CAPACITY: usize = 4;
+
 impl Inputs {
     fn depths(&self) -> (usize, usize) {
         [
@@ -1026,7 +1028,7 @@ impl Runtime {
         let (database, database_rx_actor) = injector();
         let (faults, fault_rx_actor) = injector();
         let (syncs, sync_rx_actor) = injector();
-        let (peer_input, peer_rx_actor) = injector();
+        let (peer_input, peer_rx_actor) = bounded_injector(PEER_INPUT_CAPACITY);
         let (stop, stop_rx_actor) = injector();
         let inputs = Inputs {
             admin,

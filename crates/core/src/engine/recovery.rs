@@ -9,6 +9,7 @@ use crate::layout::{self, BlobName};
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
 use crate::protocol::Verdict;
 use crate::replica_spool::scan_replica_spool;
+use crate::segment::{PageLoc, scan_segment};
 use crate::types::{JournalSeq, PageId, SegId, VolumeId, VsetId};
 use crate::world::{BlobEntry, Blobs};
 
@@ -17,6 +18,7 @@ struct Found {
     records: Vec<JournalRecord>,
     journals: Vec<(u64, JournalSeq)>,
     segments: Vec<(u64, SegId, u64)>,
+    pending_segments: Vec<(u64, SegId, u64, String)>,
     leaves: BTreeMap<LeafPtr, (u64, MapLeaf)>,
     names: Vec<String>,
     max_seq: u64,
@@ -63,14 +65,35 @@ pub async fn recover_local<W: Blobs>(
     for (key, generations) in replica_blobs {
         recover_replica_blobs(&state, world, key, generations).await?;
     }
+    for (&vset, candidate) in &mut found {
+        for (fence, segment, len, name) in std::mem::take(&mut candidate.pending_segments) {
+            let Some(bytes) = Blobs::read(world, &name).await? else {
+                continue;
+            };
+            if bytes.len() as u64 == len
+                && scan_segment(&bytes).is_ok_and(|(owner, found_fence, found_segment, _)| {
+                    (owner, found_fence, found_segment) == (vset, fence, segment)
+                })
+            {
+                candidate.segments.push((fence, segment, len));
+            }
+        }
+    }
+
+    let available_segments = found
+        .iter()
+        .flat_map(|(&vset, found)| {
+            found
+                .segments
+                .iter()
+                .map(move |&(fence, segment, bytes)| ((vset, fence, segment), bytes))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let mut verdicts = BTreeMap::new();
     for (vset, found) in found {
         let usable = |record: &&JournalRecord| {
-            record
-                .leaves
-                .values()
-                .all(|pointer| found.leaves.contains_key(pointer))
+            record_usable(vset, record, &found.leaves, &available_segments)
         };
         let chosen = found
             .records
@@ -84,12 +107,27 @@ pub async fn recover_local<W: Blobs>(
             state.borrow_mut().forget_blobs(&found.names);
             continue;
         };
-        let watermark = found
+        let usable_watermark = found
             .records
             .iter()
+            .filter(usable)
             .map(|record| record.sync_covered_through)
             .max()
             .unwrap_or(0);
+        let durability_watermark = found
+            .records
+            .iter()
+            .filter(|record| record.sync_covered_through <= record.capture_seq)
+            .map(|record| record.sync_covered_through)
+            .max()
+            .unwrap_or(0);
+        if chosen.capture_seq < durability_watermark {
+            verdicts.insert(vset, Verdict::Unrestorable);
+            Blobs::delete_many_durable(world, &found.names).await?;
+            state.borrow_mut().forget_blobs(&found.names);
+            continue;
+        }
+        let watermark = usable_watermark.max(durability_watermark);
         let verdict = if chosen.config.kind == VsetKind::Database {
             Verdict::DatabaseReady {
                 synced_through: chosen.sync_covered_through,
@@ -276,7 +314,7 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: BlobEntry) {
         BlobName::ReplicaSpool { .. } => return,
     };
     let entry = found.entry(vset).or_default();
-    entry.names.push(blob.name);
+    entry.names.push(blob.name.clone());
     match parsed {
         BlobName::Journal { fence, seq, .. } => {
             entry.journals.push((fence, seq));
@@ -289,8 +327,16 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: BlobEntry) {
             }
         }
         BlobName::Segment { fence, seg, .. } => {
-            entry.segments.push((fence, seg, blob.len));
             entry.max_seg = entry.max_seg.max(seg.0 + 1);
+            if blob.bytes.is_empty() && blob.len != 0 {
+                entry
+                    .pending_segments
+                    .push((fence, seg, blob.len, blob.name));
+            } else if scan_segment(&blob.bytes).is_ok_and(|(owner, found_fence, found_seg, _)| {
+                (owner, found_fence, found_seg) == (vset, fence, seg)
+            }) {
+                entry.segments.push((fence, seg, blob.len));
+            }
         }
         BlobName::Leaf { fence, id, .. } => {
             entry.max_leaf = entry.max_leaf.max(id + 1);
@@ -314,6 +360,45 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: BlobEntry) {
         }
         BlobName::ReplicaSpool { .. } => {}
     }
+}
+
+fn record_usable(
+    vset: VsetId,
+    record: &JournalRecord,
+    leaves: &BTreeMap<LeafPtr, (u64, MapLeaf)>,
+    segments: &BTreeMap<(VsetId, u64, SegId), u64>,
+) -> bool {
+    let location_exists = |location: &PageLoc| {
+        let owner = if location.base == 0 {
+            vset
+        } else {
+            VsetId(location.base)
+        };
+        match segments.get(&(owner, location.fence, location.seg)) {
+            Some(bytes) => {
+                location.len != 0
+                    && u64::from(location.offset)
+                        .checked_add(u64::from(location.len))
+                        .is_some_and(|end| end <= *bytes)
+            }
+            None => {
+                location.base == 0
+                    && record.migrated_from.is_some()
+                    && location.fence < record.fence
+            }
+        }
+    };
+    record
+        .overlay
+        .values()
+        .all(|(_, location)| location_exists(location))
+        && record.leaves.values().all(|pointer| {
+            leaves.get(pointer).is_some_and(|(_, leaf)| {
+                leaf.entries
+                    .iter()
+                    .all(|(_, _, _, location)| location_exists(location))
+            })
+        })
 }
 
 fn materialize(
@@ -417,6 +502,155 @@ mod tests {
             self.0.borrow_mut().remove(name);
             Ok(())
         }
+    }
+
+    fn test_state() -> SharedHost {
+        Rc::new(RefCell::new(super::super::state::HostState::new(
+            HostConfig {
+                host: HostId(8),
+                cache_pages: 1,
+                writeback_interval: 1,
+                backup_retry: 1,
+                disk_capacity: None,
+                disk_headroom: 0,
+                wedge_ticks: 0,
+                replica_placement: None,
+            },
+        )))
+    }
+
+    #[test]
+    fn recovery_rejects_a_record_with_a_missing_segment() {
+        let vset = VsetId(1);
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(0),
+        };
+        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        builder.add(page, Gen(1), &vec![7; page_size()]);
+        let (_, locations) = builder.finish();
+        let record = JournalRecord {
+            config: VsetConfig::compute(1, 4, false),
+            seq: JournalSeq(0),
+            fence: 1,
+            kind: RecordKind::Commit,
+            capture_seq: 1,
+            sync_covered_through: 1,
+            database: DatabaseMeta::default(),
+            overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let world = Rc::new(TestBlobs::default());
+        world.0.borrow_mut().insert(
+            layout::journal_blob(vset, 1, JournalSeq(0)),
+            record.encode(vset),
+        );
+        let state = test_state();
+        let mut executor = Executor::simulation(2);
+        let verdicts = executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { recover_local(state, world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+        assert_eq!(verdicts.get(&vset), Some(&Verdict::Unrestorable));
+    }
+
+    #[test]
+    fn unusable_newer_record_does_not_advance_recovery_watermark() {
+        let vset = VsetId(2);
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(0),
+            },
+            page: PageNo(0),
+        };
+        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        builder.add(page, Gen(1), &vec![3; page_size()]);
+        let (segment, locations) = builder.finish();
+        let config = VsetConfig::compute(1, 4, false);
+        let checkpoint = JournalRecord {
+            config,
+            seq: JournalSeq(1),
+            fence: 1,
+            kind: RecordKind::Checkpoint {
+                epoch: crate::types::Epoch(1),
+                vmstate: 5,
+            },
+            capture_seq: 5,
+            sync_covered_through: 5,
+            database: DatabaseMeta::default(),
+            overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let mut missing = locations[0].2;
+        missing.seg = SegId(9);
+        let unusable = JournalRecord {
+            seq: JournalSeq(2),
+            kind: RecordKind::Commit,
+            capture_seq: 6,
+            sync_covered_through: 100,
+            overlay: BTreeMap::from([(page, (Gen(2), missing))]),
+            ..checkpoint.clone()
+        };
+        let world = Rc::new(TestBlobs::default());
+        let mut blobs = world.0.borrow_mut();
+        blobs.insert(layout::segment_blob(vset, 1, SegId(0)), segment.clone());
+        blobs.insert(
+            layout::journal_blob(vset, 1, checkpoint.seq),
+            checkpoint.encode(vset),
+        );
+        blobs.insert(
+            layout::journal_blob(vset, 1, unusable.seq),
+            unusable.encode(vset),
+        );
+        drop(blobs);
+        let state = test_state();
+        let mut executor = Executor::simulation(3);
+        let verdicts = executor
+            .block_on({
+                let state = Rc::clone(&state);
+                let world = Rc::clone(&world);
+                async move { recover_local(state, world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+        assert_eq!(
+            verdicts.get(&vset),
+            Some(&Verdict::Resume {
+                epoch: crate::types::Epoch(1),
+                vmstate: 5,
+            })
+        );
+        assert_eq!(state.borrow().vsets[&vset].local_covered_through, 5);
+
+        let mut sane_unusable = unusable;
+        sane_unusable.sync_covered_through = sane_unusable.capture_seq;
+        let world = Rc::new(TestBlobs::default());
+        let mut blobs = world.0.borrow_mut();
+        blobs.insert(layout::segment_blob(vset, 1, SegId(0)), segment);
+        blobs.insert(
+            layout::journal_blob(vset, 1, checkpoint.seq),
+            checkpoint.encode(vset),
+        );
+        blobs.insert(
+            layout::journal_blob(vset, 1, sane_unusable.seq),
+            sane_unusable.encode(vset),
+        );
+        drop(blobs);
+        let mut executor = Executor::simulation(4);
+        let verdicts = executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { recover_local(test_state(), world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+        assert_eq!(verdicts.get(&vset), Some(&Verdict::Unrestorable));
     }
 
     #[test]
