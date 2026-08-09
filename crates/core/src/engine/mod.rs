@@ -20,7 +20,7 @@ pub use database::{
     attach_database, begin_detach_database, database_source, finish_detach_database,
 };
 pub use fault::serve_fault;
-pub use host::host_actor;
+pub use host::{host_actor, host_actor_with_state};
 pub use hydration::hydrate_mapping;
 pub use lineage::{create_fork, delete_base, keep_base};
 pub use migration::{

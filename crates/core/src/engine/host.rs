@@ -19,9 +19,12 @@ pub trait HostWorld: Blobs + Store + Peers + GuestMem + AdminIo + 'static {}
 impl<T> HostWorld for T where T: Blobs + Store + Peers + GuestMem + AdminIo + 'static {}
 
 pub async fn host_actor<W: HostWorld>(config: HostConfig, world: Rc<W>) {
-    let state = Rc::new(std::cell::RefCell::new(super::HostState::new(
-        config.clone(),
-    )));
+    let state = Rc::new(std::cell::RefCell::new(super::HostState::new(config)));
+    host_actor_with_state(state, world).await;
+}
+
+pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>) {
+    let config = state.borrow().config.clone();
     let Ok(verdicts) = recover_local(Rc::clone(&state), world.as_ref()).await else {
         AdminIo::abort(world.as_ref(), "local recovery scan failed").await;
         return;
