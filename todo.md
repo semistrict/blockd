@@ -35,9 +35,23 @@ Status legend: `[ ]` pending, `[~]` validated/in progress, `[x]` fixed and verif
 - [x] Target the newest journal copy for scheduled record rot; add deterministic selection coverage.
 - [x] Populate scripted workload completion metrics; extend workload report assertions.
 
+## Review fixes
+
+- [x] Preserve local blobs for unrestorable vsets that have an intact outbound handoff marker.
+  - Added recovery coverage for an unusable source plus durable handoff.
+- [x] Prevent production timers from starving behind continuously ready actors.
+  - Added executor coverage with a self-waking actor and a manually advanced production clock.
+- [x] Re-register bounded-channel senders whose previous wake was consumed before capacity was available.
+  - Added a deterministic sender wake-race regression.
+- [x] Protect object-store artifacts belonging to an in-flight publication from garbage collection.
+  - Added a durable pending-manifest root used by direct and replica-backed publishers, plus GC coverage beyond the normal grace period.
+- [x] Keep recovery metadata-only for immutable segment payloads.
+  - Added recovery coverage that rejects startup payload reads.
+
 ## Final verification
 
 - [x] Format and lint changed code.
 - [x] Run focused regression tests.
 - [x] Run the full workspace test suite and configured integration/Linux lanes.
 - [x] Run pre-ship review, resolve findings, commit, push, and open a pull request to `main`.
+- [x] Re-run the full workspace suite and pre-ship review for the review fixes above.

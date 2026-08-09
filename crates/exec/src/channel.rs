@@ -290,7 +290,11 @@ impl<T> Future for Send<'_, T> {
             }
             Poll::Ready(Ok(()))
         } else {
-            if this.waiter.as_ref().map(|waiting| waiting.task) != Some(waiter.task) {
+            if !state
+                .sender_waiters
+                .iter()
+                .any(|waiting| waiting.task == waiter.task)
+            {
                 state.sender_waiters.push_back(Waiter {
                     task: waiter.task,
                     scheduler: std::sync::Arc::clone(&waiter.scheduler),

@@ -105,6 +105,10 @@ pub(super) fn decode_handoff(vset: VsetId, bytes: &[u8]) -> Option<HostId> {
     Handoff::decode(vset, bytes).ok().map(|handoff| handoff.to)
 }
 
+pub(super) fn encode_handoff(vset: VsetId, to: HostId) -> Vec<u8> {
+    Handoff { vset, to }.encode()
+}
+
 pub async fn migrate_out<W>(state: SharedHost, world: Rc<W>, req: ReqId, vset: VsetId, to: HostId)
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
@@ -172,9 +176,8 @@ where
             delay(retry).await;
         }
     }
-    let handoff = Handoff { vset, to };
     let handoff_name = layout::handoff_blob(vset);
-    let handoff_bytes = handoff.encode();
+    let handoff_bytes = encode_handoff(vset, to);
     if !state
         .borrow_mut()
         .try_reserve_blob(handoff_name.clone(), handoff_bytes.len() as u64)

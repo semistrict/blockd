@@ -22,6 +22,8 @@
 //!   and pointer to the newest backed-up manifest
 //! - `v/<vset:016x>/m/<fence:016x>-<seq:016x>` — manifest: the selected
 //!   journal cut, optionally rewritten to archive-only page locations
+//! - `v/<vset:016x>/p/<fence:016x>-<seq:016x>` — pending publication root:
+//!   the manifest bytes retained until the head CAS makes them authoritative
 //! - `v/<vset:016x>/s/<fence:016x>-<seg:016x>` — source segment bytes or a
 //!   passive-derived archive pack, both in the same verified format
 //! - `b/<base:016x>/…` — bases (lineage milestone)
@@ -69,6 +71,11 @@ pub fn resume_set_key(vset: VsetId) -> String {
 
 pub fn manifest_key(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
     format!("v/{:016x}/m/{fence:016x}-{:016x}", vset.0, seq.0)
+}
+
+/// Durable root for a manifest publication that has not reached the head CAS.
+pub fn pending_manifest_key(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
+    format!("v/{:016x}/p/{fence:016x}-{:016x}", vset.0, seq.0)
 }
 
 pub fn segment_key(vset: VsetId, fence: u64, seg: SegId) -> String {
@@ -142,6 +149,11 @@ pub enum StoreKey {
         fence: u64,
         seq: JournalSeq,
     },
+    PendingManifest {
+        vset: VsetId,
+        fence: u64,
+        seq: JournalSeq,
+    },
     Segment {
         vset: VsetId,
         fence: u64,
@@ -185,6 +197,14 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
         if let Some(body) = rest.strip_prefix("m/") {
             let (fence, seq) = hex_pair(body)?;
             return Some(StoreKey::Manifest {
+                vset,
+                fence,
+                seq: JournalSeq(seq),
+            });
+        }
+        if let Some(body) = rest.strip_prefix("p/") {
+            let (fence, seq) = hex_pair(body)?;
+            return Some(StoreKey::PendingManifest {
                 vset,
                 fence,
                 seq: JournalSeq(seq),
@@ -421,6 +441,14 @@ mod tests {
                 vset,
                 fence: 2,
                 id: 7
+            })
+        );
+        assert_eq!(
+            parse_key("v/000000000badcafe/p/0000000000000002-000000000000001f"),
+            Some(StoreKey::PendingManifest {
+                vset,
+                fence: 2,
+                seq: JournalSeq(0x1F)
             })
         );
         assert_eq!(

@@ -636,6 +636,19 @@ async fn upload_commit<W>(
         return;
     }
     let retry = state.borrow().config.backup_retry;
+    if store_put_retry(
+        state,
+        world,
+        layout::pending_manifest_key(vset, info.writer_fence, info.seq),
+        record.clone(),
+        retry,
+    )
+    .await
+    .is_none()
+    {
+        AdminIo::abort(world, "replica pending manifest upload failed").await;
+        return;
+    }
     for (artifact, bytes) in artifacts {
         if fault_point(FaultPoint::CrashPeerDuringUpload) {
             AdminIo::abort(world, "injected replica crash").await;
@@ -842,6 +855,11 @@ where
         }
         host.counters.manifests_published += 1;
     }
+    let _ = Store::delete(
+        world.as_ref(),
+        &layout::pending_manifest_key(vset, pointer.fence, pointer.seq),
+    )
+    .await;
     if fault_point(FaultPoint::CrashPrimaryAfterHeadBeforeRelease) {
         AdminIo::abort(world.as_ref(), "injected primary crash").await;
         return;

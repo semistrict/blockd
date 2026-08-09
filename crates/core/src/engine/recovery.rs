@@ -9,7 +9,7 @@ use crate::layout::{self, BlobName};
 use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
 use crate::protocol::Verdict;
 use crate::replica_spool::scan_replica_spool;
-use crate::segment::{PageLoc, scan_segment};
+use crate::segment::PageLoc;
 use crate::types::{JournalSeq, PageId, SegId, VolumeId, VsetId};
 use crate::world::{BlobEntry, Blobs};
 
@@ -18,7 +18,6 @@ struct Found {
     records: Vec<JournalRecord>,
     journals: Vec<(u64, JournalSeq)>,
     segments: Vec<(u64, SegId, u64)>,
-    pending_segments: Vec<(u64, SegId, u64, String)>,
     leaves: BTreeMap<LeafPtr, (u64, MapLeaf)>,
     names: Vec<String>,
     max_seq: u64,
@@ -60,26 +59,11 @@ pub async fn recover_local<W: Blobs>(
                 .insert(generation, blob);
             continue;
         }
-        collect_blob(&mut found, blob);
+        collect_blob(&mut found, &blob);
     }
     for (key, generations) in replica_blobs {
         recover_replica_blobs(&state, world, key, generations).await?;
     }
-    for (&vset, candidate) in &mut found {
-        for (fence, segment, len, name) in std::mem::take(&mut candidate.pending_segments) {
-            let Some(bytes) = Blobs::read(world, &name).await? else {
-                continue;
-            };
-            if bytes.len() as u64 == len
-                && scan_segment(&bytes).is_ok_and(|(owner, found_fence, found_segment, _)| {
-                    (owner, found_fence, found_segment) == (vset, fence, segment)
-                })
-            {
-                candidate.segments.push((fence, segment, len));
-            }
-        }
-    }
-
     let available_segments = found
         .iter()
         .flat_map(|(&vset, found)| {
@@ -103,8 +87,10 @@ pub async fn recover_local<W: Blobs>(
             .cloned();
         let Some(mut chosen) = chosen else {
             verdicts.insert(vset, Verdict::Unrestorable);
-            Blobs::delete_many_durable(world, &found.names).await?;
-            state.borrow_mut().forget_blobs(&found.names);
+            if found.handoff.is_none() {
+                Blobs::delete_many_durable(world, &found.names).await?;
+                state.borrow_mut().forget_blobs(&found.names);
+            }
             continue;
         };
         let usable_watermark = found
@@ -123,8 +109,10 @@ pub async fn recover_local<W: Blobs>(
             .unwrap_or(0);
         if chosen.capture_seq < durability_watermark {
             verdicts.insert(vset, Verdict::Unrestorable);
-            Blobs::delete_many_durable(world, &found.names).await?;
-            state.borrow_mut().forget_blobs(&found.names);
+            if found.handoff.is_none() {
+                Blobs::delete_many_durable(world, &found.names).await?;
+                state.borrow_mut().forget_blobs(&found.names);
+            }
             continue;
         }
         let watermark = usable_watermark.max(durability_watermark);
@@ -301,7 +289,7 @@ async fn recover_replica_blobs<W: Blobs>(
     Ok(())
 }
 
-fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: BlobEntry) {
+fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: &BlobEntry) {
     let Some(parsed) = layout::parse_blob(&blob.name) else {
         return;
     };
@@ -328,15 +316,7 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: BlobEntry) {
         }
         BlobName::Segment { fence, seg, .. } => {
             entry.max_seg = entry.max_seg.max(seg.0 + 1);
-            if blob.bytes.is_empty() && blob.len != 0 {
-                entry
-                    .pending_segments
-                    .push((fence, seg, blob.len, blob.name));
-            } else if scan_segment(&blob.bytes).is_ok_and(|(owner, found_fence, found_seg, _)| {
-                (owner, found_fence, found_seg) == (vset, fence, seg)
-            }) {
-                entry.segments.push((fence, seg, blob.len));
-            }
+            entry.segments.push((fence, seg, blob.len));
         }
         BlobName::Leaf { fence, id, .. } => {
             entry.max_leaf = entry.max_leaf.max(id + 1);
@@ -504,6 +484,58 @@ mod tests {
         }
     }
 
+    struct MetadataOnlyBlobs(TestBlobs);
+
+    #[async_trait(?Send)]
+    impl Blobs for MetadataOnlyBlobs {
+        async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
+            Ok(self
+                .0
+                .0
+                .borrow()
+                .iter()
+                .map(|(name, bytes)| BlobEntry {
+                    name: name.clone(),
+                    bytes: if matches!(layout::parse_blob(name), Some(BlobName::Segment { .. })) {
+                        Vec::new()
+                    } else {
+                        bytes.clone()
+                    },
+                    len: bytes.len() as u64,
+                })
+                .collect())
+        }
+
+        async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
+            Blobs::write(&self.0, name, bytes).await
+        }
+
+        async fn append(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
+            Blobs::append(&self.0, name, bytes).await
+        }
+
+        async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError> {
+            Blobs::truncate(&self.0, name, len).await
+        }
+
+        async fn read(&self, name: &str) -> Result<Option<Vec<u8>>, BlobError> {
+            panic!("recovery read immutable segment payload {name}")
+        }
+
+        async fn read_range(
+            &self,
+            name: &str,
+            offset: u64,
+            len: u64,
+        ) -> Result<Option<Vec<u8>>, BlobError> {
+            Blobs::read_range(&self.0, name, offset, len).await
+        }
+
+        async fn delete(&self, name: &str) -> Result<(), BlobError> {
+            Blobs::delete(&self.0, name).await
+        }
+    }
+
     fn test_state() -> SharedHost {
         Rc::new(RefCell::new(super::super::state::HostState::new(
             HostConfig {
@@ -558,6 +590,86 @@ mod tests {
             })
             .expect("scan succeeds");
         assert_eq!(verdicts.get(&vset), Some(&Verdict::Unrestorable));
+    }
+
+    #[test]
+    fn recovery_uses_segment_metadata_without_reading_payloads() {
+        let vset = VsetId(3);
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(0),
+        };
+        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        builder.add(page, Gen(1), &vec![7; page_size()]);
+        let (segment, locations) = builder.finish();
+        let record = JournalRecord {
+            config: VsetConfig::compute(1, 4, false),
+            seq: JournalSeq(0),
+            fence: 1,
+            kind: RecordKind::Commit,
+            capture_seq: 1,
+            sync_covered_through: 1,
+            database: DatabaseMeta::default(),
+            overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let blobs = TestBlobs::default();
+        blobs
+            .0
+            .borrow_mut()
+            .insert(layout::segment_blob(vset, 1, SegId(0)), segment);
+        blobs.0.borrow_mut().insert(
+            layout::journal_blob(vset, 1, record.seq),
+            record.encode(vset),
+        );
+        let world = Rc::new(MetadataOnlyBlobs(blobs));
+        let mut executor = Executor::simulation(2);
+
+        let verdicts = executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { recover_local(test_state(), world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+
+        assert_eq!(verdicts.get(&vset), Some(&Verdict::ColdBoot));
+    }
+
+    #[test]
+    fn unrestorable_outbound_handoff_keeps_source_blobs() {
+        let vset = VsetId(4);
+        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(0),
+        };
+        builder.add(page, Gen(1), &vec![9; page_size()]);
+        let (segment, _) = builder.finish();
+        let segment_name = layout::segment_blob(vset, 1, SegId(0));
+        let handoff_name = layout::handoff_blob(vset);
+        let handoff = super::super::migration::encode_handoff(vset, HostId(9));
+        let world = Rc::new(TestBlobs::default());
+        world.0.borrow_mut().insert(segment_name.clone(), segment);
+        world.0.borrow_mut().insert(handoff_name.clone(), handoff);
+        let mut executor = Executor::simulation(3);
+
+        let verdicts = executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { recover_local(test_state(), world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+
+        assert_eq!(verdicts.get(&vset), Some(&Verdict::Unrestorable));
+        assert!(world.0.borrow().contains_key(&segment_name));
+        assert!(world.0.borrow().contains_key(&handoff_name));
     }
 
     #[test]

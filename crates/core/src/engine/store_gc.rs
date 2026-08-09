@@ -52,6 +52,7 @@ async fn store_gc_pass<W: Store>(
             Some(
                 StoreKey::Head { .. }
                     | StoreKey::Manifest { .. }
+                    | StoreKey::PendingManifest { .. }
                     | StoreKey::Leaf { .. }
                     | StoreKey::BaseRecord { .. }
                     | StoreKey::BaseLeaf { .. }
@@ -86,10 +87,14 @@ mod tests {
     use blockd_exec::{Executor, delay};
 
     use super::*;
-    use crate::head::HeadRecord;
+    use crate::head::{HeadRecord, ManifestPtr};
+    use crate::journal::{DatabaseMeta, JournalRecord, RecordKind, VsetConfig};
     use crate::layout;
     use crate::protocol::StoreFault;
-    use crate::types::{HostId, VsetId};
+    use crate::segment::PageLoc;
+    use crate::types::{
+        Gen, HostId, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId,
+    };
     use crate::world::StoreError;
 
     #[derive(Default)]
@@ -201,6 +206,108 @@ mod tests {
             !store.fetched.borrow().contains(&expected_orphan),
             "segment payloads must not be fetched during GC"
         );
+    }
+
+    #[test]
+    fn collector_preserves_inflight_publication_roots() {
+        let store = Rc::new(TestStore::default());
+        let vset = VsetId(2);
+        let fence = 3;
+        let seq = JournalSeq(4);
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(0),
+        };
+        let location = PageLoc {
+            base: 0,
+            fence,
+            seg: SegId(4),
+            offset: 0,
+            len: 1,
+        };
+        let record = JournalRecord {
+            config: VsetConfig::compute(1, 4, true),
+            seq,
+            fence,
+            kind: RecordKind::Commit,
+            capture_seq: 5,
+            sync_covered_through: 5,
+            database: DatabaseMeta::default(),
+            overlay: BTreeMap::from([(page, (Gen(1), location))]),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let head = layout::head_key(vset);
+        let manifest = layout::manifest_key(vset, fence, seq);
+        let pending = layout::pending_manifest_key(vset, fence, seq);
+        let segment = layout::segment_key(vset, fence, location.seg);
+        store.objects.borrow_mut().extend([
+            (
+                head.clone(),
+                (
+                    1,
+                    HeadRecord {
+                        vset,
+                        holder: HostId(1),
+                        fence,
+                        manifest: None,
+                        stash: None,
+                        retired_stashes: Vec::new(),
+                    }
+                    .encode(),
+                ),
+            ),
+            (pending.clone(), (1, record.encode(vset))),
+            (segment.clone(), (1, vec![1, 2, 3])),
+        ]);
+        let task_store = Rc::clone(&store);
+        let mut executor = Executor::simulation(2);
+
+        executor.block_on(async move {
+            let mut observed = BTreeMap::new();
+            assert_eq!(
+                store_gc_pass(task_store.as_ref(), &mut observed, 10).await,
+                Ok(0)
+            );
+            delay(11).await;
+            assert_eq!(
+                store_gc_pass(task_store.as_ref(), &mut observed, 10).await,
+                Ok(0)
+            );
+            task_store
+                .objects
+                .borrow_mut()
+                .insert(manifest, (1, record.encode(vset)));
+            task_store.objects.borrow_mut().insert(
+                head,
+                (
+                    2,
+                    HeadRecord {
+                        vset,
+                        holder: HostId(1),
+                        fence,
+                        manifest: Some(ManifestPtr {
+                            fence,
+                            seq,
+                            capture_seq: record.capture_seq,
+                        }),
+                        stash: None,
+                        retired_stashes: Vec::new(),
+                    }
+                    .encode(),
+                ),
+            );
+            assert_eq!(
+                store_gc_pass(task_store.as_ref(), &mut observed, 10).await,
+                Ok(1)
+            );
+        });
+
+        assert!(store.objects.borrow().contains_key(&segment));
+        assert!(!store.objects.borrow().contains_key(&pending));
     }
 
     #[test]

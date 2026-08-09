@@ -178,6 +178,21 @@ where
         }) {
             break;
         }
+        let pending_key =
+            layout::pending_manifest_key(vset, snapshot.pointer.fence, snapshot.pointer.seq);
+        if put_retry(
+            &state,
+            world.as_ref(),
+            pending_key.clone(),
+            snapshot.record.clone(),
+            retry,
+        )
+        .await
+        .is_none()
+        {
+            AdminIo::abort(world.as_ref(), "pending manifest write failed").await;
+            return;
+        }
         for (fence, segment) in snapshot.segments {
             let name = layout::segment_blob(vset, fence, segment);
             let Some(bytes) = read_blob_retry(world.as_ref(), &name, retry).await else {
@@ -258,17 +273,20 @@ where
         .await
         {
             PublishHead::Published(version) => {
-                let mut host = state.borrow_mut();
-                let Some(vset_state) = host
-                    .vsets
-                    .get_mut(&vset)
-                    .filter(|vset| vset.incarnation == incarnation)
-                else {
-                    return;
-                };
-                vset_state.head_version = Some(version);
-                vset_state.backed = Some(snapshot.pointer);
-                host.counters.manifests_published += 1;
+                {
+                    let mut host = state.borrow_mut();
+                    let Some(vset_state) = host
+                        .vsets
+                        .get_mut(&vset)
+                        .filter(|vset| vset.incarnation == incarnation)
+                    else {
+                        return;
+                    };
+                    vset_state.head_version = Some(version);
+                    vset_state.backed = Some(snapshot.pointer);
+                    host.counters.manifests_published += 1;
+                }
+                let _ = Store::delete(world.as_ref(), &pending_key).await;
             }
             PublishHead::Fenced => {
                 fence_vset(&state, world.as_ref(), vset, Some(incarnation)).await;

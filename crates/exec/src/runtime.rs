@@ -577,15 +577,12 @@ impl Executor {
     }
 
     fn run_one(&mut self) -> bool {
-        if self.poll_ready() {
-            return true;
-        }
         if self.mode == Mode::Production {
             refresh_now(&self.context);
             self.fire_due_timers();
-            if self.poll_ready() {
-                return true;
-            }
+        }
+        if self.poll_ready() {
+            return true;
         }
         if self.mode == Mode::Simulation && !self.timers.is_empty() {
             self.fire_next_timers();
@@ -719,6 +716,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{Executor, delay, random_u64, yield_now};
     use crate::channel::{bounded, oneshot, unbounded};
@@ -806,6 +805,74 @@ mod tests {
             ]
         });
         assert_eq!(values, [1, 2]);
+    }
+
+    #[test]
+    fn bounded_sender_requeues_after_losing_the_freed_slot() {
+        let mut executor = Executor::simulation(2);
+        let (sender, mut receiver) = bounded(1);
+        executor.block_on({
+            let sender = sender.clone();
+            async move { sender.send(0).await.unwrap() }
+        });
+
+        let first = sender.clone();
+        executor
+            .spawn(async move { first.send(1).await.unwrap() })
+            .detach();
+        let second = sender.clone();
+        let (release, released) = oneshot();
+        executor
+            .spawn(async move {
+                released.await.unwrap();
+                second.send(2).await.unwrap();
+            })
+            .detach();
+        executor.run_ready();
+
+        release.send(()).unwrap();
+        assert_eq!(receiver.try_recv(), Ok(0));
+        executor.run_ready();
+        assert_eq!(receiver.try_recv(), Ok(2));
+        executor.run_ready();
+
+        assert_eq!(receiver.try_recv(), Ok(1));
+        assert_eq!(executor.task_count(), 0);
+    }
+
+    #[test]
+    fn production_timer_fires_while_an_actor_remains_ready() {
+        let clock = Arc::new(AtomicU64::new(0));
+        let timer_clock = Arc::clone(&clock);
+        let mut executor =
+            Executor::production_with_clock(Arc::new(move || timer_clock.load(Ordering::Relaxed)));
+        let polls = Rc::new(Cell::new(0));
+        let fired_after = Rc::new(Cell::new(None));
+        let timer_polls = Rc::clone(&polls);
+        let timer_fired_after = Rc::clone(&fired_after);
+        executor
+            .spawn(async move {
+                delay(1).await;
+                timer_fired_after.set(Some(timer_polls.get()));
+            })
+            .detach();
+        let spinner_polls = Rc::clone(&polls);
+        executor
+            .spawn(async move {
+                for poll in 1..=64 {
+                    spinner_polls.set(poll);
+                    clock.store(1, Ordering::Relaxed);
+                    yield_now().await;
+                }
+            })
+            .detach();
+
+        executor.run_until_stalled();
+
+        assert!(
+            fired_after.get().is_some_and(|poll| poll < 64),
+            "a due timer must not wait for continuously ready work to finish"
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! delete has not unrooted. Undecodable roots are kept: GC refuses to act
 //! on anything it cannot vouch for (R8.1's spirit).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::head::HeadRecord;
 use crate::journal::JournalRecord;
@@ -27,6 +27,15 @@ use crate::types::{SimTime, VsetId};
 pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) -> Vec<String> {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let find = |key: &str| objects.iter().find(|(k, _, _)| k == key);
+    let heads = objects
+        .iter()
+        .filter_map(|(key, _, bytes)| {
+            let Some(StoreKey::Head { vset }) = layout::parse_key(key) else {
+                return None;
+            };
+            Some((vset, HeadRecord::decode(vset, bytes).ok()))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     // Mark. Roots: every head record and every base record — plus
     // everything undecodable among them (never act on what you can't read).
@@ -67,6 +76,39 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
                 mark_record(objects, &mut keep, &record, Namespace::Base(base));
             }
             _ => {}
+        }
+    }
+
+    // A pending manifest is a durable, cluster-visible publication root.
+    // It closes the unbounded retry window between the first artifact PUT
+    // and the head CAS. Once that head reaches this record (or a newer one),
+    // the marker becomes ordinary garbage because the head owns the closure.
+    for (key, _, bytes) in objects {
+        let Some(StoreKey::PendingManifest { vset, fence, seq }) = layout::parse_key(key) else {
+            continue;
+        };
+        let Ok(record) = JournalRecord::decode(vset, bytes) else {
+            keep.insert(key);
+            continue;
+        };
+        if record.fence != fence || record.seq != seq {
+            keep.insert(key);
+            continue;
+        }
+        let active = match heads.get(&vset) {
+            None => false,
+            Some(None) => true,
+            Some(Some(head)) => {
+                let same_assignment = head.fence == 0 || head.fence == fence;
+                let published = head.manifest.is_some_and(|manifest| {
+                    (manifest.capture_seq, manifest.seq) >= (record.capture_seq, record.seq)
+                });
+                same_assignment && !published
+            }
+        };
+        if active {
+            keep.insert(key);
+            mark_record(objects, &mut keep, &record, Namespace::Vset(vset));
         }
     }
     keep.remove("");
