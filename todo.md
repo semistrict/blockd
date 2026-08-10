@@ -527,6 +527,8 @@ it is independent.
   ownership fence.
 - [x] Express the simulator pressure budget in pages so its reclaim regression
   exercises the same lifecycle cut at 4 KiB and 16 KiB page sizes.
+- [x] Correct the Linux integration script to execute the existing
+  `fc_e2e_linux` target.
 - [ ] Run the full workspace test suite and every configured integration/Linux
   lane.
 - [x] Run pre-ship review and resolve every migration-related correctness,

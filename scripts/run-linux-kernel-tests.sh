@@ -45,7 +45,7 @@ cc -std=c11 -Wall -Wextra -Werror scripts/check-userfaultfd-abi.c -o "$abi_binar
 tests=(
     "blockd-hostmem:uffd_linux"
     "blockd-hostmem:vm_fleet_linux"
-    "blockd-runtime:e2e_linux"
+    "blockd-runtime:fc_e2e_linux"
     "blockd-runtime:workload_e2e_linux"
     "blockd-runtime:peer_linux"
     "blockd-runtime:migrate_e2e_linux"
