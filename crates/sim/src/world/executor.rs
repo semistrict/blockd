@@ -3,7 +3,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use async_trait::async_trait;
 use blockd_core::layout::BlobName;
 use blockd_core::protocol::StoreFault;
 use blockd_core::types::SimTime;
@@ -32,7 +31,6 @@ impl SimBlobs {
     }
 }
 
-#[async_trait(?Send)]
 impl Blobs for SimBlobs {
     async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
         Ok(self
@@ -146,7 +144,6 @@ fn map_store_error(error: &ModelStoreError) -> StoreError {
     }
 }
 
-#[async_trait(?Send)]
 impl Store for SimStore {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
         let (done, result) =

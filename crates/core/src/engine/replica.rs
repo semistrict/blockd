@@ -1,18 +1,21 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use blockd_exec::channel::oneshot;
-use blockd_exec::{FaultPoint, delay, fault_point, now, spawn, timeout};
+use blockd_exec::{FaultPoint, delay, fault_point, now, spawn};
 
 use super::backup::claim_new_head_with_stash;
 use super::capture::finish_creation;
-use super::state::{ReplicaArchiveCut, ReplicaKey, SharedHost};
+use super::peer_client::PeerRpcError;
+use super::reclaim::reclaim_backed_segments;
+use super::state::{PublicationOwner, ReplicaArchiveCut, ReplicaKey, SharedHost};
 use crate::format::crc32c;
 use crate::head::{HeadRecord, MAX_RETIRED_STASHES, ManifestPtr, RetiredStash, StashAssignment};
 use crate::journal::{JournalRecord, VsetConfig};
 use crate::layout;
 use crate::placement::rank_stash_candidates;
-use crate::protocol::{AdminReply, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, ReqId, StoreFault};
+use crate::protocol::{
+    AdminError, AdminResult, AdminSuccess, PeerMsg, ReplicaArtifact, ReplicaCommitInfo, StoreFault,
+};
 use crate::replica_spool::{
     seal_replica_commit, seal_verified_replica_artifact, verify_replica_artifact,
 };
@@ -108,40 +111,30 @@ where
             artifact,
             checksum,
         } => {
-            if let Some(waiter) = state.borrow_mut().replica_put_waiters.remove(&(
-                vset,
-                assignment_epoch,
-                artifact,
-                checksum,
-            )) {
-                let _ = waiter.send(from);
-            }
+            state
+                .borrow_mut()
+                .peer_client
+                .resolve_put(from, (from, vset, assignment_epoch, artifact, checksum));
         }
         PeerMsg::ReplicaCommitAck {
             vset,
             assignment_epoch,
             info,
         } => {
-            if let Some(waiter) = state
+            state
                 .borrow_mut()
-                .replica_commit_waiters
-                .remove(&commit_wait_key(vset, assignment_epoch, info))
-            {
-                let _ = waiter.send(from);
-            }
+                .peer_client
+                .resolve_commit(from, commit_wait_key(from, vset, assignment_epoch, info));
         }
         PeerMsg::ReplicaStatusReply {
             vset,
             assignment_epoch,
             committed,
         } => {
-            if let Some(waiter) = state
+            state
                 .borrow_mut()
-                .replica_status_waiters
-                .remove(&(vset, assignment_epoch))
-            {
-                let _ = waiter.send((from, committed));
-            }
+                .peer_client
+                .resolve_status(from, vset, assignment_epoch, committed);
         }
         PeerMsg::ReplicaUploadDone {
             vset,
@@ -182,6 +175,7 @@ where
                 } else {
                     false
                 };
+                state.borrow_mut().schedule_vset(vset);
                 if obsolete {
                     let _ = Store::delete(
                         world,
@@ -343,7 +337,7 @@ async fn replica_put<W>(
         .await
         .is_err()
     {
-        AdminIo::abort(world, "replica artifact append failed").await;
+        state.borrow_mut().fail("replica artifact append failed");
         return;
     }
     {
@@ -361,7 +355,7 @@ async fn replica_put<W>(
         host.counters.replica_artifact_flushes += 1;
     }
     if fault_point(FaultPoint::CrashPeerAfterDataFlushBeforeCommit) {
-        AdminIo::abort(world, "injected replica crash").await;
+        state.borrow_mut().fail("injected replica crash");
         return;
     }
     Peers::send(
@@ -487,7 +481,7 @@ async fn replica_commit<W>(
         .await
         .is_err()
     {
-        AdminIo::abort(world, "replica commit append failed").await;
+        state.borrow_mut().fail("replica commit append failed");
         return;
     }
     {
@@ -507,7 +501,7 @@ async fn replica_commit<W>(
         host.counters.replica_commit_flushes += 1;
     }
     if fault_point(FaultPoint::CrashPeerAfterCommitBeforeAck) {
-        AdminIo::abort(world, "injected replica crash").await;
+        state.borrow_mut().fail("injected replica crash");
         return;
     }
     Peers::send(
@@ -610,7 +604,7 @@ pub fn archives_ready(state: &SharedHost) -> Vec<ReplicaKey> {
 
 pub async fn archive_latest<W>(state: SharedHost, world: Rc<W>, key: ReplicaKey)
 where
-    W: Store + Peers + AdminIo + 'static,
+    W: Blobs + Store + Peers + AdminIo + 'static,
 {
     let cut = {
         let mut host = state.borrow_mut();
@@ -778,13 +772,15 @@ async fn upload_commit<W>(
     .await
     .is_none()
     {
-        AdminIo::abort(world.as_ref(), "replica pending manifest upload failed").await;
+        state
+            .borrow_mut()
+            .fail("replica pending manifest upload failed");
         return;
     }
     let mut uploads = Vec::with_capacity(artifacts.len());
     for (artifact, bytes) in artifacts {
         if fault_point(FaultPoint::CrashPeerDuringUpload) {
-            AdminIo::abort(world.as_ref(), "injected replica crash").await;
+            state.borrow_mut().fail("injected replica crash");
             return;
         }
         let object_key = match artifact {
@@ -806,7 +802,7 @@ async fn upload_commit<W>(
             return;
         };
         if !uploaded {
-            AdminIo::abort(world.as_ref(), "replica artifact upload failed").await;
+            state.borrow_mut().fail("replica artifact upload failed");
             return;
         }
         state.borrow_mut().counters.replica_store_bytes += bytes;
@@ -821,7 +817,7 @@ async fn upload_commit<W>(
     .await
     .is_none()
     {
-        AdminIo::abort(world.as_ref(), "replica manifest upload failed").await;
+        state.borrow_mut().fail("replica manifest upload failed");
         return;
     }
     state.borrow_mut().counters.replica_store_bytes += record.len() as u64;
@@ -830,7 +826,7 @@ async fn upload_commit<W>(
         replica.uploaded_record = Some(record.clone());
     }
     if fault_point(FaultPoint::CrashPeerAfterUploadBeforeHead) {
-        AdminIo::abort(world.as_ref(), "injected replica crash").await;
+        state.borrow_mut().fail("injected replica crash");
         return;
     }
     Peers::send(
@@ -927,14 +923,13 @@ async fn store_put_retry<W: Store>(
 #[allow(clippy::too_many_lines)]
 pub async fn publish_replica_head<W>(state: SharedHost, world: Rc<W>, vset: VsetId)
 where
-    W: Store + Peers + AdminIo + 'static,
+    W: Blobs + Store + Peers + AdminIo + 'static,
 {
-    let Some((incarnation, expected, pointer, head, retry, record)) = ({
+    let Some((incarnation, expected, pointer, head, record)) = ({
         let mut host = state.borrow_mut();
         let holder = host.config.host;
-        let retry = host.config.backup_retry;
         host.vsets.get_mut(&vset).and_then(|vset_state| {
-            if vset_state.publishing {
+            if vset_state.operations.publication_owner().is_some() {
                 return None;
             }
             let info = vset_state.peer_upload_done?;
@@ -953,7 +948,11 @@ where
                 return None;
             }
             let expected = vset_state.head_version?;
-            vset_state.publishing = true;
+            assert!(
+                vset_state
+                    .operations
+                    .try_start_publication(PublicationOwner::Replica)
+            );
             Some((
                 vset_state.incarnation,
                 expected,
@@ -966,7 +965,6 @@ where
                     stash: vset_state.stash_assignment,
                     retired_stashes: vset_state.retired_stashes.clone(),
                 },
-                retry,
                 record,
             ))
         })
@@ -975,7 +973,9 @@ where
     };
     let _lease = ReplicaPublishLease::new(&state, vset, incarnation);
     let mut expected = expected;
+    let mut attempts = 0u8;
     let version = loop {
+        attempts = attempts.saturating_add(1);
         match Store::put_cas(
             world.as_ref(),
             layout::head_key(vset),
@@ -986,7 +986,7 @@ where
         {
             Ok(version) => break version,
             Err(StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge) => {
-                fence_primary(&state, world.as_ref(), vset, incarnation).await;
+                fence_primary(&state, vset, incarnation);
                 return;
             }
             Err(StoreError::Fault(StoreFault::Unavailable)) => {
@@ -994,7 +994,7 @@ where
                 match Store::get(world.as_ref(), &layout::head_key(vset)).await {
                     Ok(Some((version, bytes))) => {
                         let Ok(found) = HeadRecord::decode(vset, &bytes) else {
-                            AdminIo::abort(world.as_ref(), "damaged replica head").await;
+                            state.borrow_mut().fail("damaged replica head");
                             return;
                         };
                         if found == head {
@@ -1004,22 +1004,27 @@ where
                             || found.fence != head.fence
                             || found.stash != head.stash
                         {
-                            fence_primary(&state, world.as_ref(), vset, incarnation).await;
+                            fence_primary(&state, vset, incarnation);
                             return;
                         }
                         expected = version;
+                        if attempts >= 3 {
+                            return;
+                        }
                     }
                     Ok(None) => {
-                        fence_primary(&state, world.as_ref(), vset, incarnation).await;
+                        fence_primary(&state, vset, incarnation);
                         return;
                     }
                     Err(StoreError::Fault(StoreFault::Unavailable)) => {
-                        blockd_exec::delay(retry).await;
+                        return;
                     }
                     Err(
                         StoreError::TooLarge | StoreError::Fault(StoreFault::CasConflict { .. }),
                     ) => {
-                        AdminIo::abort(world.as_ref(), "replica head reconciliation failed").await;
+                        state
+                            .borrow_mut()
+                            .fail("replica head reconciliation failed");
                         return;
                     }
                 }
@@ -1038,6 +1043,7 @@ where
         let previous = vset_state.backed;
         vset_state.head_version = Some(version);
         vset_state.backed = Some(pointer);
+        vset_state.peer_published = Some(commit_info(&record));
         if vset_state.peer_upload_done == Some(commit_info(&record)) {
             vset_state.peer_upload_done = None;
             vset_state.peer_upload_record = None;
@@ -1091,7 +1097,16 @@ where
     )
     .await;
     if fault_point(FaultPoint::CrashPrimaryAfterHeadBeforeRelease) {
-        AdminIo::abort(world.as_ref(), "injected primary crash").await;
+        state.borrow_mut().fail("injected primary crash");
+        return;
+    }
+    let reclaim_requested = state.borrow().disk_reclaim_requested;
+    if reclaim_requested
+        && reclaim_backed_segments(Rc::clone(&state), world.as_ref())
+            .await
+            .is_err()
+    {
+        state.borrow_mut().fail("backed segment reclaim failed");
         return;
     }
     retry_replica_releases(Rc::clone(&state), Rc::clone(&world), vset).await;
@@ -1107,13 +1122,12 @@ pub async fn retry_replica_releases<W: Peers + 'static>(
         let Some(vset_state) = host.vsets.get(&vset) else {
             return;
         };
-        let Some(record) = vset_state.best_record.as_ref() else {
+        let Some(info) = vset_state.peer_published else {
             return;
         };
-        let info = commit_info(record);
-        let published = vset_state.backed.is_some_and(|pointer| {
-            (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
-        });
+        let published = vset_state
+            .backed
+            .is_some_and(|pointer| (pointer.fence, pointer.seq) == (info.writer_fence, info.seq));
         if !published {
             return;
         }
@@ -1177,6 +1191,33 @@ pub async fn retry_replica_releases<W: Peers + 'static>(
     }
 }
 
+/// Ask the assigned passive peer to archive the newest committed cut now.
+/// Local NVMe pressure uses this to create a reclaimable store copy without
+/// waiting for the normal archive cadence.
+pub async fn request_replica_archive<W: Peers>(state: SharedHost, world: Rc<W>, vset: VsetId) {
+    let request = state.borrow().vsets.get(&vset).and_then(|vset_state| {
+        let assignment = vset_state.stash_assignment?;
+        let through = vset_state.peer_committed?;
+        Some((
+            assignment.transition_peer.unwrap_or(assignment.active_peer),
+            assignment.assignment_epoch,
+            through,
+        ))
+    });
+    if let Some((peer, assignment_epoch, through)) = request {
+        Peers::send(
+            world.as_ref(),
+            peer,
+            PeerMsg::ReplicaArchive {
+                vset,
+                assignment_epoch,
+                through,
+            },
+        )
+        .await;
+    }
+}
+
 pub async fn retry_archive_notices<W: Peers>(state: SharedHost, world: Rc<W>) {
     let notices = state
         .borrow()
@@ -1201,7 +1242,7 @@ pub async fn retry_archive_notices<W: Peers>(state: SharedHost, world: Rc<W>) {
     }
 }
 
-async fn fence_primary<W: AdminIo>(state: &SharedHost, world: &W, vset: VsetId, incarnation: u64) {
+fn fence_primary(state: &SharedHost, vset: VsetId, incarnation: u64) {
     let removed = state
         .borrow()
         .vsets
@@ -1210,26 +1251,24 @@ async fn fence_primary<W: AdminIo>(state: &SharedHost, world: &W, vset: VsetId, 
     if removed {
         state.borrow_mut().vsets.remove(&vset);
         state.borrow_mut().counters.fenced += 1;
-        AdminIo::abort(world, "replica primary fenced").await;
+        state.borrow_mut().fail("replica primary fenced");
     }
 }
 
 pub async fn create_peer_stashed<W>(
     state: SharedHost,
     world: Rc<W>,
-    req: ReqId,
     vset: VsetId,
     config: VsetConfig,
-) where
+) -> Option<AdminResult>
+where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
     if state.borrow().vsets.contains_key(&vset) {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Some(Err(AdminError::Busy));
     }
     let Some(stash) = initial_stash(&state, vset) else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Some(Err(AdminError::Unavailable));
     };
     let incarnation = state.borrow_mut().insert_fresh(vset, config);
     let _ = fault_point(FaultPoint::AssignmentCasRace);
@@ -1237,8 +1276,7 @@ pub async fn create_peer_stashed<W>(
         claim_new_head_with_stash(&state, world.as_ref(), vset, incarnation, Some(stash)).await
     else {
         state.borrow_mut().vsets.remove(&vset);
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Some(Err(AdminError::Rejected));
     };
     {
         let mut host = state.borrow_mut();
@@ -1249,10 +1287,12 @@ pub async fn create_peer_stashed<W>(
         host.counters.assignment_claims += 1;
     }
     if !finish_creation(Rc::clone(&state), world.as_ref(), vset, incarnation).await {
-        AdminIo::abort(world.as_ref(), "peer-stashed journal creation failed").await;
-        return;
+        state
+            .borrow_mut()
+            .fail("peer-stashed journal creation failed");
+        return None;
     }
-    AdminIo::reply_admin(world.as_ref(), AdminReply::VsetCreated { req, vset }).await;
+    Some(Ok(AdminSuccess::VsetCreated { vset }))
 }
 
 struct ReplicationLease {
@@ -1291,8 +1331,11 @@ impl Drop for ReplicaPublishLease {
             .get_mut(&self.vset)
             .filter(|vset_state| vset_state.incarnation == self.incarnation)
         {
-            vset_state.publishing = false;
+            vset_state
+                .operations
+                .finish_publication(PublicationOwner::Replica);
         }
+        self.state.borrow_mut().schedule_vset(self.vset);
     }
 }
 
@@ -1313,8 +1356,9 @@ impl Drop for ReplicationLease {
             .get_mut(&self.vset)
             .filter(|vset_state| vset_state.incarnation == self.incarnation)
         {
-            vset_state.replicating = false;
+            vset_state.operations.finish_replication();
         }
+        self.state.borrow_mut().schedule_vset(self.vset);
     }
 }
 
@@ -1332,10 +1376,9 @@ where
             let record_is_backed = vset_state.backed.is_some_and(|pointer| {
                 (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
             });
-            let needed = !vset_state.replicating
-                && (!record_is_backed || record.sync_covered_through > vset_state.sync_ack_through);
-            needed.then(|| {
-                vset_state.replicating = true;
+            let needed =
+                !record_is_backed || record.sync_covered_through > vset_state.sync_ack_through;
+            (needed && vset_state.operations.try_start_replication()).then(|| {
                 (
                     vset_state.incarnation,
                     stash.transition_peer.unwrap_or(stash.active_peer),
@@ -1368,18 +1411,18 @@ where
         return;
     };
     if status.is_some_and(|committed| commit_rank(committed) >= commit_rank(info)) {
-        finish_primary_commit(&state, world.as_ref(), vset, incarnation, info).await;
+        finish_primary_commit(&state, vset, incarnation, info);
         return;
     }
     if fault_point(FaultPoint::CrashPrimaryBeforeClosureCapture) {
-        AdminIo::abort(world.as_ref(), "injected primary crash").await;
+        state.borrow_mut().fail("injected primary crash");
         return;
     }
     let Some(required) = replica_closure(&state, vset, incarnation, &record) else {
         return;
     };
     if fault_point(FaultPoint::CrashPrimaryAfterClosureCapture) {
-        AdminIo::abort(world.as_ref(), "injected primary crash").await;
+        state.borrow_mut().fail("injected primary crash");
         return;
     }
     for &artifact in &required {
@@ -1394,7 +1437,7 @@ where
             return;
         }
         if fault_point(FaultPoint::CrashPrimaryDuringArtifactTransfer) {
-            AdminIo::abort(world.as_ref(), "injected primary crash").await;
+            state.borrow_mut().fail("injected primary crash");
             return;
         }
         {
@@ -1447,7 +1490,7 @@ where
     });
     if transitioning {
         if fault_point(FaultPoint::CrashPrimaryAfterSeedBeforeActiveCas) {
-            AdminIo::abort(world.as_ref(), "injected primary crash").await;
+            state.borrow_mut().fail("injected primary crash");
             return;
         }
         if !activate_stash(
@@ -1465,12 +1508,12 @@ where
         }
     }
     if fault_point(FaultPoint::CrashPrimaryAfterAckBeforeSyncOk) {
-        AdminIo::abort(world.as_ref(), "injected primary crash").await;
+        state.borrow_mut().fail("injected primary crash");
         return;
     }
-    finish_primary_commit(&state, world.as_ref(), vset, incarnation, info).await;
+    finish_primary_commit(&state, vset, incarnation, info);
     if fault_point(FaultPoint::CrashPrimaryAfterSyncOk) {
-        AdminIo::abort(world.as_ref(), "injected primary crash").await;
+        state.borrow_mut().fail("injected primary crash");
     }
 }
 
@@ -1525,7 +1568,7 @@ where
         return false;
     };
     if fault_point(FaultPoint::CrashPrimaryBeforeTransitionCas) {
-        AdminIo::abort(world, "injected primary crash").await;
+        state.borrow_mut().fail("injected primary crash");
         return false;
     }
     let retired = state.borrow().vsets[&vset].retired_stashes.clone();
@@ -1631,7 +1674,7 @@ where
             && !fault_point(FaultPoint::StoreUnknownResult)
         {
             if crash_after.is_some_and(fault_point) {
-                AdminIo::abort(world, "injected primary crash").await;
+                state.borrow_mut().fail("injected primary crash");
                 return false;
             }
             return adopt_assignment(
@@ -1664,14 +1707,22 @@ where
             return false;
         };
         let local = state.borrow().config.host;
-        let fence = state.borrow().vsets[&vset].fence;
+        let Some(fence) = state
+            .borrow()
+            .vsets
+            .get(&vset)
+            .filter(|vset_state| vset_state.incarnation == incarnation)
+            .map(|vset_state| vset_state.fence)
+        else {
+            return false;
+        };
         if found.holder != local || found.fence != fence {
-            AdminIo::abort(world, "replica assignment fenced").await;
+            state.borrow_mut().fail("replica assignment fenced");
             return false;
         }
         if found == head {
             if crash_after.is_some_and(fault_point) {
-                AdminIo::abort(world, "injected primary crash").await;
+                state.borrow_mut().fail("injected primary crash");
                 return false;
             }
             return adopt_assignment(
@@ -1720,6 +1771,10 @@ fn adopt_assignment(
         return false;
     };
     if vset_state.stash_assignment != Some(assignment) {
+        // Exact commit information belongs to the peer/assignment that
+        // acknowledged it.  Keeping it across a transition could make the
+        // scheduler ask the new peer to archive a cut it has not committed.
+        vset_state.peer_committed = None;
         vset_state.peer_upload_done = None;
         vset_state.peer_upload_record = None;
     }
@@ -1745,6 +1800,7 @@ fn adopt_assignment_from_head(
         return false;
     };
     if vset_state.stash_assignment != head.stash {
+        vset_state.peer_committed = None;
         vset_state.peer_upload_done = None;
         vset_state.peer_upload_record = None;
     }
@@ -1836,11 +1892,13 @@ fn commit_rank(info: ReplicaCommitInfo) -> (u64, crate::types::JournalSeq, u64) 
 }
 
 fn commit_wait_key(
+    target: HostId,
     vset: VsetId,
     assignment_epoch: u64,
     info: ReplicaCommitInfo,
-) -> (VsetId, u64, u64, crate::types::JournalSeq, u64) {
+) -> (HostId, VsetId, u64, u64, crate::types::JournalSeq, u64) {
     (
+        target,
         vset,
         assignment_epoch,
         info.writer_fence,
@@ -1849,9 +1907,8 @@ fn commit_wait_key(
     )
 }
 
-async fn finish_primary_commit<W: GuestMem>(
+fn finish_primary_commit(
     state: &SharedHost,
-    world: &W,
     vset: VsetId,
     incarnation: u64,
     info: ReplicaCommitInfo,
@@ -1865,24 +1922,30 @@ async fn finish_primary_commit<W: GuestMem>(
         else {
             return;
         };
+        if vset_state
+            .peer_committed
+            .is_none_or(|committed| commit_rank(info) >= commit_rank(committed))
+        {
+            vset_state.peer_committed = Some(info);
+        }
         vset_state.peer_committed_through = vset_state
             .peer_committed_through
             .max(info.sync_covered_through);
         vset_state.sync_ack_through = vset_state.sync_ack_through.max(info.sync_covered_through);
         let mut completed = Vec::new();
-        vset_state.pending_syncs.retain(|(req, barrier)| {
-            if *barrier <= vset_state.sync_ack_through {
-                completed.push(*req);
-                false
+        let pending = std::mem::take(&mut vset_state.pending_syncs);
+        for sync in pending {
+            if sync.barrier <= vset_state.sync_ack_through {
+                completed.push(sync);
             } else {
-                true
+                vset_state.pending_syncs.push(sync);
             }
-        });
+        }
         host.counters.syncs_acked += completed.len() as u64;
         completed
     };
-    for req in completed {
-        GuestMem::sync_ok(world, req).await;
+    for sync in completed {
+        sync.resolve(true);
     }
 }
 
@@ -1893,38 +1956,13 @@ async fn wait_status<W: Peers>(
     vset: VsetId,
     assignment_epoch: u64,
     retry: u64,
-) -> Result<Option<ReplicaCommitInfo>, ()> {
-    let mut retries = 0_u8;
-    loop {
-        let (send, receive) = oneshot();
-        state
-            .borrow_mut()
-            .replica_status_waiters
-            .insert((vset, assignment_epoch), send);
-        Peers::send(
-            world,
-            target,
-            PeerMsg::ReplicaStatus {
-                vset,
-                assignment_epoch,
-            },
-        )
-        .await;
-        if let Ok(Ok((from, committed))) = timeout(retry, receive).await
-            && from == target
-        {
-            let _ = fault_point(FaultPoint::StatusReconciliation);
-            return Ok(committed);
-        }
-        state
-            .borrow_mut()
-            .replica_status_waiters
-            .remove(&(vset, assignment_epoch));
-        retries = retries.saturating_add(1);
-        if fault_point(FaultPoint::ReplicaRetryTimer) || retries >= 3 {
-            return Err(());
-        }
-    }
+) -> Result<Option<ReplicaCommitInfo>, PeerRpcError> {
+    let client = state.borrow().peer_client.clone();
+    let (committed, _) = client
+        .replica_status(world, target, vset, assignment_epoch, retry)
+        .await?;
+    let _ = fault_point(FaultPoint::StatusReconciliation);
+    Ok(committed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1938,50 +1976,35 @@ async fn wait_put_ack<W: Peers>(
     checksum: u32,
     bytes: Vec<u8>,
     retry: u64,
-) -> Result<(), ()> {
-    let mut retries = 0_u8;
-    loop {
-        let (send, receive) = oneshot();
-        state
-            .borrow_mut()
-            .replica_put_waiters
-            .insert((vset, assignment_epoch, artifact, checksum), send);
-        {
-            let mut host = state.borrow_mut();
-            host.counters.replica_network_bytes = host
-                .counters
-                .replica_network_bytes
-                .saturating_add(bytes.len() as u64);
-        }
-        Peers::send(
+) -> Result<(), PeerRpcError> {
+    let client = state.borrow().peer_client.clone();
+    let result = client
+        .replica_put(
             world,
             target,
-            PeerMsg::ReplicaPut {
-                vset,
-                assignment_epoch,
-                artifact,
-                checksum,
-                bytes: bytes.clone(),
-            },
-        )
-        .await;
-        if let Ok(Ok(from)) = timeout(retry, receive).await
-            && from == target
-        {
-            return Ok(());
-        }
-        state.borrow_mut().replica_put_waiters.remove(&(
             vset,
             assignment_epoch,
             artifact,
             checksum,
-        ));
-        state.borrow_mut().counters.peer_retries += 1;
-        retries = retries.saturating_add(1);
-        if fault_point(FaultPoint::ReplicaRetryTimer) || retries >= 3 {
-            return Err(());
-        }
-    }
+            bytes.clone(),
+            retry,
+        )
+        .await;
+    let (attempts, retries) = match &result {
+        Ok(attempts) => (*attempts, attempts.saturating_sub(1)),
+        Err(error) => (error.attempts, error.attempts),
+    };
+    let mut host = state.borrow_mut();
+    host.counters.replica_network_bytes = host
+        .counters
+        .replica_network_bytes
+        .saturating_add((bytes.len() as u64).saturating_mul(u64::from(attempts)));
+    host.counters.peer_retries = host
+        .counters
+        .peer_retries
+        .saturating_add(u64::from(retries));
+    drop(host);
+    result.map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1995,41 +2018,31 @@ async fn wait_commit_ack<W: Peers>(
     required: Vec<ReplicaArtifact>,
     record: Vec<u8>,
     retry: u64,
-) -> Result<(), ()> {
-    let mut retries = 0_u8;
-    loop {
-        let (send, receive) = oneshot();
-        state
-            .borrow_mut()
-            .replica_commit_waiters
-            .insert(commit_wait_key(vset, assignment_epoch, info), send);
-        Peers::send(
+) -> Result<(), PeerRpcError> {
+    let client = state.borrow().peer_client.clone();
+    let result = client
+        .replica_commit(
             world,
             target,
-            PeerMsg::ReplicaCommit {
-                vset,
-                assignment_epoch,
-                info,
-                required: required.clone(),
-                record: record.clone(),
-            },
+            vset,
+            assignment_epoch,
+            info,
+            required,
+            record,
+            retry,
         )
         .await;
-        if let Ok(Ok(from)) = timeout(retry, receive).await
-            && from == target
-        {
-            return Ok(());
-        }
-        state
-            .borrow_mut()
-            .replica_commit_waiters
-            .remove(&commit_wait_key(vset, assignment_epoch, info));
-        state.borrow_mut().counters.peer_retries += 1;
-        retries = retries.saturating_add(1);
-        if fault_point(FaultPoint::ReplicaRetryTimer) || retries >= 3 {
-            return Err(());
-        }
-    }
+    let retries = match &result {
+        Ok(attempts) => attempts.saturating_sub(1),
+        Err(error) => error.attempts,
+    };
+    let mut host = state.borrow_mut();
+    host.counters.peer_retries = host
+        .counters
+        .peer_retries
+        .saturating_add(u64::from(retries));
+    drop(host);
+    result.map(|_| ())
 }
 
 fn replica_append_plan(
@@ -2179,6 +2192,50 @@ mod tests {
         retain_latest_upload(&mut state, newer, record(newer));
         retain_latest_upload(&mut state, older, record(older));
         assert_eq!(state.peer_upload_done, Some(newer));
+    }
+
+    #[test]
+    fn assignment_change_forgets_commit_owned_by_previous_peer() {
+        let state = test_state(HostId(1));
+        let vset = VsetId(3);
+        let current = StashAssignment {
+            assignment_epoch: 1,
+            active_peer: HostId(2),
+            active_assignment_epoch: 1,
+            transition_peer: None,
+            membership_epoch: 1,
+        };
+        let next = StashAssignment {
+            assignment_epoch: 2,
+            active_peer: HostId(2),
+            active_assignment_epoch: 1,
+            transition_peer: Some(HostId(4)),
+            membership_epoch: 1,
+        };
+        let committed = ReplicaCommitInfo {
+            writer_fence: 3,
+            seq: JournalSeq(7),
+            sync_covered_through: 9,
+        };
+        {
+            let mut host = state.borrow_mut();
+            let mut vset_state =
+                super::super::state::VsetState::fresh(VsetConfig::compute(1, 4), 1);
+            vset_state.stash_assignment = Some(current);
+            vset_state.peer_committed = Some(committed);
+            vset_state.peer_committed_through = committed.sync_covered_through;
+            host.vsets.insert(vset, vset_state);
+        }
+
+        assert!(adopt_assignment(&state, vset, 1, 5, next, Vec::new()));
+
+        let host = state.borrow();
+        let vset_state = &host.vsets[&vset];
+        assert_eq!(vset_state.peer_committed, None);
+        assert_eq!(
+            vset_state.peer_committed_through,
+            committed.sync_covered_through
+        );
     }
 
     #[test]

@@ -1,19 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use blockd_exec::channel::oneshot;
-use blockd_exec::{TaskSet, delay, timeout, yield_now};
+use blockd_exec::channel::{OneReceiver, Sender, TrySendError, bounded, oneshot, unbounded};
+use blockd_exec::{Either, TaskSet, delay, select2, timeout, yield_now};
 
 use super::capture::{capture_migration, shard_map, write_record_copies};
+use super::keyed_queue::KeyedQueue;
 use super::replica::publish_replica_head;
-use super::state::CommitFlagLease;
+use super::state::MutationOwner;
 use super::{SharedHost, VsetState, replica_message, replicate_latest};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::head::HeadRecord;
-use crate::journal::{JournalRecord, RecordKind, VsetKind};
+use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LeafPtr, MapLeaf};
-use crate::protocol::{AdminReply, PeerMsg, ReqId, Verdict};
+use crate::protocol::{AdminError, AdminEvent, AdminResult, AdminSuccess, PeerMsg, Verdict};
 use crate::segment::{SegmentBatchBuilder, open_entry};
 use crate::types::{HostId, PageId, VsetId};
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
@@ -21,7 +22,48 @@ use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
 const MAGIC_HANDOFF: u32 = u32::from_le_bytes(*b"BHF1");
 const OFFER_RETRY: u64 = 5_000_000;
 const PEER_RETRY: u64 = 50_000_000;
+const HYDRATE_FETCH_ATTEMPTS: u64 = 3;
 const HYDRATE_BATCH: usize = 64;
+const PEER_STORAGE_SHARDS: usize = 16;
+const PEER_STORAGE_CAPACITY: usize = 64;
+const REPLICA_ROUTE_SHARDS: usize = 32;
+const REPLICA_ROUTE_CAPACITY: usize = 128;
+const PEER_LIFECYCLE_CONCURRENCY: usize = 64;
+const PEER_LIFECYCLE_QUEUE_CAPACITY: usize = 64;
+const PEER_INGRESS_BATCH: usize = 64;
+
+enum PeerStorageRequest {
+    Range {
+        from: HostId,
+        io: crate::protocol::PeerRequestId,
+        vset: VsetId,
+        fence: u64,
+        seg: crate::types::SegId,
+        offset: u32,
+        len: u32,
+    },
+    Leaf {
+        from: HostId,
+        io: crate::protocol::PeerRequestId,
+        vset: VsetId,
+        base: u64,
+        fence: u64,
+        id: u64,
+    },
+}
+
+enum PeerLifecycleRequest {
+    MigrateOffer {
+        from: HostId,
+        vset: VsetId,
+        record: Vec<u8>,
+    },
+    Released {
+        from: HostId,
+        vset: VsetId,
+        release_fence: u64,
+    },
+}
 
 struct Handoff {
     vset: VsetId,
@@ -40,6 +82,37 @@ struct MigrationLease {
     active: bool,
 }
 
+struct HydrationLease {
+    state: SharedHost,
+    vset: VsetId,
+    incarnation: u64,
+    active: bool,
+}
+
+impl HydrationLease {
+    fn new(state: &SharedHost, vset: VsetId, incarnation: u64) -> Self {
+        Self {
+            state: Rc::clone(state),
+            vset,
+            incarnation,
+            active: true,
+        }
+    }
+
+    fn commit(mut self) {
+        self.state.borrow_mut().schedule_vset(self.vset);
+        self.active = false;
+    }
+}
+
+impl Drop for HydrationLease {
+    fn drop(&mut self) {
+        if self.active {
+            finish_hydration(&self.state, self.vset, self.incarnation);
+        }
+    }
+}
+
 impl MigrationLease {
     fn new(state: &SharedHost, vset: VsetId, incarnation: u64) -> Self {
         Self {
@@ -51,6 +124,7 @@ impl MigrationLease {
     }
 
     fn commit(mut self) {
+        self.state.borrow_mut().schedule_vset(self.vset);
         self.active = false;
     }
 }
@@ -65,8 +139,9 @@ impl Drop for MigrationLease {
                 .get_mut(&self.vset)
                 .filter(|vset_state| vset_state.incarnation == self.incarnation)
         {
-            vset_state.migration_running = false;
+            vset_state.operations.finish_migration();
         }
+        self.state.borrow_mut().schedule_vset(self.vset);
     }
 }
 
@@ -109,45 +184,82 @@ pub(super) fn encode_handoff(vset: VsetId, to: HostId) -> Vec<u8> {
 }
 
 #[allow(clippy::too_many_lines)]
-pub async fn migrate_out<W>(state: SharedHost, world: Rc<W>, req: ReqId, vset: VsetId, to: HostId)
+pub async fn migrate_out<W>(
+    state: SharedHost,
+    world: Rc<W>,
+    vset: VsetId,
+    to: HostId,
+) -> Option<AdminResult>
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
-    let incarnation = {
-        let mut host = state.borrow_mut();
-        host.vsets.get_mut(&vset).and_then(|vset_state| {
-            let allowed = vset_state.ready
-                && vset_state.peer_source.is_none()
-                && vset_state.outbound.is_none()
-                && !vset_state.migration_running
-                && (vset_state.config.kind != VsetKind::Database
-                    || (vset_state.database_runtime.phase
-                        == super::state::AttachmentPhase::Detached
-                        && vset_state.database_runtime.active.is_none()
-                        && vset_state.database_runtime.handles.is_empty()));
-            if allowed {
-                vset_state.migration_running = true;
+    if Peers::protocol_version(world.as_ref(), to) < crate::peer::FENCED_MIGRATION_VERSION {
+        return Some(Err(AdminError::Rejected));
+    }
+    let incarnation = loop {
+        enum Decision {
+            Invalid,
+            Hydrating(OneReceiver<bool>),
+            Reserved(u64),
+        }
+        let decision =
+            {
+                let mut host = state.borrow_mut();
+                let Some(vset_state) = host.vsets.get_mut(&vset) else {
+                    return Some(Err(AdminError::Rejected));
+                };
+                let allowed = vset_state.ready
+                    && vset_state.outbound.is_none()
+                    && !vset_state.operations.migration_running()
+                    && !vset_state.operations.guest_resume_pending()
+                    && (vset_state.config.kind != VsetKind::Database
+                        || (vset_state.database_runtime.phase
+                            == super::state::AttachmentPhase::Detached
+                            && vset_state.database_runtime.active.is_none()
+                            && vset_state.database_runtime.handles.is_empty()));
+                if !allowed {
+                    Decision::Invalid
+                } else if vset_state.peer_source.is_some()
+                    && (vset_state.page_locs.values().any(|(_, location)| {
+                        location.base == 0 && location.fence < vset_state.fence
+                    }) || vset_state
+                        .leaf_table
+                        .keys()
+                        .any(|span| !vset_state.hydrated_spans.contains(span)))
+                {
+                    let (wake, wait) = oneshot();
+                    vset_state.hydration_waiters.push(wake);
+                    host.schedule_vset(vset);
+                    Decision::Hydrating(wait)
+                } else {
+                    assert!(vset_state.operations.start_migration());
+                    Decision::Reserved(vset_state.incarnation)
+                }
+            };
+        match decision {
+            Decision::Invalid => return Some(Err(AdminError::Rejected)),
+            Decision::Hydrating(wait) => {
+                if wait.await != Ok(true) {
+                    return Some(Err(AdminError::Unavailable));
+                }
             }
-            allowed.then_some(vset_state.incarnation)
-        })
-    };
-    let Some(incarnation) = incarnation else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+            Decision::Reserved(incarnation) => break incarnation,
+        }
     };
     let lease = MigrationLease::new(&state, vset, incarnation);
     let kind = state.borrow().vsets[&vset].config.kind;
+    let mut paused = None;
     let record = if kind == VsetKind::Compute {
-        let Some(record) = capture_migration(Rc::clone(&state), Rc::clone(&world), vset).await
+        let Some((record, guard)) =
+            capture_migration(Rc::clone(&state), Rc::clone(&world), vset).await
         else {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Some(Err(AdminError::Unavailable));
         };
+        paused = Some(guard);
         record
     } else {
         let Some(record) = state.borrow().vsets[&vset].best_record.clone() else {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Some(Err(AdminError::Rejected));
         };
         record
     };
@@ -165,8 +277,12 @@ where
         ))
     });
     let Some((archive_peer, assignment_epoch, through)) = archive else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        if let Some(paused) = paused.take()
+            && !paused.resume().await
+        {
+            return None;
+        }
+        return Some(Err(AdminError::Unavailable));
     };
     loop {
         Peers::send(
@@ -188,83 +304,100 @@ where
         if published {
             break;
         }
+        // A scheduler-owned replication may have occupied the slot when the
+        // migration first tried. Keep driving the exact migration cut after
+        // an unsuccessful publication attempt.
+        replicate_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
         let retry = state.borrow().config.backup_retry;
         delay(retry).await;
     }
     let handoff_name = layout::handoff_blob(vset);
     let handoff_bytes = encode_handoff(vset, to);
+    // A vset can return to a host before an older release has removed that
+    // host's previous outbound marker. The in-memory state above proves this
+    // is a new migration, so replace any stale marker before publishing the
+    // current destination.
+    if Blobs::delete(world.as_ref(), &handoff_name).await.is_err() {
+        state
+            .borrow_mut()
+            .fail("stale migration handoff cleanup failed");
+        return None;
+    }
+    state
+        .borrow_mut()
+        .forget_blobs(std::iter::once(&handoff_name));
     if !state
         .borrow_mut()
         .try_reserve_blob(handoff_name.clone(), handoff_bytes.len() as u64)
     {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        if let Some(paused) = paused.take()
+            && !paused.resume().await
+        {
+            return None;
+        }
+        return Some(Err(AdminError::Unavailable));
     }
     if Blobs::write(world.as_ref(), handoff_name.clone(), handoff_bytes.clone())
         .await
         .is_err()
     {
-        AdminIo::abort(world.as_ref(), "migration handoff write failed").await;
-        return;
+        state.borrow_mut().fail("migration handoff write failed");
+        return None;
     }
     {
         let mut host = state.borrow_mut();
         host.record_blob(handoff_name, handoff_bytes.len() as u64);
-        let Some(vset_state) = host.vsets.get_mut(&vset) else {
-            return;
-        };
+        let vset_state = host.vsets.get_mut(&vset)?;
         vset_state.ready = false;
         vset_state.outbound = Some(to);
     }
-    offer_until_accepted(&state, world.as_ref(), vset, to, record.encode(vset)).await;
+    if let Some(paused) = paused.take() {
+        paused.disarm();
+    }
+    let encoded = record.encode(vset);
+    while !offer_once(
+        &state,
+        world.as_ref(),
+        vset,
+        to,
+        record.fence,
+        encoded.clone(),
+    )
+    .await
+    {}
     lease.commit();
-    AdminIo::reply_admin(world.as_ref(), AdminReply::MigratedOut { req, vset }).await;
+    Some(Ok(AdminSuccess::MigratedOut { vset }))
 }
 
-async fn offer_until_accepted<W: Peers>(
+async fn offer_once<W: Peers>(
     state: &SharedHost,
     world: &W,
     vset: VsetId,
     to: HostId,
+    offer_fence: u64,
     bytes: Vec<u8>,
-) {
-    loop {
-        let (wake, wait) = oneshot();
-        state.borrow_mut().migration_accepts.insert(vset, wake);
-        Peers::send(
-            world,
-            to,
-            PeerMsg::MigrateOffer {
-                vset,
-                record: bytes.clone(),
-            },
-        )
-        .await;
-        if let Ok(Ok(())) = timeout(OFFER_RETRY, wait).await {
-            break;
-        }
-        state.borrow_mut().migration_accepts.remove(&vset);
-        if state
-            .borrow()
-            .vsets
-            .get(&vset)
-            .is_none_or(|vset_state| vset_state.migration_accepted)
-        {
-            break;
-        }
-    }
+) -> bool {
+    let expected_fence =
+        if Peers::protocol_version(world, to) < crate::peer::FENCED_MIGRATION_VERSION {
+            0
+        } else {
+            offer_fence
+        };
+    let client = state.borrow().peer_client.clone();
+    client
+        .offer_migration_once(world, to, vset, expected_fence, bytes, OFFER_RETRY)
+        .await
 }
 
 pub async fn reoffer_outbound<W: Peers>(state: SharedHost, world: Rc<W>, vset: VsetId) {
-    let Some((to, record)) = state.borrow().vsets.get(&vset).and_then(|vset_state| {
-        Some((
-            vset_state.outbound?,
-            vset_state.best_record.as_ref()?.encode(vset),
-        ))
+    let Some((to, offer_fence, record)) = state.borrow().vsets.get(&vset).and_then(|vset_state| {
+        let record = vset_state.best_record.as_ref()?;
+        Some((vset_state.outbound?, record.fence, record.encode(vset)))
     }) else {
         return;
     };
-    offer_until_accepted(&state, world.as_ref(), vset, to, record).await;
+    let _ = offer_once(&state, world.as_ref(), vset, to, offer_fence, record).await;
+    state.borrow_mut().schedule_vset(vset);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -273,31 +406,98 @@ where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
     let mut handlers = TaskSet::new();
-    while let Some((from, message)) = Peers::recv(world.as_ref()).await {
-        handlers.reap();
+    let storage_routes = (0..PEER_STORAGE_SHARDS)
+        .map(|_| {
+            let (send, mut receive) = bounded(PEER_STORAGE_CAPACITY);
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            handlers.spawn(async move {
+                while let Some(request) = receive.recv().await {
+                    handle_peer_storage(Rc::clone(&state), world.as_ref(), request).await;
+                }
+            });
+            send
+        })
+        .collect::<Vec<Sender<PeerStorageRequest>>>();
+    let replica_routes = (0..REPLICA_ROUTE_SHARDS)
+        .map(|_| {
+            let (send, mut receive) = bounded(REPLICA_ROUTE_CAPACITY);
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            handlers.spawn(async move {
+                while let Some((from, message)) = receive.recv().await {
+                    replica_message(Rc::clone(&state), world.as_ref(), from, message).await;
+                }
+            });
+            send
+        })
+        .collect::<Vec<Sender<(HostId, PeerMsg)>>>();
+    let (replica_reply_send, mut replica_reply_receive) = bounded(REPLICA_ROUTE_CAPACITY);
+    {
+        let state = Rc::clone(&state);
+        let world = Rc::clone(&world);
+        handlers.spawn(async move {
+            while let Some((from, message)) = replica_reply_receive.recv().await {
+                replica_message(Rc::clone(&state), world.as_ref(), from, message).await;
+            }
+        });
+    }
+    let (lifecycle_completed, mut lifecycle_completions) = unbounded();
+    let mut lifecycle = KeyedQueue::new();
+    let mut ingress_open = true;
+    let mut ingress_batch = 0;
+    loop {
+        while let Some((vset, request)) = lifecycle.start_next(PEER_LIFECYCLE_CONCURRENCY) {
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            let lifecycle_completed = lifecycle_completed.clone();
+            handlers.spawn(async move {
+                handle_peer_lifecycle(state, world, request).await;
+                let _ = lifecycle_completed.send(vset);
+            });
+        }
+        if !ingress_open && lifecycle.is_idle() {
+            return;
+        }
+        let event = if ingress_open {
+            select2(lifecycle_completions.recv(), Peers::recv(world.as_ref())).await
+        } else {
+            Either::First(lifecycle_completions.recv().await)
+        };
+        let (from, message) = match event {
+            Either::First(Some(vset)) => {
+                lifecycle.complete(vset);
+                continue;
+            }
+            Either::First(None) => return,
+            Either::Second(Some(message)) => message,
+            Either::Second(None) => {
+                ingress_open = false;
+                continue;
+            }
+        };
         match message {
             PeerMsg::MigrateOffer { vset, record } => {
-                handlers.spawn(migrate_in(
-                    Rc::clone(&state),
-                    Rc::clone(&world),
-                    from,
-                    vset,
-                    record,
-                ));
+                if lifecycle.pending_len() < PEER_LIFECYCLE_QUEUE_CAPACITY
+                    && !lifecycle.contains_key(vset)
+                {
+                    lifecycle.push(
+                        vset,
+                        PeerLifecycleRequest::MigrateOffer { from, vset, record },
+                    );
+                }
             }
-            PeerMsg::MigrateAccept { vset } => {
+            PeerMsg::MigrateAccept { vset, offer_fence } => {
                 let accepted = state
                     .borrow()
                     .vsets
                     .get(&vset)
                     .is_some_and(|vset_state| vset_state.outbound == Some(from));
                 if accepted {
-                    if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                        vset_state.migration_accepted = true;
-                    }
-                    if let Some(waiter) = state.borrow_mut().migration_accepts.remove(&vset) {
-                        let _ = waiter.send(());
-                    }
+                    state
+                        .borrow()
+                        .peer_client
+                        .resolve_migration(vset, from, offer_fence);
                 }
             }
             PeerMsg::FetchRange {
@@ -308,38 +508,20 @@ where
                 offset,
                 len,
             } => {
-                let authorized = state
-                    .borrow()
-                    .vsets
-                    .get(&vset)
-                    .is_some_and(|vset_state| vset_state.outbound == Some(from));
-                if authorized && let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                    vset_state.wedge.served += 1;
-                }
-                let bytes = if authorized {
-                    Blobs::read_range(
-                        world.as_ref(),
-                        &layout::segment_blob(vset, fence, seg),
-                        u64::from(offset),
-                        u64::from(len),
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                } else {
-                    None
+                let request = PeerStorageRequest::Range {
+                    from,
+                    io,
+                    vset,
+                    fence,
+                    seg,
+                    offset,
+                    len,
                 };
-                Peers::send(world.as_ref(), from, PeerMsg::Page { io, bytes }).await;
+                let route = peer_storage_route(from, vset);
+                let _ = storage_routes[route].try_send(request);
             }
             PeerMsg::Page { io, bytes } => {
-                let expected = state
-                    .borrow()
-                    .peer_pages
-                    .get(&io)
-                    .is_some_and(|(expected, _)| *expected == from);
-                if expected && let Some((_, waiter)) = state.borrow_mut().peer_pages.remove(&io) {
-                    let _ = waiter.send(bytes);
-                }
+                state.borrow_mut().peer_client.resolve_page(io, from, bytes);
             }
             PeerMsg::FetchLeaf {
                 io,
@@ -348,73 +530,284 @@ where
                 fence,
                 id,
             } => {
-                let authorized = state
-                    .borrow()
-                    .vsets
-                    .get(&vset)
-                    .is_some_and(|vset_state| vset_state.outbound == Some(from));
-                if authorized && let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                    vset_state.wedge.served += 1;
-                }
-                let name = if base == 0 {
-                    layout::leaf_blob(vset, fence, id)
-                } else {
-                    layout::base_leaf_blob(vset, base, fence, id)
+                let request = PeerStorageRequest::Leaf {
+                    from,
+                    io,
+                    vset,
+                    base,
+                    fence,
+                    id,
                 };
-                let bytes = if authorized {
-                    Blobs::read(world.as_ref(), &name).await.ok().flatten()
-                } else {
-                    None
-                };
-                Peers::send(world.as_ref(), from, PeerMsg::Leaf { io, bytes }).await;
+                let route = peer_storage_route(from, vset);
+                let _ = storage_routes[route].try_send(request);
             }
             PeerMsg::Leaf { io, bytes } => {
-                let expected = state
-                    .borrow()
-                    .peer_leaves
-                    .get(&io)
-                    .is_some_and(|(expected, _)| *expected == from);
-                if expected && let Some((_, waiter)) = state.borrow_mut().peer_leaves.remove(&io) {
-                    let _ = waiter.send(bytes);
+                state.borrow_mut().peer_client.resolve_leaf(io, from, bytes);
+            }
+            PeerMsg::Released {
+                vset,
+                release_fence,
+            } => {
+                if lifecycle.pending_len() < PEER_LIFECYCLE_QUEUE_CAPACITY
+                    && !lifecycle.contains_key(vset)
+                {
+                    lifecycle.push(
+                        vset,
+                        PeerLifecycleRequest::Released {
+                            from,
+                            vset,
+                            release_fence,
+                        },
+                    );
                 }
             }
-            PeerMsg::Released { vset } => {
-                release_source(&state, world.as_ref(), from, vset).await;
+            PeerMsg::ReleasedAck {
+                vset,
+                release_fence,
+            } => {
+                // A v1/v2 peer cannot carry the destination fence on the
+                // wire, so a handoff begun before upgrading acknowledges its
+                // release with zero. New v3 handoffs still require the exact
+                // destination fence below.
+                let legacy_release = release_fence == 0
+                    && Peers::protocol_version(world.as_ref(), from)
+                        < crate::peer::FENCED_MIGRATION_VERSION;
+                let waiters = state
+                    .borrow_mut()
+                    .vsets
+                    .get_mut(&vset)
+                    .filter(|vset_state| {
+                        vset_state.peer_source == Some(from)
+                            && (vset_state.fence == release_fence || legacy_release)
+                    })
+                    .map(|vset_state| {
+                        vset_state.peer_source = None;
+                        vset_state.peer_source_offer_fence = None;
+                        std::mem::take(&mut vset_state.hydration_waiters)
+                    })
+                    .unwrap_or_default();
+                for waiter in waiters {
+                    let _ = waiter.send(true);
+                }
             }
-            PeerMsg::ReleasedAck { vset } => {
-                if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                    vset_state.peer_source = None;
+            message @ (PeerMsg::ReplicaPutAck { .. }
+            | PeerMsg::ReplicaCommitAck { .. }
+            | PeerMsg::ReplicaStatusReply { .. }) => {
+                if let Err(error) = replica_reply_send.try_send((from, message)) {
+                    let (from, message) = match error {
+                        TrySendError::Full(message) | TrySendError::Closed(message) => message,
+                    };
+                    replica_message(Rc::clone(&state), world.as_ref(), from, message).await;
                 }
             }
             message @ (PeerMsg::ReplicaPut { .. }
-            | PeerMsg::ReplicaPutAck { .. }
             | PeerMsg::ReplicaCommit { .. }
-            | PeerMsg::ReplicaCommitAck { .. }
             | PeerMsg::ReplicaStatus { .. }
-            | PeerMsg::ReplicaStatusReply { .. }
             | PeerMsg::ReplicaUploadDone { .. }
             | PeerMsg::ReplicaArchive { .. }
             | PeerMsg::ReplicaRelease { .. }
             | PeerMsg::ReplicaReleaseAck { .. }) => {
-                replica_message(Rc::clone(&state), world.as_ref(), from, message).await;
+                let key = replica_route_key(from, &message);
+                let route = replica_route(key);
+                if replica_routes[route].try_send((from, message)).is_err() {
+                    state.borrow_mut().counters.replica_capacity_backpressure += 1;
+                }
             }
+        }
+        ingress_batch += 1;
+        if ingress_batch == PEER_INGRESS_BATCH {
+            ingress_batch = 0;
+            yield_now().await;
         }
     }
 }
 
-#[allow(clippy::too_many_lines)]
-async fn migrate_in<W>(state: SharedHost, world: Rc<W>, from: HostId, vset: VsetId, bytes: Vec<u8>)
+async fn handle_peer_lifecycle<W>(state: SharedHost, world: Rc<W>, request: PeerLifecycleRequest)
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
-    let existing = state
+    match request {
+        PeerLifecycleRequest::MigrateOffer { from, vset, record } => {
+            migrate_in(state, world, from, vset, record).await;
+        }
+        PeerLifecycleRequest::Released {
+            from,
+            vset,
+            release_fence,
+        } => {
+            release_source(&state, world.as_ref(), from, vset, release_fence).await;
+        }
+    }
+}
+
+fn peer_storage_route(from: HostId, vset: VsetId) -> usize {
+    usize::try_from((u64::from(from.0).wrapping_mul(31) ^ vset.0) % PEER_STORAGE_SHARDS as u64)
+        .expect("peer storage route fits")
+}
+
+fn replica_route((from, vset, assignment_epoch): (HostId, VsetId, u64)) -> usize {
+    usize::try_from(
+        (u64::from(from.0).wrapping_mul(31) ^ vset.0.wrapping_mul(17) ^ assignment_epoch)
+            % REPLICA_ROUTE_SHARDS as u64,
+    )
+    .expect("replica route fits")
+}
+
+async fn handle_peer_storage<W: Blobs + Peers>(
+    state: SharedHost,
+    world: &W,
+    request: PeerStorageRequest,
+) {
+    let (from, vset) = match &request {
+        PeerStorageRequest::Range { from, vset, .. }
+        | PeerStorageRequest::Leaf { from, vset, .. } => (*from, *vset),
+    };
+    let authorized = state
         .borrow()
         .vsets
         .get(&vset)
-        .map(|existing| existing.peer_source == Some(from) && existing.ready);
+        .is_some_and(|vset_state| vset_state.outbound == Some(from));
+    if authorized && let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
+        vset_state.wedge.served += 1;
+    }
+    match request {
+        PeerStorageRequest::Range {
+            io,
+            fence,
+            seg,
+            offset,
+            len,
+            ..
+        } => {
+            let bytes = if authorized {
+                Blobs::read_range(
+                    world,
+                    &layout::segment_blob(vset, fence, seg),
+                    u64::from(offset),
+                    u64::from(len),
+                )
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            Peers::send(world, from, PeerMsg::Page { io, bytes }).await;
+        }
+        PeerStorageRequest::Leaf {
+            io,
+            base,
+            fence,
+            id,
+            ..
+        } => {
+            let name = if base == 0 {
+                layout::leaf_blob(vset, fence, id)
+            } else {
+                layout::base_leaf_blob(vset, base, fence, id)
+            };
+            let bytes = if authorized {
+                Blobs::read(world, &name).await.ok().flatten()
+            } else {
+                None
+            };
+            Peers::send(world, from, PeerMsg::Leaf { io, bytes }).await;
+        }
+    }
+}
+
+fn replica_route_key(from: HostId, message: &PeerMsg) -> (HostId, VsetId, u64) {
+    let (vset, assignment_epoch) = match message {
+        PeerMsg::ReplicaPut {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaPutAck {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaCommit {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaCommitAck {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaStatus {
+            vset,
+            assignment_epoch,
+        }
+        | PeerMsg::ReplicaStatusReply {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaUploadDone {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaArchive {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaRelease {
+            vset,
+            assignment_epoch,
+            ..
+        }
+        | PeerMsg::ReplicaReleaseAck {
+            vset,
+            assignment_epoch,
+            ..
+        } => (*vset, *assignment_epoch),
+        _ => unreachable!("non-replica message"),
+    };
+    (from, vset, assignment_epoch)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) async fn migrate_in<W>(
+    state: SharedHost,
+    world: Rc<W>,
+    from: HostId,
+    vset: VsetId,
+    bytes: Vec<u8>,
+) where
+    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
+{
+    let Ok(offered) = JournalRecord::decode(vset, &bytes) else {
+        return;
+    };
+    let existing = state.borrow().vsets.get(&vset).map(|existing| {
+        // A pre-v7 journal cannot remember the source offer fence. Keep
+        // recognizing that installed handoff as legacy even after the peer
+        // itself upgrades to v3, otherwise a lost acceptance can never be
+        // retried after restart.
+        let legacy = existing.peer_source_offer_fence.is_none()
+            || Peers::protocol_version(world.as_ref(), from)
+                < crate::peer::FENCED_MIGRATION_VERSION;
+        existing.peer_source == Some(from)
+            && existing.ready
+            && (legacy || existing.peer_source_offer_fence == Some(offered.fence))
+    });
     if let Some(ready) = existing {
         if ready {
-            Peers::send(world.as_ref(), from, PeerMsg::MigrateAccept { vset }).await;
+            Peers::send(
+                world.as_ref(),
+                from,
+                PeerMsg::MigrateAccept {
+                    vset,
+                    offer_fence: offered.fence,
+                },
+            )
+            .await;
         }
         return;
     }
@@ -424,9 +817,6 @@ where
     let _lease = InboundLease {
         state: Rc::clone(&state),
         vset,
-    };
-    let Ok(offered) = JournalRecord::decode(vset, &bytes) else {
-        return;
     };
     let verdict = match (offered.config.kind, offered.kind) {
         (VsetKind::Compute, RecordKind::Checkpoint { epoch, vmstate }) => {
@@ -473,17 +863,21 @@ where
         state.borrow_mut().record_blob(name, bytes.len() as u64);
         leaves.insert(pointer, (bytes.len() as u64, leaf));
     }
+    let Some(fence) = available_inbound_fence(&state, vset, offered.fence) else {
+        return;
+    };
     let incarnation = state.borrow_mut().allocate_incarnation();
-    let fence = offered
-        .fence
-        .checked_add(1)
-        .expect("migration fence overflow");
     let mut record = offered.clone();
     record.seq = crate::types::JournalSeq(0);
     record.fence = fence;
-    record.migrated_from = Some(from);
+    record.migrated_from = Some(MigrationSource {
+        host: from,
+        offer_fence: Some(offered.fence),
+    });
     if !write_record_copies(&state, world.as_ref(), vset, &record).await {
-        AdminIo::abort(world.as_ref(), "inbound migration journal write failed").await;
+        state
+            .borrow_mut()
+            .fail("inbound migration journal write failed");
         return;
     }
     {
@@ -494,6 +888,7 @@ where
         let mut incoming = VsetState::fresh(record.config, incarnation);
         incoming.ready = false;
         incoming.peer_source = Some(from);
+        incoming.peer_source_offer_fence = Some(offered.fence);
         incoming.fence = fence;
         if let Verdict::Resume { epoch, .. } = verdict {
             incoming.epoch = epoch;
@@ -541,11 +936,33 @@ where
         state.borrow_mut().vsets.remove(&vset);
         return;
     }
-    if matches!(verdict, Verdict::Resume { .. }) {
-        GuestMem::resume(world.as_ref(), vset).await;
+    if matches!(verdict, Verdict::Resume { .. })
+        && GuestMem::resume(world.as_ref(), vset, None).await.is_err()
+    {
+        state.borrow_mut().fail("migrated guest resume failed");
+        return;
     }
-    AdminIo::reply_admin(world.as_ref(), AdminReply::VsetMigratedIn { vset, verdict }).await;
-    Peers::send(world.as_ref(), from, PeerMsg::MigrateAccept { vset }).await;
+    AdminIo::emit_admin_event(world.as_ref(), AdminEvent::VsetMigratedIn { vset, verdict }).await;
+    Peers::send(
+        world.as_ref(),
+        from,
+        PeerMsg::MigrateAccept {
+            vset,
+            offer_fence: offered.fence,
+        },
+    )
+    .await;
+}
+
+pub(super) fn available_inbound_fence(
+    state: &SharedHost,
+    vset: VsetId,
+    offered: u64,
+) -> Option<u64> {
+    let occupied = state.borrow().local_artifact_fences(vset);
+    offered
+        .max(occupied.iter().copied().max().unwrap_or(0))
+        .checked_add(1)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -582,22 +999,27 @@ where
         let Ok(head) = HeadRecord::decode(vset, &current.1) else {
             return false;
         };
-        if head.holder == local {
-            if head.fence == 0 {
-                break (current.0, head.manifest, head.stash, head.retired_stashes);
-            }
-            break (head.fence, head.manifest, head.stash, head.retired_stashes);
-        }
-        if head.holder != source {
+        if head.holder != local && head.holder != source {
             return false;
         }
+        let locally_held = head.holder == local;
+        let stash = if locally_held {
+            head.stash.or(Some(local_stash))
+        } else {
+            Some(local_stash)
+        };
+        let retired_stashes = if locally_held {
+            head.retired_stashes.clone()
+        } else {
+            Vec::new()
+        };
         let claim = HeadRecord {
             vset,
             holder: local,
             fence: 0,
             manifest: head.manifest,
-            stash: Some(local_stash),
-            retired_stashes: Vec::new(),
+            stash,
+            retired_stashes: retired_stashes.clone(),
         };
         match Store::put_cas(
             world,
@@ -607,7 +1029,15 @@ where
         )
         .await
         {
-            Ok(version) => break (version, head.manifest, Some(local_stash), Vec::new()),
+            Ok(version) if version > head.fence => {
+                break (version, head.manifest, stash, retired_stashes);
+            }
+            Ok(_) => {
+                state
+                    .borrow_mut()
+                    .fail("head CAS did not advance the ownership fence");
+                return false;
+            }
             Err(StoreError::Fault(
                 crate::protocol::StoreFault::Unavailable
                 | crate::protocol::StoreFault::CasConflict { .. },
@@ -628,9 +1058,14 @@ where
             .checked_add(1)
             .expect("migration journal sequence overflow"),
     );
-    claimed.migrated_from = Some(source);
+    claimed.migrated_from = Some(MigrationSource {
+        host: source,
+        offer_fence: Some(offered.fence),
+    });
     if !write_record_copies(state, world, vset, &claimed).await {
-        AdminIo::abort(world, "claimed migration journal write failed").await;
+        state
+            .borrow_mut()
+            .fail("claimed migration journal write failed");
         return false;
     }
     {
@@ -719,6 +1154,7 @@ where
     };
     vset_state.head_version = Some(head_version);
     vset_state.ready = true;
+    host.schedule_vset(vset);
     true
 }
 
@@ -729,34 +1165,10 @@ pub async fn peer_fetch_page<W: Peers>(
     vset: VsetId,
     location: crate::segment::PageLoc,
 ) -> Option<Vec<u8>> {
-    loop {
-        let (send, receive) = oneshot();
-        let io = {
-            let mut host = state.borrow_mut();
-            let io = host.allocate_peer_request();
-            host.peer_pages.insert(io, (source, send));
-            io
-        };
-        Peers::send(
-            world,
-            source,
-            PeerMsg::FetchRange {
-                io,
-                vset,
-                fence: location.fence,
-                seg: location.seg,
-                offset: location.offset,
-                len: location.len,
-            },
-        )
-        .await;
-        match timeout(PEER_RETRY, receive).await {
-            Ok(Ok(bytes)) => return bytes,
-            Ok(Err(_)) | Err(_) => {
-                state.borrow_mut().peer_pages.remove(&io);
-            }
-        }
-    }
+    let client = state.borrow().peer_client.clone();
+    client
+        .fetch_page(world, source, vset, location, PEER_RETRY)
+        .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -768,7 +1180,7 @@ where
         let mut host = state.borrow_mut();
         host.vsets.get_mut(&vset).and_then(|vset_state| {
             let source = vset_state.peer_source?;
-            if !vset_state.ready || vset_state.commit_running {
+            if !vset_state.ready || vset_state.operations.mutation_blocked() {
                 return None;
             }
             let pages = vset_state
@@ -789,7 +1201,11 @@ where
                     pages,
                 ));
             }
-            vset_state.commit_running = true;
+            assert!(
+                vset_state
+                    .operations
+                    .try_start_mutation(MutationOwner::Hydration)
+            );
             Some((
                 vset_state.incarnation,
                 source,
@@ -802,15 +1218,38 @@ where
         return;
     };
     if pages.is_empty() {
-        Peers::send(world.as_ref(), source, PeerMsg::Released { vset }).await;
+        Peers::send(
+            world.as_ref(),
+            source,
+            PeerMsg::Released {
+                vset,
+                release_fence: fence,
+            },
+        )
+        .await;
         return;
     }
-    let lease = CommitFlagLease::new(&state, vset, incarnation);
-    let mut fetched = Vec::new();
+    let lease = HydrationLease::new(&state, vset, incarnation);
+    let mut workers = TaskSet::new();
+    let mut outcomes = Vec::with_capacity(pages.len());
     for (page, (generation, location)) in pages {
-        let Some(bytes) = peer_fetch_page(&state, world.as_ref(), source, vset, location).await
-        else {
-            finish_hydration(&state, vset, incarnation);
+        let (send, receive) = oneshot();
+        let state = Rc::clone(&state);
+        let world = Rc::clone(&world);
+        workers.spawn(async move {
+            let bytes = timeout(
+                PEER_RETRY.saturating_mul(HYDRATE_FETCH_ATTEMPTS),
+                peer_fetch_page(&state, world.as_ref(), source, vset, location),
+            )
+            .await
+            .unwrap_or(None);
+            let _ = send.send((page, generation, bytes));
+        });
+        outcomes.push(receive);
+    }
+    let mut fetched = Vec::new();
+    for outcome in outcomes {
+        let Ok((page, generation, Some(bytes))) = outcome.await else {
             return;
         };
         let Some(raw) = open_entry(vset, &bytes)
@@ -819,12 +1258,21 @@ where
                 (found == page && found_generation == generation).then_some(raw)
             })
         else {
-            finish_hydration(&state, vset, incarnation);
             return;
         };
         fetched.push((page, raw));
     }
-    let Some((generations, mut staged, seq, kind, capture_seq, covered, config, database)) = ({
+    let Some((
+        generations,
+        mut staged,
+        seq,
+        kind,
+        capture_seq,
+        covered,
+        config,
+        database,
+        source_offer_fence,
+    )) = ({
         let host = state.borrow();
         host.vsets
             .get(&vset)
@@ -861,9 +1309,11 @@ where
                     vset_state.local_covered_through,
                     vset_state.config,
                     vset_state.database,
+                    vset_state.peer_source_offer_fence,
                 )
             })
-    }) else {
+    })
+    else {
         return;
     };
     let mut builder = SegmentBatchBuilder::new(vset, fence, first_segment);
@@ -888,7 +1338,10 @@ where
         database,
         overlay: overlay.clone(),
         leaves: leaves.clone(),
-        migrated_from: Some(source),
+        migrated_from: Some(MigrationSource {
+            host: source,
+            offer_fence: source_offer_fence,
+        }),
     };
     let reservations = segments
         .iter()
@@ -914,7 +1367,7 @@ where
             .await
             .is_err()
         {
-            AdminIo::abort(world.as_ref(), "hydrated segment write failed").await;
+            state.borrow_mut().fail("hydrated segment write failed");
             return;
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
@@ -926,17 +1379,17 @@ where
             .await
             .is_err()
         {
-            AdminIo::abort(world.as_ref(), "hydrated map-leaf write failed").await;
+            state.borrow_mut().fail("hydrated map-leaf write failed");
             return;
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
         new_leaf_blobs.push((*pointer, (bytes.len() as u64, segments.clone())));
     }
     if !write_record_copies(&state, world.as_ref(), vset, &record).await {
-        AdminIo::abort(world.as_ref(), "hydration journal write failed").await;
+        state.borrow_mut().fail("hydration journal write failed");
         return;
     }
-    {
+    let (hydration_waiters, mutation_waiters) = {
         let mut host = state.borrow_mut();
         let Some(vset_state) = host
             .vsets
@@ -970,22 +1423,48 @@ where
         vset_state
             .record_writes
             .insert(record.seq, (record.fence, record.sync_covered_through));
-        vset_state.commit_running = false;
+        vset_state
+            .operations
+            .finish_mutation(MutationOwner::Hydration);
+        let hydration_waiters = std::mem::take(&mut vset_state.hydration_waiters);
+        let mutation_waiters = std::mem::take(&mut vset_state.mutation_waiters);
         host.counters.records_written += 1;
         host.counters.hydrate_fills += fetched.len() as u64;
         host.counters.leaf_rolls += leaf_writes.len() as u64;
-    }
+        (hydration_waiters, mutation_waiters)
+    };
     lease.commit();
+    for waiter in hydration_waiters {
+        let _ = waiter.send(true);
+    }
+    for waiter in mutation_waiters {
+        let _ = waiter.send(());
+    }
 }
 
-fn finish_hydration(state: &SharedHost, vset: VsetId, incarnation: u64) {
-    if let Some(vset_state) = state
-        .borrow_mut()
-        .vsets
-        .get_mut(&vset)
-        .filter(|vset_state| vset_state.incarnation == incarnation)
-    {
-        vset_state.commit_running = false;
+pub(super) fn finish_hydration(state: &SharedHost, vset: VsetId, incarnation: u64) {
+    let (hydration_waiters, mutation_waiters) = {
+        let mut host = state.borrow_mut();
+        let Some(vset_state) = host
+            .vsets
+            .get_mut(&vset)
+            .filter(|vset_state| vset_state.incarnation == incarnation)
+        else {
+            return;
+        };
+        vset_state
+            .operations
+            .finish_mutation(MutationOwner::Hydration);
+        let hydration_waiters = std::mem::take(&mut vset_state.hydration_waiters);
+        let mutation_waiters = std::mem::take(&mut vset_state.mutation_waiters);
+        host.schedule_vset(vset);
+        (hydration_waiters, mutation_waiters)
+    };
+    for waiter in hydration_waiters {
+        let _ = waiter.send(false);
+    }
+    for waiter in mutation_waiters {
+        let _ = waiter.send(());
     }
 }
 
@@ -996,33 +1475,10 @@ pub async fn peer_fetch_leaf<W: Peers>(
     vset: VsetId,
     pointer: LeafPtr,
 ) -> Option<Vec<u8>> {
-    loop {
-        let (send, receive) = oneshot();
-        let io = {
-            let mut host = state.borrow_mut();
-            let io = host.allocate_peer_request();
-            host.peer_leaves.insert(io, (source, send));
-            io
-        };
-        Peers::send(
-            world,
-            source,
-            PeerMsg::FetchLeaf {
-                io,
-                vset,
-                base: pointer.base,
-                fence: pointer.fence,
-                id: pointer.id,
-            },
-        )
-        .await;
-        match timeout(PEER_RETRY, receive).await {
-            Ok(Ok(bytes)) => return bytes,
-            Ok(Err(_)) | Err(_) => {
-                state.borrow_mut().peer_leaves.remove(&io);
-            }
-        }
-    }
+    let client = state.borrow().peer_client.clone();
+    client
+        .fetch_leaf(world, source, vset, pointer, PEER_RETRY)
+        .await
 }
 
 async fn release_source<W: Blobs + Peers + GuestMem>(
@@ -1030,12 +1486,15 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
     world: &W,
     from: HostId,
     vset: VsetId,
+    release_fence: u64,
 ) {
-    let authorized = state
-        .borrow()
-        .vsets
-        .get(&vset)
-        .is_none_or(|vset_state| vset_state.outbound == Some(from));
+    // New outbound migrations require fenced protocol v3, so a configured
+    // v1/v2 peer can only be finishing a handoff that predates fenced releases.
+    let legacy_release = release_fence == 0
+        && Peers::protocol_version(world, from) < crate::peer::FENCED_MIGRATION_VERSION;
+    let authorized = state.borrow().vsets.get(&vset).is_none_or(|vset_state| {
+        vset_state.outbound == Some(from) && (release_fence > vset_state.fence || legacy_release)
+    });
     let (removed, resident) = if authorized {
         let mut host = state.borrow_mut();
         let removed = host.vsets.remove(&vset);
@@ -1067,12 +1526,25 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
     }
     if authorized {
         for (index, page) in resident.into_iter().enumerate() {
-            GuestMem::evict(world, page).await;
+            if GuestMem::evict(world, page).await.is_err() {
+                state
+                    .borrow_mut()
+                    .fail("released guest page eviction failed");
+                return;
+            }
             if (index + 1) % HYDRATE_BATCH == 0 {
                 yield_now().await;
             }
         }
-        Peers::send(world, from, PeerMsg::ReleasedAck { vset }).await;
+        Peers::send(
+            world,
+            from,
+            PeerMsg::ReleasedAck {
+                vset,
+                release_fence,
+            },
+        )
+        .await;
     }
 }
 
@@ -1095,4 +1567,48 @@ fn materialize(
     }
     locations.extend(record.overlay.iter().map(|(&page, &entry)| (page, entry)));
     locations
+}
+
+#[cfg(test)]
+#[allow(clippy::default_trait_access)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::engine::HostState;
+    use crate::hostmeta::HostConfig;
+    use crate::journal::VsetConfig;
+
+    #[test]
+    fn successful_hydration_preserves_an_overlapping_migration_reservation() {
+        let state = Rc::new(RefCell::new(HostState::new(HostConfig {
+            archive: Default::default(),
+            host: HostId(1),
+            cache_pages: 1,
+            writeback_interval: 1,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: None,
+        })));
+        let vset = VsetId(1);
+        let incarnation = {
+            let mut host = state.borrow_mut();
+            let incarnation = host.insert_fresh(vset, VsetConfig::compute(1, 1));
+            let operations = &mut host.vsets.get_mut(&vset).expect("inserted vset").operations;
+            assert!(operations.try_start_mutation(MutationOwner::Hydration));
+            assert!(operations.start_migration());
+            operations.finish_mutation(MutationOwner::Hydration);
+            incarnation
+        };
+
+        HydrationLease::new(&state, vset, incarnation).commit();
+
+        let mut host = state.borrow_mut();
+        let operations = &mut host.vsets.get_mut(&vset).expect("inserted vset").operations;
+        assert!(operations.migration_running());
+        assert!(!operations.start_migration());
+    }
 }

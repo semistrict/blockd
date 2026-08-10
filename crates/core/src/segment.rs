@@ -123,6 +123,9 @@ pub struct SegmentBatchBuilder {
     finished: Vec<(SegId, Vec<u8>, SegmentEntries)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentIdOverflow;
+
 impl SegmentBatchBuilder {
     pub fn new(vset: VsetId, fence: u64, first_seg: SegId) -> Self {
         Self {
@@ -134,20 +137,25 @@ impl SegmentBatchBuilder {
     }
 
     pub fn add(&mut self, page: PageId, generation: Gen, page_bytes: &[u8]) {
-        if !self.current.is_empty() && !self.current.can_add_page() {
-            self.rotate();
-        }
-        self.current.add(page, generation, page_bytes);
+        self.try_add(page, generation, page_bytes)
+            .expect("segment id overflow");
     }
 
-    fn rotate(&mut self) {
-        let next = SegId(
-            self.current
-                .seg
-                .0
-                .checked_add(1)
-                .expect("segment id overflow"),
-        );
+    pub fn try_add(
+        &mut self,
+        page: PageId,
+        generation: Gen,
+        page_bytes: &[u8],
+    ) -> Result<(), SegmentIdOverflow> {
+        if !self.current.is_empty() && !self.current.can_add_page() {
+            self.try_rotate()?;
+        }
+        self.current.add(page, generation, page_bytes);
+        Ok(())
+    }
+
+    fn try_rotate(&mut self) -> Result<(), SegmentIdOverflow> {
+        let next = SegId(self.current.seg.0.checked_add(1).ok_or(SegmentIdOverflow)?);
         let current = std::mem::replace(
             &mut self.current,
             SegmentBuilder::new(self.vset, self.fence, next),
@@ -156,11 +164,15 @@ impl SegmentBatchBuilder {
         let (blob, entries) = current.finish();
         debug_assert!(blob.len() <= MAX_SEGMENT_BYTES);
         self.finished.push((seg, blob, entries));
+        Ok(())
     }
 
     pub fn finish(mut self) -> Vec<(SegId, Vec<u8>, SegmentEntries)> {
         if !self.current.is_empty() {
-            self.rotate();
+            let seg = self.current.seg;
+            let (blob, entries) = self.current.finish();
+            debug_assert!(blob.len() <= MAX_SEGMENT_BYTES);
+            self.finished.push((seg, blob, entries));
         }
         self.finished
     }
@@ -319,6 +331,17 @@ mod tests {
             );
         }
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn batch_rotation_reports_segment_id_overflow_before_building_a_successor() {
+        let mut batch = SegmentBatchBuilder::new(VsetId(0xA1), 6, SegId(u64::MAX));
+        batch
+            .current
+            .add(sample_page(0, 0), Gen(0), &pattern_page(0x55));
+        assert_eq!(batch.try_rotate(), Err(SegmentIdOverflow));
+        assert!(batch.finished.is_empty());
+        assert_eq!(batch.current.seg, SegId(u64::MAX));
     }
 
     #[test]

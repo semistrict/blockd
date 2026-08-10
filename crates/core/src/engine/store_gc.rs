@@ -6,7 +6,7 @@ use blockd_exec::{delay, now};
 use super::SharedHost;
 use crate::layout::StoreKey;
 use crate::types::SimTime;
-use crate::world::Store;
+use crate::world::{Store, StoreError};
 
 const GC_INTERVAL_MULTIPLIER: u64 = 600;
 const GC_GRACE_PASSES: u64 = 10;
@@ -39,8 +39,8 @@ async fn store_gc_pass<W: Store>(
     world: &W,
     observed_at: &mut BTreeMap<String, SimTime>,
     grace: u64,
-) -> Result<usize, ()> {
-    let keys = Store::list_prefix(world, "").await.map_err(|_| ())?;
+) -> Result<usize, StoreError> {
+    let keys = Store::list_prefix(world, "").await?;
     let present = keys.iter().cloned().collect::<BTreeSet<_>>();
     observed_at.retain(|key, _| present.contains(key));
 
@@ -59,7 +59,7 @@ async fn store_gc_pass<W: Store>(
             )
         );
         let bytes = if needs_body {
-            let Some((_, bytes)) = Store::get(world, &key).await.map_err(|_| ())? else {
+            let Some((_, bytes)) = Store::get(world, &key).await? else {
                 observed_at.remove(&key);
                 continue;
             };
@@ -73,7 +73,7 @@ async fn store_gc_pass<W: Store>(
 
     let deletions = crate::gc::plan(observed_now, grace, &objects);
     for key in &deletions {
-        Store::delete(world, key).await.map_err(|_| ())?;
+        Store::delete(world, key).await?;
         observed_at.remove(key);
     }
     Ok(deletions.len())
@@ -83,7 +83,6 @@ async fn store_gc_pass<W: Store>(
 mod tests {
     use std::cell::RefCell;
 
-    use async_trait::async_trait;
     use blockd_exec::{Executor, delay};
 
     use super::*;
@@ -103,7 +102,6 @@ mod tests {
         fetched: RefCell<Vec<String>>,
     }
 
-    #[async_trait(?Send)]
     impl Store for TestStore {
         async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
             self.objects.borrow_mut().insert(key, (1, bytes));
@@ -314,7 +312,6 @@ mod tests {
     fn unavailable_listing_fails_closed() {
         struct Unavailable;
 
-        #[async_trait(?Send)]
         impl Store for Unavailable {
             async fn put(&self, _: String, _: Vec<u8>) -> Result<u64, StoreError> {
                 unreachable!()
@@ -350,7 +347,7 @@ mod tests {
         assert_eq!(
             executor
                 .block_on(async { store_gc_pass(&Unavailable, &mut BTreeMap::new(), 10).await }),
-            Err(())
+            Err(StoreError::Fault(StoreFault::Unavailable))
         );
     }
 }

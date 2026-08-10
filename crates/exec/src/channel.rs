@@ -139,6 +139,12 @@ pub enum TryRecvError {
     Closed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrySendError<T> {
+    Full(T),
+    Closed(T),
+}
+
 pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "bounded channel capacity must be positive");
     channel(Some(capacity))
@@ -173,6 +179,27 @@ impl<T> Sender<T> {
             value: Some(value),
             waiter: None,
         }
+    }
+
+    pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        let waiter = {
+            let mut state = self.state.borrow_mut();
+            if !state.receiver_alive {
+                return Err(TrySendError::Closed(value));
+            }
+            if state
+                .capacity
+                .is_some_and(|capacity| state.queue.len() >= capacity)
+            {
+                return Err(TrySendError::Full(value));
+            }
+            state.queue.push_back(value);
+            state.receiver_waiter.take()
+        };
+        if let Some(waiter) = waiter {
+            wake(&waiter, WakeSource::Channel);
+        }
+        Ok(())
     }
 }
 
@@ -338,5 +365,21 @@ impl<T> Future for Recv<'_, T> {
             state.receiver_waiter = Some(current_waiter());
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_try_send_reports_pressure_without_growing_the_queue() {
+        let (sender, mut receiver) = bounded(1);
+        assert_eq!(sender.try_send(1), Ok(()));
+        assert_eq!(sender.try_send(2), Err(TrySendError::Full(2)));
+        assert_eq!(receiver.try_recv(), Ok(1));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        drop(receiver);
+        assert_eq!(sender.try_send(3), Err(TrySendError::Closed(3)));
     }
 }

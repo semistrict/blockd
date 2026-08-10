@@ -141,6 +141,22 @@ impl<T> Injected<T> {
     pub fn recv(&self) -> Recv<'_, T> {
         Recv { receiver: self }
     }
+
+    pub fn try_recv(&self) -> Option<T> {
+        let mut state = self.state.lock().expect("injector mutex poisoned");
+        let use_background = !state.background.is_empty()
+            && (state.critical.is_empty() || state.streak >= BACKGROUND_SHARE);
+        if use_background {
+            state.streak = 0;
+            state.background.pop_front()
+        } else {
+            let value = state.critical.pop_front();
+            if value.is_some() {
+                state.streak = state.streak.saturating_add(1);
+            }
+            value
+        }
+    }
 }
 
 impl<T> Drop for Injected<T> {

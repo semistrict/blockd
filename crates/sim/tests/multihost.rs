@@ -3,6 +3,7 @@
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{VsetId, millis, secs};
 use blockd_sim::cluster::{ClusterConfig, ClusterReport, FaultPoint, run};
+use blockd_sim::scenario::RealizedScenario;
 
 fn assert_clean(report: &ClusterReport) {
     assert!(report.violations.is_empty(), "{:?}", report.violations);
@@ -22,6 +23,7 @@ fn migration_config() -> ClusterConfig {
         drop_peer: None,
         race_restore: false,
         migrate_at: vec![(millis(500), VsetId(1), 1)],
+        checkpoint_interval: None,
         horizon: secs(2),
         ..restore_config()
     }
@@ -34,6 +36,22 @@ fn cluster_replays_byte_for_byte_and_distinct_seeds_diverge() {
     let other = run(44, restore_config());
     assert_eq!(first, replay);
     assert_ne!(first.trace_hash, other.trace_hash);
+}
+
+#[test]
+fn workload_horizon_begins_after_initial_creation() {
+    let mut config = migration_config();
+    config.store.latency_min = millis(50);
+    config.store.latency_max = millis(50);
+    config.store.ns_per_byte = 0;
+    config.migrate_at.clear();
+    config.horizon = millis(20);
+    config.think = (millis(1), millis(1));
+
+    let report = run(37, config);
+
+    assert_clean(&report);
+    assert!(report.completed_ops > 0, "{report:?}");
 }
 
 #[test]
@@ -68,7 +86,11 @@ fn migration_is_lossless_and_background_hydration_releases_the_source() {
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.restores, 0);
     assert!(report.max_migration_pause_ns > 0);
-    assert!(report.max_migration_pause_ns < millis(500));
+    assert!(
+        report.max_migration_pause_ns < millis(500),
+        "migration pause was {} ns",
+        report.max_migration_pause_ns
+    );
     assert!(report.hydrate_fills > 0);
     assert!(report.releases >= 1);
     assert_eq!(report.blobs_per_host[0], 0);
@@ -95,26 +117,69 @@ fn lossy_duplicating_links_preserve_migration_and_replay() {
 fn return_migration_and_crash_preserve_every_page() {
     let mut config = migration_config();
     config.migrate_at = vec![(millis(400), VsetId(1), 1), (millis(1_000), VsetId(1), 0)];
-    config.crash_hosts_at = vec![(millis(750), 0), (millis(1_350), 1)];
-    config.horizon = secs(2);
+    config.crash_hosts_at = vec![(millis(750), 0), (millis(2_200), 1)];
+    config.horizon = secs(3);
     let report = run(1, config);
     assert_clean(&report);
-    assert_eq!(report.migrations, 2);
-    assert!(report.releases >= 2);
+    assert_eq!(report.migrations, 2, "{report:?}");
+    assert!(report.releases >= 2, "{report:?}");
     assert_eq!(report.host_crashes, 2);
 }
 
 #[test]
 fn released_source_residue_never_starts_a_second_guest() {
     let mut config = migration_config();
-    config.migrate_at = vec![(millis(400), VsetId(1), 1), (millis(1_000), VsetId(1), 0)];
-    config.crash_hosts_at = vec![(millis(405), 1), (millis(1_350), 1)];
+    config.think = (millis(20), millis(20));
+    config.migrate_at = vec![(millis(400), VsetId(1), 1), (millis(1_500), VsetId(1), 0)];
+    config.crash_hosts_at = vec![(millis(405), 1), (millis(2_200), 1)];
     config.horizon = secs(3);
     let report = run(1, config);
     assert_clean(&report);
-    assert_eq!(report.migrations, 2);
+    assert_eq!(report.migrations, 2, "{report:?}");
     assert!(report.releases >= 1);
     assert_eq!(report.host_crashes, 2);
+}
+
+#[test]
+fn migration_quiesces_an_inflight_guest_operation_before_capture() {
+    let scenario = blockd_sim::scenario::load("migration").expect("migration scenario");
+    let RealizedScenario::Cluster(config) = scenario.realize(261).expect("cluster configuration")
+    else {
+        panic!("migration scenario must realize as a cluster");
+    };
+    let report = run(261, config);
+    assert_clean(&report);
+    assert!(report.migrations > 0, "{report:?}");
+    assert!(report.host_crashes > 0, "{report:?}");
+}
+
+#[test]
+fn migration_drains_inflight_guest_operations_before_recovery_cuts() {
+    let scenario = blockd_sim::scenario::load("migration").expect("migration scenario");
+    for seed in [19, 429, 487, 499, 640, 714, 736, 826, 890, 896, 922] {
+        let RealizedScenario::Cluster(config) =
+            scenario.realize(seed).expect("cluster configuration")
+        else {
+            panic!("migration scenario must realize as a cluster");
+        };
+        let report = run(seed, config);
+        assert_clean(&report);
+        assert!(report.completed_ops > 0, "seed {seed}: {report:?}");
+        assert!(report.migrations > 0, "seed {seed}: {report:?}");
+        assert!(report.host_crashes > 0, "seed {seed}: {report:?}");
+    }
+}
+
+#[test]
+fn returning_migration_avoids_stale_destination_journal_names() {
+    let scenario = blockd_sim::scenario::load("migration").expect("migration scenario");
+    let RealizedScenario::Cluster(config) = scenario.realize(952).expect("cluster configuration")
+    else {
+        panic!("migration scenario must realize as a cluster");
+    };
+    let report = run(952, config);
+    assert_clean(&report);
+    assert!(report.migrations > 0, "{report:?}");
 }
 
 #[test]

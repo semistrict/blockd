@@ -10,6 +10,12 @@ use crate::protocol::StoreFault;
 use crate::types::{PageId, VsetId};
 use crate::world::{Blobs, Store, StoreError};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HydrationError {
+    Stale,
+    Failed,
+}
+
 enum HydrateAction {
     Ready,
     Failed,
@@ -69,12 +75,12 @@ impl Drop for LeafLoadLease {
 }
 
 #[allow(clippy::too_many_lines)]
-pub async fn hydrate_mapping<W>(
+pub(crate) async fn hydrate_mapping<W>(
     state: &SharedHost,
     world: &W,
     page: PageId,
     incarnation: u64,
-) -> Result<(), ()>
+) -> Result<(), HydrationError>
 where
     W: Blobs + Store,
 {
@@ -88,7 +94,7 @@ where
                 .get_mut(&page.volume.vset)
                 .filter(|vset| vset.incarnation == incarnation && vset.ready)
             else {
-                return Err(());
+                return Err(HydrationError::Stale);
             };
             if vset.page_locs.contains_key(&page)
                 || vset.hydrated_spans.contains(&span)
@@ -113,7 +119,7 @@ where
         };
         match action {
             HydrateAction::Ready => return Ok(()),
-            HydrateAction::Failed => return Err(()),
+            HydrateAction::Failed => return Err(HydrationError::Failed),
             HydrateAction::Wait(wait) => {
                 let _ = wait.await;
             }
@@ -139,7 +145,7 @@ where
                         vset.failed_spans.insert(span);
                     }
                     lease.finish();
-                    return Err(());
+                    return Err(HydrationError::Failed);
                 };
                 {
                     let mut host = state.borrow_mut();

@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
 use blockd_core::protocol::{MAX_OBJECT_BYTES, StoreFault};
 use blockd_core::world::{BlobEntry, BlobError, Blobs, Store, StoreError};
 use blockd_exec::inject::{Injected, Injector, Lane, injector};
@@ -243,7 +242,6 @@ fn file_worker(root: &Path, receiver: &Arc<Mutex<Receiver<FileJob>>>) {
     }
 }
 
-#[async_trait(?Send)]
 impl Blobs for FileBlobs {
     async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
         let (reply, response) = injector();
@@ -345,7 +343,6 @@ fn map_fault<T>(result: Result<T, StoreFault>) -> Result<T, StoreError> {
     result.map_err(StoreError::Fault)
 }
 
-#[async_trait(?Send)]
 impl Store for RuntimeStore {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
         if bytes.len() > MAX_OBJECT_BYTES as usize {

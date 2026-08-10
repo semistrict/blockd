@@ -39,7 +39,8 @@ where
         }
     };
     let Some(incarnation) = incarnation else {
-        GuestMem::fail(world.as_ref(), page).await;
+        let _ = GuestMem::fail(world.as_ref(), page).await;
+        state.borrow_mut().fail("unservable guest page");
         return;
     };
 
@@ -64,7 +65,7 @@ async fn serve_resident_fault<W: GuestMem>(
             .vsets
             .get(&page.volume.vset)
             .filter(|vset| vset.incarnation == incarnation)
-            .and_then(|vset| vset.drain.as_ref())
+            .and_then(|vset| vset.operations.drain())
             .is_some_and(|drain| drain.unread.contains_key(&page));
     if copy_on_fault {
         let bytes = GuestMem::read_page(world, page).await;
@@ -76,7 +77,7 @@ async fn serve_resident_fault<W: GuestMem>(
         else {
             return;
         };
-        let copied = vset.drain.as_mut().is_some_and(|drain| {
+        let copied = vset.operations.drain_mut().is_some_and(|drain| {
             drain.unread.remove(&page).is_some_and(|generation| {
                 drain
                     .copied_on_fault
@@ -108,8 +109,11 @@ async fn serve_resident_fault<W: GuestMem>(
                 host.counters.wp_faults += 1;
                 host.counters.guest_pages_dirtied += 1;
             }
+            host.schedule_vset(page.volume.vset);
         }
-        GuestMem::unprotect(world, page).await;
+        if GuestMem::unprotect(world, page).await.is_err() {
+            state.borrow_mut().fail("guest page unprotect failed");
+        }
     }
 }
 
@@ -146,7 +150,8 @@ async fn serve_missing_fault<W>(
         .is_err()
     {
         state.borrow_mut().counters.faults_unservable += 1;
-        GuestMem::fail(world.as_ref(), page).await;
+        let _ = GuestMem::fail(world.as_ref(), page).await;
+        state.borrow_mut().fail("unservable guest page");
         return;
     }
 
@@ -222,8 +227,11 @@ async fn serve_missing_fault<W>(
             } => {
                 let fill_lease = PageFillLease::new(&state, page);
                 let reservation = write.then(|| CacheReservation::new(&state));
-                if let Some(victim) = victim {
-                    GuestMem::evict(world.as_ref(), victim).await;
+                if let Some(victim) = victim
+                    && GuestMem::evict(world.as_ref(), victim).await.is_err()
+                {
+                    state.borrow_mut().fail("guest page eviction failed");
+                    return;
                 }
                 if write {
                     let mut host = state.borrow_mut();
@@ -236,6 +244,7 @@ async fn serve_missing_fault<W>(
                         .expect("validated vset")
                         .mutation_seq += 1;
                     host.counters.guest_pages_dirtied += 1;
+                    host.schedule_vset(page.volume.vset);
                     host.wake_pressure_waiter();
                 }
                 {
@@ -250,7 +259,13 @@ async fn serve_missing_fault<W>(
                 if let Some(reservation) = reservation {
                     reservation.commit();
                 }
-                GuestMem::fill_shared(world.as_ref(), page, share, None, write).await;
+                if GuestMem::fill_shared(world.as_ref(), page, share, None, write)
+                    .await
+                    .is_err()
+                {
+                    state.borrow_mut().fail("guest shared-page fill failed");
+                    return;
+                }
                 fill_lease.finish(true);
                 return;
             }
@@ -268,8 +283,11 @@ async fn serve_missing_fault<W>(
         };
         let fill_lease = PageFillLease::new(&state, page);
         let reservation = CacheReservation::new(&state);
-        if let Some(victim) = victim {
-            GuestMem::evict(world.as_ref(), victim).await;
+        if let Some(victim) = victim
+            && GuestMem::evict(world.as_ref(), victim).await.is_err()
+        {
+            state.borrow_mut().fail("guest page eviction failed");
+            return;
         }
 
         let Some((generation, location)) = location else {
@@ -285,6 +303,7 @@ async fn serve_missing_fault<W>(
                         .expect("validated vset")
                         .mutation_seq += 1;
                     host.counters.guest_pages_dirtied += 1;
+                    host.schedule_vset(page.volume.vset);
                 }
                 host.counters.zero_fills += 1;
                 host.vsets
@@ -294,14 +313,19 @@ async fn serve_missing_fault<W>(
                     .fills += 1;
             }
             reservation.commit();
-            GuestMem::fill(
+            if GuestMem::fill(
                 world.as_ref(),
                 page,
                 vec![0; page_size()],
                 write,
                 FillSource::Zero,
             )
-            .await;
+            .await
+            .is_err()
+            {
+                state.borrow_mut().fail("guest zero-page fill failed");
+                return;
+            }
             fill_lease.finish(true);
             return;
         };
@@ -333,7 +357,8 @@ async fn serve_missing_fault<W>(
                 continue;
             }
             state.borrow_mut().counters.faults_unservable += 1;
-            GuestMem::fail(world.as_ref(), page).await;
+            let _ = GuestMem::fail(world.as_ref(), page).await;
+            state.borrow_mut().fail("unservable guest page");
             return;
         };
         {
@@ -365,6 +390,7 @@ async fn serve_missing_fault<W>(
                     .expect("validated vset")
                     .mutation_seq += 1;
                 host.counters.guest_pages_dirtied += 1;
+                host.schedule_vset(page.volume.vset);
             }
             host.counters.fills += 1;
             host.vsets
@@ -380,9 +406,19 @@ async fn serve_missing_fault<W>(
             location.seg,
             location.offset,
         )) {
-            GuestMem::fill_shared(world.as_ref(), page, share, Some(raw), false).await;
-        } else {
-            GuestMem::fill(world.as_ref(), page, raw, write, fill_source).await;
+            if GuestMem::fill_shared(world.as_ref(), page, share, Some(raw), false)
+                .await
+                .is_err()
+            {
+                state.borrow_mut().fail("guest shared-page fill failed");
+                return;
+            }
+        } else if GuestMem::fill(world.as_ref(), page, raw, write, fill_source)
+            .await
+            .is_err()
+        {
+            state.borrow_mut().fail("guest page fill failed");
+            return;
         }
         fill_lease.finish(true);
         return;

@@ -7,32 +7,28 @@ use crate::head::{HeadRecord, ManifestPtr};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::span_is_memory;
-use crate::protocol::{AdminReply, ReqId, StoreFault, Verdict};
+use crate::protocol::{AdminError, AdminResult, AdminSuccess, StoreFault, Verdict};
 use crate::types::VsetId;
 use crate::world::{AdminIo, Blobs, GuestMem, Store, StoreError};
 
 #[allow(clippy::too_many_lines)]
-pub async fn restore_vset<W>(state: SharedHost, world: Rc<W>, req: ReqId, vset: VsetId)
+pub async fn restore_vset<W>(state: SharedHost, world: Rc<W>, vset: VsetId) -> AdminResult
 where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
     if state.borrow().vsets.contains_key(&vset) {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Err(AdminError::Busy);
     }
     let retry = state.borrow().config.backup_retry;
     let Some((fence, pointer)) = claim_restore(&state, world.as_ref(), vset, retry).await else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Err(AdminError::NotFound);
     };
     let Some(mut record) = get_manifest(world.as_ref(), vset, pointer, retry).await else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Err(AdminError::Unavailable);
     };
     let verdict = recovery_verdict(&mut record);
     if state.borrow().vsets.contains_key(&vset) {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Err(AdminError::Busy);
     }
 
     {
@@ -74,13 +70,10 @@ where
             }
         }
         host.vsets.insert(vset, restored);
+        host.schedule_vset(vset);
         host.counters.assignment_claims += 1;
     }
-    AdminIo::reply_admin(
-        world.as_ref(),
-        AdminReply::VsetRestored { req, vset, verdict },
-    )
-    .await;
+    Ok(AdminSuccess::VsetRestored { vset, verdict })
 }
 
 async fn claim_restore<W: Store>(

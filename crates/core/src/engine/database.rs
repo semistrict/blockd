@@ -1,33 +1,59 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use blockd_exec::yield_now;
+use blockd_exec::channel::{Receiver, unbounded};
+use blockd_exec::{Either, OneOf3, TaskSet, select2, select3, yield_now};
 
 use super::capture::{shard_map, write_record_copies};
 use super::fault::load_page_for_database;
+use super::hydration::HydrationError;
+use super::keyed_queue::KeyedQueue;
 use super::reclaim::cleanup_local;
 use super::replica::replicate_latest;
-use super::state::CommitFlagLease;
-use super::state::{AttachmentPhase, SharedHost};
+use super::state::{AttachmentPhase, CommitFlagLease, MutationOwner, SharedHost};
 use crate::database::{
-    AttachmentId, DatabaseError, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest,
-    MAX_DATABASE_IO,
+    AttachmentId, DatabaseCall, DatabaseError, DatabaseFile, DatabaseOp, DatabaseResult,
+    DatabaseSuccess, MAX_DATABASE_IO,
 };
-use crate::journal::{DatabaseFileMeta, JournalRecord, RecordKind, VsetKind};
+use crate::journal::{DatabaseFileMeta, JournalRecord, MigrationSource, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, span_of};
-use crate::protocol::{AdminReply, DetachMode, ReqId};
+use crate::protocol::{AdminError, AdminResult, AdminSuccess, DetachMode};
 use crate::segment::SegmentBatchBuilder;
 use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VsetId, page_size};
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store};
 
-pub async fn attach_database<W: AdminIo>(
-    state: SharedHost,
-    world: &W,
-    req: ReqId,
-    vset: VsetId,
-    vm: crate::types::VmId,
-) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabasePersistError {
+    Stale,
+    Busy,
+    Overflow,
+    Capacity,
+    Fatal,
+}
+
+const DATABASE_CONCURRENCY: usize = 64;
+const DATABASE_QUEUE_CAPACITY: usize = 64;
+const DATABASE_INGRESS_BATCH: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DetachedDatabaseDrain {
+    pub(crate) vset: VsetId,
+    pub(crate) attachment: AttachmentId,
+}
+
+enum DatabaseWork {
+    Request(crate::world::DatabaseActorRequest),
+    Drain(DetachedDatabaseDrain),
+}
+
+enum DatabaseSourceEvent {
+    Completed(Option<VsetId>),
+    Request(Option<crate::world::DatabaseActorRequest>),
+    Drain(Option<DetachedDatabaseDrain>),
+}
+
+pub fn attach_database(state: &SharedHost, vset: VsetId, vm: crate::types::VmId) -> AdminResult {
     let attachment = {
         let mut host = state.borrow_mut();
         let valid = host.vsets.get(&vset).is_some_and(|vset_state| {
@@ -48,26 +74,17 @@ pub async fn attach_database<W: AdminIo>(
             None
         }
     };
-    let reply = attachment.map_or(AdminReply::AdminFailed { req }, |attachment| {
-        AdminReply::DatabaseAttached {
-            req,
-            vset,
-            attachment,
-        }
-    });
-    AdminIo::reply_admin(world, reply).await;
+    attachment.map_or(Err(AdminError::Rejected), |attachment| {
+        Ok(AdminSuccess::DatabaseAttached { vset, attachment })
+    })
 }
 
-pub async fn begin_detach_database<W>(
-    state: SharedHost,
-    world: Rc<W>,
-    req: ReqId,
+pub fn begin_detach_database(
+    state: &SharedHost,
     vset: VsetId,
     attachment: AttachmentId,
     mode: DetachMode,
-) where
-    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
-{
+) -> (AdminResult, bool) {
     let started = {
         let mut host = state.borrow_mut();
         host.vsets.get_mut(&vset).is_some_and(|vset_state| {
@@ -91,37 +108,34 @@ pub async fn begin_detach_database<W>(
             true
         })
     };
-    let reply = if started {
-        AdminReply::DatabaseDetachStarted {
-            req,
+    let response = if started {
+        Ok(AdminSuccess::DatabaseDetachStarted {
             vset,
             attachment,
             forced: mode == DetachMode::Forced,
-        }
+        })
     } else {
-        AdminReply::AdminFailed { req }
+        Err(AdminError::Stale)
     };
-    AdminIo::reply_admin(world.as_ref(), reply).await;
-    if !started || mode == DetachMode::Forced {
-        return;
-    }
-    loop {
-        let active = state
-            .borrow()
-            .vsets
-            .get(&vset)
-            .is_some_and(|vset_state| vset_state.database_runtime.active.is_some());
-        if !active {
-            break;
-        }
-        yield_now().await;
-    }
+    (response, started && mode != DetachMode::Forced)
+}
+
+pub async fn drain_detached_database<W>(
+    state: SharedHost,
+    world: Rc<W>,
+    vset: VsetId,
+    attachment: AttachmentId,
+) where
+    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
+{
     let barrier = {
         let mut host = state.borrow_mut();
         let Some(vset_state) = host.vsets.get_mut(&vset) else {
             return;
         };
-        if vset_state.database_runtime.phase != AttachmentPhase::Draining(attachment) {
+        if vset_state.database_runtime.phase != AttachmentPhase::Draining(attachment)
+            || vset_state.database_runtime.active.is_some()
+        {
             return;
         }
         vset_state.database_runtime.drain_barrier = vset_state.mutation_seq;
@@ -130,13 +144,11 @@ pub async fn begin_detach_database<W>(
     let _ = ensure_database_sync(&state, world, vset, barrier).await;
 }
 
-pub async fn finish_detach_database<W: AdminIo>(
-    state: SharedHost,
-    world: &W,
-    req: ReqId,
+pub fn finish_detach_database(
+    state: &SharedHost,
     vset: VsetId,
     attachment: AttachmentId,
-) {
+) -> AdminResult {
     let detached = {
         let mut host = state.borrow_mut();
         host.vsets.get_mut(&vset).is_some_and(|vset_state| {
@@ -157,76 +169,162 @@ pub async fn finish_detach_database<W: AdminIo>(
             true
         })
     };
-    let reply = if detached {
-        AdminReply::DatabaseDetached {
-            req,
-            vset,
-            attachment,
-        }
+    if detached {
+        Ok(AdminSuccess::DatabaseDetached { vset, attachment })
     } else {
-        AdminReply::AdminFailed { req }
-    };
-    AdminIo::reply_admin(world, reply).await;
+        Err(AdminError::Stale)
+    }
 }
 
-pub async fn database_source<W>(state: SharedHost, world: Rc<W>)
-where
+pub(crate) async fn database_source<W>(
+    state: SharedHost,
+    world: Rc<W>,
+    mut drains: Receiver<DetachedDatabaseDrain>,
+) where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
-    while let Some(request) = AdminIo::next_database(world.as_ref()).await {
-        let vset = request.vset;
-        let attachment = request.attachment;
-        let tracked = {
-            let mut host = state.borrow_mut();
-            host.vsets.get_mut(&vset).is_some_and(|vset_state| {
-                let valid = matches!(
-                    vset_state.database_runtime.phase,
-                    AttachmentPhase::Attached(id) | AttachmentPhase::Draining(id)
-                        if id == attachment
-                );
-                if valid {
-                    vset_state.database_runtime.active = Some(attachment);
+    let mut actors = TaskSet::new();
+    let (completed, mut completions) = unbounded();
+    let mut requests = KeyedQueue::new();
+    let mut ingress_open = true;
+    let mut drains_open = true;
+    let mut external_pending = 0usize;
+    let mut ingress_batch = 0;
+    loop {
+        while let Some((vset, work)) = requests.start_next(DATABASE_CONCURRENCY) {
+            let external = matches!(work, DatabaseWork::Request(_));
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            let completed = completed.clone();
+            actors.spawn(async move {
+                match work {
+                    DatabaseWork::Request(request) => {
+                        handle_database_request(state, world, request).await;
+                    }
+                    DatabaseWork::Drain(drain) => {
+                        drain_detached_database(state, world, drain.vset, drain.attachment).await;
+                    }
                 }
-                valid
-            })
-        };
-        let reply = database_request(&state, Rc::clone(&world), request).await;
-        let retired = if tracked {
-            let mut host = state.borrow_mut();
-            if let Some(vset_state) = host.vsets.get_mut(&vset) {
-                if vset_state.database_runtime.active == Some(attachment) {
-                    vset_state.database_runtime.active = None;
-                }
-                !matches!(
-                    vset_state.database_runtime.phase,
-                    AttachmentPhase::Attached(id) | AttachmentPhase::Draining(id)
-                        if id == attachment
-                )
-            } else {
-                true
+                let _ = completed.send(vset);
+            });
+            if external {
+                external_pending = external_pending
+                    .checked_sub(1)
+                    .expect("queued database request started");
             }
-        } else {
-            false
+        }
+        if !ingress_open && !drains_open && requests.is_idle() {
+            return;
+        }
+        let event = match (ingress_open, drains_open) {
+            (true, true) => match select3(
+                completions.recv(),
+                AdminIo::next_database(world.as_ref()),
+                drains.recv(),
+            )
+            .await
+            {
+                OneOf3::First(value) => DatabaseSourceEvent::Completed(value),
+                OneOf3::Second(value) => DatabaseSourceEvent::Request(value),
+                OneOf3::Third(value) => DatabaseSourceEvent::Drain(value),
+            },
+            (true, false) => {
+                match select2(completions.recv(), AdminIo::next_database(world.as_ref())).await {
+                    Either::First(value) => DatabaseSourceEvent::Completed(value),
+                    Either::Second(value) => DatabaseSourceEvent::Request(value),
+                }
+            }
+            (false, true) => match select2(completions.recv(), drains.recv()).await {
+                Either::First(value) => DatabaseSourceEvent::Completed(value),
+                Either::Second(value) => DatabaseSourceEvent::Drain(value),
+            },
+            (false, false) => DatabaseSourceEvent::Completed(completions.recv().await),
         };
-        let reply = if retired {
-            failed(reply.req(), DatabaseError::StaleAttachment)
-        } else {
-            reply
-        };
-        AdminIo::reply_database(world.as_ref(), reply).await;
+        match event {
+            DatabaseSourceEvent::Completed(Some(vset)) => requests.complete(vset),
+            DatabaseSourceEvent::Completed(None) => return,
+            DatabaseSourceEvent::Request(Some(request)) => {
+                if external_pending >= DATABASE_QUEUE_CAPACITY {
+                    let (_, mut reply) = request.into_parts();
+                    let _ = reply.send(Err(DatabaseError::Busy));
+                } else {
+                    requests.push(request.body.vset, DatabaseWork::Request(request));
+                    external_pending += 1;
+                }
+                ingress_batch += 1;
+                if ingress_batch == DATABASE_INGRESS_BATCH {
+                    ingress_batch = 0;
+                    yield_now().await;
+                }
+            }
+            DatabaseSourceEvent::Request(None) => ingress_open = false,
+            DatabaseSourceEvent::Drain(Some(drain)) => {
+                requests.push(drain.vset, DatabaseWork::Drain(drain));
+            }
+            DatabaseSourceEvent::Drain(None) => drains_open = false,
+        }
     }
+}
+
+async fn handle_database_request<W>(
+    state: SharedHost,
+    world: Rc<W>,
+    request: crate::world::DatabaseActorRequest,
+) where
+    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
+{
+    let (request, mut reply_target) = request.into_parts();
+    let vset = request.vset;
+    let attachment = request.attachment;
+    let tracked = {
+        let mut host = state.borrow_mut();
+        host.vsets.get_mut(&vset).is_some_and(|vset_state| {
+            let valid = matches!(
+                vset_state.database_runtime.phase,
+                AttachmentPhase::Attached(id) | AttachmentPhase::Draining(id)
+                    if id == attachment
+            );
+            if valid {
+                vset_state.database_runtime.active = Some(attachment);
+            }
+            valid
+        })
+    };
+    let result = database_request(&state, Rc::clone(&world), request).await;
+    let retired = if tracked {
+        let mut host = state.borrow_mut();
+        if let Some(vset_state) = host.vsets.get_mut(&vset) {
+            if vset_state.database_runtime.active == Some(attachment) {
+                vset_state.database_runtime.active = None;
+            }
+            !matches!(
+                vset_state.database_runtime.phase,
+                AttachmentPhase::Attached(id) | AttachmentPhase::Draining(id)
+                    if id == attachment
+            )
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    let result = if retired {
+        Err(DatabaseError::StaleAttachment)
+    } else {
+        result
+    };
+    let _ = reply_target.send(result);
 }
 
 #[allow(clippy::too_many_lines)]
 async fn database_request<W>(
     state: &SharedHost,
     world: Rc<W>,
-    request: DatabaseRequest,
-) -> DatabaseReply
+    request: DatabaseCall,
+) -> DatabaseResult
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
-    let req = request.req;
     let phase = state
         .borrow()
         .vsets
@@ -234,7 +332,7 @@ where
         .filter(|vset| vset.ready && vset.config.kind == VsetKind::Database)
         .map(|vset| vset.database_runtime.phase);
     let Some(phase) = phase else {
-        return failed(req, DatabaseError::NotAttached);
+        return Err(DatabaseError::NotAttached);
     };
     let current = match phase {
         AttachmentPhase::Attached(id)
@@ -248,7 +346,7 @@ where
             AttachmentPhase::Detached | AttachmentPhase::Forced(_)
         )
     {
-        return failed(req, DatabaseError::StaleAttachment);
+        return Err(DatabaseError::StaleAttachment);
     }
     if matches!(phase, AttachmentPhase::Draining(_))
         && !matches!(
@@ -256,10 +354,10 @@ where
             DatabaseOp::Close { .. } | DatabaseOp::Sync { .. }
         )
     {
-        return failed(req, DatabaseError::Draining);
+        return Err(DatabaseError::Draining);
     }
     if !bounded_request(state, request.vset, &request.op) {
-        return failed(req, DatabaseError::TooLarge);
+        return Err(DatabaseError::TooLarge);
     }
     match request.op {
         DatabaseOp::Open {
@@ -271,7 +369,6 @@ where
                 state,
                 world.as_ref(),
                 request.vset,
-                req,
                 handle,
                 file,
                 create,
@@ -279,59 +376,36 @@ where
             )
             .await
         }
-        DatabaseOp::Close { handle } => close(state, request.vset, req, handle),
+        DatabaseOp::Close { handle } => close(state, request.vset, handle),
         DatabaseOp::Read {
             handle,
             offset,
             len,
-        } => {
-            read(
-                state,
-                world.as_ref(),
-                request.vset,
-                req,
-                handle,
-                offset,
-                len,
-            )
-            .await
-        }
-        DatabaseOp::FileSize { handle } => file_size(state, request.vset, req, handle),
+        } => read(state, world.as_ref(), request.vset, handle, offset, len).await,
+        DatabaseOp::FileSize { handle } => file_size(state, request.vset, handle),
         DatabaseOp::Access { file } => {
             let exists = file_meta(state.borrow().vsets[&request.vset].database, file).exists;
-            DatabaseReply::Access { req, exists }
+            Ok(DatabaseSuccess::Access { exists })
         }
         DatabaseOp::Stat { file } => {
             let meta = file_meta(state.borrow().vsets[&request.vset].database, file);
-            DatabaseReply::Stat {
-                req,
+            Ok(DatabaseSuccess::Stat {
                 exists: meta.exists,
                 size: meta.size,
-            }
+            })
         }
         DatabaseOp::Sync { handle } => {
-            sync(state, world, request.vset, req, handle, request.attachment).await
+            sync(state, world, request.vset, handle, request.attachment).await
         }
         DatabaseOp::Write {
             handle,
             offset,
             bytes,
-        } => {
-            write(
-                state,
-                world.as_ref(),
-                request.vset,
-                req,
-                handle,
-                offset,
-                bytes,
-            )
-            .await
-        }
+        } => write(state, world.as_ref(), request.vset, handle, offset, bytes).await,
         DatabaseOp::Truncate { handle, size } => {
-            truncate(state, world.as_ref(), request.vset, req, handle, size).await
+            truncate(state, world.as_ref(), request.vset, handle, size).await
         }
-        DatabaseOp::Delete { file } => delete(state, world.as_ref(), request.vset, req, file).await,
+        DatabaseOp::Delete { file } => delete(state, world.as_ref(), request.vset, file).await,
     }
 }
 
@@ -340,21 +414,20 @@ async fn open<W: Blobs + AdminIo>(
     state: &SharedHost,
     world: &W,
     vset: VsetId,
-    req: ReqId,
     handle: u64,
     file: DatabaseFile,
     create: bool,
     attachment: AttachmentId,
-) -> DatabaseReply {
+) -> DatabaseResult {
     let (exists, database) = {
         let host = state.borrow();
         let vset_state = &host.vsets[&vset];
         if vset_state.database_runtime.handles.contains_key(&handle) {
-            return failed(req, DatabaseError::AlreadyOpen);
+            return Err(DatabaseError::AlreadyOpen);
         }
         let meta = file_meta(vset_state.database, file);
         if !meta.exists && !create {
-            return failed(req, DatabaseError::NotFound);
+            return Err(DatabaseError::NotFound);
         }
         let mut database = vset_state.database;
         if !meta.exists {
@@ -370,54 +443,52 @@ async fn open<W: Blobs + AdminIo>(
             .await
             .is_err()
     {
-        return failed(req, DatabaseError::Io);
+        return Err(DatabaseError::Io);
     }
     let mut host = state.borrow_mut();
     let Some(vset_state) = host.vsets.get_mut(&vset) else {
-        return failed(req, DatabaseError::StaleAttachment);
+        return Err(DatabaseError::StaleAttachment);
     };
     if !matches!(
         vset_state.database_runtime.phase,
         AttachmentPhase::Attached(id) | AttachmentPhase::Draining(id) if id == attachment
     ) {
-        return failed(req, DatabaseError::StaleAttachment);
+        return Err(DatabaseError::StaleAttachment);
     }
     vset_state.database_runtime.handles.insert(handle, file);
-    DatabaseReply::Opened { req }
+    Ok(DatabaseSuccess::Opened)
 }
 
-fn close(state: &SharedHost, vset: VsetId, req: ReqId, handle: u64) -> DatabaseReply {
+fn close(state: &SharedHost, vset: VsetId, handle: u64) -> DatabaseResult {
     let removed = state
         .borrow_mut()
         .vsets
         .get_mut(&vset)
         .and_then(|vset| vset.database_runtime.handles.remove(&handle));
     removed.map_or_else(
-        || failed(req, DatabaseError::InvalidHandle),
-        |_| DatabaseReply::Closed { req },
+        || Err(DatabaseError::InvalidHandle),
+        |_| Ok(DatabaseSuccess::Closed),
     )
 }
 
-fn file_size(state: &SharedHost, vset: VsetId, req: ReqId, handle: u64) -> DatabaseReply {
+fn file_size(state: &SharedHost, vset: VsetId, handle: u64) -> DatabaseResult {
     let host = state.borrow();
     let vset_state = &host.vsets[&vset];
     let Some(&file) = vset_state.database_runtime.handles.get(&handle) else {
-        return failed(req, DatabaseError::InvalidHandle);
+        return Err(DatabaseError::InvalidHandle);
     };
-    DatabaseReply::FileSize {
-        req,
+    Ok(DatabaseSuccess::FileSize {
         size: file_meta(vset_state.database, file).size,
-    }
+    })
 }
 
 async fn sync<W>(
     state: &SharedHost,
     world: Rc<W>,
     vset: VsetId,
-    req: ReqId,
     handle: u64,
     attachment: AttachmentId,
-) -> DatabaseReply
+) -> DatabaseResult
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
@@ -425,7 +496,7 @@ where
         let host = state.borrow();
         let vset_state = &host.vsets[&vset];
         if !vset_state.database_runtime.handles.contains_key(&handle) {
-            return failed(req, DatabaseError::InvalidHandle);
+            return Err(DatabaseError::InvalidHandle);
         }
         vset_state.mutation_seq
     };
@@ -433,25 +504,22 @@ where
         .await
         .is_err()
     {
-        return failed(req, DatabaseError::Io);
+        return Err(DatabaseError::Io);
     }
     let host = state.borrow();
     let Some(vset_state) = host.vsets.get(&vset) else {
-        return failed(req, DatabaseError::StaleAttachment);
+        return Err(DatabaseError::StaleAttachment);
     };
     if !matches!(
         vset_state.database_runtime.phase,
         AttachmentPhase::Attached(id) | AttachmentPhase::Draining(id) if id == attachment
     ) {
-        return failed(req, DatabaseError::StaleAttachment);
+        return Err(DatabaseError::StaleAttachment);
     }
     if vset_state.sync_ack_through < barrier {
-        return failed(req, DatabaseError::Io);
+        return Err(DatabaseError::Io);
     }
-    DatabaseReply::Synced {
-        req,
-        sequence: barrier,
-    }
+    Ok(DatabaseSuccess::Synced { sequence: barrier })
 }
 
 async fn ensure_database_sync<W>(
@@ -459,13 +527,16 @@ async fn ensure_database_sync<W>(
     world: Rc<W>,
     vset: VsetId,
     barrier: u64,
-) -> Result<(), ()>
+) -> Result<(), DatabaseError>
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
     let (covered, acknowledged, database, peer_stashed) = {
         let host = state.borrow();
-        let vset_state = host.vsets.get(&vset).ok_or(())?;
+        let vset_state = host
+            .vsets
+            .get(&vset)
+            .ok_or(DatabaseError::StaleAttachment)?;
         (
             vset_state.local_covered_through,
             vset_state.sync_ack_through,
@@ -484,7 +555,8 @@ where
             false,
             Some(barrier),
         )
-        .await?;
+        .await
+        .map_err(|_| DatabaseError::Io)?;
     }
     if peer_stashed
         && state
@@ -501,18 +573,17 @@ where
         .get(&vset)
         .is_some_and(|vset_state| vset_state.sync_ack_through >= barrier)
         .then_some(())
-        .ok_or(())
+        .ok_or(DatabaseError::Io)
 }
 
 async fn write<W>(
     state: &SharedHost,
     world: &W,
     vset: VsetId,
-    req: ReqId,
     handle: u64,
     offset: u64,
     bytes: Vec<u8>,
-) -> DatabaseReply
+) -> DatabaseResult
 where
     W: Blobs + Store + Peers + AdminIo,
 {
@@ -520,19 +591,18 @@ where
         let host = state.borrow();
         let vset_state = &host.vsets[&vset];
         let Some(&file) = vset_state.database_runtime.handles.get(&handle) else {
-            return failed(req, DatabaseError::InvalidHandle);
+            return Err(DatabaseError::InvalidHandle);
         };
         let meta = file_meta(vset_state.database, file);
         if !meta.exists {
-            return failed(req, DatabaseError::NotFound);
+            return Err(DatabaseError::NotFound);
         }
         (file, meta.size, vset_state.incarnation, vset_state.database)
     };
     if bytes.is_empty() {
-        return DatabaseReply::Written {
-            req,
+        return Ok(DatabaseSuccess::Written {
             sequence: state.borrow().vsets[&vset].mutation_seq,
-        };
+        });
     }
     let mut updates = Vec::new();
     let mut cursor = 0;
@@ -544,7 +614,7 @@ where
         let page = file.page(vset, page_number);
         let Some(mut page_bytes) = load_page_for_database(state, world, page, incarnation).await
         else {
-            return failed(req, DatabaseError::Io);
+            return Err(DatabaseError::Io);
         };
         page_bytes[in_page..in_page + take].copy_from_slice(&bytes[cursor..cursor + take]);
         updates.push((page, page_bytes));
@@ -560,8 +630,8 @@ where
             .expect("validated request"),
     );
     match persist_database(state, world, vset, updates, None, database, true, None).await {
-        Ok(sequence) => DatabaseReply::Written { req, sequence },
-        Err(()) => failed(req, DatabaseError::Io),
+        Ok(sequence) => Ok(DatabaseSuccess::Written { sequence }),
+        Err(_) => Err(DatabaseError::Io),
     }
 }
 
@@ -569,10 +639,9 @@ async fn truncate<W>(
     state: &SharedHost,
     world: &W,
     vset: VsetId,
-    req: ReqId,
     handle: u64,
     size: u64,
-) -> DatabaseReply
+) -> DatabaseResult
 where
     W: Blobs + Store + Peers + AdminIo,
 {
@@ -580,11 +649,11 @@ where
         let host = state.borrow();
         let vset_state = &host.vsets[&vset];
         let Some(&file) = vset_state.database_runtime.handles.get(&handle) else {
-            return failed(req, DatabaseError::InvalidHandle);
+            return Err(DatabaseError::InvalidHandle);
         };
         let meta = file_meta(vset_state.database, file);
         if !meta.exists {
-            return failed(req, DatabaseError::NotFound);
+            return Err(DatabaseError::NotFound);
         }
         (file, meta.size, vset_state.incarnation, vset_state.database)
     };
@@ -593,7 +662,7 @@ where
         let page_number = u32::try_from(size / page_size() as u64).expect("bounded request");
         let page = file.page(vset, page_number);
         let Some(mut bytes) = load_page_for_database(state, world, page, incarnation).await else {
-            return failed(req, DatabaseError::Io);
+            return Err(DatabaseError::Io);
         };
         bytes[usize::try_from(size % page_size() as u64).expect("page offset")..].fill(0);
         updates.push((page, bytes));
@@ -604,14 +673,14 @@ where
             .await
             .is_err()
     {
-        return failed(req, DatabaseError::Io);
+        return Err(DatabaseError::Io);
     }
     let mut database = database;
     file_meta_mut(&mut database, file).size = size;
     let prune = (size < old_size).then_some((file, first_removed));
     match persist_database(state, world, vset, updates, prune, database, true, None).await {
-        Ok(sequence) => DatabaseReply::Truncated { req, sequence },
-        Err(()) => failed(req, DatabaseError::Io),
+        Ok(sequence) => Ok(DatabaseSuccess::Truncated { sequence }),
+        Err(_) => Err(DatabaseError::Io),
     }
 }
 
@@ -619,9 +688,8 @@ async fn delete<W>(
     state: &SharedHost,
     world: &W,
     vset: VsetId,
-    req: ReqId,
     file: DatabaseFile,
-) -> DatabaseReply
+) -> DatabaseResult
 where
     W: Blobs + Store + Peers + AdminIo,
 {
@@ -634,7 +702,7 @@ where
         .await
         .is_err()
     {
-        return failed(req, DatabaseError::Io);
+        return Err(DatabaseError::Io);
     }
     *file_meta_mut(&mut database, file) = DatabaseFileMeta::default();
     match persist_database(
@@ -649,8 +717,8 @@ where
     )
     .await
     {
-        Ok(sequence) => DatabaseReply::Deleted { req, sequence },
-        Err(()) => failed(req, DatabaseError::Io),
+        Ok(sequence) => Ok(DatabaseSuccess::Deleted { sequence }),
+        Err(_) => Err(DatabaseError::Io),
     }
 }
 
@@ -680,7 +748,7 @@ async fn hydrate_prune_spans<W>(
     file: DatabaseFile,
     first_removed: u64,
     incarnation: u64,
-) -> Result<(), ()>
+) -> Result<(), HydrationError>
 where
     W: Blobs + Store,
 {
@@ -722,7 +790,7 @@ async fn persist_database<W>(
     database: crate::journal::DatabaseMeta,
     mutation: bool,
     sync_barrier: Option<u64>,
-) -> Result<u64, ()>
+) -> Result<u64, DatabasePersistError>
 where
     W: Blobs + AdminIo,
 {
@@ -737,24 +805,45 @@ where
         mut staged,
         covered,
         peer_source,
+        peer_source_offer_fence,
+        sequence_after,
+        generation_after,
     ) = {
-        let mut host = state.borrow_mut();
-        let vset_state = host.vsets.get_mut(&vset).ok_or(())?;
-        if !vset_state.ready || vset_state.commit_running {
-            return Err(());
+        let host = state.borrow();
+        let vset_state = host.vsets.get(&vset).ok_or(DatabasePersistError::Stale)?;
+        if !vset_state.ready {
+            return Err(DatabasePersistError::Stale);
         }
-        vset_state.commit_running = true;
+        if vset_state.operations.mutation_blocked() {
+            return Err(DatabasePersistError::Busy);
+        }
         let capture_seq = if mutation {
-            vset_state.mutation_seq.checked_add(1).ok_or(())?
+            vset_state
+                .mutation_seq
+                .checked_add(1)
+                .ok_or(DatabasePersistError::Overflow)?
         } else {
             vset_state.mutation_seq
         };
         let seq = JournalSeq(vset_state.next_seq);
+        let sequence_after = vset_state
+            .next_seq
+            .checked_add(1)
+            .ok_or(DatabasePersistError::Overflow)?;
         let first_segment = SegId(vset_state.next_seg);
+        let generation_count = u64::try_from(updates.len()).expect("update count fits u64");
+        let generation_after = vset_state
+            .next_gen
+            .checked_add(generation_count)
+            .ok_or(DatabasePersistError::Overflow)?;
         let generations = (0..updates.len())
             .map(|offset| {
                 let offset = u64::try_from(offset).expect("update count fits u64");
-                vset_state.next_gen.checked_add(offset).map(Gen).ok_or(())
+                vset_state
+                    .next_gen
+                    .checked_add(offset)
+                    .map(Gen)
+                    .ok_or(DatabasePersistError::Overflow)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut staged = super::state::VsetState::fresh(vset_state.config, vset_state.incarnation);
@@ -777,14 +866,22 @@ where
             staged,
             covered,
             vset_state.peer_source,
+            vset_state.peer_source_offer_fence,
+            sequence_after,
+            generation_after,
         )
     };
-    let lease = CommitFlagLease::new(state, vset, incarnation);
     let mut builder = SegmentBatchBuilder::new(vset, fence, first_segment);
     for ((page, bytes), generation) in updates.iter().zip(&generations) {
-        builder.add(*page, *generation, bytes);
+        builder
+            .try_add(*page, *generation, bytes)
+            .map_err(|_| DatabasePersistError::Overflow)?;
     }
     let segments = builder.finish();
+    let segment_after = first_segment
+        .0
+        .checked_add(u64::try_from(segments.len()).expect("segment count fits u64"))
+        .ok_or(DatabasePersistError::Overflow)?;
     for (_, _, entries) in &segments {
         for &(page, generation, location) in entries {
             staged.page_locs.insert(page, (generation, location));
@@ -805,7 +902,10 @@ where
         database,
         overlay: record_overlay.clone(),
         leaves: record_leaves.clone(),
-        migrated_from: peer_source,
+        migrated_from: peer_source.map(|host| MigrationSource {
+            host,
+            offer_fence: peer_source_offer_fence,
+        }),
     };
     let reservations = segments
         .iter()
@@ -822,8 +922,25 @@ where
             )
         }))
         .collect::<Vec<_>>();
+    {
+        let mut host = state.borrow_mut();
+        let vset_state = host
+            .vsets
+            .get_mut(&vset)
+            .filter(|vset_state| vset_state.incarnation == incarnation)
+            .ok_or(DatabasePersistError::Stale)?;
+        if vset_state.operations.mutation_blocked() {
+            return Err(DatabasePersistError::Busy);
+        }
+        assert!(
+            vset_state
+                .operations
+                .try_start_mutation(MutationOwner::Database)
+        );
+    }
+    let lease = CommitFlagLease::new(state, vset, incarnation, MutationOwner::Database);
     if !state.borrow_mut().try_reserve_blobs(&reservations) {
-        return Err(());
+        return Err(DatabasePersistError::Capacity);
     }
     for (segment, bytes, _) in &segments {
         let name = layout::segment_blob(vset, fence, *segment);
@@ -831,8 +948,8 @@ where
             .await
             .is_err()
         {
-            AdminIo::abort(world, "database segment write failed").await;
-            return Err(());
+            state.borrow_mut().fail("database segment write failed");
+            return Err(DatabasePersistError::Fatal);
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
     }
@@ -843,33 +960,27 @@ where
             .await
             .is_err()
         {
-            AdminIo::abort(world, "database map-leaf write failed").await;
-            return Err(());
+            state.borrow_mut().fail("database map-leaf write failed");
+            return Err(DatabasePersistError::Fatal);
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
         new_leaf_blobs.push((*pointer, (bytes.len() as u64, segments.clone())));
     }
     if !write_record_copies(state, world, vset, &record).await {
-        AdminIo::abort(world, "database journal write failed").await;
-        return Err(());
+        state.borrow_mut().fail("database journal write failed");
+        return Err(DatabasePersistError::Fatal);
     }
-    {
+    let mutation_waiters = {
         let mut host = state.borrow_mut();
         let vset_state = host
             .vsets
             .get_mut(&vset)
             .filter(|vset_state| vset_state.incarnation == incarnation)
-            .ok_or(())?;
+            .ok_or(DatabasePersistError::Stale)?;
         vset_state.mutation_seq = capture_seq;
-        vset_state.next_seq = seq.0.checked_add(1).ok_or(())?;
-        vset_state.next_seg = first_segment
-            .0
-            .checked_add(u64::try_from(segments.len()).expect("segment count fits u64"))
-            .ok_or(())?;
-        vset_state.next_gen = vset_state
-            .next_gen
-            .checked_add(u64::try_from(generations.len()).expect("generation count fits u64"))
-            .ok_or(())?;
+        vset_state.next_seq = sequence_after;
+        vset_state.next_seg = segment_after;
+        vset_state.next_gen = generation_after;
         vset_state.next_leaf = staged.next_leaf;
         vset_state.page_locs = staged.page_locs;
         vset_state.database = database;
@@ -886,18 +997,25 @@ where
         vset_state
             .record_writes
             .insert(seq, (fence, record.sync_covered_through));
-        vset_state.commit_running = false;
+        vset_state
+            .operations
+            .finish_mutation(MutationOwner::Database);
+        let mutation_waiters = std::mem::take(&mut vset_state.mutation_waiters);
         host.counters.pages_flushed += updates.len() as u64;
         host.counters.records_written += 1;
         host.counters.leaf_rolls += leaf_writes.len() as u64;
-    }
+        mutation_waiters
+    };
     lease.commit();
+    for waiter in mutation_waiters {
+        let _ = waiter.send(());
+    }
     if cleanup_local(Rc::clone(state), world, vset, incarnation)
         .await
         .is_err()
     {
-        AdminIo::abort(world, "database local reclaim failed").await;
-        return Err(());
+        state.borrow_mut().fail("database local reclaim failed");
+        return Err(DatabasePersistError::Fatal);
     }
     Ok(capture_seq)
 }
@@ -948,17 +1066,16 @@ async fn read<W>(
     state: &SharedHost,
     world: &W,
     vset: VsetId,
-    req: ReqId,
     handle: u64,
     offset: u64,
     len: u32,
-) -> DatabaseReply
+) -> DatabaseResult
 where
     W: Blobs + Store + Peers,
 {
     let len = len as usize;
     if len > MAX_DATABASE_IO {
-        return failed(req, DatabaseError::TooLarge);
+        return Err(DatabaseError::TooLarge);
     }
     let Some((file, meta, incarnation)) = ({
         let host = state.borrow();
@@ -975,19 +1092,18 @@ where
                 )
             })
     }) else {
-        return failed(req, DatabaseError::InvalidHandle);
+        return Err(DatabaseError::InvalidHandle);
     };
     if !meta.exists {
-        return failed(req, DatabaseError::NotFound);
+        return Err(DatabaseError::NotFound);
     }
     let size = meta.size;
     let eof = size.saturating_sub(offset) < len as u64;
     if offset >= size {
-        return DatabaseReply::Read {
-            req,
+        return Ok(DatabaseSuccess::Read {
             bytes: Vec::new(),
             eof,
-        };
+        });
     }
     let end = size.min(offset.saturating_add(len as u64));
     let mut cursor = offset;
@@ -1000,16 +1116,12 @@ where
             .min(page_size() - in_page);
         let page = file.page(vset, u32::try_from(page_number).expect("bounded request"));
         let Some(bytes) = load_page_for_database(state, world, page, incarnation).await else {
-            return failed(req, DatabaseError::Io);
+            return Err(DatabaseError::Io);
         };
         output.extend_from_slice(&bytes[in_page..in_page + take]);
         cursor += take as u64;
     }
-    DatabaseReply::Read {
-        req,
-        bytes: output,
-        eof,
-    }
+    Ok(DatabaseSuccess::Read { bytes: output, eof })
 }
 
 fn file_meta(database: crate::journal::DatabaseMeta, file: DatabaseFile) -> DatabaseFileMeta {
@@ -1031,10 +1143,6 @@ fn file_meta_mut(
     }
 }
 
-const fn failed(req: ReqId, error: DatabaseError) -> DatabaseReply {
-    DatabaseReply::Failed { req, error }
-}
-
 #[cfg(test)]
 #[allow(clippy::default_trait_access)]
 mod tests {
@@ -1042,24 +1150,23 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::rc::Rc;
 
-    use async_trait::async_trait;
-    use blockd_exec::Executor;
+    use blockd_exec::{Executor, bridge_request, spawn};
 
     use super::*;
     use crate::hostmeta::HostConfig;
     use crate::journal::{DatabaseMeta, VsetConfig};
-    use crate::protocol::AdminCmd;
+    use crate::protocol::{AdminCall, AdminEvent, AdminResult};
     use crate::types::{HostId, VolumeId, VolumeIdx};
     use crate::world::{BlobEntry, BlobError};
 
     #[derive(Default)]
     struct TestWorld {
         blobs: RefCell<BTreeMap<String, Vec<u8>>>,
-        replies: RefCell<Vec<AdminReply>>,
-        admin: RefCell<VecDeque<AdminCmd>>,
+        replies: Rc<RefCell<Vec<AdminResult>>>,
+        events: RefCell<Vec<AdminEvent>>,
+        admin: RefCell<VecDeque<AdminCall>>,
     }
 
-    #[async_trait(?Send)]
     impl Blobs for TestWorld {
         async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
             Ok(Vec::new())
@@ -1086,20 +1193,28 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
     impl AdminIo for TestWorld {
-        async fn next_admin(&self) -> Option<AdminCmd> {
-            self.admin.borrow_mut().pop_front()
+        async fn next_admin(&self) -> Option<crate::world::AdminRequest> {
+            let command = self.admin.borrow_mut().pop_front()?;
+            let (request, receive) = bridge_request(command);
+            let replies = Rc::clone(&self.replies);
+            spawn(async move {
+                if let Ok(result) = receive.await {
+                    replies.borrow_mut().push(result);
+                }
+            })
+            .detach();
+            Some(request)
         }
-        async fn reply_admin(&self, reply: AdminReply) {
-            self.replies.borrow_mut().push(reply);
+
+        async fn emit_admin_event(&self, event: AdminEvent) {
+            self.events.borrow_mut().push(event);
         }
-        async fn next_database(&self) -> Option<DatabaseRequest> {
+        async fn next_database(&self) -> Option<crate::world::DatabaseActorRequest> {
             None
         }
-        async fn reply_database(&self, _: DatabaseReply) {}
-        async fn abort(&self, reason: &'static str) {
-            panic!("unexpected abort: {reason}")
+        async fn host_failed(&self, failure: crate::engine::HostFatal) {
+            panic!("unexpected host failure: {}", failure.reason)
         }
     }
 
@@ -1146,12 +1261,12 @@ mod tests {
                 .await
             }
         });
-        assert_eq!(failed, Err(()));
+        assert_eq!(failed, Err(DatabasePersistError::Capacity));
         {
             let host = state.borrow();
             let vset_state = &host.vsets[&vset];
             assert_eq!(vset_state.incarnation, incarnation);
-            assert!(!vset_state.commit_running);
+            assert!(vset_state.operations.mutation_owner().is_none());
             assert_eq!(vset_state.mutation_seq, 0);
             assert_eq!(vset_state.next_seq, 0);
             assert!(vset_state.page_locs.is_empty());
@@ -1175,6 +1290,187 @@ mod tests {
             }
         });
         assert_eq!(retried, Ok(1));
-        assert!(!state.borrow().vsets[&vset].commit_running);
+        assert!(
+            state.borrow().vsets[&vset]
+                .operations
+                .mutation_owner()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn counter_overflow_does_not_claim_database_mutation_ownership() {
+        let vset = VsetId(1);
+        let pages = [0, 1].map(|page| PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(0),
+            },
+            page: PageNo(page),
+        });
+        let mut host = super::super::state::HostState::new(HostConfig {
+            archive: Default::default(),
+            host: HostId(1),
+            cache_pages: 1,
+            writeback_interval: 1,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: None,
+        });
+        host.insert_fresh(vset, VsetConfig::database(4));
+        let vset_state = host.vsets.get_mut(&vset).expect("vset");
+        vset_state.ready = true;
+        vset_state.mutation_seq = u64::MAX;
+        let state = Rc::new(RefCell::new(host));
+        let world = Rc::new(TestWorld::default());
+        let mut executor = Executor::simulation(2);
+
+        let mutation_overflow = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    Vec::new(),
+                    None,
+                    DatabaseMeta::default(),
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(mutation_overflow, Err(DatabasePersistError::Overflow));
+        assert!(
+            state.borrow().vsets[&vset]
+                .operations
+                .mutation_owner()
+                .is_none()
+        );
+
+        {
+            let mut host = state.borrow_mut();
+            let vset_state = host.vsets.get_mut(&vset).expect("vset");
+            vset_state.mutation_seq = 0;
+            vset_state.next_seq = u64::MAX;
+        }
+        let sequence_overflow = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    Vec::new(),
+                    None,
+                    DatabaseMeta::default(),
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(sequence_overflow, Err(DatabasePersistError::Overflow));
+        assert!(world.blobs.borrow().is_empty());
+        assert!(
+            state.borrow().vsets[&vset]
+                .operations
+                .mutation_owner()
+                .is_none()
+        );
+
+        {
+            let mut host = state.borrow_mut();
+            let vset_state = host.vsets.get_mut(&vset).expect("vset");
+            vset_state.next_seq = 0;
+            vset_state.next_gen = u64::MAX;
+        }
+        let generation_overflow = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    pages.map(|page| (page, vec![1; page_size()])).to_vec(),
+                    None,
+                    DatabaseMeta::default(),
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(generation_overflow, Err(DatabasePersistError::Overflow));
+        assert!(
+            state.borrow().vsets[&vset]
+                .operations
+                .mutation_owner()
+                .is_none()
+        );
+
+        {
+            let mut host = state.borrow_mut();
+            let vset_state = host.vsets.get_mut(&vset).expect("vset");
+            vset_state.next_gen = 0;
+            vset_state.next_seg = u64::MAX;
+        }
+        let segment_overflow = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    vec![(pages[0], vec![1; page_size()])],
+                    None,
+                    DatabaseMeta::default(),
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(segment_overflow, Err(DatabasePersistError::Overflow));
+        assert!(world.blobs.borrow().is_empty());
+        assert!(
+            state.borrow().vsets[&vset]
+                .operations
+                .mutation_owner()
+                .is_none()
+        );
+
+        state
+            .borrow_mut()
+            .vsets
+            .get_mut(&vset)
+            .expect("vset")
+            .next_seg = 0;
+        let retried = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    vec![(pages[0], vec![1; page_size()])],
+                    None,
+                    DatabaseMeta::default(),
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(retried, Ok(1));
     }
 }

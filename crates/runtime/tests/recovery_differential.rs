@@ -11,19 +11,17 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use blockd_core::database::{DatabaseReply, DatabaseRequest};
-use blockd_core::engine::{HostState, reconcile_backed_recovery, recover_local};
+use blockd_core::engine::{HostFatal, HostState, reconcile_backed_recovery, recover_local};
 use blockd_core::hostmeta::{DaemonStats, HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::JournalRecord;
 use blockd_core::layout::{self, BlobName};
 use blockd_core::placement::PeerCandidate;
-use blockd_core::protocol::{AdminCmd, AdminReply, Verdict};
+use blockd_core::protocol::{AdminEvent, Verdict};
 use blockd_core::segment::open_entry;
 use blockd_core::types::{HostId, PageId, VsetId, page_size};
 use blockd_core::world::{
-    AdminIo, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem, GuestSync, Store,
-    StoreError,
+    AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, DatabaseActorRequest, FillSource,
+    GuestFault, GuestMem, GuestMemoryError, GuestPause, GuestSyncRequest, Store, StoreError,
 };
 use blockd_exec::Executor;
 use blockd_runtime::ObjectStore;
@@ -44,7 +42,6 @@ impl MemoryBlobs {
     }
 }
 
-#[async_trait(?Send)]
 impl Blobs for MemoryBlobs {
     async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
         Ok(self
@@ -204,10 +201,9 @@ async fn recovered_content_hash(
 
 struct FixtureWorld {
     store: RuntimeStore,
-    replies: RefCell<Vec<AdminReply>>,
+    events: RefCell<Vec<AdminEvent>>,
 }
 
-#[async_trait(?Send)]
 impl Store for FixtureWorld {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
         Store::put(&self.store, key, bytes).await
@@ -244,57 +240,79 @@ impl Store for FixtureWorld {
     }
 }
 
-#[async_trait(?Send)]
 impl GuestMem for FixtureWorld {
     async fn read_page(&self, _: PageId) -> Vec<u8> {
         vec![0; page_size()]
     }
-    async fn arm_write_protect(&self, _: &[PageId]) {}
-    async fn fill(&self, _: PageId, _: Vec<u8>, _: bool, _: FillSource) {}
+    async fn arm_write_protect(&self, _: &[PageId]) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
+    async fn fill(
+        &self,
+        _: PageId,
+        _: Vec<u8>,
+        _: bool,
+        _: FillSource,
+    ) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
     async fn fill_shared(
         &self,
         _: PageId,
         _: (u64, u64, blockd_core::types::SegId, u32),
         _: Option<Vec<u8>>,
         _: bool,
-    ) {
+    ) -> Result<(), GuestMemoryError> {
+        Ok(())
     }
-    async fn fail(&self, _: PageId) {}
-    async fn unprotect(&self, _: PageId) {}
-    async fn evict(&self, _: PageId) {}
-    async fn install_database(&self, _: PageId, _: Vec<u8>) {}
-    async fn pause(&self, _: VsetId) -> u64 {
-        0
+    async fn fail(&self, _: PageId) -> Result<(), GuestMemoryError> {
+        Ok(())
     }
-    async fn resume(&self, _: VsetId) {}
+    async fn unprotect(&self, _: PageId) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
+    async fn evict(&self, _: PageId) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
+    async fn install_database(&self, _: PageId, _: Vec<u8>) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
+    async fn pause(&self, _: VsetId) -> Result<GuestPause, GuestMemoryError> {
+        Ok(GuestPause {
+            vmstate: 0,
+            generation: 0,
+        })
+    }
+    async fn resume(&self, _: VsetId, _: Option<GuestPause>) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
     async fn harvest_accessed(&self) -> Vec<PageId> {
         Vec::new()
     }
     async fn next_fault(&self) -> Option<GuestFault> {
         None
     }
-    async fn next_sync(&self) -> Option<GuestSync> {
+    async fn next_sync(&self) -> Option<GuestSyncRequest> {
         None
     }
-    async fn sync_ok(&self, _: blockd_core::protocol::ReqId) {}
-    async fn sync_failed(&self, _: blockd_core::protocol::ReqId) {}
-    async fn fence(&self, _: VsetId) {}
+    async fn fence(&self, _: VsetId) -> Result<(), GuestMemoryError> {
+        Ok(())
+    }
 }
 
-#[async_trait(?Send)]
 impl AdminIo for FixtureWorld {
-    async fn next_admin(&self) -> Option<AdminCmd> {
+    async fn next_admin(&self) -> Option<AdminRequest> {
         None
     }
-    async fn reply_admin(&self, reply: AdminReply) {
-        self.replies.borrow_mut().push(reply);
+
+    async fn emit_admin_event(&self, event: AdminEvent) {
+        self.events.borrow_mut().push(event);
     }
-    async fn next_database(&self) -> Option<DatabaseRequest> {
+    async fn next_database(&self) -> Option<DatabaseActorRequest> {
         None
     }
-    async fn reply_database(&self, _: DatabaseReply) {}
-    async fn abort(&self, reason: &'static str) {
-        panic!("fixture recovery aborted: {reason}");
+    async fn host_failed(&self, failure: HostFatal) {
+        panic!("fixture recovery failed: {}", failure.reason);
     }
 }
 
@@ -408,13 +426,13 @@ fn main_branch_fixture_recovers_under_the_actor_runtime() {
     );
     let world = Rc::new(FixtureWorld {
         store: RuntimeStore::new(tokio.handle().clone(), store),
-        replies: RefCell::new(Vec::new()),
+        events: RefCell::new(Vec::new()),
     });
     let backed = state
         .borrow()
         .vsets
         .iter()
-        .filter_map(|(&vset, state)| state.pending_verdict.is_some().then_some(vset))
+        .filter_map(|(&vset, state)| state.operations.recovery_pending().then_some(vset))
         .collect::<Vec<_>>();
     for vset in backed {
         executor.block_on(reconcile_backed_recovery(
@@ -424,8 +442,8 @@ fn main_branch_fixture_recovers_under_the_actor_runtime() {
         ));
     }
     let mut verdicts = initial;
-    for reply in world.replies.borrow().iter() {
-        if let AdminReply::VsetRecovered { vset, verdict } = reply {
+    for event in world.events.borrow().iter() {
+        if let AdminEvent::VsetRecovered { vset, verdict } = event {
             verdicts.insert(*vset, *verdict);
         }
     }

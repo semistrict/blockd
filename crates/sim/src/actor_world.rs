@@ -4,20 +4,21 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use async_trait::async_trait;
 use blockd_core::database::{DatabaseReply, DatabaseRequest};
+use blockd_core::engine::HostFatal;
 use blockd_core::head::HeadRecord;
 use blockd_core::journal::JournalRecord;
 use blockd_core::layout;
 use blockd_core::mapleaf::MapLeaf;
-use blockd_core::protocol::{AdminCmd, AdminReply, PeerMsg, ReqId, StoreFault};
+use blockd_core::protocol::{AdminCall, AdminEvent, AdminResult, PeerMsg, StoreFault};
 use blockd_core::types::{Gen, HostId, PageId, VolumeId, VsetId, page_size};
 use blockd_core::world::{
-    AdminIo, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem, GuestSync, Peers,
-    Store, StoreError,
+    AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, DatabaseActorRequest, FillSource,
+    GuestFault, GuestMem, GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store,
+    StoreError,
 };
 use blockd_exec::channel::{OneSender, Receiver, UnboundedSender, oneshot, unbounded};
-use blockd_exec::{current_poll, delay, now, random_u64, spawn};
+use blockd_exec::{BridgeReceiver, bridge_request, current_poll, delay, now, random_u64, spawn};
 
 use crate::world::blobdev::{BlobDevConfig, CrashFate};
 use crate::world::store::{MAX_OBJECT_BYTES, StoreConfig, StoreCounters, StoreObjectKind};
@@ -30,6 +31,51 @@ fn random_between(low: u64, high: u64) -> u64 {
 struct ReceiverLease<'a, T> {
     slot: &'a RefCell<Option<Receiver<T>>>,
     receiver: Option<Receiver<T>>,
+}
+
+struct PendingGuestPause<'a> {
+    world: &'a SimWorld,
+    vset: VsetId,
+    generation: u64,
+    active: bool,
+}
+
+impl PendingGuestPause<'_> {
+    fn finish(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingGuestPause<'_> {
+    fn drop(&mut self) {
+        if !self.active
+            || self
+                .world
+                .pause_generations
+                .borrow()
+                .get(&self.vset)
+                .copied()
+                != Some(self.generation)
+        {
+            return;
+        }
+        self.world.pause_started.borrow_mut().remove(&self.vset);
+        let was_paused = self.world.memory.borrow_mut().paused.remove(&self.vset);
+        if was_paused {
+            // `fault()` enters through `begin_guest_op()`, so a request that
+            // observes this paused bit waits in `operation_waiters`; it cannot
+            // create a non-inflight `fault_waiters` entry while paused.
+            for waiter in self
+                .world
+                .operation_waiters
+                .borrow_mut()
+                .remove(&self.vset)
+                .unwrap_or_default()
+            {
+                let _ = waiter.send(());
+            }
+        }
+    }
 }
 
 impl<T> ReceiverLease<'_, T> {
@@ -374,17 +420,20 @@ pub(crate) struct SimWorld {
     blobs: RefCell<BlobState>,
     store: Rc<RefCell<StoreState>>,
     memory: RefCell<MemoryState>,
-    admin: Stream<AdminCmd>,
-    admin_reply_events: Stream<AdminReply>,
+    admin: Stream<AdminRequest>,
+    admin_events: Stream<(u64, u64, AdminEvent)>,
+    admin_event_generations: RefCell<BTreeMap<VsetId, u64>>,
+    admin_event_generation_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
+    incarnation: Cell<u64>,
     database: Stream<DatabaseRequest>,
-    database_replies: RefCell<Vec<DatabaseReply>>,
+    database_replies: Rc<RefCell<Vec<DatabaseReply>>>,
     faults: Stream<GuestFault>,
-    syncs: Stream<GuestSync>,
+    syncs: Stream<GuestSyncRequest>,
     peers: Stream<(HostId, PeerMsg)>,
     aborts: Stream<&'static str>,
     network: Rc<SimNetwork>,
     fault_waiters: RefCell<BTreeMap<PageId, Vec<OneSender<bool>>>>,
-    sync_waiters: RefCell<BTreeMap<ReqId, OneSender<bool>>>,
+    faults_inflight: RefCell<BTreeSet<PageId>>,
     aborted: Cell<bool>,
     abort_reason: RefCell<Option<&'static str>>,
     corrupt_fills: Cell<bool>,
@@ -394,6 +443,7 @@ pub(crate) struct SimWorld {
     page_reads_in_poll: Cell<u64>,
     max_page_reads_in_poll: Cell<u64>,
     pause_started: RefCell<BTreeMap<VsetId, u64>>,
+    pause_generations: RefCell<BTreeMap<VsetId, u64>>,
     pause_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
     operation_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
     oracle_pages: RefCell<BTreeMap<VsetId, OracleState>>,
@@ -479,16 +529,19 @@ impl SimWorld {
             store,
             memory: RefCell::new(MemoryState::default()),
             admin: Stream::new(),
-            admin_reply_events: Stream::new(),
+            admin_events: Stream::new(),
+            admin_event_generations: RefCell::new(BTreeMap::new()),
+            admin_event_generation_waiters: RefCell::new(BTreeMap::new()),
+            incarnation: Cell::new(0),
             database: Stream::new(),
-            database_replies: RefCell::new(Vec::new()),
+            database_replies: Rc::new(RefCell::new(Vec::new())),
             faults: Stream::new(),
             syncs: Stream::new(),
             peers: Stream::new(),
             aborts: Stream::new(),
             network: Rc::clone(network),
             fault_waiters: RefCell::new(BTreeMap::new()),
-            sync_waiters: RefCell::new(BTreeMap::new()),
+            faults_inflight: RefCell::new(BTreeSet::new()),
             aborted: Cell::new(false),
             abort_reason: RefCell::new(None),
             corrupt_fills: Cell::new(false),
@@ -498,6 +551,7 @@ impl SimWorld {
             page_reads_in_poll: Cell::new(0),
             max_page_reads_in_poll: Cell::new(0),
             pause_started: RefCell::new(BTreeMap::new()),
+            pause_generations: RefCell::new(BTreeMap::new()),
             pause_waiters: RefCell::new(BTreeMap::new()),
             operation_waiters: RefCell::new(BTreeMap::new()),
             oracle_pages: RefCell::new(BTreeMap::new()),
@@ -511,8 +565,10 @@ impl SimWorld {
         world
     }
 
-    pub(crate) fn enqueue_admin(&self, command: AdminCmd) {
-        assert!(self.admin.send(command), "admin actor is alive");
+    pub(crate) fn request_admin(&self, call: AdminCall) -> BridgeReceiver<AdminResult> {
+        let (request, reply) = bridge_request(call);
+        assert!(self.admin.send(request), "admin actor is alive");
+        reply
     }
 
     pub(crate) fn register_oracle_pages(
@@ -534,12 +590,92 @@ impl SimWorld {
             .unwrap_or_default()
     }
 
-    pub(crate) async fn next_admin_reply(&self) -> Option<AdminReply> {
-        self.admin_reply_events.recv().await
+    pub(crate) async fn next_admin_event(&self) -> Option<AdminEvent> {
+        self.next_admin_event_with_generation()
+            .await
+            .map(|(event, _)| event)
     }
 
-    pub(crate) fn try_next_admin_reply(&self) -> Option<AdminReply> {
-        self.admin_reply_events.try_recv()
+    pub(crate) async fn next_admin_event_with_generation(&self) -> Option<(AdminEvent, u64)> {
+        loop {
+            let (incarnation, generation, event) = self.admin_events.recv().await?;
+            if incarnation == self.incarnation.get() {
+                return Some((event, generation));
+            }
+        }
+    }
+
+    pub(crate) fn try_next_admin_event(&self) -> Option<AdminEvent> {
+        while let Some((incarnation, _, event)) = self.admin_events.try_recv() {
+            if incarnation == self.incarnation.get() {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn admin_event_generation(&self, vset: VsetId) -> u64 {
+        self.admin_event_generations
+            .borrow()
+            .get(&vset)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) async fn wait_for_admin_event_generation_change(
+        &self,
+        vset: VsetId,
+        generation: u64,
+    ) {
+        let changed = {
+            if self.admin_event_generation(vset) == generation {
+                let (wake, changed) = oneshot();
+                self.admin_event_generation_waiters
+                    .borrow_mut()
+                    .entry(vset)
+                    .or_default()
+                    .push(wake);
+                Some(changed)
+            } else {
+                None
+            }
+        };
+        if let Some(changed) = changed {
+            let _ = changed.await;
+        }
+    }
+
+    pub(crate) fn advance_incarnation(&self) {
+        let incarnation = self
+            .incarnation
+            .get()
+            .checked_add(1)
+            .expect("host incarnation overflow");
+        let invalidated = self
+            .admin_event_generations
+            .borrow()
+            .iter()
+            .map(|(&vset, &generation)| {
+                (
+                    vset,
+                    generation
+                        .checked_add(1)
+                        .expect("admin event generation overflow"),
+                )
+            })
+            .collect();
+        *self.admin_event_generations.borrow_mut() = invalidated;
+        for waiter in std::mem::take(&mut *self.admin_event_generation_waiters.borrow_mut())
+            .into_values()
+            .flatten()
+        {
+            let _ = waiter.send(());
+        }
+        self.incarnation.set(incarnation);
+    }
+
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation.get()
     }
 
     pub(crate) fn durable_blobs(&self) -> Vec<(String, Vec<u8>)> {
@@ -778,15 +914,16 @@ impl SimWorld {
                 .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
         }
         let fault_waiters = std::mem::take(&mut *self.fault_waiters.borrow_mut());
+        self.faults_inflight.borrow_mut().clear();
         for waiter in fault_waiters.into_values().flatten() {
-            let _ = waiter.send(false);
-        }
-        let sync_waiters = std::mem::take(&mut *self.sync_waiters.borrow_mut());
-        for waiter in sync_waiters.into_values() {
             let _ = waiter.send(false);
         }
         self.faults.discard_pending();
         self.syncs.discard_pending();
+        self.admin.discard_pending();
+        self.database.discard_pending();
+        self.peers.discard_pending();
+        self.aborts.discard_pending();
         let pause_waiters = std::mem::take(&mut *self.pause_waiters.borrow_mut());
         let operation_waiters = std::mem::take(&mut *self.operation_waiters.borrow_mut());
         for waiter in pause_waiters
@@ -975,7 +1112,11 @@ impl SimWorld {
                 .entry(page)
                 .or_default()
                 .push(send);
-            if !paused && !self.faults.send(GuestFault { page, write }) {
+            if !paused
+                && self.faults_inflight.borrow_mut().insert(page)
+                && !self.faults.send(GuestFault { page, write })
+            {
+                self.faults_inflight.borrow_mut().remove(&page);
                 return false;
             }
             if receive.await != Ok(true) {
@@ -986,10 +1127,8 @@ impl SimWorld {
 
     pub(crate) async fn sync(&self, sync: GuestSync) -> bool {
         self.begin_guest_op(sync.volume.vset).await;
-        let (send, receive) = oneshot();
-        self.sync_waiters.borrow_mut().insert(sync.req, send);
-        if !self.syncs.send(sync) {
-            self.sync_waiters.borrow_mut().remove(&sync.req);
+        let (request, receive) = bridge_request(sync);
+        if !self.syncs.send(request) {
             return false;
         }
         receive.await.unwrap_or(false)
@@ -1102,9 +1241,13 @@ impl SimWorld {
             let _ = waiter.send(success);
         }
     }
+
+    fn finish_fault(&self, page: PageId, success: bool) {
+        self.faults_inflight.borrow_mut().remove(&page);
+        self.wake_fault(page, success);
+    }
 }
 
-#[async_trait(?Send)]
 impl Blobs for SimWorld {
     async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
         let latency = self.blob_latency(0, false);
@@ -1191,7 +1334,6 @@ impl Blobs for SimWorld {
     }
 }
 
-#[async_trait(?Send)]
 impl Store for SimWorld {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
         let result = {
@@ -1347,7 +1489,6 @@ impl Store for SimWorld {
     }
 }
 
-#[async_trait(?Send)]
 impl Peers for SimWorld {
     async fn send(&self, to: HostId, message: PeerMsg) {
         let from = self.host;
@@ -1445,7 +1586,6 @@ fn peer_tag(message: &PeerMsg) -> u8 {
     }
 }
 
-#[async_trait(?Send)]
 impl GuestMem for SimWorld {
     async fn read_page(&self, page: PageId) -> Vec<u8> {
         let poll = current_poll();
@@ -1469,14 +1609,21 @@ impl GuestMem for SimWorld {
         bytes
     }
 
-    async fn arm_write_protect(&self, pages: &[PageId]) {
+    async fn arm_write_protect(&self, pages: &[PageId]) -> Result<(), GuestMemoryError> {
         if self.drop_write_protect.get() {
-            return;
+            return Ok(());
         }
         self.memory.borrow_mut().protected.extend(pages);
+        Ok(())
     }
 
-    async fn fill(&self, page: PageId, mut bytes: Vec<u8>, writable: bool, _source: FillSource) {
+    async fn fill(
+        &self,
+        page: PageId,
+        mut bytes: Vec<u8>,
+        writable: bool,
+        _source: FillSource,
+    ) -> Result<(), GuestMemoryError> {
         if self.corrupt_fills.get() && !bytes.is_empty() {
             bytes[0] ^= 1;
         }
@@ -1489,7 +1636,8 @@ impl GuestMem for SimWorld {
             memory.protected.insert(page);
         }
         drop(memory);
-        self.wake_fault(page, true);
+        self.finish_fault(page, true);
+        Ok(())
     }
 
     async fn fill_shared(
@@ -1498,36 +1646,57 @@ impl GuestMem for SimWorld {
         share: (u64, u64, blockd_core::types::SegId, u32),
         bytes: Option<Vec<u8>>,
         writable: bool,
-    ) {
+    ) -> Result<(), GuestMemoryError> {
         if let Some(bytes) = bytes {
             self.memory.borrow_mut().shared_pages.insert(share, bytes);
         }
         let bytes = self.memory.borrow().shared_pages[&share].clone();
-        self.fill(page, bytes, writable, FillSource::Store).await;
+        self.fill(page, bytes, writable, FillSource::Store).await
     }
 
-    async fn fail(&self, page: PageId) {
+    async fn fail(&self, page: PageId) -> Result<(), GuestMemoryError> {
         self.memory.borrow_mut().failed.insert(page);
-        self.wake_fault(page, false);
+        self.finish_fault(page, false);
+        Err(GuestMemoryError::Unservable)
     }
 
-    async fn unprotect(&self, page: PageId) {
+    async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError> {
         self.memory.borrow_mut().protected.remove(&page);
-        self.wake_fault(page, true);
+        self.finish_fault(page, true);
+        Ok(())
     }
 
-    async fn evict(&self, page: PageId) {
+    async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError> {
         let mut memory = self.memory.borrow_mut();
         memory.pages.remove(&page);
         memory.protected.remove(&page);
+        Ok(())
     }
 
-    async fn install_database(&self, page: PageId, bytes: Vec<u8>) {
+    async fn install_database(&self, page: PageId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
         self.memory.borrow_mut().pages.insert(page, bytes);
+        Ok(())
     }
 
-    async fn pause(&self, vset: VsetId) -> u64 {
+    async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError> {
+        let generation = {
+            let mut generations = self.pause_generations.borrow_mut();
+            let generation = generations
+                .get(&vset)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .expect("guest pause generation overflow");
+            generations.insert(vset, generation);
+            generation
+        };
         self.pause_started.borrow_mut().entry(vset).or_insert(now());
+        let pending = PendingGuestPause {
+            world: self,
+            vset,
+            generation,
+            active: true,
+        };
         loop {
             let decision = {
                 let mut memory = self.memory.borrow_mut();
@@ -1569,7 +1738,11 @@ impl GuestMem for SimWorld {
                             candidates.push(snapshot);
                         }
                     }
-                    return vmstate;
+                    pending.finish();
+                    return Ok(GuestPause {
+                        vmstate,
+                        generation,
+                    });
                 }
                 Err(wait) => {
                     let _ = wait.await;
@@ -1578,7 +1751,16 @@ impl GuestMem for SimWorld {
         }
     }
 
-    async fn resume(&self, vset: VsetId) {
+    async fn resume(
+        &self,
+        vset: VsetId,
+        pause: Option<GuestPause>,
+    ) -> Result<(), GuestMemoryError> {
+        if pause.is_some_and(|pause| {
+            self.pause_generations.borrow().get(&vset).copied() != Some(pause.generation)
+        }) {
+            return Ok(());
+        }
         if let Some(started) = self.pause_started.borrow_mut().remove(&vset) {
             self.max_pause_ns
                 .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
@@ -1600,8 +1782,11 @@ impl GuestMem for SimWorld {
             .copied()
             .collect::<Vec<_>>();
         for page in pages {
-            self.wake_fault(page, true);
+            if !self.faults_inflight.borrow().contains(&page) {
+                self.wake_fault(page, true);
+            }
         }
+        Ok(())
     }
 
     async fn harvest_accessed(&self) -> Vec<PageId> {
@@ -1614,23 +1799,11 @@ impl GuestMem for SimWorld {
         self.faults.recv().await
     }
 
-    async fn next_sync(&self) -> Option<GuestSync> {
+    async fn next_sync(&self) -> Option<GuestSyncRequest> {
         self.syncs.recv().await
     }
 
-    async fn sync_ok(&self, req: ReqId) {
-        if let Some(waiter) = self.sync_waiters.borrow_mut().remove(&req) {
-            let _ = waiter.send(true);
-        }
-    }
-
-    async fn sync_failed(&self, req: ReqId) {
-        if let Some(waiter) = self.sync_waiters.borrow_mut().remove(&req) {
-            let _ = waiter.send(false);
-        }
-    }
-
-    async fn fence(&self, vset: VsetId) {
+    async fn fence(&self, vset: VsetId) -> Result<(), GuestMemoryError> {
         let pages = self
             .fault_waiters
             .borrow()
@@ -1639,30 +1812,65 @@ impl GuestMem for SimWorld {
             .copied()
             .collect::<Vec<_>>();
         for page in pages {
-            self.wake_fault(page, false);
+            self.finish_fault(page, false);
         }
+        Ok(())
     }
 }
 
-#[async_trait(?Send)]
 impl AdminIo for SimWorld {
-    async fn next_admin(&self) -> Option<AdminCmd> {
+    async fn next_admin(&self) -> Option<AdminRequest> {
         self.admin.recv().await
     }
 
-    async fn reply_admin(&self, reply: AdminReply) {
-        let _ = self.admin_reply_events.send(reply);
+    async fn emit_admin_event(&self, event: AdminEvent) {
+        let vset = match event {
+            AdminEvent::VsetRecovered { vset, .. } | AdminEvent::VsetMigratedIn { vset, .. } => {
+                vset
+            }
+        };
+        let generation = {
+            let mut generations = self.admin_event_generations.borrow_mut();
+            let generation = generations
+                .get(&vset)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .expect("admin event generation overflow");
+            generations.insert(vset, generation);
+            generation
+        };
+        for waiter in self
+            .admin_event_generation_waiters
+            .borrow_mut()
+            .remove(&vset)
+            .unwrap_or_default()
+        {
+            let _ = waiter.send(());
+        }
+        let _ = self
+            .admin_events
+            .send((self.incarnation.get(), generation, event));
     }
 
-    async fn next_database(&self) -> Option<DatabaseRequest> {
-        self.database.recv().await
+    async fn next_database(&self) -> Option<DatabaseActorRequest> {
+        let request = self.database.recv().await?;
+        let (req, call) = request.into_call();
+        let (request, receive) = bridge_request(call);
+        let replies = Rc::clone(&self.database_replies);
+        spawn(async move {
+            if let Ok(result) = receive.await {
+                replies
+                    .borrow_mut()
+                    .push(DatabaseReply::from_result(req, result));
+            }
+        })
+        .detach();
+        Some(request)
     }
 
-    async fn reply_database(&self, reply: DatabaseReply) {
-        self.database_replies.borrow_mut().push(reply);
-    }
-
-    async fn abort(&self, reason: &'static str) {
+    async fn host_failed(&self, failure: HostFatal) {
+        let reason = failure.reason;
         self.aborted.set(true);
         self.abort_reason.borrow_mut().replace(reason);
         let _ = self.aborts.send(reason);
@@ -1676,11 +1884,37 @@ mod tests {
     use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
     use blockd_core::journal::VsetConfig;
     use blockd_core::placement::PeerCandidate;
-    use blockd_core::protocol::AdminReply;
+    use blockd_core::protocol::{AdminCall, AdminSuccess, ReqId};
     use blockd_core::types::VsetId;
     use blockd_exec::Executor;
 
     use super::*;
+
+    #[test]
+    fn unservable_page_failure_matches_the_production_fatal_signal() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let page = PageId {
+            volume: blockd_core::types::VolumeId {
+                vset: VsetId(1),
+                idx: blockd_core::types::VolumeIdx(0),
+            },
+            page: blockd_core::types::PageNo(3),
+        };
+        let mut executor = Executor::simulation(8);
+
+        let failed = executor.block_on({
+            let world = Rc::clone(&world);
+            async move { GuestMem::fail(world.as_ref(), page).await }
+        });
+        assert_eq!(failed, Err(GuestMemoryError::Unservable));
+        assert!(world.memory.borrow().failed.contains(&page));
+    }
 
     #[test]
     fn actor_world_runs_creation_through_the_real_async_host() {
@@ -1736,8 +1970,7 @@ mod tests {
             wedge_ticks: 0,
             replica_placement: Some(placement(passive_host)),
         })));
-        world.enqueue_admin(AdminCmd::CreateVset {
-            req: ReqId(1),
+        let reply = world.request_admin(AdminCall::CreateVset {
             vset: VsetId(2),
             config: VsetConfig::compute(1, 4),
             from_base: None,
@@ -1745,16 +1978,10 @@ mod tests {
         let mut executor = Executor::simulation(4);
         let passive = executor.spawn(host_actor_with_state(passive_state, passive_world));
         let actor = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
-        let reply = executor.block_on({
-            let world = Rc::clone(&world);
-            async move { world.next_admin_reply().await }
-        });
+        let reply = executor.block_on(reply).ok();
         assert_eq!(
             reply,
-            Some(AdminReply::VsetCreated {
-                req: ReqId(1),
-                vset: VsetId(2)
-            })
+            Some(Ok(AdminSuccess::VsetCreated { vset: VsetId(2) }))
         );
         assert!(state.borrow().vsets[&VsetId(2)].ready);
         drop(actor);
@@ -1781,10 +2008,11 @@ mod tests {
         let seen_at = Rc::new(Cell::new(None));
         let mut executor = Executor::simulation(9);
         world.set_vmstate(VsetId(1), 0);
-        executor.block_on({
+        let pause = executor.block_on({
             let world = Rc::clone(&world);
             async move { GuestMem::pause(world.as_ref(), VsetId(1)).await }
         });
+        assert_eq!(pause.map(|pause| pause.vmstate), Ok(0));
         executor
             .spawn({
                 let world = Rc::clone(&world);
@@ -1799,7 +2027,8 @@ mod tests {
                         fault.write,
                         FillSource::Zero,
                     )
-                    .await;
+                    .await
+                    .expect("simulated fill succeeds");
                 }
             })
             .detach();
@@ -1812,12 +2041,55 @@ mod tests {
                 let world = Rc::clone(&world);
                 async move {
                     delay(10).await;
-                    GuestMem::resume(world.as_ref(), VsetId(1)).await;
+                    GuestMem::resume(world.as_ref(), VsetId(1), pause.ok())
+                        .await
+                        .expect("simulated resume succeeds");
                 }
             })
             .detach();
         assert_eq!(executor.block_on(client), Ok(true));
         assert_eq!(seen_at.get(), Some(10));
+    }
+
+    #[test]
+    fn stale_resume_cannot_release_a_newer_pause() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let vset = VsetId(1);
+        world.set_vmstate(vset, 9);
+        let mut executor = Executor::simulation(11);
+        let first = executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { GuestMem::pause(world.as_ref(), vset).await }
+            })
+            .expect("first pause");
+        let second = executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { GuestMem::pause(world.as_ref(), vset).await }
+            })
+            .expect("second pause");
+
+        executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { GuestMem::resume(world.as_ref(), vset, Some(first)).await }
+            })
+            .expect("stale resume is harmless");
+        assert!(world.memory.borrow().paused.contains(&vset));
+        executor
+            .block_on({
+                let world = Rc::clone(&world);
+                async move { GuestMem::resume(world.as_ref(), vset, Some(second)).await }
+            })
+            .expect("matching resume succeeds");
+        assert!(!world.memory.borrow().paused.contains(&vset));
     }
 
     #[test]
@@ -1851,8 +2123,73 @@ mod tests {
                 }
             })
             .detach();
-        assert_eq!(executor.block_on(pause), Ok(7));
+        assert_eq!(
+            executor
+                .block_on(pause)
+                .map(|result| result.map(|pause| pause.vmstate)),
+            Ok(Ok(7))
+        );
         assert_eq!(paused_at.get(), Some(10));
+    }
+
+    #[test]
+    fn cancelling_a_pending_pause_clears_its_bookkeeping() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let vset = VsetId(1);
+        world.memory.borrow_mut().in_ops.insert(vset);
+        let mut executor = Executor::simulation(12);
+        let pause = executor.spawn({
+            let world = Rc::clone(&world);
+            async move { GuestMem::pause(world.as_ref(), vset).await }
+        });
+        executor.run_ready();
+        assert!(world.pause_started.borrow().contains_key(&vset));
+
+        drop(pause);
+        executor.run_ready();
+
+        assert!(!world.pause_started.borrow().contains_key(&vset));
+        assert!(!world.memory.borrow().paused.contains(&vset));
+    }
+
+    #[test]
+    fn advancing_incarnation_invalidates_active_recovery_generations() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let vset = VsetId(1);
+        let mut executor = Executor::simulation(13);
+        let (_, generation) = executor.block_on({
+            let world = Rc::clone(&world);
+            async move {
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+                world
+                    .next_admin_event_with_generation()
+                    .await
+                    .expect("recovery event")
+            }
+        });
+
+        world.advance_incarnation();
+
+        assert_ne!(world.admin_event_generation(vset), generation);
     }
 
     #[test]
@@ -1872,10 +2209,11 @@ mod tests {
             page: blockd_core::types::PageNo(3),
         };
         assert!(world.faults.send(GuestFault { page, write: false }));
-        assert!(world.syncs.send(GuestSync {
+        let (sync, _reply) = bridge_request(GuestSync {
             req: ReqId(7),
             volume: page.volume,
-        }));
+        });
+        assert!(world.syncs.send(sync));
 
         world.crash_guest_io();
 

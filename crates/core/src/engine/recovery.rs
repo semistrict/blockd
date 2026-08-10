@@ -138,7 +138,9 @@ pub async fn recover_local<W: Blobs>(
         let mut recovered = VsetState::fresh(chosen.config, incarnation);
         recovered.ready = false;
         recovered.database = chosen.database;
-        recovered.peer_source = chosen.migrated_from;
+        recovered.peer_source = chosen.migrated_from.map(|source| source.host);
+        recovered.peer_source_offer_fence =
+            chosen.migrated_from.and_then(|source| source.offer_fence);
         recovered.fence = chosen.fence;
         recovered.mutation_seq = chosen.capture_seq;
         recovered.next_seq = found.max_seq;
@@ -181,10 +183,12 @@ pub async fn recover_local<W: Blobs>(
         recovered.best_record = Some(chosen);
         if let Some(destination) = found.handoff {
             recovered.outbound = Some(destination);
-            recovered.migration_running = true;
         }
-        if backed {
-            recovered.pending_verdict = Some(verdict);
+        // An outbound handoff is already authoritative for this incarnation.
+        // It must remain available to serve the destination's post-copy tail
+        // even after the destination has claimed the durable head.
+        if backed && found.handoff.is_none() {
+            recovered.operations.set_recovery(verdict);
         }
         recovered.record_writes = found
             .journals
@@ -424,7 +428,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
-    use async_trait::async_trait;
     use blockd_exec::Executor;
 
     use super::*;
@@ -440,7 +443,6 @@ mod tests {
     #[derive(Default)]
     struct TestBlobs(RefCell<BTreeMap<String, Vec<u8>>>);
 
-    #[async_trait(?Send)]
     impl Blobs for TestBlobs {
         async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
             Ok(self
@@ -499,7 +501,6 @@ mod tests {
 
     struct MetadataOnlyBlobs(TestBlobs);
 
-    #[async_trait(?Send)]
     impl Blobs for MetadataOnlyBlobs {
         async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
             Ok(self

@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
-use blockd_exec::channel::OneSender;
+use blockd_exec::ReplyTarget;
+use blockd_exec::channel::{OneSender, UnboundedSender};
 
 use crate::cache::Cache;
 use crate::database::{AttachmentId, DatabaseFile};
@@ -16,9 +17,10 @@ use crate::mapleaf::LeafPtr;
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
 
+use super::HostFatal;
+use super::peer_client::PeerClient;
+
 pub type SharedHost = Rc<RefCell<HostState>>;
-type ReplicaStatusSender = OneSender<(HostId, Option<crate::protocol::ReplicaCommitInfo>)>;
-type PeerBytesSender = (HostId, OneSender<Option<Vec<u8>>>);
 
 pub struct HostState {
     pub config: HostConfig,
@@ -30,18 +32,16 @@ pub struct HostState {
     pub pressure_waiters: VecDeque<OneSender<()>>,
     pub filling_pages: BTreeSet<PageId>,
     pub page_fill_waiters: BTreeMap<PageId, Vec<OneSender<bool>>>,
-    pub peer_pages: BTreeMap<crate::protocol::PeerRequestId, PeerBytesSender>,
-    pub peer_leaves: BTreeMap<crate::protocol::PeerRequestId, PeerBytesSender>,
+    pub(super) peer_client: PeerClient,
     pub inbound_migrations: BTreeSet<VsetId>,
-    pub migration_accepts: BTreeMap<VsetId, OneSender<()>>,
     pub replicas: BTreeMap<ReplicaKey, ReplicaState>,
     pub replica_latest_epoch: BTreeMap<(HostId, VsetId), u64>,
-    pub replica_status_waiters: BTreeMap<(VsetId, u64), ReplicaStatusSender>,
-    pub replica_put_waiters:
-        BTreeMap<(VsetId, u64, crate::protocol::ReplicaArtifact, u32), OneSender<HostId>>,
-    pub replica_commit_waiters: BTreeMap<(VsetId, u64, u64, JournalSeq, u64), OneSender<HostId>>,
     pub replica_releases: Vec<(HostId, VsetId, u64, crate::protocol::ReplicaCommitInfo)>,
-    next_peer_request: u64,
+    scheduled_vsets: BTreeSet<VsetId>,
+    scheduled_cursor: Option<VsetId>,
+    disk_reclaim_scan_cursor: Option<VsetId>,
+    disk_reclaim_scan_remaining: usize,
+    fatal: Option<OneSender<HostFatal>>,
     next_attachment_generation: u64,
     next_incarnation: u64,
 }
@@ -66,19 +66,35 @@ impl HostState {
             pressure_waiters: VecDeque::new(),
             filling_pages: BTreeSet::new(),
             page_fill_waiters: BTreeMap::new(),
-            peer_pages: BTreeMap::new(),
-            peer_leaves: BTreeMap::new(),
+            peer_client: PeerClient::default(),
             inbound_migrations: BTreeSet::new(),
-            migration_accepts: BTreeMap::new(),
             replicas: BTreeMap::new(),
             replica_latest_epoch: BTreeMap::new(),
-            replica_status_waiters: BTreeMap::new(),
-            replica_put_waiters: BTreeMap::new(),
-            replica_commit_waiters: BTreeMap::new(),
             replica_releases: Vec::new(),
-            next_peer_request: 0,
+            scheduled_vsets: BTreeSet::new(),
+            scheduled_cursor: None,
+            disk_reclaim_scan_cursor: None,
+            disk_reclaim_scan_remaining: 0,
+            fatal: None,
             next_attachment_generation: 0,
             next_incarnation: 0,
+        }
+    }
+
+    pub(crate) fn install_fatal_signal(&mut self, signal: OneSender<HostFatal>) {
+        assert!(
+            self.fatal.replace(signal).is_none(),
+            "fatal signal installed once"
+        );
+    }
+
+    pub(crate) fn clear_fatal_signal(&mut self) {
+        self.fatal = None;
+    }
+
+    pub(crate) fn fail(&mut self, reason: &'static str) {
+        if let Some(signal) = self.fatal.take() {
+            let _ = signal.send(HostFatal::new(reason));
         }
     }
 
@@ -100,21 +116,86 @@ impl HostState {
         incarnation
     }
 
+    pub(crate) fn schedule_vset(&mut self, vset: VsetId) {
+        if self.vsets.contains_key(&vset) {
+            self.scheduled_vsets.insert(vset);
+        }
+    }
+
+    pub(crate) fn take_scheduled_vsets(&mut self, limit: usize) -> Vec<VsetId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let selected = if let Some(cursor) = self.scheduled_cursor {
+            self.scheduled_vsets
+                .range((Excluded(cursor), Unbounded))
+                .chain(self.scheduled_vsets.range(..=cursor))
+                .take(limit)
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            self.scheduled_vsets
+                .iter()
+                .take(limit)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if let Some(last) = selected.last() {
+            self.scheduled_cursor = Some(*last);
+        }
+        for vset in &selected {
+            self.scheduled_vsets.remove(vset);
+        }
+        selected
+    }
+
+    pub(crate) fn scheduled_vset_count(&self) -> usize {
+        self.scheduled_vsets.len()
+    }
+
+    pub(crate) fn take_disk_reclaim_scan_vsets(&mut self, limit: usize) -> Vec<VsetId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        if !self.disk_reclaim_requested {
+            self.disk_reclaim_scan_remaining = 0;
+            return Vec::new();
+        }
+        let limit = limit.min(self.disk_reclaim_scan_remaining);
+        let selected = if let Some(cursor) = self.disk_reclaim_scan_cursor {
+            self.vsets
+                .range((Excluded(cursor), Unbounded))
+                .chain(self.vsets.range(..=cursor))
+                .take(limit)
+                .map(|(&vset, _)| vset)
+                .collect::<Vec<_>>()
+        } else {
+            self.vsets.keys().take(limit).copied().collect::<Vec<_>>()
+        };
+        if let Some(last) = selected.last() {
+            self.disk_reclaim_scan_cursor = Some(*last);
+        }
+        self.disk_reclaim_scan_remaining = self
+            .disk_reclaim_scan_remaining
+            .saturating_sub(selected.len());
+        if selected.is_empty() {
+            self.disk_reclaim_scan_remaining = 0;
+        }
+        selected
+    }
+
+    fn request_disk_reclaim(&mut self) {
+        if !self.disk_reclaim_requested {
+            self.disk_reclaim_scan_cursor = None;
+            self.disk_reclaim_scan_remaining = self.vsets.len();
+        }
+        self.disk_reclaim_requested = true;
+    }
+
     pub fn wake_pressure_waiter(&mut self) {
         while let Some(waiter) = self.pressure_waiters.pop_front() {
             if waiter.send(()).is_ok() {
                 return;
             }
         }
-    }
-
-    pub fn allocate_peer_request(&mut self) -> crate::protocol::PeerRequestId {
-        let request = crate::protocol::PeerRequestId(self.next_peer_request);
-        self.next_peer_request = self
-            .next_peer_request
-            .checked_add(1)
-            .expect("peer request overflow");
-        request
     }
 
     pub fn allocate_attachment(&mut self, vm: crate::types::VmId) -> AttachmentId {
@@ -166,6 +247,34 @@ impl HostState {
         self.blob_sizes.insert(name, bytes);
     }
 
+    pub(crate) fn local_artifact_fences(&self, vset: VsetId) -> BTreeSet<u64> {
+        self.blob_sizes
+            .keys()
+            .filter_map(|name| match crate::layout::parse_blob(name)? {
+                crate::layout::BlobName::Journal {
+                    vset: found, fence, ..
+                }
+                | crate::layout::BlobName::Segment {
+                    vset: found, fence, ..
+                }
+                | crate::layout::BlobName::Leaf {
+                    vset: found, fence, ..
+                } if found == vset => Some(fence),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn disk_reclaim_target_met(&self) -> bool {
+        self.config.disk_capacity.is_none_or(|capacity| {
+            self.blob_sizes
+                .values()
+                .sum::<u64>()
+                .saturating_add(self.config.disk_headroom)
+                <= capacity
+        })
+    }
+
     pub fn try_reserve_blob(&mut self, name: String, bytes: u64) -> bool {
         let prior = self.blob_sizes.get(&name).copied().unwrap_or(0);
         let next = self
@@ -180,7 +289,7 @@ impl HostState {
             .is_some_and(|capacity| next > capacity.saturating_sub(self.config.disk_headroom))
         {
             self.counters.nvme_stalls += 1;
-            self.disk_reclaim_requested = true;
+            self.request_disk_reclaim();
             return false;
         }
         self.blob_sizes.insert(name, bytes);
@@ -200,7 +309,7 @@ impl HostState {
             .is_some_and(|capacity| next > capacity.saturating_sub(self.config.disk_headroom))
         {
             self.counters.nvme_stalls += 1;
-            self.disk_reclaim_requested = true;
+            self.request_disk_reclaim();
             return false;
         }
         for (name, bytes) in blobs {
@@ -225,7 +334,7 @@ impl HostState {
             .is_some_and(|capacity| next > capacity)
         {
             self.counters.nvme_stalls += 1;
-            self.disk_reclaim_requested = true;
+            self.request_disk_reclaim();
             return false;
         }
         for (name, bytes) in blobs {
@@ -242,7 +351,7 @@ impl HostState {
             .is_some_and(|capacity| next > capacity.saturating_sub(self.config.disk_headroom))
         {
             self.counters.nvme_stalls += 1;
-            self.disk_reclaim_requested = true;
+            self.request_disk_reclaim();
             return false;
         }
         self.append_blob(name, bytes);
@@ -280,6 +389,7 @@ impl HostState {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn stats(&self) -> DaemonStats {
         let vsets = self
             .vsets
@@ -300,13 +410,18 @@ impl HostState {
                     VsetRole::Initializing
                 };
                 let mut operations = 0;
-                if state.commit_running || state.drain.is_some() {
+                if state.operations.mutation_owner().is_some() {
                     operations |= VsetOperations::CAPTURE;
                 }
-                if state.checkpoint_running {
+                if matches!(
+                    state.operations.mutation_owner(),
+                    Some(MutationOwner::Capture(
+                        CaptureKind::Checkpoint | CaptureKind::Migration
+                    ))
+                ) {
                     operations |= VsetOperations::CHECKPOINT;
                 }
-                if state.publishing {
+                if state.operations.publication_owner().is_some() {
                     operations |= VsetOperations::BACKUP;
                 }
                 if hydrating {
@@ -513,16 +628,227 @@ pub struct DatabaseRuntime {
 }
 
 pub struct DrainState {
-    pub seq: JournalSeq,
-    pub capture_seq: u64,
     pub unread: BTreeMap<PageId, Gen>,
     pub copied_on_fault: BTreeMap<PageId, (Gen, Vec<u8>)>,
     pub armed: Vec<PageId>,
     pub rescues: Vec<(PageId, Gen, Vec<u8>)>,
-    pub compact_victims: BTreeSet<(u64, SegId)>,
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CaptureKind {
+    Writeback,
+    Checkpoint,
+    Migration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MutationOwner {
+    Capture(CaptureKind),
+    Database,
+    Hydration,
+}
+
+struct MutationOperation {
+    owner: MutationOwner,
+    drain: Option<DrainState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PublicationOwner {
+    Direct,
+    Replica,
+}
+
+#[derive(Default)]
+pub struct VsetOperationState {
+    mutation: Option<MutationOperation>,
+    migration: bool,
+    guest_resume_pending: bool,
+    publication: Option<PublicationOwner>,
+    replication: bool,
+    recovery: Option<crate::protocol::Verdict>,
+}
+
+impl VsetOperationState {
+    pub(super) fn mutation_owner(&self) -> Option<MutationOwner> {
+        self.mutation.as_ref().map(|operation| operation.owner)
+    }
+
+    pub(super) fn try_start_mutation(&mut self, owner: MutationOwner) -> bool {
+        if self.mutation.is_some()
+            || self.guest_resume_pending
+            || (self.migration && owner != MutationOwner::Capture(CaptureKind::Migration))
+        {
+            return false;
+        }
+        self.mutation = Some(MutationOperation { owner, drain: None });
+        true
+    }
+
+    pub(super) fn finish_mutation(&mut self, owner: MutationOwner) -> Option<DrainState> {
+        if self.mutation_owner() != Some(owner) {
+            return None;
+        }
+        self.mutation.take().and_then(|operation| operation.drain)
+    }
+
+    pub(super) fn begin_drain(&mut self, drain: DrainState) {
+        let operation = self
+            .mutation
+            .as_mut()
+            .expect("capture owns the mutation slot before draining");
+        assert!(
+            matches!(operation.owner, MutationOwner::Capture(_)),
+            "only capture operations may own a page drain"
+        );
+        assert!(
+            operation.drain.replace(drain).is_none(),
+            "capture begins one drain"
+        );
+    }
+
+    pub(super) fn drain(&self) -> Option<&DrainState> {
+        self.mutation
+            .as_ref()
+            .and_then(|operation| operation.drain.as_ref())
+    }
+
+    pub(super) fn drain_mut(&mut self) -> Option<&mut DrainState> {
+        self.mutation
+            .as_mut()
+            .and_then(|operation| operation.drain.as_mut())
+    }
+
+    pub(super) fn start_migration(&mut self) -> bool {
+        if self.migration || self.guest_resume_pending {
+            return false;
+        }
+        self.migration = true;
+        true
+    }
+
+    pub(super) fn finish_migration(&mut self) {
+        self.migration = false;
+    }
+
+    pub(super) fn migration_running(&self) -> bool {
+        self.migration
+    }
+
+    pub(super) fn mutation_blocked(&self) -> bool {
+        self.mutation.is_some() || self.guest_resume_pending
+    }
+
+    pub(super) fn start_guest_resume(&mut self) -> bool {
+        if self.guest_resume_pending {
+            return false;
+        }
+        self.guest_resume_pending = true;
+        true
+    }
+
+    pub(super) fn finish_guest_resume(&mut self) {
+        self.guest_resume_pending = false;
+    }
+
+    pub(super) fn guest_resume_pending(&self) -> bool {
+        self.guest_resume_pending
+    }
+
+    pub(super) fn try_start_publication(&mut self, owner: PublicationOwner) -> bool {
+        if self.publication.is_some() {
+            return false;
+        }
+        self.publication = Some(owner);
+        true
+    }
+
+    pub(super) fn finish_publication(&mut self, owner: PublicationOwner) {
+        if self.publication == Some(owner) {
+            self.publication = None;
+        }
+    }
+
+    pub(super) fn publication_owner(&self) -> Option<PublicationOwner> {
+        self.publication
+    }
+
+    pub(super) fn try_start_replication(&mut self) -> bool {
+        if self.replication {
+            return false;
+        }
+        self.replication = true;
+        true
+    }
+
+    pub(super) fn finish_replication(&mut self) {
+        self.replication = false;
+    }
+
+    pub(super) fn replication_running(&self) -> bool {
+        self.replication
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        self.recovery.is_some()
+    }
+
+    pub(super) fn set_recovery(&mut self, verdict: crate::protocol::Verdict) {
+        assert!(
+            self.recovery.replace(verdict).is_none(),
+            "one startup recovery verdict per vset"
+        );
+    }
+
+    pub(super) fn take_recovery(&mut self) -> Option<crate::protocol::Verdict> {
+        self.recovery.take()
+    }
+}
+
+pub struct PendingSync {
+    id: u64,
+    pub barrier: u64,
+    reply: ReplyTarget<bool>,
+    resolved: Option<UnboundedSender<()>>,
+}
+
+impl PendingSync {
+    pub fn new(
+        id: u64,
+        barrier: u64,
+        reply: ReplyTarget<bool>,
+        resolved: UnboundedSender<()>,
+    ) -> Self {
+        Self {
+            id,
+            barrier,
+            reply,
+            resolved: Some(resolved),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn resolve(mut self, success: bool) {
+        let _ = self.reply.send(success);
+        self.notify_resolved();
+    }
+
+    fn notify_resolved(&mut self) {
+        if let Some(resolved) = self.resolved.take() {
+            let _ = resolved.send(());
+        }
+    }
+}
+
+impl Drop for PendingSync {
+    fn drop(&mut self) {
+        self.notify_resolved();
+    }
+}
+
 pub struct VsetState {
     pub incarnation: u64,
     pub config: VsetConfig,
@@ -545,13 +871,11 @@ pub struct VsetState {
     pub best_record: Option<JournalRecord>,
     pub local_covered_through: u64,
     pub sync_ack_through: u64,
-    pub pending_syncs: Vec<(crate::protocol::ReqId, u64)>,
-    pub commit_running: bool,
-    pub checkpoint_running: bool,
-    pub capture_waiters: Vec<OneSender<()>>,
+    pub pending_syncs: Vec<PendingSync>,
+    pub operations: VsetOperationState,
+    pub mutation_waiters: Vec<OneSender<()>>,
     pub checkpoint_results: BTreeMap<crate::protocol::ReqId, Epoch>,
     pub pinned: Option<JournalRecord>,
-    pub drain: Option<DrainState>,
     pub record_writes: BTreeMap<JournalSeq, (u64, u64)>,
     pub segment_blobs: Vec<(u64, SegId, u64)>,
     pub head_version: Option<u64>,
@@ -559,15 +883,14 @@ pub struct VsetState {
     pub backed_segments: BTreeSet<(u64, SegId)>,
     pub backed_leaves: BTreeSet<(u64, u64)>,
     pub store_manifests: BTreeSet<(u64, JournalSeq)>,
-    pub publishing: bool,
-    pub pending_verdict: Option<crate::protocol::Verdict>,
     pub outbound: Option<HostId>,
     pub peer_source: Option<HostId>,
-    pub migration_running: bool,
-    pub migration_accepted: bool,
+    pub peer_source_offer_fence: Option<u64>,
+    pub hydration_waiters: Vec<OneSender<bool>>,
     pub stash_assignment: Option<crate::head::StashAssignment>,
     pub retired_stashes: Vec<crate::head::RetiredStash>,
-    pub replicating: bool,
+    pub peer_committed: Option<crate::protocol::ReplicaCommitInfo>,
+    pub peer_published: Option<crate::protocol::ReplicaCommitInfo>,
     pub peer_committed_through: u64,
     pub peer_upload_done: Option<crate::protocol::ReplicaCommitInfo>,
     pub peer_upload_record: Option<JournalRecord>,
@@ -600,12 +923,10 @@ impl VsetState {
             local_covered_through: 0,
             sync_ack_through: 0,
             pending_syncs: Vec::new(),
-            commit_running: false,
-            checkpoint_running: false,
-            capture_waiters: Vec::new(),
+            operations: VsetOperationState::default(),
+            mutation_waiters: Vec::new(),
             checkpoint_results: BTreeMap::new(),
             pinned: None,
-            drain: None,
             record_writes: BTreeMap::new(),
             segment_blobs: Vec::new(),
             head_version: None,
@@ -613,15 +934,14 @@ impl VsetState {
             backed_segments: BTreeSet::new(),
             backed_leaves: BTreeSet::new(),
             store_manifests: BTreeSet::new(),
-            publishing: false,
-            pending_verdict: None,
             outbound: None,
             peer_source: None,
-            migration_running: false,
-            migration_accepted: false,
+            peer_source_offer_fence: None,
+            hydration_waiters: Vec::new(),
             stash_assignment: None,
             retired_stashes: Vec::new(),
-            replicating: false,
+            peer_committed: None,
+            peer_published: None,
             peer_committed_through: 0,
             peer_upload_done: None,
             peer_upload_record: None,
@@ -712,6 +1032,9 @@ pub struct CaptureLease {
     state: SharedHost,
     vset: VsetId,
     incarnation: u64,
+    owner: MutationOwner,
+    cleanup: Option<OneSender<Vec<PageId>>>,
+    cleanup_finishes_mutation: bool,
     active: bool,
 }
 
@@ -719,50 +1042,92 @@ pub struct CommitFlagLease {
     state: SharedHost,
     vset: VsetId,
     incarnation: u64,
+    owner: MutationOwner,
     active: bool,
 }
 
 impl CommitFlagLease {
-    pub fn new(state: &SharedHost, vset: VsetId, incarnation: u64) -> Self {
+    pub fn new(state: &SharedHost, vset: VsetId, incarnation: u64, owner: MutationOwner) -> Self {
         Self {
             state: Rc::clone(state),
             vset,
             incarnation,
+            owner,
             active: true,
         }
     }
 
     pub fn commit(mut self) {
+        self.state.borrow_mut().schedule_vset(self.vset);
         self.active = false;
     }
 }
 
 impl Drop for CommitFlagLease {
     fn drop(&mut self) {
-        if self.active
-            && let Some(vset) = self
-                .state
-                .borrow_mut()
-                .vsets
+        let waiters = if self.active {
+            let mut host = self.state.borrow_mut();
+            host.vsets
                 .get_mut(&self.vset)
                 .filter(|vset| vset.incarnation == self.incarnation)
-        {
-            vset.commit_running = false;
+                .map_or_else(Vec::new, |vset| {
+                    vset.operations.finish_mutation(self.owner);
+                    std::mem::take(&mut vset.mutation_waiters)
+                })
+        } else {
+            Vec::new()
+        };
+        for waiter in waiters {
+            let _ = waiter.send(());
         }
+        self.state.borrow_mut().schedule_vset(self.vset);
     }
 }
 
 impl CaptureLease {
-    pub fn new(state: &SharedHost, vset: VsetId, incarnation: u64) -> Self {
+    pub fn new(
+        state: &SharedHost,
+        vset: VsetId,
+        incarnation: u64,
+        owner: MutationOwner,
+        cleanup: OneSender<Vec<PageId>>,
+    ) -> Self {
         Self {
             state: Rc::clone(state),
             vset,
             incarnation,
+            owner,
+            cleanup: Some(cleanup),
+            cleanup_finishes_mutation: false,
+            active: true,
+        }
+    }
+
+    pub fn new_with_serialized_cleanup(
+        state: &SharedHost,
+        vset: VsetId,
+        incarnation: u64,
+        owner: MutationOwner,
+        cleanup: OneSender<Vec<PageId>>,
+    ) -> Self {
+        Self {
+            state: Rc::clone(state),
+            vset,
+            incarnation,
+            owner,
+            cleanup: Some(cleanup),
+            cleanup_finishes_mutation: true,
             active: true,
         }
     }
 
     pub fn commit(mut self) {
+        if self.cleanup_finishes_mutation {
+            self.cleanup.take();
+        } else if let Some(cleanup) = self.cleanup.take() {
+            let _ = cleanup.send(Vec::new());
+        }
+        self.state.borrow_mut().schedule_vset(self.vset);
         self.active = false;
     }
 }
@@ -778,17 +1143,29 @@ impl Drop for CaptureLease {
             .get_mut(&self.vset)
             .filter(|vset| vset.incarnation == self.incarnation)
         else {
+            drop(host);
+            if let Some(cleanup) = self.cleanup.take() {
+                let _ = cleanup.send(Vec::new());
+            }
             return;
         };
-        let armed = vset
-            .drain
-            .take()
-            .map(|drain| drain.armed)
-            .unwrap_or_default();
-        vset.commit_running = false;
-        vset.checkpoint_running = false;
-        let waiters = std::mem::take(&mut vset.capture_waiters);
-        for page in armed {
+        let armed = if self.cleanup_finishes_mutation {
+            vset.operations
+                .drain_mut()
+                .map(|drain| std::mem::take(&mut drain.armed))
+                .unwrap_or_default()
+        } else {
+            vset.operations
+                .finish_mutation(self.owner)
+                .map(|drain| drain.armed)
+                .unwrap_or_default()
+        };
+        let waiters = if self.cleanup_finishes_mutation {
+            Vec::new()
+        } else {
+            std::mem::take(&mut vset.mutation_waiters)
+        };
+        for &page in &armed {
             host.cache.end_flush(page);
             if !host.cache.is_dirty(page) {
                 host.cache.mark_dirty(page);
@@ -796,8 +1173,14 @@ impl Drop for CaptureLease {
         }
         host.wake_pressure_waiter();
         drop(host);
+        if let Some(cleanup) = self.cleanup.take() {
+            let _ = cleanup.send(armed);
+        }
         for waiter in waiters {
             let _ = waiter.send(());
+        }
+        if !self.cleanup_finishes_mutation {
+            self.state.borrow_mut().schedule_vset(self.vset);
         }
     }
 }
@@ -822,5 +1205,54 @@ impl Drop for CacheReservation {
             state.cache.release_slot();
             state.wake_pressure_waiter();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureKind, MutationOwner, PublicationOwner, VsetOperationState};
+
+    #[test]
+    fn typed_operation_slots_reject_overlapping_owners() {
+        let mut operations = VsetOperationState::default();
+
+        assert!(operations.try_start_mutation(MutationOwner::Database));
+        assert!(!operations.try_start_mutation(MutationOwner::Hydration));
+        assert_eq!(operations.mutation_owner(), Some(MutationOwner::Database));
+        assert!(
+            operations
+                .finish_mutation(MutationOwner::Hydration)
+                .is_none()
+        );
+        assert_eq!(operations.mutation_owner(), Some(MutationOwner::Database));
+        operations.finish_mutation(MutationOwner::Database);
+        assert!(operations.try_start_mutation(MutationOwner::Hydration));
+        operations.finish_mutation(MutationOwner::Hydration);
+
+        assert!(operations.start_migration());
+        assert!(!operations.start_migration());
+        assert!(!operations.try_start_mutation(MutationOwner::Database));
+        assert!(operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Migration)));
+        operations.finish_mutation(MutationOwner::Capture(CaptureKind::Migration));
+        operations.finish_migration();
+        assert!(!operations.migration_running());
+
+        assert!(operations.start_guest_resume());
+        assert!(operations.guest_resume_pending());
+        assert!(!operations.try_start_mutation(MutationOwner::Database));
+        assert!(!operations.start_migration());
+        operations.finish_guest_resume();
+        assert!(operations.try_start_mutation(MutationOwner::Database));
+        operations.finish_mutation(MutationOwner::Database);
+
+        assert!(operations.try_start_publication(PublicationOwner::Direct));
+        assert!(!operations.try_start_publication(PublicationOwner::Replica));
+        operations.finish_publication(PublicationOwner::Replica);
+        assert_eq!(
+            operations.publication_owner(),
+            Some(PublicationOwner::Direct)
+        );
+        operations.finish_publication(PublicationOwner::Direct);
+        assert!(operations.publication_owner().is_none());
     }
 }

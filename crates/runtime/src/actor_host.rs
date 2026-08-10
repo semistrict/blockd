@@ -1,32 +1,33 @@
 //! Production host for the shared async protocol actors.
 
 use std::cell::{Cell, RefCell};
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use blockd_core::database::{AttachmentId, DatabaseError, DatabaseReply, DatabaseRequest};
-use blockd_core::engine::{HostState, host_actor_with_state};
+use blockd_core::engine::{HostFatal, HostState, host_actor_with_state};
 use blockd_core::hostmeta::{
     Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVsetMetrics, VsetOperations,
 };
 use blockd_core::journal::{VsetConfig, VsetKind};
-use blockd_core::protocol::{AdminCmd, AdminReply, PeerMsg, ReqId, Verdict};
+use blockd_core::protocol::{
+    AdminCall, AdminEvent, AdminResult, AdminSuccess, PeerMsg, ReqId, Verdict,
+};
 use blockd_core::types::{HostId, PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
 use blockd_core::world::{
-    AdminIo, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem, GuestSync, Peers,
-    Store, StoreError,
+    AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, DatabaseActorRequest, FillSource,
+    GuestFault, GuestMem, GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store,
+    StoreError,
 };
 use blockd_exec::inject::{Injected, Injector, Lane, bounded_injector, injector};
-use blockd_exec::{Executor, delay};
+use blockd_exec::{Executor, bridge_request, delay};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 use tokio::io::unix::AsyncFd;
 
@@ -78,6 +79,7 @@ struct GuestCtl {
 struct CtlState {
     pause_requested: bool,
     paused: bool,
+    pause_generation: u64,
     in_op: bool,
     applied: u64,
     pause_waiter: Option<Injector<u64>>,
@@ -197,8 +199,8 @@ const PAUSE_NAMES: [&str; 2] = ["checkpoint", "migration"];
 
 struct Shared {
     vsets: Mutex<BTreeMap<VsetId, Arc<VsetHost>>>,
-    sync_waiters: Mutex<BTreeMap<ReqId, Sender<bool>>>,
-    database_waiters: Mutex<BTreeMap<ReqId, Sender<DatabaseReply>>>,
+    admin_events: Mutex<VecDeque<AdminEvent>>,
+    admin_event_ready: Condvar,
     incidents: Mutex<Vec<String>>,
     counters: Mutex<Counters>,
     daemon_stats: Mutex<DaemonStats>,
@@ -223,8 +225,8 @@ impl Shared {
         let state = HostState::new(config.clone());
         Self {
             vsets: Mutex::new(vsets),
-            sync_waiters: Mutex::new(BTreeMap::new()),
-            database_waiters: Mutex::new(BTreeMap::new()),
+            admin_events: Mutex::new(VecDeque::new()),
+            admin_event_ready: Condvar::new(),
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(Counters::default()),
             daemon_stats: Mutex::new(state.stats()),
@@ -247,6 +249,38 @@ impl Shared {
             operation_started: Mutex::new(BTreeMap::new()),
             next_req: AtomicU64::new(1),
         }
+    }
+}
+
+struct PendingGuestPause {
+    shared: Arc<Shared>,
+    host: Arc<VsetHost>,
+    vset: VsetId,
+    generation: u64,
+    active: bool,
+}
+
+impl PendingGuestPause {
+    fn finish(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingGuestPause {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.host.ctl.state.lock().expect("guest control lock");
+        if state.pause_generation != self.generation {
+            return;
+        }
+        state.pause_requested = false;
+        state.paused = false;
+        state.pause_waiter = None;
+        drop(state);
+        complete_pause(&self.shared, self.vset);
+        self.host.ctl.cv.notify_all();
     }
 }
 
@@ -342,7 +376,7 @@ fn spawn_fault_io_runtime() -> FaultIo {
 }
 
 fn execute_fault_work(work: FaultWork) {
-    let result = match work {
+    match work {
         FaultWork::Fill {
             host,
             page,
@@ -374,11 +408,12 @@ fn execute_fault_work(work: FaultWork) {
         }
         FaultWork::Evict { host, page, reply } => {
             let index = host.page_index(page);
-            host.view
+            let result = host
+                .view
                 .evict(index, 1)
                 .and_then(|()| host.region.punch_hole(index, 1))
-                .map_err(|_| ())
-                .map(|()| (reply, ()))
+                .map_err(|_| ());
+            let _ = reply.push(Lane::Critical, result);
         }
         FaultWork::WriteProtect { hosts, reply } => {
             let mut result = Ok(());
@@ -409,14 +444,6 @@ fn execute_fault_work(work: FaultWork) {
             let _ = done.send(());
             return;
         }
-    };
-    if let Ok((reply, ())) = result {
-        let _ = reply.push(Lane::Critical, Ok(()));
-    } else if let Err(()) = result {
-        // The only expression-form branch is eviction. Its reply is retained
-        // only on success, so fatal mapping failures cannot be recovered.
-        tracing::error!("fatal guest-memory eviction failure");
-        std::process::abort();
     }
 }
 
@@ -447,10 +474,9 @@ struct ProductionWorld {
     self_id: HostId,
     peer_rx: Injected<(HostId, PeerMsg)>,
     fault_rx: Injected<GuestFault>,
-    sync_rx: Injected<GuestSync>,
-    admin_rx: Injected<AdminCmd>,
-    database_rx: Injected<DatabaseRequest>,
-    admin_reply: Sender<AdminReply>,
+    sync_rx: Injected<GuestSyncRequest>,
+    admin_rx: Injected<AdminRequest>,
+    database_rx: Injected<DatabaseActorRequest>,
     shared: Arc<Shared>,
     fault_work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
     shared_pages: RefCell<BTreeMap<(u64, u64, blockd_core::types::SegId, u32), Vec<u8>>>,
@@ -461,16 +487,17 @@ impl ProductionWorld {
         self.shared.vsets.lock().expect("vset lock")[&vset].clone()
     }
 
-    async fn fault_response(&self, response: &Injected<Result<(), ()>>, operation: usize) {
+    async fn fault_response(
+        &self,
+        response: &Injected<Result<(), ()>>,
+        operation: usize,
+    ) -> Result<(), GuestMemoryError> {
         let started = Instant::now();
         let result = response.recv().await.unwrap_or(Err(()));
         self.shared
             .stats
             .record_world(operation, elapsed_ns(started.elapsed()));
-        if result.is_err() {
-            tracing::error!("fatal guest-memory operation failure");
-            std::process::abort();
-        }
+        result.map_err(|()| GuestMemoryError::Unavailable)
     }
 
     async fn blob_observe<T>(
@@ -507,7 +534,6 @@ impl ProductionWorld {
     }
 }
 
-#[async_trait(?Send)]
 impl Blobs for ProductionWorld {
     async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
         self.blob_observe(world_kind::BLOB_READ, 1, self.blobs.scan(), |_entries| {
@@ -589,7 +615,6 @@ impl Blobs for ProductionWorld {
     }
 }
 
-#[async_trait(?Send)]
 impl Store for ProductionWorld {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
         self.store_observe(world_kind::STORE_PUT, self.store.put(key, bytes))
@@ -638,8 +663,13 @@ impl Store for ProductionWorld {
     }
 }
 
-#[async_trait(?Send)]
 impl Peers for ProductionWorld {
+    fn protocol_version(&self, to: HostId) -> u16 {
+        self.peers
+            .as_ref()
+            .map_or(0, |peers| peers.protocol_version(to))
+    }
+
     async fn send(&self, to: HostId, message: PeerMsg) {
         let started = Instant::now();
         if let Some(peers) = &self.peers {
@@ -661,14 +691,13 @@ impl Peers for ProductionWorld {
     }
 }
 
-#[async_trait(?Send)]
 impl GuestMem for ProductionWorld {
     async fn read_page(&self, page: PageId) -> Vec<u8> {
         let host = self.host(page.volume.vset);
         host.region.read_page(host.page_index(page))
     }
 
-    async fn arm_write_protect(&self, pages: &[PageId]) {
+    async fn arm_write_protect(&self, pages: &[PageId]) -> Result<(), GuestMemoryError> {
         let hosts = {
             let mut by_vset = BTreeMap::<VsetId, Vec<usize>>::new();
             let vsets = self.shared.vsets.lock().expect("vset lock");
@@ -689,12 +718,18 @@ impl GuestMem for ProductionWorld {
         let (reply, response) = injector();
         self.fault_work
             .send(FaultWork::WriteProtect { hosts, reply })
-            .expect("fault I/O runtime alive");
+            .map_err(|_| GuestMemoryError::Unavailable)?;
         self.fault_response(&response, world_kind::WRITE_PROTECT)
-            .await;
+            .await
     }
 
-    async fn fill(&self, page: PageId, bytes: Vec<u8>, writable: bool, source: FillSource) {
+    async fn fill(
+        &self,
+        page: PageId,
+        bytes: Vec<u8>,
+        writable: bool,
+        source: FillSource,
+    ) -> Result<(), GuestMemoryError> {
         let host = self.host(page.volume.vset);
         let (reply, response) = injector();
         self.fault_work
@@ -705,9 +740,10 @@ impl GuestMem for ProductionWorld {
                 writable,
                 reply,
             })
-            .expect("fault I/O runtime alive");
-        self.fault_response(&response, world_kind::FILL).await;
+            .map_err(|_| GuestMemoryError::Unavailable)?;
+        self.fault_response(&response, world_kind::FILL).await?;
         complete_fault(&self.shared, Some(&host), page, source.into(), "served");
+        Ok(())
     }
 
     async fn fill_shared(
@@ -716,7 +752,7 @@ impl GuestMem for ProductionWorld {
         share: (u64, u64, blockd_core::types::SegId, u32),
         bytes: Option<Vec<u8>>,
         writable: bool,
-    ) {
+    ) -> Result<(), GuestMemoryError> {
         if let Some(bytes) = bytes {
             self.shared_pages.borrow_mut().insert(share, bytes);
         }
@@ -736,9 +772,9 @@ impl GuestMem for ProductionWorld {
                 writable,
                 reply,
             })
-            .expect("fault I/O runtime alive");
+            .map_err(|_| GuestMemoryError::Unavailable)?;
         self.fault_response(&response, world_kind::FILL_SHARED)
-            .await;
+            .await?;
         complete_fault(
             &self.shared,
             Some(&host),
@@ -746,16 +782,17 @@ impl GuestMem for ProductionWorld {
             FaultSource::Shared,
             "served",
         );
+        Ok(())
     }
 
-    async fn fail(&self, page: PageId) {
+    async fn fail(&self, page: PageId) -> Result<(), GuestMemoryError> {
         self.shared.stats.record_world(world_kind::FILL_FAILED, 0);
         complete_fault(&self.shared, None, page, FaultSource::Unservable, "failed");
         tracing::error!(?page, "fatal unservable guest page");
-        std::process::abort();
+        Err(GuestMemoryError::Unservable)
     }
 
-    async fn unprotect(&self, page: PageId) {
+    async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError> {
         let host = self.host(page.volume.vset);
         let (reply, response) = injector();
         self.fault_work
@@ -764,8 +801,9 @@ impl GuestMem for ProductionWorld {
                 page,
                 reply,
             })
-            .expect("fault I/O runtime alive");
-        self.fault_response(&response, world_kind::UNPROTECT).await;
+            .map_err(|_| GuestMemoryError::Unavailable)?;
+        self.fault_response(&response, world_kind::UNPROTECT)
+            .await?;
         complete_fault(
             &self.shared,
             Some(&host),
@@ -773,18 +811,19 @@ impl GuestMem for ProductionWorld {
             FaultSource::WriteProtect,
             "served",
         );
+        Ok(())
     }
 
-    async fn evict(&self, page: PageId) {
+    async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError> {
         let host = self.host(page.volume.vset);
         let (reply, response) = injector();
         self.fault_work
             .send(FaultWork::Evict { host, page, reply })
-            .expect("fault I/O runtime alive");
-        self.fault_response(&response, world_kind::EVICT).await;
+            .map_err(|_| GuestMemoryError::Unavailable)?;
+        self.fault_response(&response, world_kind::EVICT).await
     }
 
-    async fn install_database(&self, page: PageId, bytes: Vec<u8>) {
+    async fn install_database(&self, page: PageId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
         let (reply, response) = injector();
         self.fault_work
             .send(FaultWork::Install {
@@ -793,60 +832,72 @@ impl GuestMem for ProductionWorld {
                 bytes,
                 reply,
             })
-            .expect("fault I/O runtime alive");
+            .map_err(|_| GuestMemoryError::Unavailable)?;
         self.fault_response(&response, world_kind::DATABASE_INSTALL)
-            .await;
+            .await
     }
 
-    async fn pause(&self, vset: VsetId) -> u64 {
+    async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError> {
         let started = Instant::now();
-        let operation = self
-            .shared
-            .pause_expected
-            .lock()
-            .expect("pause lock")
-            .get_mut(&vset)
-            .and_then(VecDeque::pop_front);
-        if let Some(operation) = operation {
-            self.shared
-                .pause_in_flight
-                .lock()
-                .expect("pause lock")
-                .insert(vset, (operation, Instant::now()));
-        }
+        begin_pause(&self.shared, vset);
         let host = self.host(vset);
-        let response = {
+        let (generation, response) = {
             let mut state = host.ctl.state.lock().expect("guest control lock");
+            state.pause_generation = state
+                .pause_generation
+                .checked_add(1)
+                .expect("guest pause generation overflow");
+            let generation = state.pause_generation;
             state.pause_requested = true;
-            if state.in_op {
+            let response = if state.in_op {
                 let (reply, response) = injector();
                 state.pause_waiter = Some(reply);
                 Some(response)
             } else {
                 state.paused = true;
                 None
-            }
+            };
+            (generation, response)
+        };
+        let pending = PendingGuestPause {
+            shared: Arc::clone(&self.shared),
+            host: Arc::clone(&host),
+            vset,
+            generation,
+            active: true,
         };
         let applied = if let Some(response) = response {
-            response.recv().await.unwrap_or(0)
+            response.recv().await.ok_or(GuestMemoryError::Unavailable)?
         } else {
             host.ctl.state.lock().expect("guest control lock").applied
         };
+        pending.finish();
         self.shared
             .stats
             .record_world(world_kind::PAUSE_GUEST, elapsed_ns(started.elapsed()));
-        applied
+        Ok(GuestPause {
+            vmstate: applied,
+            generation,
+        })
     }
 
-    async fn resume(&self, vset: VsetId) {
-        complete_pause(&self.shared, vset);
+    async fn resume(
+        &self,
+        vset: VsetId,
+        pause: Option<GuestPause>,
+    ) -> Result<(), GuestMemoryError> {
         let host = self.host(vset);
         let mut state = host.ctl.state.lock().expect("guest control lock");
+        if pause.is_some_and(|pause| pause.generation != state.pause_generation) {
+            return Ok(());
+        }
         state.pause_requested = false;
         state.paused = false;
         drop(state);
+        complete_pause(&self.shared, vset);
         host.ctl.cv.notify_all();
         self.shared.stats.record_world(world_kind::RESUME_GUEST, 0);
+        Ok(())
     }
 
     async fn harvest_accessed(&self) -> Vec<PageId> {
@@ -857,81 +908,47 @@ impl GuestMem for ProductionWorld {
         self.fault_rx.recv().await
     }
 
-    async fn next_sync(&self) -> Option<GuestSync> {
+    async fn next_sync(&self) -> Option<GuestSyncRequest> {
         self.sync_rx.recv().await
     }
 
-    async fn sync_ok(&self, req: ReqId) {
-        if let Some(waiter) = self
-            .shared
-            .sync_waiters
-            .lock()
-            .expect("sync waiter lock")
-            .remove(&req)
-        {
-            let _ = waiter.send(true);
-        }
-        self.shared.stats.record_world(world_kind::SYNC_OK, 0);
-    }
-
-    async fn sync_failed(&self, req: ReqId) {
-        if let Some(waiter) = self
-            .shared
-            .sync_waiters
-            .lock()
-            .expect("sync waiter lock")
-            .remove(&req)
-        {
-            let _ = waiter.send(false);
-        }
-        self.shared.stats.record_world(world_kind::SYNC_FAILED, 0);
-    }
-
-    async fn fence(&self, vset: VsetId) {
+    async fn fence(&self, vset: VsetId) -> Result<(), GuestMemoryError> {
         self.shared
             .incidents
             .lock()
             .expect("incident lock")
             .push(format!("fenced: {vset:?}"));
         self.shared.stats.record_world(world_kind::VSET_FENCED, 0);
+        Ok(())
     }
 }
 
-#[async_trait(?Send)]
 impl AdminIo for ProductionWorld {
-    async fn next_admin(&self) -> Option<AdminCmd> {
+    async fn next_admin(&self) -> Option<AdminRequest> {
         self.admin_rx.recv().await
     }
 
-    async fn reply_admin(&self, reply: AdminReply) {
-        let _ = self.admin_reply.send(reply);
+    async fn emit_admin_event(&self, event: AdminEvent) {
+        self.shared
+            .admin_events
+            .lock()
+            .expect("admin event lock")
+            .push_back(event);
+        self.shared.admin_event_ready.notify_all();
         self.shared.stats.record_world(world_kind::ADMIN, 0);
     }
 
-    async fn next_database(&self) -> Option<DatabaseRequest> {
+    async fn next_database(&self) -> Option<DatabaseActorRequest> {
         self.database_rx.recv().await
     }
 
-    async fn reply_database(&self, reply: DatabaseReply) {
-        if let Some(waiter) = self
-            .shared
-            .database_waiters
-            .lock()
-            .expect("database waiter lock")
-            .remove(&reply.req())
-        {
-            let _ = waiter.send(reply);
-        }
-        self.shared.stats.record_world(world_kind::DATABASE, 0);
-    }
-
-    async fn abort(&self, reason: &'static str) {
-        tracing::error!(%reason, "fatal host actor abort");
+    async fn host_failed(&self, failure: HostFatal) {
+        tracing::error!(reason = failure.reason, "fatal host actor failure");
         self.shared
             .incidents
             .lock()
             .expect("incident lock")
-            .push(format!("abort: {reason}"));
+            .push(format!("host failure: {}", failure.reason));
         self.shared.stats.record_world(world_kind::ABORT, 0);
         std::process::abort();
     }
@@ -939,10 +956,10 @@ impl AdminIo for ProductionWorld {
 
 #[derive(Clone)]
 struct Inputs {
-    admin: Injector<AdminCmd>,
-    database: Injector<DatabaseRequest>,
+    admin: Injector<AdminRequest>,
+    database: Injector<DatabaseActorRequest>,
     faults: Injector<GuestFault>,
-    syncs: Injector<GuestSync>,
+    syncs: Injector<GuestSyncRequest>,
     peers: Injector<(HostId, PeerMsg)>,
     stop: Injector<()>,
 }
@@ -971,8 +988,6 @@ impl Inputs {
 pub struct Runtime {
     inputs: Inputs,
     shared: Arc<Shared>,
-    admin_rx: Mutex<Receiver<AdminReply>>,
-    admin_backlog: Mutex<VecDeque<AdminReply>>,
     blob_dir: PathBuf,
     peers: Option<Arc<PeerNet>>,
     fault_io: FaultIo,
@@ -1026,7 +1041,6 @@ impl Runtime {
             peers: peer_input,
             stop,
         };
-        let (admin_reply, admin_rx) = channel();
         let shared = Arc::new(Shared::new(hosts, &config.daemon));
         let peers = config.peer.as_ref().map(|peer_config| {
             let incoming = inputs.peers.clone();
@@ -1062,7 +1076,6 @@ impl Runtime {
                     sync_rx: sync_rx_actor,
                     admin_rx: admin_rx_actor,
                     database_rx: database_rx_actor,
-                    admin_reply,
                     shared: Arc::clone(&actor_shared),
                     fault_work,
                     shared_pages: RefCell::new(BTreeMap::new()),
@@ -1120,8 +1133,6 @@ impl Runtime {
         let runtime = Self {
             inputs,
             shared,
-            admin_rx: Mutex::new(admin_rx),
-            admin_backlog: Mutex::new(VecDeque::new()),
             blob_dir: config.blob_dir.clone(),
             peers,
             fault_io,
@@ -1317,55 +1328,53 @@ impl Runtime {
         ReqId(self.shared.next_req.fetch_add(1, Ordering::SeqCst))
     }
 
-    fn wait_admin<T>(&self, mut want: impl FnMut(&AdminReply) -> Option<T>) -> T {
-        {
-            let mut backlog = self.admin_backlog.lock().expect("admin backlog lock");
-            for index in 0..backlog.len() {
-                if let Some(output) = want(&backlog[index]) {
-                    backlog.remove(index);
-                    return output;
-                }
-            }
-        }
-        let receiver = self.admin_rx.lock().expect("admin receiver lock");
+    fn admin_request(&self, call: AdminCall) -> AdminResult {
+        let (request, reply) = bridge_request(call);
+        self.inputs
+            .admin
+            .push(Lane::Background, request)
+            .expect("actor host alive");
+        reply
+            .blocking_recv_timeout(Duration::from_secs(30))
+            .expect("admin reply within 30 seconds")
+    }
+
+    fn wait_admin_event<T>(&self, mut want: impl FnMut(&AdminEvent) -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut events = self.shared.admin_events.lock().expect("admin event lock");
         loop {
-            let reply = receiver
-                .recv_timeout(Duration::from_secs(30))
-                .expect("admin reply within 30 seconds");
-            if let Some(output) = want(&reply) {
+            if let Some((index, output)) = events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| want(event).map(|output| (index, output)))
+            {
+                events.remove(index);
                 return output;
             }
-            self.admin_backlog
-                .lock()
-                .expect("admin backlog lock")
-                .push_back(reply);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "admin event within 30 seconds");
+            let (next, timeout) = self
+                .shared
+                .admin_event_ready
+                .wait_timeout(events, remaining)
+                .expect("admin event lock");
+            events = next;
+            assert!(!timeout.timed_out(), "admin event within 30 seconds");
         }
     }
 
     pub fn create_vset(&self, vset: VsetId, config: VsetConfig) {
         let started = Instant::now();
         self.install_vset_host(vset, config);
-        let req = self.req();
-        self.inputs
-            .admin
-            .push(
-                Lane::Background,
-                AdminCmd::CreateVset {
-                    req,
-                    vset,
-                    config,
-                    from_base: None,
-                },
-            )
-            .expect("actor host alive");
-        let created = self.wait_admin(|reply| match reply {
-            AdminReply::VsetCreated {
-                req: found,
-                vset: found_vset,
-            } if *found == req && *found_vset == vset => Some(true),
-            AdminReply::AdminFailed { req: found } if *found == req => Some(false),
-            _ => None,
-        });
+        let created = match self.admin_request(AdminCall::CreateVset {
+            vset,
+            config,
+            from_base: None,
+        }) {
+            Ok(AdminSuccess::VsetCreated { vset: found }) if found == vset => true,
+            Err(_) => false,
+            result => panic!("unexpected create result: {result:?}"),
+        };
         self.observe_operation(0, created, started.elapsed());
         assert!(created, "vset creation failed");
     }
@@ -1374,17 +1383,11 @@ impl Runtime {
         let started = Instant::now();
         let req = self.req();
         self.expect_pause(vset, 0);
-        self.inputs
-            .admin
-            .push(Lane::Background, AdminCmd::Checkpoint { req, vset })
-            .expect("actor host alive");
-        let result = self.wait_admin(|reply| match reply {
-            AdminReply::CheckpointDone {
-                req: found, epoch, ..
-            } if *found == req => Some(Some(epoch.0)),
-            AdminReply::AdminFailed { req: found } if *found == req => Some(None),
-            _ => None,
-        });
+        let result = match self.admin_request(AdminCall::Checkpoint { retry: req, vset }) {
+            Ok(AdminSuccess::CheckpointDone { epoch, .. }) => Some(epoch.0),
+            Err(_) => None,
+            result => panic!("unexpected checkpoint result: {result:?}"),
+        };
         self.observe_operation(1, result.is_some(), started.elapsed());
         if result.is_none() {
             self.cancel_expected_pause(vset, 0);
@@ -1398,20 +1401,14 @@ impl Runtime {
     }
 
     pub fn try_attach_database(&self, vset: VsetId, vm: VmId) -> Option<AttachmentId> {
-        let req = self.req();
-        self.inputs
-            .admin
-            .push(Lane::Background, AdminCmd::AttachDatabase { req, vset, vm })
-            .expect("actor host alive");
-        self.wait_admin(|reply| match reply {
-            AdminReply::DatabaseAttached {
-                req: found,
+        match self.admin_request(AdminCall::AttachDatabase { vset, vm }) {
+            Ok(AdminSuccess::DatabaseAttached {
                 vset: found_vset,
                 attachment,
-            } if *found == req && *found_vset == vset => Some(Some(*attachment)),
-            AdminReply::AdminFailed { req: found } if *found == req => Some(None),
-            _ => None,
-        })
+            }) if found_vset == vset => Some(attachment),
+            Err(_) => None,
+            result => panic!("unexpected database attach result: {result:?}"),
+        }
     }
 
     pub fn begin_detach_database(
@@ -1420,114 +1417,53 @@ impl Runtime {
         attachment: AttachmentId,
         mode: blockd_core::protocol::DetachMode,
     ) {
-        let req = self.req();
-        self.inputs
-            .admin
-            .push(
-                Lane::Background,
-                AdminCmd::BeginDetachDatabase {
-                    req,
-                    vset,
-                    attachment,
-                    mode,
-                },
-            )
-            .expect("actor host alive");
-        self.wait_admin(|reply| match reply {
-            AdminReply::DatabaseDetachStarted { req: found, .. } if *found == req => Some(()),
-            AdminReply::AdminFailed { req: found } if *found == req => {
-                panic!("database detach failed")
-            }
-            _ => None,
-        });
+        match self.admin_request(AdminCall::BeginDetachDatabase {
+            vset,
+            attachment,
+            mode,
+        }) {
+            Ok(AdminSuccess::DatabaseDetachStarted { .. }) => {}
+            Err(error) => panic!("database detach failed: {error:?}"),
+            result => panic!("unexpected database detach result: {result:?}"),
+        }
     }
 
     pub fn finish_detach_database(&self, vset: VsetId, attachment: AttachmentId) -> bool {
-        let req = self.req();
-        self.inputs
-            .admin
-            .push(
-                Lane::Background,
-                AdminCmd::FinishDetachDatabase {
-                    req,
-                    vset,
-                    attachment,
-                },
-            )
-            .expect("actor host alive");
-        self.wait_admin(|reply| match reply {
-            AdminReply::DatabaseDetached { req: found, .. } if *found == req => Some(true),
-            AdminReply::AdminFailed { req: found } if *found == req => Some(false),
-            _ => None,
-        })
+        match self.admin_request(AdminCall::FinishDetachDatabase { vset, attachment }) {
+            Ok(AdminSuccess::DatabaseDetached { .. }) => true,
+            Err(_) => false,
+            result => panic!("unexpected database detach result: {result:?}"),
+        }
     }
 
-    pub fn database_request(&self, mut request: DatabaseRequest) -> DatabaseReply {
-        let caller_req = request.req;
-        let req = self.req();
-        request.req = req;
-        let (done_tx, done_rx) = channel();
-        {
-            let mut waiters = self
-                .shared
-                .database_waiters
-                .lock()
-                .expect("database waiter lock");
-            match waiters.entry(req) {
-                Entry::Occupied(_) => {
-                    return DatabaseReply::Failed {
-                        req: caller_req,
-                        error: DatabaseError::Busy,
-                    };
-                }
-                Entry::Vacant(slot) => {
-                    slot.insert(done_tx);
-                }
-            }
-        }
+    pub fn database_request(&self, request: DatabaseRequest) -> DatabaseReply {
+        let (req, call) = request.into_call();
+        let (request, reply) = bridge_request(call);
         self.inputs
             .database
             .push(Lane::Background, request)
             .expect("actor host alive");
-        if let Ok(reply) = done_rx.recv_timeout(Duration::from_secs(30)) {
-            reply.with_req(caller_req)
-        } else {
-            self.shared
-                .database_waiters
-                .lock()
-                .expect("database waiter lock")
-                .remove(&req);
-            DatabaseReply::Failed {
-                req: caller_req,
-                error: DatabaseError::Io,
-            }
-        }
+        let result = reply
+            .blocking_recv_timeout(Duration::from_secs(30))
+            .unwrap_or(Err(DatabaseError::Io));
+        DatabaseReply::from_result(req, result)
     }
 
     pub fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
         let started = Instant::now();
         self.install_vset_host(vset, config);
-        let req = self.req();
-        self.inputs
-            .admin
-            .push(Lane::Background, AdminCmd::RestoreVset { req, vset })
-            .expect("actor host alive");
-        let result = self.wait_admin(|reply| match reply {
-            AdminReply::VsetRestored {
-                req: found,
-                verdict,
-                ..
-            } if *found == req => Some(Some(*verdict)),
-            AdminReply::AdminFailed { req: found } if *found == req => Some(None),
-            _ => None,
-        });
+        let result = match self.admin_request(AdminCall::RestoreVset { vset }) {
+            Ok(AdminSuccess::VsetRestored { verdict, .. }) => Some(verdict),
+            Err(_) => None,
+            result => panic!("unexpected restore result: {result:?}"),
+        };
         self.observe_operation(2, result.is_some(), started.elapsed());
         result.expect("restore failed")
     }
 
     pub fn wait_recovered(&self, vset: VsetId) -> Verdict {
-        self.wait_admin(|reply| match reply {
-            AdminReply::VsetRecovered {
+        self.wait_admin_event(|event| match event {
+            AdminEvent::VsetRecovered {
                 vset: found,
                 verdict,
             } if *found == vset => Some(*verdict),
@@ -1554,27 +1490,24 @@ impl Runtime {
 
     pub fn migrate_out(&self, vset: VsetId, to: HostId) {
         let started = Instant::now();
-        let req = self.req();
         self.expect_pause(vset, 1);
-        self.inputs
-            .admin
-            .push(Lane::Background, AdminCmd::MigrateOut { req, vset, to })
-            .expect("actor host alive");
-        let migrated = self.wait_admin(|reply| match reply {
-            AdminReply::MigratedOut { req: found, .. } if *found == req => Some(true),
-            AdminReply::AdminFailed { req: found } if *found == req => Some(false),
-            _ => None,
-        });
+        let migrated = match self.admin_request(AdminCall::MigrateOut { vset, to }) {
+            Ok(AdminSuccess::MigratedOut { .. }) => true,
+            Err(_) => false,
+            result => panic!("unexpected migration result: {result:?}"),
+        };
         self.observe_operation(3, migrated, started.elapsed());
-        if !migrated {
+        if migrated {
+            complete_pause(&self.shared, vset);
+        } else {
             self.cancel_expected_pause(vset, 1);
         }
         assert!(migrated, "migrate out failed");
     }
 
     pub fn wait_migrated_in(&self, vset: VsetId) -> Verdict {
-        self.wait_admin(|reply| match reply {
-            AdminReply::VsetMigratedIn {
+        self.wait_admin_event(|event| match event {
+            AdminEvent::VsetMigratedIn {
                 vset: found,
                 verdict,
             } if *found == vset => Some(*verdict),
@@ -1685,24 +1618,16 @@ impl Runtime {
         let host = self.host(vset);
         Self::op_start(&host);
         let req = self.req();
-        let (done_tx, done_rx) = channel();
-        self.shared
-            .sync_waiters
-            .lock()
-            .expect("sync waiter lock")
-            .insert(req, done_tx);
+        let (request, reply) = bridge_request(GuestSync {
+            req,
+            volume: VolumeId { vset, idx: volume },
+        });
         self.inputs
             .syncs
-            .push(
-                Lane::Critical,
-                GuestSync {
-                    req,
-                    volume: VolumeId { vset, idx: volume },
-                },
-            )
+            .push(Lane::Critical, request)
             .expect("actor host alive");
-        let ok = done_rx
-            .recv_timeout(Duration::from_secs(30))
+        let ok = reply
+            .blocking_recv_timeout(Duration::from_secs(30))
             .expect("sync reply within 30 seconds");
         Self::op_end(&host);
         self.observe_operation(4, ok, started.elapsed());
@@ -1832,6 +1757,22 @@ fn complete_pause(shared: &Shared, vset: VsetId) {
         .remove(&vset)
     {
         shared.pause_latency[operation].observe(started.elapsed());
+    }
+}
+
+fn begin_pause(shared: &Shared, vset: VsetId) {
+    let operation = shared
+        .pause_expected
+        .lock()
+        .expect("pause lock")
+        .get_mut(&vset)
+        .and_then(VecDeque::pop_front);
+    if let Some(operation) = operation {
+        shared
+            .pause_in_flight
+            .lock()
+            .expect("pause lock")
+            .insert(vset, (operation, Instant::now()));
     }
 }
 
@@ -1967,4 +1908,147 @@ fn update_capacity_signal(shared: &Shared, daemon: &DaemonStats, actor_inputs: &
         .lock()
         .expect("capacity lock")
         .observe(inputs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_host_config() -> HostConfig {
+        HostConfig {
+            archive: Default::default(),
+            host: HostId(1),
+            cache_pages: 1,
+            writeback_interval: 1,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_admin_requests_keep_out_of_order_replies_with_their_callers() {
+        let (admin, incoming) = injector::<AdminRequest>();
+        let actor = thread::spawn(move || {
+            let mut executor = Executor::production();
+            executor.block_on(async move {
+                let first = incoming.recv().await.expect("first request");
+                let second = incoming.recv().await.expect("second request");
+                let (first, mut first_reply) = first.into_parts();
+                let (second, mut second_reply) = second.into_parts();
+                let AdminCall::DeleteBase { base: second_base } = second else {
+                    panic!("delete-base request");
+                };
+                let AdminCall::DeleteBase { base: first_base } = first else {
+                    panic!("delete-base request");
+                };
+                second_reply
+                    .send(Ok(AdminSuccess::BaseDeleted { base: second_base }))
+                    .expect("second caller alive");
+                first_reply
+                    .send(Ok(AdminSuccess::BaseDeleted { base: first_base }))
+                    .expect("first caller alive");
+            });
+        });
+
+        let call = |base: u64, admin: Injector<AdminRequest>| {
+            thread::spawn(move || {
+                let (request, reply) = bridge_request(AdminCall::DeleteBase { base });
+                admin.push(Lane::Background, request).expect("actor alive");
+                reply
+                    .blocking_recv_timeout(Duration::from_secs(1))
+                    .expect("reply without shared-stream timeout")
+            })
+        };
+        let first = call(1, admin.clone());
+        let second = call(2, admin);
+
+        for (expected, caller) in [(1, first), (2, second)] {
+            assert_eq!(
+                caller.join().expect("caller thread"),
+                Ok(AdminSuccess::BaseDeleted { base: expected })
+            );
+        }
+        actor.join().expect("actor thread");
+    }
+
+    #[test]
+    fn successful_migration_completes_pause_once() {
+        let shared = Shared::new(BTreeMap::new(), &test_host_config());
+        let vset = VsetId(7);
+        shared
+            .pause_expected
+            .lock()
+            .expect("pause lock")
+            .entry(vset)
+            .or_default()
+            .push_back(1);
+
+        begin_pause(&shared, vset);
+        assert!(
+            shared
+                .pause_in_flight
+                .lock()
+                .expect("pause lock")
+                .contains_key(&vset)
+        );
+
+        complete_pause(&shared, vset);
+        complete_pause(&shared, vset);
+
+        assert!(
+            !shared
+                .pause_in_flight
+                .lock()
+                .expect("pause lock")
+                .contains_key(&vset)
+        );
+        assert_eq!(shared.pause_latency[1].snapshot().count, 1);
+    }
+
+    #[test]
+    fn cancelled_pending_pause_releases_guest_control() {
+        let vset = VsetId(8);
+        let host = VsetHost::new(VsetConfig::database(1));
+        let shared = Arc::new(Shared::new(
+            BTreeMap::from([(vset, Arc::clone(&host))]),
+            &test_host_config(),
+        ));
+        shared
+            .pause_expected
+            .lock()
+            .expect("pause lock")
+            .entry(vset)
+            .or_default()
+            .push_back(0);
+        begin_pause(&shared, vset);
+        {
+            let mut state = host.ctl.state.lock().expect("guest control lock");
+            state.pause_generation = 1;
+            state.pause_requested = true;
+            state.paused = true;
+        }
+
+        drop(PendingGuestPause {
+            shared: Arc::clone(&shared),
+            host: Arc::clone(&host),
+            vset,
+            generation: 1,
+            active: true,
+        });
+
+        let state = host.ctl.state.lock().expect("guest control lock");
+        assert!(!state.pause_requested);
+        assert!(!state.paused);
+        drop(state);
+        assert!(
+            !shared
+                .pause_in_flight
+                .lock()
+                .expect("pause lock")
+                .contains_key(&vset)
+        );
+    }
 }

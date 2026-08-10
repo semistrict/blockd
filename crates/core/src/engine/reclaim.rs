@@ -48,7 +48,7 @@ pub async fn reclaim_backed_segments<W: Blobs>(
         Blobs::delete(world, &name).await?;
         let mut host = state.borrow_mut();
         host.blob_sizes.remove(&name);
-        host.disk_reclaim_requested = false;
+        host.disk_reclaim_requested = !host.disk_reclaim_target_met();
         if let Some(vset_state) = host.vsets.get_mut(&vset) {
             vset_state
                 .segment_blobs
@@ -68,7 +68,7 @@ pub async fn cleanup_local<W: Blobs>(
     vset: VsetId,
     incarnation: u64,
 ) -> Result<(), BlobError> {
-    let (names, records_to_remove, segments_to_remove, leaves_to_remove) = {
+    let (names, records_to_remove, segments_to_remove, leaves_to_remove, pressure_reclaims) = {
         let host = state.borrow();
         let Some(vset_state) = host
             .vsets
@@ -112,6 +112,14 @@ pub async fn cleanup_local<W: Blobs>(
                 (!keep_segments.contains(&(fence, segment))).then_some((fence, segment))
             })
             .collect::<Vec<_>>();
+        let pressure_reclaims = if host.disk_reclaim_requested {
+            segments_to_remove
+                .iter()
+                .filter(|candidate| vset_state.backed_segments.contains(candidate))
+                .count()
+        } else {
+            0
+        };
         let leaves_to_remove = vset_state
             .leaf_blobs
             .keys()
@@ -142,6 +150,7 @@ pub async fn cleanup_local<W: Blobs>(
             records_to_remove,
             segments_to_remove,
             leaves_to_remove,
+            pressure_reclaims,
         )
     };
     if names.is_empty() {
@@ -168,6 +177,13 @@ pub async fn cleanup_local<W: Blobs>(
         vset_state.leaf_blobs.remove(&pointer);
     }
     host.counters.blobs_deleted += names.len() as u64;
+    if pressure_reclaims > 0 {
+        host.disk_reclaim_requested = !host.disk_reclaim_target_met();
+        host.counters.nvme_reclaims = host
+            .counters
+            .nvme_reclaims
+            .saturating_add(u64::try_from(pressure_reclaims).expect("reclaim count fits u64"));
+    }
     Ok(())
 }
 

@@ -9,7 +9,6 @@ rust-version.workspace = true
 test-page-size = ["blockd-core/test-page-size"]
 
 [dependencies]
-async-trait.workspace = true
 blockd-core = { path = "../core" }
 blockd-exec = { path = "../exec" }
 blockd-workload = { path = "../workload" }

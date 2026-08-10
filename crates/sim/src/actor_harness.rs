@@ -1,7 +1,7 @@
 //! Single-host deterministic runs over the async actor core.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -9,10 +9,14 @@ use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
-use blockd_core::protocol::{AdminCmd, AdminReply, ReqId};
+use blockd_core::protocol::{AdminCall, AdminError, AdminEvent, AdminSuccess, ReqId};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
+use blockd_exec::channel::unbounded;
 use blockd_exec::rng::Ppm;
-use blockd_exec::{Executor, OneOf3, TaskHandle, delay, now, random_u64, select3, spawn};
+use blockd_exec::{
+    Either, Executor, OneOf3, TaskHandle, TaskId, TaskSet, delay, now, random_u64, select2,
+    select3, spawn, yield_now,
+};
 use blockd_workload::{
     LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
 };
@@ -168,6 +172,29 @@ type SharedHostState = Rc<RefCell<HostState>>;
 type HostSlot = Rc<RefCell<Option<TaskHandle<()>>>>;
 type StateSlot = Rc<RefCell<SharedHostState>>;
 type GuestSlots = Rc<RefCell<BTreeMap<VsetId, Option<TaskHandle<()>>>>>;
+const RECOVERY_CONCURRENCY: usize = 32;
+const RECOVERY_QUEUE_CAPACITY: usize = 1_024;
+const CHECKPOINT_CONCURRENCY: usize = 32;
+
+struct RecoveryWork {
+    event: AdminEvent,
+    count_unrestorable: bool,
+    generation: u64,
+}
+
+struct RecoveryContext {
+    world: Rc<SimWorld>,
+    guest_states: Rc<BTreeMap<VsetId, Rc<GuestState>>>,
+    guest_slots: GuestSlots,
+    events: Rc<RunEvents>,
+    config: ActorHarnessConfig,
+}
+
+enum RecoverySupervisorEvent {
+    Completed(Option<(VsetId, u64, Option<RecoveryWork>)>),
+    Ingress(Option<(AdminEvent, u64)>),
+    RetryReady,
+}
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
@@ -200,8 +227,7 @@ pub fn run_capture_profile(
         passive_host,
     ))));
     let vset = VsetId(1);
-    world.enqueue_admin(AdminCmd::CreateVset {
-        req: ReqId(1),
+    let create = world.request_admin(AdminCall::CreateVset {
         vset,
         config: config.vset,
         from_base: None,
@@ -217,14 +243,8 @@ pub fn run_capture_profile(
         let world = Rc::clone(&world);
         let passive_world = Rc::clone(&passive_world);
         async move {
-            match select3(
-                world.next_admin_reply(),
-                world.next_abort(),
-                passive_world.next_abort(),
-            )
-            .await
-            {
-                OneOf3::First(reply) => reply,
+            match select3(create, world.next_abort(), passive_world.next_abort()).await {
+                OneOf3::First(reply) => reply.ok(),
                 OneOf3::Second(reason) => panic!("primary aborted during creation: {reason:?}"),
                 OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
             }
@@ -233,10 +253,10 @@ pub fn run_capture_profile(
     assert!(
         matches!(
             created,
-            Some(AdminReply::VsetCreated {
+            Some(Ok(AdminSuccess::VsetCreated {
                 vset: VsetId(1),
                 ..
-            })
+            }))
         ),
         "capture-profile vset creation failed: {created:?}"
     );
@@ -300,41 +320,30 @@ pub fn run_final_blobs(
     let host_slot = Rc::new(RefCell::new(Some(
         executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world))),
     )));
-    for number in 1..=config.vset_count {
-        let vset = VsetId(u64::from(number));
-        let req = ReqId(u64::from(number));
-        world.enqueue_admin(AdminCmd::CreateVset {
-            req,
-            vset,
-            config: config.vset,
-            from_base: None,
-        });
-    }
+    let creates = (1..=config.vset_count)
+        .map(|number| {
+            let vset = VsetId(u64::from(number));
+            let reply = world.request_admin(AdminCall::CreateVset {
+                vset,
+                config: config.vset,
+                from_base: None,
+            });
+            (vset, reply)
+        })
+        .collect::<Vec<_>>();
     executor.block_on({
         let world = Rc::clone(&world);
         let passive_world = Rc::clone(&passive_world);
         async move {
-            let mut created = BTreeSet::new();
-            while created.len() < usize::from(config.vset_count) {
-                match select3(
-                    world.next_admin_reply(),
-                    world.next_abort(),
-                    passive_world.next_abort(),
-                )
-                .await
-                {
-                    OneOf3::First(Some(AdminReply::VsetCreated { req, vset }))
-                        if req.0 == vset.0
-                            && (1..=u64::from(config.vset_count)).contains(&vset.0) =>
-                    {
-                        created.insert(vset);
+            for (expected_vset, reply) in creates {
+                match select3(reply, world.next_abort(), passive_world.next_abort()).await {
+                    OneOf3::First(Ok(Ok(AdminSuccess::VsetCreated { vset })))
+                        if vset == expected_vset => {}
+                    OneOf3::First(Ok(Err(error))) => {
+                        panic!("vset creation failed: {error:?}")
                     }
-                    OneOf3::First(Some(AdminReply::AdminFailed { req })) => {
-                        panic!("vset creation failed for {req:?}")
-                    }
-                    OneOf3::First(Some(_)) => {}
-                    OneOf3::First(None) => {
-                        panic!("admin reply stream closed during creation")
+                    OneOf3::First(reply) => {
+                        panic!("unexpected vset creation reply: {reply:?}")
                     }
                     OneOf3::Second(reason) => {
                         panic!("primary aborted during creation: {reason:?}")
@@ -436,11 +445,6 @@ pub fn run_final_blobs(
     if executor.now() < config.horizon {
         executor.run_until(config.horizon);
     }
-    for guest in guest_slots.borrow_mut().values_mut() {
-        if let Some(mut guest) = guest.take() {
-            guest.cancel();
-        }
-    }
     for mut actor in fault_actors {
         actor.cancel();
     }
@@ -456,6 +460,11 @@ pub fn run_final_blobs(
         .now()
         .saturating_add(config.host.writeback_interval.saturating_mul(4));
     executor.run_until(drain);
+    for guest in guest_slots.borrow_mut().values_mut() {
+        if let Some(mut guest) = guest.take() {
+            guest.cancel();
+        }
+    }
     supervisor.cancel();
     executor.run_ready();
 
@@ -569,8 +578,7 @@ pub fn run_workload(
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let vset = VsetId(1);
-    world.enqueue_admin(AdminCmd::CreateVset {
-        req: ReqId(1),
+    let create = world.request_admin(AdminCall::CreateVset {
         vset,
         config: config.vset,
         from_base: None,
@@ -593,14 +601,8 @@ pub fn run_workload(
         let world = Rc::clone(&world);
         let passive_world = Rc::clone(&passive_world);
         async move {
-            match select3(
-                world.next_admin_reply(),
-                world.next_abort(),
-                passive_world.next_abort(),
-            )
-            .await
-            {
-                OneOf3::First(reply) => reply,
+            match select3(create, world.next_abort(), passive_world.next_abort()).await {
+                OneOf3::First(reply) => reply.ok(),
                 OneOf3::Second(reason) => panic!("primary aborted during creation: {reason:?}"),
                 OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
             }
@@ -608,10 +610,10 @@ pub fn run_workload(
     });
     if !matches!(
         created,
-        Some(AdminReply::VsetCreated {
+        Some(Ok(AdminSuccess::VsetCreated {
             vset: VsetId(1),
             ..
-        })
+        }))
     ) {
         return Err(format!("vset creation failed: {created:?}"));
     }
@@ -719,27 +721,9 @@ pub fn run_workload(
             Operation::Checkpoint => {
                 let req = ReqId(next_req);
                 next_req = next_req.checked_add(1).expect("script request overflow");
-                world.enqueue_admin(AdminCmd::Checkpoint { req, vset });
-                let reply = executor.block_on({
-                    let world = Rc::clone(&world);
-                    async move {
-                        loop {
-                            match world.next_admin_reply().await {
-                                Some(AdminReply::CheckpointDone { req: done, .. })
-                                    if done == req =>
-                                {
-                                    return Some(());
-                                }
-                                Some(AdminReply::AdminFailed { req: failed }) if failed == req => {
-                                    return None;
-                                }
-                                Some(_) => {}
-                                None => return None,
-                            }
-                        }
-                    }
-                });
-                if reply.is_none() {
+                let reply = world.request_admin(AdminCall::Checkpoint { retry: req, vset });
+                let reply = executor.block_on(reply);
+                if !matches!(reply, Ok(Ok(AdminSuccess::CheckpointDone { .. }))) {
                     return Err("scripted checkpoint failed".to_owned());
                 }
             }
@@ -769,8 +753,8 @@ pub fn run_workload(
             Operation::Restore => {
                 let deadline = executor.now().saturating_add(1_000_000_000);
                 let verdict = loop {
-                    match world.try_next_admin_reply() {
-                        Some(AdminReply::VsetRecovered {
+                    match world.try_next_admin_event() {
+                        Some(AdminEvent::VsetRecovered {
                             vset: VsetId(1),
                             verdict,
                         }) => break Some(verdict),
@@ -955,6 +939,7 @@ fn report_from_state(
     report
 }
 
+#[allow(clippy::too_many_lines)]
 async fn recovery_supervisor(
     world: Rc<SimWorld>,
     guest_states: Rc<BTreeMap<VsetId, Rc<GuestState>>>,
@@ -962,14 +947,139 @@ async fn recovery_supervisor(
     events: Rc<RunEvents>,
     config: ActorHarnessConfig,
 ) {
-    while let Some(reply) = world.next_admin_reply().await {
-        let (vset, verdict, local_recovery, restored) = match reply {
-            AdminReply::VsetRecovered { vset, verdict } => (vset, verdict, true, false),
-            AdminReply::VsetRestored { vset, verdict, .. } => (vset, verdict, false, true),
-            AdminReply::VsetMigratedIn { vset, verdict }
-            | AdminReply::VsetForked { vset, verdict, .. } => (vset, verdict, false, false),
-            _ => continue,
+    let mut actors = TaskSet::new();
+    let (completed, mut completions) = unbounded();
+    let mut active = BTreeMap::<VsetId, (u64, TaskId)>::new();
+    let mut pending = BTreeMap::<VsetId, (u64, RecoveryWork)>::new();
+    let mut ingress_open = true;
+    let retry_delay = config.host.backup_retry.max(1);
+    loop {
+        while active.len() < RECOVERY_CONCURRENCY {
+            let Some(vset) = pending.iter().find_map(|(&vset, (ready_at, _))| {
+                (*ready_at <= now() && !active.contains_key(&vset)).then_some(vset)
+            }) else {
+                break;
+            };
+            let (_, work) = pending.remove(&vset).expect("selected recovery event");
+            let completed = completed.clone();
+            let context = RecoveryContext {
+                world: Rc::clone(&world),
+                guest_states: Rc::clone(&guest_states),
+                guest_slots: Rc::clone(&guest_slots),
+                events: Rc::clone(&events),
+                config: config.clone(),
+            };
+            let generation = work.generation;
+            if world.admin_event_generation(vset) != generation {
+                yield_now().await;
+                continue;
+            }
+            let task = actors.spawn(async move {
+                let retry =
+                    handle_recovery_event(context, work.event, work.count_unrestorable, generation)
+                        .await;
+                let _ = completed.send((vset, generation, retry));
+            });
+            active.insert(vset, (generation, task));
+        }
+        if !ingress_open && active.is_empty() && pending.is_empty() {
+            return;
+        }
+        let at_capacity = active.len() + pending.len() >= RECOVERY_QUEUE_CAPACITY;
+        let wait_for_retry = if active.len() < RECOVERY_CONCURRENCY {
+            pending
+                .iter()
+                .filter(|(vset, _)| !active.contains_key(vset))
+                .map(|(_, (ready_at, _))| ready_at.saturating_sub(now()))
+                .min()
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
         };
+        let event = if ingress_open && !at_capacity {
+            match select3(
+                completions.recv(),
+                world.next_admin_event_with_generation(),
+                delay(wait_for_retry),
+            )
+            .await
+            {
+                OneOf3::First(completion) => RecoverySupervisorEvent::Completed(completion),
+                OneOf3::Second(event) => RecoverySupervisorEvent::Ingress(event),
+                OneOf3::Third(()) => RecoverySupervisorEvent::RetryReady,
+            }
+        } else {
+            match select2(completions.recv(), delay(wait_for_retry)).await {
+                Either::First(completion) => RecoverySupervisorEvent::Completed(completion),
+                Either::Second(()) => RecoverySupervisorEvent::RetryReady,
+            }
+        };
+        match event {
+            RecoverySupervisorEvent::Completed(Some((vset, generation, retry))) => {
+                if active
+                    .get(&vset)
+                    .is_some_and(|(active_generation, _)| *active_generation == generation)
+                {
+                    active.remove(&vset);
+                    if world.admin_event_generation(vset) == generation
+                        && let Some(work) = retry
+                    {
+                        pending
+                            .entry(vset)
+                            .or_insert((now().saturating_add(retry_delay), work));
+                    }
+                }
+            }
+            RecoverySupervisorEvent::Completed(None) => return,
+            RecoverySupervisorEvent::Ingress(Some((event, generation))) => {
+                let vset = match event {
+                    AdminEvent::VsetRecovered { vset, .. }
+                    | AdminEvent::VsetMigratedIn { vset, .. } => vset,
+                };
+                if let Some((_, task)) = active.remove(&vset) {
+                    actors.cancel(task);
+                }
+                pending.insert(
+                    vset,
+                    (
+                        now(),
+                        RecoveryWork {
+                            event,
+                            count_unrestorable: true,
+                            generation,
+                        },
+                    ),
+                );
+            }
+            RecoverySupervisorEvent::Ingress(None) => ingress_open = false,
+            RecoverySupervisorEvent::RetryReady => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn handle_recovery_event(
+    context: RecoveryContext,
+    event: AdminEvent,
+    count_unrestorable: bool,
+    generation: u64,
+) -> Option<RecoveryWork> {
+    let RecoveryContext {
+        world,
+        guest_states,
+        guest_slots,
+        events,
+        config,
+    } = context;
+    let (vset, mut verdict, mut local_recovery) = match event {
+        AdminEvent::VsetRecovered { vset, verdict } => (vset, verdict, true),
+        AdminEvent::VsetMigratedIn { vset, verdict } => (vset, verdict, false),
+    };
+    if world.admin_event_generation(vset) != generation {
+        return None;
+    }
+    let mut restored = false;
+    'verdict: loop {
         if restored {
             events.restores.set(events.restores.get().saturating_add(1));
         }
@@ -1018,18 +1128,55 @@ async fn recovery_supervisor(
                 *guest_states[&vset].durable_expected.borrow_mut() = cold;
             }
             blockd_core::protocol::Verdict::Unrestorable => {
-                events
-                    .unrestorable
-                    .set(events.unrestorable.get().saturating_add(1));
-                if local_recovery {
-                    world.enqueue_admin(AdminCmd::RestoreVset {
-                        req: ReqId(u64::MAX.saturating_sub(vset.0)),
-                        vset,
-                    });
+                if count_unrestorable {
+                    events
+                        .unrestorable
+                        .set(events.unrestorable.get().saturating_add(1));
                 }
-                continue;
+                if local_recovery {
+                    let restored_reply = match select2(
+                        world.request_admin(AdminCall::RestoreVset { vset }),
+                        world.wait_for_admin_event_generation_change(vset, generation),
+                    )
+                    .await
+                    {
+                        Either::First(reply) => reply,
+                        Either::Second(()) => return None,
+                    };
+                    if world.admin_event_generation(vset) != generation {
+                        return None;
+                    }
+                    match restored_reply {
+                        Ok(Ok(AdminSuccess::VsetRestored {
+                            vset: restored_vset,
+                            verdict: restored_verdict,
+                            ..
+                        })) => {
+                            assert_eq!(restored_vset, vset);
+                            verdict = restored_verdict;
+                            local_recovery = false;
+                            restored = true;
+                            continue 'verdict;
+                        }
+                        Ok(Err(AdminError::Busy | AdminError::Stale | AdminError::Unavailable))
+                        | Err(_) => {
+                            return Some(RecoveryWork {
+                                event: AdminEvent::VsetRecovered {
+                                    vset,
+                                    verdict: blockd_core::protocol::Verdict::Unrestorable,
+                                },
+                                count_unrestorable: false,
+                                generation,
+                            });
+                        }
+                        Ok(Err(AdminError::Rejected | AdminError::NotFound) | Ok(_)) => {
+                            return None;
+                        }
+                    }
+                }
+                return None;
             }
-            blockd_core::protocol::Verdict::DatabaseReady { .. } => continue,
+            blockd_core::protocol::Verdict::DatabaseReady { .. } => return None,
         }
         *guest_states[&vset].recovering_pages.borrow_mut() = config
             .vset
@@ -1041,6 +1188,9 @@ async fn recovery_supervisor(
                 })
             })
             .collect();
+        if world.admin_event_generation(vset) != generation {
+            return None;
+        }
         let handle = spawn(guest_actor(
             Rc::clone(&world),
             Rc::clone(&guest_states[&vset]),
@@ -1053,6 +1203,7 @@ async fn recovery_supervisor(
             previous.is_none_or(|slot| slot.is_none()),
             "recovery started a duplicate guest"
         );
+        return None;
     }
 }
 
@@ -1199,21 +1350,64 @@ async fn record_bitflip_at(world: Rc<SimWorld>, at: u64, mirror: bool) {
 
 async fn checkpoint_schedule(world: Rc<SimWorld>, interval: u64, horizon: u64, vset_count: u16) {
     let mut req = 1_u64 << 63;
+    let mut actors = TaskSet::new();
+    let (completed, mut completions) = unbounded();
+    let mut active = BTreeSet::new();
+    let mut queued = BTreeSet::new();
+    let mut pending = VecDeque::new();
+    let interval = interval.max(1);
+    let mut next_cadence = now().saturating_add(interval);
     loop {
-        delay(interval).await;
-        if now() > horizon {
-            return;
+        if now() >= next_cadence {
+            if now() > horizon {
+                pending.clear();
+                queued.clear();
+                while !active.is_empty() {
+                    let Some(vset) = completions.recv().await else {
+                        return;
+                    };
+                    active.remove(&vset);
+                }
+                return;
+            }
+            for number in 1..=vset_count {
+                let vset = VsetId(u64::from(number));
+                if world.vmstate_ready(vset) && !active.contains(&vset) && queued.insert(vset) {
+                    pending.push_back(vset);
+                }
+            }
+            next_cadence = now().saturating_add(interval);
         }
-        for number in 1..=vset_count {
-            let vset = VsetId(u64::from(number));
-            if !world.vmstate_ready(vset) {
+        while active.len() < CHECKPOINT_CONCURRENCY {
+            let Some(vset) = pending.pop_front() else {
+                break;
+            };
+            queued.remove(&vset);
+            if !world.vmstate_ready(vset) || !active.insert(vset) {
                 continue;
             }
-            world.enqueue_admin(AdminCmd::Checkpoint {
-                req: ReqId(req),
+            let reply = world.request_admin(AdminCall::Checkpoint {
+                retry: ReqId(req),
                 vset,
             });
+            let completed = completed.clone();
+            actors.spawn(async move {
+                let _ = reply.await;
+                let _ = completed.send(vset);
+            });
             req = req.checked_add(1).expect("checkpoint request overflow");
+        }
+        match select2(
+            completions.recv(),
+            delay(next_cadence.saturating_sub(now())),
+        )
+        .await
+        {
+            Either::First(Some(vset)) => {
+                active.remove(&vset);
+            }
+            Either::First(None) => return,
+            Either::Second(()) => {}
         }
     }
 }
@@ -1442,6 +1636,7 @@ fn hit(probability: Ppm) -> bool {
 mod tests {
     use blockd_core::types::millis;
     use blockd_core::world::AdminIo;
+    use blockd_exec::timeout;
 
     use super::*;
     use crate::actor_world::SimNetwork;
@@ -1532,23 +1727,658 @@ mod tests {
                     events,
                     config,
                 ));
-                AdminIo::reply_admin(
+                AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminReply::VsetRecovered {
+                    blockd_core::protocol::AdminEvent::VsetRecovered {
                         vset,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
                 .await;
-                let command = AdminIo::next_admin(world.as_ref()).await;
+                let command = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .map(|request| request.into_parts().0);
                 drop(supervisor);
                 command
             }
         });
         assert!(matches!(
             command,
-            Some(AdminCmd::RestoreVset { vset: found, .. }) if found == vset
+            Some(AdminCall::RestoreVset { vset: found }) if found == vset
         ));
+    }
+
+    #[test]
+    fn recoverable_restore_failure_retries_without_blocking_another_vset() {
+        let mut config = config();
+        config.host.backup_retry = 1;
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let first = VsetId(1);
+        let second = VsetId(2);
+        let guest_states = Rc::new(BTreeMap::from([
+            (first, Rc::new(GuestState::default())),
+            (second, Rc::new(GuestState::default())),
+        ]));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(30);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            let guest_slots = Rc::clone(&guest_slots);
+            async move {
+                let supervisor = spawn(recovery_supervisor(
+                    Rc::clone(&world),
+                    guest_states,
+                    Rc::clone(&guest_slots),
+                    events,
+                    config,
+                ));
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset: first,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                )
+                .await;
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset: second,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+
+                let request = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("first restore request");
+                let (call, mut reply) = request.into_parts();
+                assert_eq!(call, AdminCall::RestoreVset { vset: first });
+                let _ = reply.send(Err(AdminError::Busy));
+                delay(2).await;
+                assert!(
+                    guest_slots
+                        .borrow()
+                        .get(&second)
+                        .is_some_and(Option::is_some)
+                );
+
+                let request = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("retried restore request");
+                let (call, _reply) = request.into_parts();
+                assert_eq!(call, AdminCall::RestoreVset { vset: first });
+                drop(supervisor);
+            }
+        });
+    }
+
+    #[test]
+    fn older_restore_success_cannot_replace_newer_recovery_event() {
+        let mut config = config();
+        config.host.backup_retry = 10;
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(32);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            let guest_slots = Rc::clone(&guest_slots);
+            async move {
+                let supervisor = spawn(recovery_supervisor(
+                    Rc::clone(&world),
+                    guest_states,
+                    Rc::clone(&guest_slots),
+                    events,
+                    config,
+                ));
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                )
+                .await;
+                let request = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("restore request");
+                let (call, mut reply) = request.into_parts();
+                assert_eq!(call, AdminCall::RestoreVset { vset });
+
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+                delay(1).await;
+                let _ = reply.send(Ok(AdminSuccess::VsetRestored {
+                    vset,
+                    verdict: blockd_core::protocol::Verdict::ColdBoot,
+                }));
+                delay(1).await;
+
+                assert!(
+                    guest_slots.borrow().get(&vset).is_some_and(Option::is_some),
+                    "the newer cold-boot recovery must win over the stale restore"
+                );
+                match select2(AdminIo::next_admin(world.as_ref()), delay(0)).await {
+                    Either::First(Some(request)) => {
+                        panic!("unexpected stale request: {:?}", request.body)
+                    }
+                    Either::First(None) | Either::Second(()) => {}
+                }
+                drop(supervisor);
+            }
+        });
+    }
+
+    #[test]
+    fn newer_recovery_preempts_a_blocked_restore() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(37);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            let guest_slots = Rc::clone(&guest_slots);
+            async move {
+                let supervisor = spawn(recovery_supervisor(
+                    Rc::clone(&world),
+                    guest_states,
+                    Rc::clone(&guest_slots),
+                    events,
+                    config,
+                ));
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                )
+                .await;
+                let stale = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("stale restore request");
+                let (_, mut stale_reply) = stale.into_parts();
+
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+                delay(2).await;
+
+                assert!(
+                    guest_slots.borrow().get(&vset).is_some_and(Option::is_some),
+                    "the newer recovery must not wait for the stale restore reply"
+                );
+                assert!(
+                    stale_reply.send(Err(AdminError::Busy)).is_err(),
+                    "preemption must cancel the stale administrative request"
+                );
+                drop(supervisor);
+            }
+        });
+    }
+
+    #[test]
+    fn generation_change_preempts_restore_before_newer_event_admission() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(38);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            async move {
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                )
+                .await;
+                let (_, generation) = world
+                    .next_admin_event_with_generation()
+                    .await
+                    .expect("initial recovery event");
+                let recovery = spawn(handle_recovery_event(
+                    RecoveryContext {
+                        world: Rc::clone(&world),
+                        guest_states,
+                        guest_slots,
+                        events,
+                        config,
+                    },
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                    true,
+                    generation,
+                ));
+                let stale = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("restore request");
+                let (_, mut stale_reply) = stale.into_parts();
+
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+
+                assert!(
+                    recovery.await.expect("recovery actor completes").is_none(),
+                    "a superseded recovery must stop without waiting for supervisor ingress"
+                );
+                assert!(
+                    stale_reply.send(Err(AdminError::Busy)).is_err(),
+                    "generation change must cancel the stale restore request"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn superseded_recovery_work_issues_no_restore_request() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let stale_generation = world.admin_event_generation(vset);
+        let mut executor = Executor::simulation(34);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            async move {
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+                let context = RecoveryContext {
+                    world: Rc::clone(&world),
+                    guest_states,
+                    guest_slots,
+                    events,
+                    config,
+                };
+                let stale = spawn(handle_recovery_event(
+                    context,
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                    false,
+                    stale_generation,
+                ));
+                match select2(AdminIo::next_admin(world.as_ref()), stale).await {
+                    Either::First(Some(request)) => {
+                        panic!("superseded recovery issued request: {:?}", request.body)
+                    }
+                    Either::First(None) => panic!("admin ingress closed"),
+                    Either::Second(result) => {
+                        assert!(result.expect("recovery task completes").is_none());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn stale_recovery_admission_does_not_block_its_newer_event() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(35);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            let guest_slots = Rc::clone(&guest_slots);
+            async move {
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                )
+                .await;
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+                let supervisor = spawn(recovery_supervisor(
+                    world,
+                    guest_states,
+                    Rc::clone(&guest_slots),
+                    events,
+                    config,
+                ));
+                delay(2).await;
+                assert!(
+                    guest_slots.borrow().get(&vset).is_some_and(Option::is_some),
+                    "the stale event must not retain the vset's active slot"
+                );
+                drop(supervisor);
+            }
+        });
+    }
+
+    #[test]
+    fn queued_recovery_supersedes_an_active_restore_at_capacity() {
+        let mut config = config();
+        config.host.backup_retry = 10;
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let first = VsetId(1);
+        let guest_states = Rc::new(
+            (1..=RECOVERY_QUEUE_CAPACITY)
+                .map(|number| {
+                    (
+                        VsetId(u64::try_from(number).expect("vset fits")),
+                        Rc::new(GuestState::default()),
+                    )
+                })
+                .collect(),
+        );
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(33);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            let guest_slots = Rc::clone(&guest_slots);
+            async move {
+                let supervisor = spawn(recovery_supervisor(
+                    Rc::clone(&world),
+                    guest_states,
+                    Rc::clone(&guest_slots),
+                    events,
+                    config,
+                ));
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset: first,
+                        verdict: blockd_core::protocol::Verdict::Unrestorable,
+                    },
+                )
+                .await;
+                let request = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("first restore request");
+                let (call, mut first_reply) = request.into_parts();
+                assert_eq!(call, AdminCall::RestoreVset { vset: first });
+
+                for number in 2..=RECOVERY_QUEUE_CAPACITY {
+                    AdminIo::emit_admin_event(
+                        world.as_ref(),
+                        AdminEvent::VsetRecovered {
+                            vset: VsetId(u64::try_from(number).expect("vset fits")),
+                            verdict: blockd_core::protocol::Verdict::Unrestorable,
+                        },
+                    )
+                    .await;
+                }
+                delay(1).await;
+                let mut other_replies = Vec::new();
+                for _ in 1..RECOVERY_CONCURRENCY {
+                    let request = AdminIo::next_admin(world.as_ref())
+                        .await
+                        .expect("concurrent restore request");
+                    let (call, reply) = request.into_parts();
+                    assert!(matches!(call, AdminCall::RestoreVset { .. }));
+                    other_replies.push(reply);
+                }
+
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset: first,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+                let _ = first_reply.send(Ok(AdminSuccess::VsetRestored {
+                    vset: first,
+                    verdict: blockd_core::protocol::Verdict::ColdBoot,
+                }));
+                delay(1).await;
+                assert!(
+                    guest_slots.borrow().get(&first).is_none(),
+                    "the superseded restore must not start a guest"
+                );
+
+                for mut reply in other_replies {
+                    let _ = reply.send(Err(AdminError::Busy));
+                }
+                delay(1).await;
+                assert!(
+                    guest_slots
+                        .borrow()
+                        .get(&first)
+                        .is_some_and(Option::is_some),
+                    "the queued recovery event must start the replacement guest"
+                );
+                drop(supervisor);
+            }
+        });
+    }
+
+    #[test]
+    fn retrying_restores_release_every_recovery_slot_for_queued_vsets() {
+        let mut config = config();
+        config.host.backup_retry = 10;
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let queued = VsetId(u64::try_from(RECOVERY_CONCURRENCY + 1).expect("vset fits"));
+        let guest_states = Rc::new(
+            (1..=queued.0)
+                .map(|number| (VsetId(number), Rc::new(GuestState::default())))
+                .collect(),
+        );
+        let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
+        let events = Rc::new(RunEvents::default());
+        let mut executor = Executor::simulation(31);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            let guest_slots = Rc::clone(&guest_slots);
+            async move {
+                let supervisor = spawn(recovery_supervisor(
+                    Rc::clone(&world),
+                    guest_states,
+                    Rc::clone(&guest_slots),
+                    events,
+                    config,
+                ));
+                for number in 1..=RECOVERY_CONCURRENCY {
+                    AdminIo::emit_admin_event(
+                        world.as_ref(),
+                        AdminEvent::VsetRecovered {
+                            vset: VsetId(u64::try_from(number).expect("vset fits")),
+                            verdict: blockd_core::protocol::Verdict::Unrestorable,
+                        },
+                    )
+                    .await;
+                }
+                let mut replies = Vec::new();
+                for _ in 0..RECOVERY_CONCURRENCY {
+                    let request = AdminIo::next_admin(world.as_ref())
+                        .await
+                        .expect("restore request");
+                    let (call, reply) = request.into_parts();
+                    assert!(matches!(call, AdminCall::RestoreVset { .. }));
+                    replies.push(reply);
+                }
+                AdminIo::emit_admin_event(
+                    world.as_ref(),
+                    AdminEvent::VsetRecovered {
+                        vset: queued,
+                        verdict: blockd_core::protocol::Verdict::ColdBoot,
+                    },
+                )
+                .await;
+                for mut reply in replies {
+                    let _ = reply.send(Err(AdminError::Busy));
+                }
+                delay(1).await;
+                assert!(
+                    guest_slots
+                        .borrow()
+                        .get(&queued)
+                        .is_some_and(Option::is_some)
+                );
+                drop(supervisor);
+            }
+        });
+    }
+
+    #[test]
+    fn checkpoint_schedule_coalesces_one_outstanding_request_per_vset() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        world.set_vmstate(vset, 1);
+        let mut executor = Executor::simulation(31);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            async move {
+                let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 100, 1));
+                let first = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("first checkpoint request");
+                delay(5).await;
+                let (_, mut first_reply) = first.into_parts();
+                let _ = first_reply.send(Err(AdminError::Busy));
+
+                let second = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("next checkpoint after completion");
+                let (_, mut second_reply) = second.into_parts();
+                let _ = second_reply.send(Err(AdminError::Busy));
+                assert!(
+                    timeout(0, AdminIo::next_admin(world.as_ref()))
+                        .await
+                        .is_err()
+                );
+                drop(schedule);
+            }
+        });
+    }
+
+    #[test]
+    fn checkpoint_schedule_drains_an_admitted_request_past_the_horizon() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset = VsetId(1);
+        world.set_vmstate(vset, 1);
+        let mut executor = Executor::simulation(36);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            async move {
+                let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 2, 1));
+                let request = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("checkpoint request before horizon");
+                let (_, mut reply) = request.into_parts();
+                delay(2).await;
+                yield_now().await;
+                yield_now().await;
+                assert!(
+                    reply.send(Err(AdminError::Busy)).is_ok(),
+                    "the scheduler must retain the admitted reply while draining"
+                );
+                schedule.await.expect("checkpoint schedule drains");
+            }
+        });
+    }
+
+    #[test]
+    fn checkpoint_schedule_bounds_global_concurrency_and_refills_fairly() {
+        let config = config();
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let vset_count = u16::try_from(CHECKPOINT_CONCURRENCY + 8).expect("vset count fits");
+        for number in 1..=vset_count {
+            world.set_vmstate(VsetId(u64::from(number)), 1);
+        }
+        let mut executor = Executor::simulation(32);
+        executor.block_on({
+            let world = Rc::clone(&world);
+            async move {
+                let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 100, vset_count));
+                let mut replies = Vec::new();
+                for number in 1..=CHECKPOINT_CONCURRENCY {
+                    let request = AdminIo::next_admin(world.as_ref())
+                        .await
+                        .expect("bounded checkpoint request");
+                    let (call, reply) = request.into_parts();
+                    assert!(matches!(
+                        call,
+                        AdminCall::Checkpoint { vset, .. }
+                            if vset == VsetId(u64::try_from(number).expect("vset fits"))
+                    ));
+                    replies.push(reply);
+                }
+                assert!(
+                    timeout(0, AdminIo::next_admin(world.as_ref()))
+                        .await
+                        .is_err()
+                );
+                let _ = replies[0].send(Err(AdminError::Busy));
+                let next = AdminIo::next_admin(world.as_ref())
+                    .await
+                    .expect("checkpoint refill request");
+                assert!(matches!(
+                    next.into_parts().0,
+                    AdminCall::Checkpoint { vset, .. }
+                        if vset
+                            == VsetId(
+                                u64::try_from(CHECKPOINT_CONCURRENCY + 1).expect("vset fits")
+                            )
+                ));
+                drop(schedule);
+            }
+        });
     }
 
     #[test]

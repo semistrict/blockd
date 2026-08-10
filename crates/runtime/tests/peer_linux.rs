@@ -32,10 +32,16 @@ fn net(
     peers: BTreeMap<HostId, SocketAddr>,
 ) -> (Arc<PeerNet>, Receiver<(HostId, PeerMsg)>) {
     let (tx, rx) = channel();
+    let outbound_protocol_versions = peers
+        .keys()
+        .copied()
+        .filter(|peer| *peer != self_id)
+        .map(|peer| (peer, blockd_core::peer::CURRENT_PEER_VERSION))
+        .collect();
     let config = PeerConfig {
         listen,
         peers,
-        outbound_protocol_versions: BTreeMap::new(),
+        outbound_protocol_versions,
         tls: None,
     };
     // The net must know its own roster identity: sender state is seeded
@@ -62,7 +68,10 @@ fn sample_msgs() -> Vec<PeerMsg> {
             vset: VsetId(7),
             record: vec![1, 2, 3],
         },
-        PeerMsg::MigrateAccept { vset: VsetId(7) },
+        PeerMsg::MigrateAccept {
+            vset: VsetId(7),
+            offer_fence: 11,
+        },
         PeerMsg::FetchRange {
             io: PeerRequestId(1),
             vset: VsetId(7),
@@ -86,8 +95,14 @@ fn sample_msgs() -> Vec<PeerMsg> {
             io: PeerRequestId(2),
             bytes: None,
         },
-        PeerMsg::Released { vset: VsetId(7) },
-        PeerMsg::ReleasedAck { vset: VsetId(7) },
+        PeerMsg::Released {
+            vset: VsetId(7),
+            release_fence: 3,
+        },
+        PeerMsg::ReleasedAck {
+            vset: VsetId(7),
+            release_fence: 3,
+        },
         PeerMsg::ReplicaPut {
             vset: VsetId(7),
             assignment_epoch: 2,
@@ -174,7 +189,14 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
     let (a, _rx_a) = net(HostId(0), addr_a, roster.clone());
 
     // No listener at addr_b yet: this frame is dropped on the floor.
-    a.send(HostId(0), HostId(1), &PeerMsg::Released { vset: VsetId(1) });
+    a.send(
+        HostId(0),
+        HostId(1),
+        &PeerMsg::Released {
+            vset: VsetId(1),
+            release_fence: 3,
+        },
+    );
     std::thread::sleep(Duration::from_millis(50));
     assert!(a.dropped_sends.load(Ordering::SeqCst) >= 1);
     assert_eq!(a.connections(), vec![(HostId(1), false)]);
@@ -186,7 +208,10 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
         a.send(
             HostId(0),
             HostId(1),
-            &PeerMsg::ReleasedAck { vset: VsetId(2) },
+            &PeerMsg::ReleasedAck {
+                vset: VsetId(2),
+                release_fence: 4,
+            },
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -194,7 +219,13 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
         .recv_timeout(Duration::from_secs(5))
         .expect("reconnected and delivered");
     assert_eq!(from, HostId(0));
-    assert_eq!(got, PeerMsg::ReleasedAck { vset: VsetId(2) });
+    assert_eq!(
+        got,
+        PeerMsg::ReleasedAck {
+            vset: VsetId(2),
+            release_fence: 4,
+        }
+    );
     assert_eq!(a.connections(), vec![(HostId(1), true)]);
 }
 
@@ -220,11 +251,24 @@ fn a_corrupt_frame_closes_its_connection_without_wedging() {
     let mut full = roster;
     full.insert(HostId(0), addr_a);
     let (a, _rx_a) = net(HostId(0), addr_a, full);
-    a.send(HostId(0), HostId(1), &PeerMsg::Released { vset: VsetId(3) });
+    a.send(
+        HostId(0),
+        HostId(1),
+        &PeerMsg::Released {
+            vset: VsetId(3),
+            release_fence: 5,
+        },
+    );
     let (_, got) = rx_b
         .recv_timeout(Duration::from_secs(5))
         .expect("delivered");
-    assert_eq!(got, PeerMsg::Released { vset: VsetId(3) });
+    assert_eq!(
+        got,
+        PeerMsg::Released {
+            vset: VsetId(3),
+            release_fence: 5,
+        }
+    );
 }
 
 /// A segment-sized page payload (8 MiB) crosses intact.

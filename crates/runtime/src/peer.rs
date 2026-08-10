@@ -17,7 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 use blockd_core::format::{Dec, FRAME_HEADER};
-use blockd_core::peer::{MAGIC_PEER, MAX_PEER_PAYLOAD, decode_peer, encode_peer_version};
+use blockd_core::peer::{
+    MAGIC_PEER, MAX_PEER_PAYLOAD, PEER_STASH_VERSION, decode_peer, encode_peer_version,
+};
 use blockd_core::protocol::PeerMsg;
 use blockd_core::types::HostId;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -44,7 +46,8 @@ pub struct PeerConfig {
     /// plane's knowledge, carried here by static config).
     pub peers: BTreeMap<HostId, SocketAddr>,
     /// Per-destination wire version during a rolling deployment. Omitted
-    /// peers use the current version. Version 1 cannot carry peer-stash data.
+    /// peers use version 2, the last version compatible with an unannotated
+    /// pre-fencing peer. Version 1 cannot carry passive durability data.
     pub outbound_protocol_versions: BTreeMap<HostId, u16>,
     /// Required for passive durability. The server config must require
     /// client certificates and the client config must present this host's
@@ -133,6 +136,13 @@ pub struct PeerNet {
 }
 
 impl PeerNet {
+    pub fn protocol_version(&self, to: HostId) -> u16 {
+        self.outbound_protocol_versions
+            .get(&to)
+            .copied()
+            .unwrap_or(PEER_STASH_VERSION)
+    }
+
     /// Start the listener and one lazy sender per configured peer;
     /// verified inbound frames reach `deliver` (the runtime injects them
     /// into the actor peer inbox).
@@ -225,11 +235,7 @@ impl PeerNet {
             self.dropped_sends.fetch_add(1, Ordering::SeqCst);
             return;
         };
-        let version = self
-            .outbound_protocol_versions
-            .get(&to)
-            .copied()
-            .unwrap_or(2);
+        let version = self.protocol_version(to);
         let Ok(frame) = encode_peer_version(self_id, msg, version) else {
             self.dropped_sends.fetch_add(1, Ordering::SeqCst);
             return;
@@ -536,6 +542,22 @@ mod tests {
     }
 
     #[test]
+    fn unknown_peer_defaults_to_the_last_rolling_compatible_version() {
+        let net = PeerNet::start(
+            &PeerConfig {
+                listen: free_addr(),
+                peers: BTreeMap::new(),
+                outbound_protocol_versions: BTreeMap::new(),
+                tls: None,
+            },
+            HostId(0),
+            |_, _| {},
+        );
+
+        assert_eq!(net.protocol_version(HostId(1)), PEER_STASH_VERSION);
+    }
+
+    #[test]
     fn mutual_tls_derives_identity_and_rejects_a_spoofed_envelope() {
         let addresses = [free_addr(), free_addr()];
         let roster = BTreeMap::from([(HostId(0), addresses[0]), (HostId(1), addresses[1])]);
@@ -544,7 +566,10 @@ mod tests {
             &PeerConfig {
                 listen: addresses[1],
                 peers: roster.clone(),
-                outbound_protocol_versions: BTreeMap::new(),
+                outbound_protocol_versions: BTreeMap::from([(
+                    HostId(0),
+                    blockd_core::peer::CURRENT_PEER_VERSION,
+                )]),
                 tls: Some(tls(1)),
             },
             HostId(1),
@@ -556,14 +581,20 @@ mod tests {
             &PeerConfig {
                 listen: addresses[0],
                 peers: roster,
-                outbound_protocol_versions: BTreeMap::new(),
+                outbound_protocol_versions: BTreeMap::from([(
+                    HostId(1),
+                    blockd_core::peer::CURRENT_PEER_VERSION,
+                )]),
                 tls: Some(tls(0)),
             },
             HostId(0),
             |_, _| {},
         );
         assert!(a.authenticated() && b.authenticated());
-        let msg = PeerMsg::Released { vset: VsetId(7) };
+        let msg = PeerMsg::Released {
+            vset: VsetId(7),
+            release_fence: 3,
+        };
         a.send(HostId(0), HostId(1), &msg);
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5))
@@ -571,7 +602,14 @@ mod tests {
             (HostId(0), msg)
         );
 
-        a.send(HostId(9), HostId(1), &PeerMsg::Released { vset: VsetId(8) });
+        a.send(
+            HostId(9),
+            HostId(1),
+            &PeerMsg::Released {
+                vset: VsetId(8),
+                release_fence: 4,
+            },
+        );
         assert!(
             rx.recv_timeout(Duration::from_millis(250)).is_err(),
             "certificate identity must override the claimed sender"

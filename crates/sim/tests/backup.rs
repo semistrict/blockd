@@ -6,7 +6,7 @@
 use blockd_core::hostmeta::{ArchivePolicy, HostConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
-use blockd_core::types::{HostId, VsetId, millis, secs};
+use blockd_core::types::{HostId, VsetId, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::rng::Ppm;
 use blockd_sim::world::blobdev::BlobDevConfig;
@@ -210,12 +210,16 @@ fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
     let mut config = base_config();
     config.vset_count = 1;
     config.daemon.cache_pages = 24;
-    config.daemon.disk_capacity = Some(256 * 1024);
-    config.daemon.disk_headroom = 64 * 1024;
+    config.daemon.disk_capacity = Some(16 * page_size() as u64);
+    config.daemon.disk_headroom = 4 * page_size() as u64;
     let report = run(14, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert!(report.counters.nvme_reclaims > 0);
+    assert!(
+        report.counters.nvme_reclaims > 0,
+        "counters: {:?}",
+        report.counters
+    );
     assert!(report.counters.nvme_stalls > 0);
     assert!(report.completed_ops > 0);
 }

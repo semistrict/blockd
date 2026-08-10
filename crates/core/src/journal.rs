@@ -124,6 +124,15 @@ pub enum RecordKind {
     Checkpoint { epoch: Epoch, vmstate: u64 },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MigrationSource {
+    pub host: HostId,
+    /// Exact source-writer fence whose offered cut this destination installed.
+    /// Legacy records lack the value and may only use the unfenced v1/v2
+    /// migration handshake.
+    pub offer_fence: Option<u64>,
+}
+
 /// A full consistency point of one vset at one capture instant.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct JournalRecord {
@@ -154,7 +163,7 @@ pub struct JournalRecord {
     /// must let a recovery finish the handshake it interrupts: answer the
     /// source's re-offers and keep pulling the tail. Cleared by the first
     /// capture after `Released`.
-    pub migrated_from: Option<HostId>,
+    pub migrated_from: Option<MigrationSource>,
 }
 
 impl JournalRecord {
@@ -173,7 +182,7 @@ impl JournalRecord {
             "record kind/metadata disagrees with vset kind"
         );
         let mut e = Enc::new();
-        e.u16(6); // version: vset kind + database metadata
+        e.u16(7); // version: accepted migration source fence
         e.u32(u32::try_from(page_size()).expect("page size fits u32"));
         e.u64(vset.0);
         e.u64(self.seq.0);
@@ -199,7 +208,17 @@ impl JournalRecord {
             }
             Some(source) => {
                 e.u8(1);
-                e.u16(source.0);
+                e.u16(source.host.0);
+            }
+        }
+        match self.migrated_from.and_then(|source| source.offer_fence) {
+            None => {
+                e.u8(0);
+                e.u64(0);
+            }
+            Some(fence) => {
+                e.u8(1);
+                e.u64(fence);
             }
         }
         e.u8(self.config.kind as u8);
@@ -242,7 +261,7 @@ impl JournalRecord {
         let payload = open_frame(MAGIC_JOURNAL, bytes)?;
         let mut d = Dec::new(payload);
         let version = d.u16()?;
-        if !matches!(version, 4..=6) {
+        if !matches!(version, 4..=7) {
             return Err(DecodeError);
         }
         if d.u32()? != u32::try_from(page_size()).expect("page size fits u32") {
@@ -263,12 +282,28 @@ impl JournalRecord {
         };
         let capture_seq = d.u64()?;
         let sync_covered_through = d.u64()?;
-        let migrated_from = match (d.u8()?, d.u16()?) {
+        let migrated_host = match (d.u8()?, d.u16()?) {
             (0, 0) => None,
             (1, source) => Some(HostId(source)),
             _ => return Err(DecodeError),
         };
-        let vset_kind = if version == 6 {
+        let offered_fence = if version >= 7 {
+            match (d.u8()?, d.u64()?) {
+                (0, 0) => None,
+                (1, fence) => Some(fence),
+                _ => return Err(DecodeError),
+            }
+        } else {
+            None
+        };
+        if migrated_host.is_none() && offered_fence.is_some() {
+            return Err(DecodeError);
+        }
+        let migrated_from = migrated_host.map(|host| MigrationSource {
+            host,
+            offer_fence: offered_fence,
+        });
+        let vset_kind = if version >= 6 {
             match d.u8()? {
                 0 => VsetKind::Compute,
                 1 => VsetKind::Database,
@@ -283,7 +318,7 @@ impl JournalRecord {
             pages_per_volume: d.u32()?,
         };
         let legacy_durability = d.u8()?;
-        if !matches!((version, legacy_durability), (4..=6, 0 | 1) | (5 | 6, 2)) {
+        if !matches!((version, legacy_durability), (4..=7, 0 | 1) | (5..=7, 2)) {
             return Err(DecodeError);
         }
         if !config.valid() {
@@ -440,7 +475,10 @@ mod tests {
                     id: 11,
                 },
             )]),
-            migrated_from: Some(HostId(2)),
+            migrated_from: Some(MigrationSource {
+                host: HostId(2),
+                offer_fence: Some(5),
+            }),
         }
     }
 
@@ -451,11 +489,23 @@ mod tests {
         assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
         // Byte pin (R10.2): any change here is a storage format change.
         let expected = match page_size() {
-            4096 => (211, 0xC33F_D568),
-            16_384 => (211, 0x0465_F765),
+            4096 => (220, 0x52C3_9C5D),
+            16_384 => (220, 0x8DBC_0E33),
             size => panic!("byte pin missing for {size}-byte pages"),
         };
         assert_eq!((bytes.len(), crc32c(&bytes)), expected);
+    }
+
+    #[test]
+    fn zero_migration_offer_fence_round_trips_as_present() {
+        let mut record = sample_record();
+        record
+            .migrated_from
+            .as_mut()
+            .expect("migration provenance")
+            .offer_fence = Some(0);
+        let bytes = record.encode(VsetId(0xA1));
+        assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
     }
 
     #[test]

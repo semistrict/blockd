@@ -25,10 +25,15 @@
 //! Dropping an in-flight method future cancels only the wait. A submitted I/O
 //! may still land, which is the crash cut actors are required to tolerate.
 
-use async_trait::async_trait;
+// These statically dispatched actor-world traits intentionally return local,
+// non-`Send` futures because one deterministic executor owns the actor tree.
+#![allow(async_fn_in_trait)]
 
-use crate::database::{DatabaseReply, DatabaseRequest};
-use crate::protocol::{AdminCmd, AdminReply, PeerMsg, ReqId, StoreFault};
+use blockd_exec::BridgeRequest;
+
+use crate::database::{DatabaseCall, DatabaseResult};
+use crate::engine::HostFatal;
+use crate::protocol::{AdminCall, AdminEvent, AdminResult, PeerMsg, ReqId, StoreFault};
 use crate::types::{HostId, PageId, VolumeId, VsetId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +75,10 @@ pub struct GuestSync {
     pub volume: VolumeId,
 }
 
-#[async_trait(?Send)]
+pub type AdminRequest = BridgeRequest<AdminCall, AdminResult>;
+pub type DatabaseActorRequest = BridgeRequest<DatabaseCall, DatabaseResult>;
+pub type GuestSyncRequest = BridgeRequest<GuestSync, bool>;
+
 pub trait Blobs {
     /// Return a canonicalizable snapshot of durable local artifacts. Unknown
     /// files may be omitted. Actors sort by name before interpreting it, so
@@ -97,7 +105,6 @@ pub trait Blobs {
     }
 }
 
-#[async_trait(?Send)]
 pub trait Store {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError>;
     async fn put_cas(
@@ -117,8 +124,11 @@ pub trait Store {
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreError>;
 }
 
-#[async_trait(?Send)]
 pub trait Peers {
+    fn protocol_version(&self, _to: HostId) -> u16 {
+        crate::peer::CURRENT_PEER_VERSION
+    }
+
     /// Fire-and-forget. Delivery is at-least-once, not reliable or ordered.
     async fn send(&self, to: HostId, message: PeerMsg);
     async fn recv(&self) -> Option<(HostId, PeerMsg)>;
@@ -132,37 +142,51 @@ pub enum FillSource {
     Store,
 }
 
-#[async_trait(?Send)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestMemoryError {
+    Unavailable,
+    Unservable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestPause {
+    pub vmstate: u64,
+    pub generation: u64,
+}
+
 pub trait GuestMem {
     async fn read_page(&self, page: PageId) -> Vec<u8>;
-    async fn arm_write_protect(&self, pages: &[PageId]);
-    async fn fill(&self, page: PageId, bytes: Vec<u8>, writable: bool, source: FillSource);
+    async fn arm_write_protect(&self, pages: &[PageId]) -> Result<(), GuestMemoryError>;
+    async fn fill(
+        &self,
+        page: PageId,
+        bytes: Vec<u8>,
+        writable: bool,
+        source: FillSource,
+    ) -> Result<(), GuestMemoryError>;
     async fn fill_shared(
         &self,
         page: PageId,
         share: (u64, u64, crate::types::SegId, u32),
         bytes: Option<Vec<u8>>,
         writable: bool,
-    );
-    async fn fail(&self, page: PageId);
-    async fn unprotect(&self, page: PageId);
-    async fn evict(&self, page: PageId);
-    async fn install_database(&self, page: PageId, bytes: Vec<u8>);
-    async fn pause(&self, vset: VsetId) -> u64;
-    async fn resume(&self, vset: VsetId);
+    ) -> Result<(), GuestMemoryError>;
+    async fn fail(&self, page: PageId) -> Result<(), GuestMemoryError>;
+    async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError>;
+    async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError>;
+    async fn install_database(&self, page: PageId, bytes: Vec<u8>) -> Result<(), GuestMemoryError>;
+    async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError>;
+    async fn resume(&self, vset: VsetId, pause: Option<GuestPause>)
+    -> Result<(), GuestMemoryError>;
     async fn harvest_accessed(&self) -> Vec<PageId>;
     async fn next_fault(&self) -> Option<GuestFault>;
-    async fn next_sync(&self) -> Option<GuestSync>;
-    async fn sync_ok(&self, req: ReqId);
-    async fn sync_failed(&self, req: ReqId);
-    async fn fence(&self, vset: VsetId);
+    async fn next_sync(&self) -> Option<GuestSyncRequest>;
+    async fn fence(&self, vset: VsetId) -> Result<(), GuestMemoryError>;
 }
 
-#[async_trait(?Send)]
 pub trait AdminIo {
-    async fn next_admin(&self) -> Option<AdminCmd>;
-    async fn reply_admin(&self, reply: AdminReply);
-    async fn next_database(&self) -> Option<DatabaseRequest>;
-    async fn reply_database(&self, reply: DatabaseReply);
-    async fn abort(&self, reason: &'static str);
+    async fn next_admin(&self) -> Option<AdminRequest>;
+    async fn emit_admin_event(&self, event: AdminEvent);
+    async fn next_database(&self) -> Option<DatabaseActorRequest>;
+    async fn host_failed(&self, failure: HostFatal);
 }

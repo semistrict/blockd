@@ -10,7 +10,7 @@ use super::{SharedHost, hydrate_mapping};
 use crate::journal::{JournalRecord, RecordKind, VsetConfig, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_is_memory};
-use crate::protocol::{AdminReply, ReqId, StoreFault, Verdict};
+use crate::protocol::{AdminError, AdminResult, AdminSuccess, StoreFault, Verdict};
 use crate::segment::scan_segment;
 use crate::types::{Epoch, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
@@ -19,7 +19,7 @@ type PageMap = BTreeMap<PageId, (crate::types::Gen, crate::segment::PageLoc)>;
 type BaseArtifacts = (Vec<(u64, SegId)>, Vec<(u64, u64)>);
 type BaseAdoption = (Verdict, RecordKind, PageMap, BTreeMap<u32, LeafPtr>);
 
-pub async fn delete_base<W>(state: SharedHost, world: Rc<W>, req: ReqId, base: u64)
+pub async fn delete_base<W>(state: SharedHost, world: Rc<W>, base: u64) -> AdminResult
 where
     W: Store + AdminIo + 'static,
 {
@@ -32,16 +32,15 @@ where
                 delay(retry).await;
             }
             Err(StoreError::TooLarge | StoreError::Fault(StoreFault::CasConflict { .. })) => {
-                AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-                return;
+                return Err(AdminError::Rejected);
             }
         }
     }
-    AdminIo::reply_admin(world.as_ref(), AdminReply::BaseDeleted { req, base }).await;
+    Ok(AdminSuccess::BaseDeleted { base })
 }
 
 #[allow(clippy::too_many_lines)]
-pub async fn keep_base<W>(state: SharedHost, world: Rc<W>, req: ReqId, vset: VsetId, base: u64)
+pub async fn keep_base<W>(state: SharedHost, world: Rc<W>, vset: VsetId, base: u64) -> AdminResult
 where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
@@ -60,8 +59,7 @@ where
                 .flatten()
         })
     }) else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Err(AdminError::Rejected);
     };
 
     for &span in record.leaves.keys() {
@@ -70,21 +68,18 @@ where
             .await
             .is_err()
         {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Err(AdminError::Rejected);
         }
     }
     let Some((mut segments, leaves)) = base_closure(&state, vset, incarnation, &record) else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Err(AdminError::Rejected);
     };
     segments.sort_unstable();
     segments.dedup();
     for (fence, segment) in segments {
         let name = layout::segment_blob(vset, fence, segment);
         let Ok(Some(bytes)) = Blobs::read(world.as_ref(), &name).await else {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Err(AdminError::Rejected);
         };
         if !scan_segment(&bytes).is_ok_and(|(owner, found_fence, found_segment, _)| {
             (owner, found_fence, found_segment) == (vset, fence, segment)
@@ -98,19 +93,16 @@ where
         .await
         .is_none()
         {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Err(AdminError::Rejected);
         }
     }
     for (fence, id) in leaves {
         let name = layout::leaf_blob(vset, fence, id);
         let Ok(Some(bytes)) = Blobs::read(world.as_ref(), &name).await else {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Err(AdminError::Rejected);
         };
         let Ok(mut leaf) = MapLeaf::decode(vset, fence, id, &bytes) else {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Err(AdminError::Rejected);
         };
         for (_, _, _, location) in &mut leaf.entries {
             if location.base == 0 {
@@ -127,8 +119,7 @@ where
         .await
         .is_none()
         {
-            AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-            return;
+            return Err(AdminError::Rejected);
         }
     }
     for (_, location) in record.overlay.values_mut() {
@@ -146,10 +137,9 @@ where
     .await
     .is_none()
     {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Err(AdminError::Rejected);
     }
-    AdminIo::reply_admin(world.as_ref(), AdminReply::BaseKept { req, base }).await;
+    Ok(AdminSuccess::BaseKept { base })
 }
 
 fn base_closure(
@@ -182,33 +172,29 @@ fn base_closure(
 pub async fn create_fork<W>(
     state: SharedHost,
     world: Rc<W>,
-    req: ReqId,
     vset: VsetId,
     config: VsetConfig,
     base: u64,
-) where
+) -> Option<AdminResult>
+where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
     if state.borrow().vsets.contains_key(&vset) {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Some(Err(AdminError::Rejected));
     }
     let retry = state.borrow().config.backup_retry;
     let Some(base_record) = get_base(&state, world.as_ref(), base, retry).await else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Some(Err(AdminError::Rejected));
     };
     let Some(stash) = initial_stash(&state, vset) else {
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Some(Err(AdminError::Rejected));
     };
     let incarnation = state.borrow_mut().insert_fresh(vset, config);
     let Some(fence) =
         claim_new_head_with_stash(&state, world.as_ref(), vset, incarnation, Some(stash)).await
     else {
         state.borrow_mut().vsets.remove(&vset);
-        AdminIo::reply_admin(world.as_ref(), AdminReply::AdminFailed { req }).await;
-        return;
+        return Some(Err(AdminError::Rejected));
     };
     {
         let mut host = state.borrow_mut();
@@ -221,13 +207,10 @@ pub async fn create_fork<W>(
     let (verdict, kind, overlay, leaves) = adopt_base(vset, base, config, &base_record);
     let record = {
         let mut host = state.borrow_mut();
-        let Some(vset_state) = host
+        let vset_state = host
             .vsets
             .get_mut(&vset)
-            .filter(|vset| vset.incarnation == incarnation)
-        else {
-            return;
-        };
+            .filter(|vset| vset.incarnation == incarnation)?;
         vset_state.database = base_record.database;
         vset_state.mutation_seq = base_record.capture_seq;
         vset_state.overlay.clone_from(&overlay);
@@ -255,18 +238,15 @@ pub async fn create_fork<W>(
     };
     if !write_record_copies(&state, world.as_ref(), vset, &record).await {
         state.borrow_mut().vsets.remove(&vset);
-        AdminIo::abort(world.as_ref(), "fork journal write failed").await;
-        return;
+        state.borrow_mut().fail("fork journal write failed");
+        return None;
     }
     {
         let mut host = state.borrow_mut();
-        let Some(vset_state) = host
+        let vset_state = host
             .vsets
             .get_mut(&vset)
-            .filter(|vset| vset.incarnation == incarnation)
-        else {
-            return;
-        };
+            .filter(|vset| vset.incarnation == incarnation)?;
         vset_state.ready = true;
         vset_state.next_seq = 1;
         vset_state
@@ -276,12 +256,9 @@ pub async fn create_fork<W>(
             vset_state.pinned = Some(record.clone());
         }
         host.counters.records_written += 1;
+        host.schedule_vset(vset);
     }
-    AdminIo::reply_admin(
-        world.as_ref(),
-        AdminReply::VsetForked { req, vset, verdict },
-    )
-    .await;
+    Some(Ok(AdminSuccess::VsetForked { vset, verdict }))
 }
 
 fn adopt_base(vset: VsetId, base: u64, config: VsetConfig, record: &JournalRecord) -> BaseAdoption {

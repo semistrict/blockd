@@ -72,6 +72,8 @@ pub enum PeerMsg {
     /// guest again.
     MigrateAccept {
         vset: VsetId,
+        /// The source fence from the exact offered record being accepted.
+        offer_fence: u64,
     },
     /// Demand fetch of one page entry from a peer (the peer tier of R2.3).
     FetchRange {
@@ -107,11 +109,13 @@ pub enum PeerMsg {
     /// the vset's local state.
     Released {
         vset: VsetId,
+        release_fence: u64,
     },
     /// The source's acknowledgment of `Released` (which is retried until
     /// acked; a source that already reclaimed still acks).
     ReleasedAck {
         vset: VsetId,
+        release_fence: u64,
     },
     /// Store one immutable artifact on the assigned passive peer. An
     /// identical retry re-acks without another append.
@@ -178,50 +182,44 @@ pub enum PeerMsg {
     },
 }
 
+/// In-process administrative call. Completion is routed by its owned reply
+/// promise; only checkpoint retains a request identity for durable retry
+/// idempotency.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AdminCmd {
-    /// Create a vset — fresh, or forked from a base in O(1) metadata
-    /// (R5.1: no bytes copied, regardless of base size). Acknowledged once
-    /// its first journal record is durable.
+pub enum AdminCall {
     CreateVset {
-        req: ReqId,
         vset: VsetId,
         config: VsetConfig,
         from_base: Option<u64>,
     },
-    /// Keep the vset's pinned checkpoint as a base (R5.2): its segments are
-    /// copied into the base's own namespace in the store, alive until an
-    /// explicit delete — never by age (R4.5). Backed-up vsets only (R4.4
-    /// forbids any store write for the other mode).
-    KeepBase { req: ReqId, vset: VsetId, base: u64 },
-    /// Explicitly delete a base (R4.5): removing its record unroots it, and
-    /// the GC's next sweep reclaims its unshared segments (R9.3).
-    DeleteBase { req: ReqId, base: u64 },
-    /// Whole-vset checkpoint (R3.1). Idempotent by `req` (R3.5).
-    Checkpoint { req: ReqId, vset: VsetId },
-    /// Restore a backed-up vset onto this host from the object store alone
-    /// (R6.1): claim the head by CAS, fetch the newest manifest, serve.
-    RestoreVset { req: ReqId, vset: VsetId },
-    /// Live-migrate the vset to a peer, post-copy (R7.1): cut over first,
-    /// fault the remainder.
+    KeepBase {
+        vset: VsetId,
+        base: u64,
+    },
+    DeleteBase {
+        base: u64,
+    },
+    Checkpoint {
+        retry: ReqId,
+        vset: VsetId,
+    },
+    RestoreVset {
+        vset: VsetId,
+    },
     MigrateOut {
-        req: ReqId,
         vset: VsetId,
         to: HostId,
     },
-    /// Grant one VM volatile authority over a locally ready database vset.
-    AttachDatabase { req: ReqId, vset: VsetId, vm: VmId },
-    /// Start a graceful drain, or immediately retire this generation.
+    AttachDatabase {
+        vset: VsetId,
+        vm: VmId,
+    },
     BeginDetachDatabase {
-        req: ReqId,
         vset: VsetId,
         attachment: AttachmentId,
         mode: DetachMode,
     },
-    /// Complete a graceful detach once handles are closed and its accepted
-    /// mutation prefix is durable.
     FinishDetachDatabase {
-        req: ReqId,
         vset: VsetId,
         attachment: AttachmentId,
     },
@@ -233,77 +231,66 @@ pub enum DetachMode {
     Forced,
 }
 
+/// Successful completion of an in-process administrative operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AdminReply {
+pub enum AdminSuccess {
     VsetCreated {
-        req: ReqId,
         vset: VsetId,
     },
     CheckpointDone {
-        req: ReqId,
         vset: VsetId,
         epoch: Epoch,
     },
-    AdminFailed {
-        req: ReqId,
-    },
-    /// Restore succeeded: this host now runs the vset, recovered per the
-    /// verdict (R6.1).
     VsetRestored {
-        req: ReqId,
         vset: VsetId,
         verdict: Verdict,
     },
-    /// A backed-up vset finished local recovery AND the head confirmed this
-    /// host still holds it with local state at least as new as the backup:
-    /// it now serves, per the verdict.
-    VsetRecovered {
-        vset: VsetId,
-        verdict: Verdict,
-    },
-    /// The base is durable in the store and forkable from any host (R5.2).
     BaseKept {
-        req: ReqId,
         base: u64,
     },
-    /// The base record's delete was issued: the base is unrooted (R9.3).
     BaseDeleted {
-        req: ReqId,
         base: u64,
     },
-    /// A fork came up: resumed if the base was whole (memory + vmstate),
-    /// cold-booted if disk-only (R5.2).
     VsetForked {
-        req: ReqId,
         vset: VsetId,
         verdict: Verdict,
     },
-    /// The migration cut over: the destination runs the vset now.
     MigratedOut {
-        req: ReqId,
         vset: VsetId,
-    },
-    /// An inbound migration is live on this host, per the verdict.
-    VsetMigratedIn {
-        vset: VsetId,
-        verdict: Verdict,
     },
     DatabaseAttached {
-        req: ReqId,
         vset: VsetId,
         attachment: AttachmentId,
     },
     DatabaseDetachStarted {
-        req: ReqId,
         vset: VsetId,
         attachment: AttachmentId,
         forced: bool,
     },
     DatabaseDetached {
-        req: ReqId,
         vset: VsetId,
         attachment: AttachmentId,
     },
+}
+
+pub type AdminResult = Result<AdminSuccess, AdminError>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AdminError {
+    Rejected,
+    Busy,
+    NotFound,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AdminEvent {
+    /// A backed-up vset finished local recovery and this host retained
+    /// authority with local state at least as new as the backup.
+    VsetRecovered { vset: VsetId, verdict: Verdict },
+    /// An inbound migration is live on this host, per the verdict.
+    VsetMigratedIn { vset: VsetId, verdict: Verdict },
 }
 
 /// Recovery verdict for one vset (R8.2: explicit, per vset).

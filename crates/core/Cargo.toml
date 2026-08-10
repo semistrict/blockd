@@ -12,7 +12,6 @@ test-page-size = ["blockd-platform/test-page-size"]
 workspace = true
 
 [dependencies]
-async-trait.workspace = true
 blockd-platform = { path = "../platform" }
 blockd-exec = { path = "../exec" }
 crc-fast = "1.10.0"
