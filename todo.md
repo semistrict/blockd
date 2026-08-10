@@ -555,7 +555,7 @@ it is independent.
   shared-page key typing left over from the callback runtime.
 - [x] Normalize Linux-only runtime configs for strict linting on the hosted
   toolchain.
-- [ ] Run the full workspace test suite and every configured integration/Linux
+- [x] Run the full workspace test suite and every configured integration/Linux
   lane.
 - [x] Run pre-ship review and resolve every migration-related correctness,
   cancellation, ordering, and performance finding before declaring the
