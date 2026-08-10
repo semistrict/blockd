@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const POLL_KINDS: [&str; 1] = ["ActorPoll"];
 
-pub(crate) const WORLD_KINDS: [&str; 30] = [
+pub(crate) const WORLD_KINDS: [&str; 25] = [
     "Fill",
     "FillShared",
     "FillFailed",
@@ -21,8 +21,6 @@ pub(crate) const WORLD_KINDS: [&str; 30] = [
     "Evict",
     "PauseGuest",
     "ResumeGuest",
-    "SyncOk",
-    "SyncFailed",
     "BlobWrite",
     "ReplicaAppend",
     "ReplicaDelete",
@@ -30,7 +28,6 @@ pub(crate) const WORLD_KINDS: [&str; 30] = [
     "BlobRead",
     "BlobReadRange",
     "BlobDelete",
-    "SetTimer",
     "StorePut",
     "StoreCas",
     "StoreGet",
@@ -41,8 +38,6 @@ pub(crate) const WORLD_KINDS: [&str; 30] = [
     "PeerSend",
     "Abort",
     "DatabaseInstall",
-    "Database",
-    "VsetUnservable",
 ];
 
 pub(crate) mod world_kind {
@@ -54,26 +49,23 @@ pub(crate) mod world_kind {
     pub const EVICT: usize = 5;
     pub const PAUSE_GUEST: usize = 6;
     pub const RESUME_GUEST: usize = 7;
-    pub const SYNC_OK: usize = 8;
-    pub const SYNC_FAILED: usize = 9;
-    pub const BLOB_WRITE: usize = 10;
-    pub const REPLICA_APPEND: usize = 11;
-    pub const REPLICA_DELETE: usize = 12;
-    pub const REPLICA_TRUNCATE: usize = 13;
-    pub const BLOB_READ: usize = 14;
-    pub const BLOB_READ_RANGE: usize = 15;
-    pub const BLOB_DELETE: usize = 16;
-    pub const STORE_PUT: usize = 18;
-    pub const STORE_CAS: usize = 19;
-    pub const STORE_GET: usize = 20;
-    pub const STORE_GET_RANGE: usize = 21;
-    pub const STORE_DELETE: usize = 22;
-    pub const VSET_FENCED: usize = 23;
-    pub const ADMIN: usize = 24;
-    pub const PEER_SEND: usize = 25;
-    pub const ABORT: usize = 26;
-    pub const DATABASE_INSTALL: usize = 27;
-    pub const DATABASE: usize = 28;
+    pub const BLOB_WRITE: usize = 8;
+    pub const REPLICA_APPEND: usize = 9;
+    pub const REPLICA_DELETE: usize = 10;
+    pub const REPLICA_TRUNCATE: usize = 11;
+    pub const BLOB_READ: usize = 12;
+    pub const BLOB_READ_RANGE: usize = 13;
+    pub const BLOB_DELETE: usize = 14;
+    pub const STORE_PUT: usize = 15;
+    pub const STORE_CAS: usize = 16;
+    pub const STORE_GET: usize = 17;
+    pub const STORE_GET_RANGE: usize = 18;
+    pub const STORE_DELETE: usize = 19;
+    pub const VSET_FENCED: usize = 20;
+    pub const ADMIN: usize = 21;
+    pub const PEER_SEND: usize = 22;
+    pub const ABORT: usize = 23;
+    pub const DATABASE_INSTALL: usize = 24;
 }
 
 #[derive(Default)]

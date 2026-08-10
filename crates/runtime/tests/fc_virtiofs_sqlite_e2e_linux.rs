@@ -77,7 +77,7 @@ fn artifacts(test_name: &str) -> Artifacts {
 fn runtime_config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
         daemon: HostConfig {
-            archive: Default::default(),
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
             cache_pages: 64,
             writeback_interval: millis(5),

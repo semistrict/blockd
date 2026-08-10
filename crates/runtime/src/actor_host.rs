@@ -393,7 +393,6 @@ fn execute_fault_work(work: FaultWork) {
                 .continue_range(host.view.addr_of(index), page_size(), !writable)
                 .map_err(|_| ());
             let _ = reply.push(Lane::Critical, result);
-            return;
         }
         FaultWork::Unprotect { host, page, reply } => {
             let index = host.page_index(page);
@@ -404,7 +403,6 @@ fn execute_fault_work(work: FaultWork) {
                 .writeprotect(host.view.addr_of(index), page_size(), false)
                 .map_err(|_| ());
             let _ = reply.push(Lane::Critical, result);
-            return;
         }
         FaultWork::Evict { host, page, reply } => {
             let index = host.page_index(page);
@@ -428,7 +426,6 @@ fn execute_fault_work(work: FaultWork) {
                 });
             }
             let _ = reply.push(Lane::Critical, result);
-            return;
         }
         FaultWork::Install {
             host,
@@ -438,11 +435,9 @@ fn execute_fault_work(work: FaultWork) {
         } => {
             host.region.write_page(host.page_index(page), &bytes);
             let _ = reply.push(Lane::Critical, Ok(()));
-            return;
         }
         FaultWork::Barrier { done } => {
             let _ = done.send(());
-            return;
         }
     }
 }
@@ -467,6 +462,8 @@ fn for_each_contiguous_run(indices: &mut Vec<usize>, mut visit: impl FnMut(usize
     visit(start, end - start + 1);
 }
 
+type SharedPageKey = (u64, u64, blockd_core::types::SegId, u32);
+
 struct ProductionWorld {
     blobs: FileBlobs,
     store: RuntimeStore,
@@ -479,7 +476,7 @@ struct ProductionWorld {
     database_rx: Injected<DatabaseActorRequest>,
     shared: Arc<Shared>,
     fault_work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
-    shared_pages: RefCell<BTreeMap<(u64, u64, blockd_core::types::SegId, u32), Vec<u8>>>,
+    shared_pages: RefCell<BTreeMap<SharedPageKey, Vec<u8>>>,
 }
 
 impl ProductionWorld {
@@ -1916,7 +1913,7 @@ mod tests {
 
     fn test_host_config() -> HostConfig {
         HostConfig {
-            archive: Default::default(),
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(1),
             cache_pages: 1,
             writeback_interval: 1,
@@ -1956,7 +1953,9 @@ mod tests {
         let call = |base: u64, admin: Injector<AdminRequest>| {
             thread::spawn(move || {
                 let (request, reply) = bridge_request(AdminCall::DeleteBase { base });
-                admin.push(Lane::Background, request).expect("actor alive");
+                admin
+                    .push(Lane::Background, request)
+                    .unwrap_or_else(|_| panic!("actor alive"));
                 reply
                     .blocking_recv_timeout(Duration::from_secs(1))
                     .expect("reply without shared-stream timeout")

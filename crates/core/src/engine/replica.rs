@@ -1994,11 +1994,30 @@ async fn wait_put_ack<W: Peers>(
         Ok(attempts) => (*attempts, attempts.saturating_sub(1)),
         Err(error) => (error.attempts, error.attempts),
     };
+    let network_bytes = (bytes.len() as u64).saturating_mul(u64::from(attempts));
     let mut host = state.borrow_mut();
     host.counters.replica_network_bytes = host
         .counters
         .replica_network_bytes
-        .saturating_add((bytes.len() as u64).saturating_mul(u64::from(attempts)));
+        .saturating_add(network_bytes);
+    let assignment = host
+        .vsets
+        .get(&vset)
+        .and_then(|vset_state| vset_state.stash_assignment);
+    if assignment.map(|assignment| assignment.transition_peer.unwrap_or(assignment.active_peer))
+        != Some(target)
+    {
+        host.counters.replica_nonactive_bytes = host
+            .counters
+            .replica_nonactive_bytes
+            .saturating_add(network_bytes);
+    }
+    if assignment.is_some_and(|assignment| assignment.transition_peer == Some(target)) {
+        host.counters.replica_replacement_bytes = host
+            .counters
+            .replica_replacement_bytes
+            .saturating_add(network_bytes);
+    }
     host.counters.peer_retries = host
         .counters
         .peer_retries

@@ -7,6 +7,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,8 +15,10 @@ use std::time::{Duration, Instant};
 use blockd_core::head::HeadRecord;
 use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
+use blockd_core::protocol::Verdict;
 use blockd_core::replica_recovery::{ReplicaResidue, export_replica_recovery};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_hostmem::page_size;
 use blockd_runtime::{Runtime, S3Store, install_replica_recovery};
 
 mod support;
@@ -61,32 +64,29 @@ fn durable_cluster(
     cache_pages: usize,
 ) -> (
     [SocketAddr; 3],
-    BTreeMap<HostId, SocketAddr>,
     [PathBuf; 3],
     Arc<S3Store>,
     Vec<Option<Runtime>>,
 ) {
-    let addresses = [free_addr(), free_addr(), free_addr()];
-    let peers: BTreeMap<HostId, SocketAddr> = addresses
-        .iter()
-        .enumerate()
-        .map(|(host, &address)| (HostId(u16::try_from(host).expect("fits")), address))
-        .collect();
-    let roots = std::array::from_fn(|host| temp_dir(&format!("{tag}-{host}")));
+    let addresses = [
+        support::free_addr(),
+        support::free_addr(),
+        support::free_addr(),
+    ];
+    let roots = std::array::from_fn(|host| support::temp_root(&format!("{tag}-{host}")));
     let store = Arc::new(S3Store::new());
     let runtimes = (0..3)
         .map(|host| {
-            let mut config = runtime_config(
+            let mut config = support::three_host_runtime_config(
                 host,
                 roots[usize::from(host)].clone(),
-                addresses[usize::from(host)],
-                peers.clone(),
+                addresses,
             );
             config.daemon.cache_pages = cache_pages;
             Some(Runtime::new(&config, store.clone()))
         })
         .collect();
-    (addresses, peers, roots, store, runtimes)
+    (addresses, roots, store, runtimes)
 }
 
 fn page(volume: u8, number: u32) -> PageId {
@@ -106,7 +106,7 @@ fn read_word(runtime: &Runtime, page: PageId) -> u64 {
 
 #[test]
 fn durable_checkpoint_crash_resumes_memory_and_disks_byte_exactly() {
-    let (addresses, peers, roots, store, mut runtimes) = durable_cluster("checkpoint", 64);
+    let (addresses, roots, store, mut runtimes) = durable_cluster("checkpoint", 64);
     let config = VsetConfig::compute(2, 16);
     let primary = runtimes[0].take().expect("primary");
     primary.create_vset(VSET, config);
@@ -120,7 +120,7 @@ fn durable_checkpoint_crash_resumes_memory_and_disks_byte_exactly() {
     std::thread::sleep(Duration::from_millis(100));
 
     let (recovered, immediate) = Runtime::recover(
-        &runtime_config(0, roots[0].clone(), addresses[0], peers),
+        &support::three_host_runtime_config(0, roots[0].clone(), addresses),
         store,
         &BTreeMap::from([(VSET, config)]),
     );
@@ -146,7 +146,7 @@ fn durable_checkpoint_crash_resumes_memory_and_disks_byte_exactly() {
 
 #[test]
 fn durable_sync_crash_cold_boots_disks_and_discards_memory() {
-    let (addresses, peers, roots, store, mut runtimes) = durable_cluster("cold-boot", 64);
+    let (addresses, roots, store, mut runtimes) = durable_cluster("cold-boot", 64);
     let config = VsetConfig::compute(2, 16);
     let primary = runtimes[0].take().expect("primary");
     primary.create_vset(VSET, config);
@@ -159,7 +159,7 @@ fn durable_sync_crash_cold_boots_disks_and_discards_memory() {
     std::thread::sleep(Duration::from_millis(100));
 
     let (recovered, immediate) = Runtime::recover(
-        &runtime_config(0, roots[0].clone(), addresses[0], peers),
+        &support::three_host_runtime_config(0, roots[0].clone(), addresses),
         store,
         &BTreeMap::from([(VSET, config)]),
     );
@@ -184,7 +184,7 @@ fn durable_sync_crash_cold_boots_disks_and_discards_memory() {
 
 #[test]
 fn durable_eviction_bounds_residency_and_refaults_exact_disk_bytes() {
-    let (_addresses, _peers, roots, _store, runtimes) = durable_cluster("eviction", 8);
+    let (_addresses, roots, _store, runtimes) = durable_cluster("eviction", 8);
     let config = VsetConfig::compute(1, 32);
     let primary = runtimes[0].as_ref().expect("primary");
     primary.create_vset(VSET, config);
@@ -326,7 +326,19 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         {
             break;
         }
-        assert!(Instant::now() < deadline, "peer spool was not released");
+        assert!(
+            Instant::now() < deadline,
+            "peer spool was not released: passive={:?} spools={:?} connections={:?} dropped={} incidents={:?}",
+            if active == HostId(1) {
+                b.replica_spool_metrics()
+            } else {
+                c.replica_spool_metrics()
+            },
+            spool_files(active_root, HostId(0), VSET),
+            recovered.peer_connections(),
+            recovered.peer_dropped_sends(),
+            recovered.incidents(),
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let active_counters = if active == HostId(1) {
@@ -387,7 +399,7 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
     let failed_peer = initial_head.stash.expect("stash").active_peer;
     assert_ne!(failed_peer, HostId(0));
 
-    store.set_outage(true);
+    store.set_data_outage(true);
     let page = PageId {
         volume: VolumeId {
             vset: VSET,
@@ -438,7 +450,7 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
     for (_, path) in spool_paths {
         spool.extend(std::fs::read(path).expect("read replacement spool"));
     }
-    store.set_outage(false);
+    store.set_data_outage(false);
     let (head_version, head_bytes) = store
         .get(&layout::head_key(VSET))
         .expect("head get")

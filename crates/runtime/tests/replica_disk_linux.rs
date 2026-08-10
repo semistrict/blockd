@@ -169,7 +169,7 @@ fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
         .expect("target")
         .failure_domain;
     let host_config = HostConfig {
-        archive: Default::default(),
+        archive: blockd_core::hostmeta::ArchivePolicy::default(),
         host: target,
         cache_pages: 8,
         writeback_interval: 1_000_000,

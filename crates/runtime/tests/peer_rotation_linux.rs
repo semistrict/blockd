@@ -83,6 +83,7 @@ fn settle_rebind() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn rolling_certificate_rotation_requires_overlap_then_removes_old_identity() {
     let addresses = [free_addr(), free_addr()];
     let (mut a, mut a_rx) = start(

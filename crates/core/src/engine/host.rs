@@ -171,6 +171,9 @@ async fn reconcile_backed_vsets<W: HostWorld>(
             }
         }
     }
+    for &vset in vsets {
+        retry_replica_releases(Rc::clone(state), Rc::clone(world), vset).await;
+    }
     Ok(())
 }
 

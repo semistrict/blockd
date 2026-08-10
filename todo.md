@@ -527,9 +527,34 @@ it is independent.
   ownership fence.
 - [x] Express the simulator pressure budget in pages so its reclaim regression
   exercises the same lifecycle cut at 4 KiB and 16 KiB page sizes.
-- [x] Correct the Linux integration script to execute the existing
-  `fc_e2e_linux` target.
+- [x] Replace the removed legacy Linux runtime target with the durable-replica
+  end-to-end suite, which needs no separately staged Firecracker artifacts.
 - [x] Remove Linux-only `Debug` requirements from closed actor request queues.
+- [x] Update Linux-only shared workload support for the mandatory-durability
+  vset constructor and asynchronous recovery verdict.
+- [x] Restore the Linux durable-replica end-to-end test's actor-host imports
+  and reuse the shared authenticated three-host runtime configuration.
+- [x] Explicitly negotiate the current peer protocol in Linux test clusters so
+  version-3 replica replacement and release messages are not downgraded.
+- [x] Preserve control-plane head CAS availability in the Linux replacement
+  test while injecting archive-data outage, allowing the replacement epoch to
+  become authoritative before its durability is asserted.
+- [x] Restore replacement and non-active replica network-byte accounting in
+  the awaited peer RPC path, including retry attempts.
+- [x] Discover and send store-covered replica releases after startup head
+  reconciliation, including externally promoted passive-recovery cuts.
+- [x] Run the shared Linux workload differential against authenticated
+  three-host durability, retaining passive runtimes across primary crashes.
+- [x] Accept both foreground peer faults and background hydration as valid
+  post-copy drain progress in the live Linux migration test.
+- [x] Run the Linux loop-interference profile with the mandatory authenticated
+  passive-durability cluster while preserving its primary-loop measurement.
+- [x] Remove obsolete effect-era world-operation telemetry slots that no
+  awaited production-world call records.
+- [x] Clean Linux-only request capability, terminal callback returns, and
+  shared-page key typing left over from the callback runtime.
+- [x] Normalize Linux-only runtime configs for strict linting on the hosted
+  toolchain.
 - [ ] Run the full workspace test suite and every configured integration/Linux
   lane.
 - [x] Run pre-ship review and resolve every migration-related correctness,

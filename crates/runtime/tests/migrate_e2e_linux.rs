@@ -51,7 +51,7 @@ fn free_addr() -> SocketAddr {
 fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
     RuntimeConfig {
         daemon: HostConfig {
-            archive: Default::default(),
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(host),
             cache_pages: 256,
             writeback_interval: millis(5),
@@ -269,10 +269,17 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
         .expect("destination remains readable");
     assert_eq!(a.incidents(), Vec::<String>::new());
     assert_eq!(b.incidents(), Vec::<String>::new());
-    // The wire really carried the drain (hydration pulled pages from A).
+    // The wire really carried the drain. Foreground demand may win the race
+    // with background hydration, so either path is valid post-copy progress.
+    let peer_faults = b
+        .fault_latency()
+        .into_iter()
+        .filter(|series| series.vset == VSET && series.source == "peer")
+        .map(|series| series.histogram.count)
+        .sum::<u64>();
     assert!(
-        b.counters().hydrate_fills > 0,
-        "no hydration happened over the wire"
+        b.counters().hydrate_fills + peer_faults > 0,
+        "no post-copy page crossed the peer wire"
     );
     assert!(
         store.s3.stats.total_requests() > 0,
