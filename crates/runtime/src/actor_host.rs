@@ -1333,7 +1333,7 @@ impl Runtime {
         self.inputs
             .admin
             .push(Lane::Background, request)
-            .expect("actor host alive");
+            .unwrap_or_else(|_| panic!("actor host alive"));
         reply
             .blocking_recv_timeout(Duration::from_secs(30))
             .expect("admin reply within 30 seconds")
@@ -1442,7 +1442,7 @@ impl Runtime {
         self.inputs
             .database
             .push(Lane::Background, request)
-            .expect("actor host alive");
+            .unwrap_or_else(|_| panic!("actor host alive"));
         let result = reply
             .blocking_recv_timeout(Duration::from_secs(30))
             .unwrap_or(Err(DatabaseError::Io));
@@ -1625,7 +1625,7 @@ impl Runtime {
         self.inputs
             .syncs
             .push(Lane::Critical, request)
-            .expect("actor host alive");
+            .unwrap_or_else(|_| panic!("actor host alive"));
         let ok = reply
             .blocking_recv_timeout(Duration::from_secs(30))
             .expect("sync reply within 30 seconds");

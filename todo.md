@@ -529,6 +529,7 @@ it is independent.
   exercises the same lifecycle cut at 4 KiB and 16 KiB page sizes.
 - [x] Correct the Linux integration script to execute the existing
   `fc_e2e_linux` target.
+- [x] Remove Linux-only `Debug` requirements from closed actor request queues.
 - [ ] Run the full workspace test suite and every configured integration/Linux
   lane.
 - [x] Run pre-ship review and resolve every migration-related correctness,
