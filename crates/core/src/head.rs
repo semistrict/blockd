@@ -10,7 +10,7 @@
 //! rare, never on a guest-visible path.
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::seam::ReplicaCommitInfo;
+use crate::protocol::ReplicaCommitInfo;
 use crate::types::{HostId, JournalSeq, VsetId};
 
 pub const MAGIC_HEAD: u32 = u32::from_le_bytes(*b"BHD1");

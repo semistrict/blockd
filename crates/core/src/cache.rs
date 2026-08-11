@@ -12,7 +12,7 @@
 //!   prefetch, R6.2) joins the oldest, just as the kernel places
 //!   speculative page-cache reads.
 //! - **Aging** advances `max_seq` and promotes pages the accessed-bit
-//!   harvest ([`crate::seam::HostMap::harvest_accessed`]) reports touched —
+//!   harvest ([`crate::world::GuestMem::harvest_accessed`]) reports touched —
 //!   the mirror of the kernel walking page tables for young bits; blockd's
 //!   uffd boundary cannot see resident-page accesses any other way.
 //!   Write-protect faults promote inline (they ARE observed accesses).

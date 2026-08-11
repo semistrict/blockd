@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
 use crate::journal::JournalRecord;
 use crate::mapleaf::MapLeaf;
+use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
 };
-use crate::seam::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::segment::scan_segment;
 use crate::types::{HostId, VsetId};
 
@@ -331,6 +331,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
+    use crate::format::crc32c;
     use crate::journal::{RecordKind, VsetConfig};
     use crate::segment::SegmentBuilder;
     use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, page_size};
@@ -424,28 +425,12 @@ mod tests {
         .encode(VsetId(7));
         let frame = seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record)
             .expect("commit valid");
-        let expected: &[u8] = match page_size() {
-            4096 => &[
-                66, 82, 67, 49, 162, 0, 0, 0, 153, 125, 153, 154, 1, 0, 2, 0, 7, 0, 0, 0, 0, 0, 0,
-                0, 5, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 12, 0,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0,
-                93, 0, 0, 0, 66, 74, 82, 49, 81, 0, 0, 0, 186, 146, 237, 236, 6, 0, 0, 16, 0, 0, 7,
-                0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 1, 16, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
-            16_384 => &[
-                66, 82, 67, 49, 162, 0, 0, 0, 248, 103, 143, 117, 1, 0, 2, 0, 7, 0, 0, 0, 0, 0, 0,
-                0, 5, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 12, 0,
-                0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0,
-                93, 0, 0, 0, 66, 74, 82, 49, 81, 0, 0, 0, 126, 13, 221, 201, 6, 0, 0, 64, 0, 0, 7,
-                0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 1, 16, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
+        let expected_pin = match page_size() {
+            4096 => (183, 0x4510_CF30),
+            16_384 => (183, 0x82B6_7903),
             size => panic!("spool frame pin missing for {size}-byte pages"),
         };
-        assert_eq!(frame, expected);
+        assert_eq!((frame.len(), crc32c(&frame)), expected_pin);
     }
 
     #[test]

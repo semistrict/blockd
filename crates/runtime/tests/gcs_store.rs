@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 use blockd_runtime::fakegcs::{FakeGcs, Fault, Seen};
 use blockd_runtime::{GcsConfig, GcsStore};
 
@@ -59,6 +59,19 @@ async fn availability_controls_distinguish_fencing_from_immutable_data() {
     assert_eq!(store.get("v/01/head").await, Err(StoreFault::Unavailable));
     control(&endpoint, "/__control/outage/off");
     assert!(matches!(store.get("v/01/head").await, Ok(Some(_))));
+}
+
+#[tokio::test]
+async fn prefix_listing_returns_complete_logical_keys() {
+    let (_, endpoint) = FakeGcs::start();
+    let store = store_against(&endpoint);
+    for key in ["v/01/head", "v/01/s/1", "v/02/head", "b/01/rec"] {
+        store.put(key, vec![1]).await.expect("put listed object");
+    }
+    assert_eq!(
+        store.list_prefix("v/01/").await.expect("list prefix"),
+        vec!["v/01/head".to_owned(), "v/01/s/1".to_owned()]
+    );
 }
 
 /// The store contract, end to end against the stateful fake: create-only
@@ -324,6 +337,13 @@ async fn gcs_real_bucket_round_trip() {
     );
     assert_eq!(store.get_range("seg", 100_000, 1).await, Ok(None));
     assert_eq!(store.get("missing").await, Ok(None));
+    assert!(
+        store
+            .list_prefix("")
+            .await
+            .expect("list")
+            .contains(&"head".to_owned())
+    );
     store.delete("seg").await;
     store.delete("head").await;
     assert_eq!(store.get("seg").await, Ok(None));

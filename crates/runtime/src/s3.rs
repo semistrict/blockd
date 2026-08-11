@@ -321,7 +321,7 @@ impl Default for S3Store {
     }
 }
 
-pub type GetResult = Result<Option<(u64, Vec<u8>)>, blockd_core::seam::StoreFault>;
+pub type GetResult = Result<Option<(u64, Vec<u8>)>, blockd_core::protocol::StoreFault>;
 
 impl S3Store {
     pub fn new() -> S3Store {
@@ -379,9 +379,9 @@ impl S3Store {
     }
 
     /// Unconditional put (segments, manifests, resume sets).
-    pub fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, blockd_core::seam::StoreFault> {
+    pub fn put(&self, key: &str, bytes: Vec<u8>) -> Result<u64, blockd_core::protocol::StoreFault> {
         if self.unavailable() || self.data_unavailable(key) {
-            return Err(blockd_core::seam::StoreFault::Unavailable);
+            return Err(blockd_core::protocol::StoreFault::Unavailable);
         }
         let etag = self
             .s3
@@ -397,9 +397,9 @@ impl S3Store {
         key: &str,
         expected: Option<u64>,
         bytes: Vec<u8>,
-    ) -> Result<u64, blockd_core::seam::StoreFault> {
+    ) -> Result<u64, blockd_core::protocol::StoreFault> {
         if self.unavailable() {
-            return Err(blockd_core::seam::StoreFault::Unavailable);
+            return Err(blockd_core::protocol::StoreFault::Unavailable);
         }
         let result = match expected {
             None => self.s3.put_object(key, bytes, None, true),
@@ -420,16 +420,18 @@ impl S3Store {
         };
         match result {
             Ok(etag) => Ok(self.record_put(key, etag)),
-            Err(S3Error::PreconditionFailed) => Err(blockd_core::seam::StoreFault::CasConflict {
-                actual: self.current_version(key),
-            }),
+            Err(S3Error::PreconditionFailed) => {
+                Err(blockd_core::protocol::StoreFault::CasConflict {
+                    actual: self.current_version(key),
+                })
+            }
             Err(other) => panic!("unexpected S3 error on put: {other:?}"),
         }
     }
 
     pub fn get(&self, key: &str) -> GetResult {
         if self.unavailable() || self.data_unavailable(key) {
-            return Err(blockd_core::seam::StoreFault::Unavailable);
+            return Err(blockd_core::protocol::StoreFault::Unavailable);
         }
         match self.s3.get_object(key, None) {
             Ok((etag, body)) => Ok(Some((self.version_of(key, &etag), body))),
@@ -440,7 +442,7 @@ impl S3Store {
 
     pub fn get_range(&self, key: &str, offset: u64, len: u64) -> GetResult {
         if self.unavailable() || self.data_unavailable(key) {
-            return Err(blockd_core::seam::StoreFault::Unavailable);
+            return Err(blockd_core::protocol::StoreFault::Unavailable);
         }
         match self.s3.get_object(key, Some((offset, offset + len - 1))) {
             Ok((etag, body)) => Ok(Some((self.version_of(key, &etag), body))),
@@ -455,6 +457,31 @@ impl S3Store {
         }
         self.s3.delete_object(key);
     }
+
+    pub fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, blockd_core::protocol::StoreFault> {
+        if self.unavailable() || self.data_unavailable(prefix) {
+            return Err(blockd_core::protocol::StoreFault::Unavailable);
+        }
+        let mut keys = Vec::new();
+        let mut continuation = None;
+        loop {
+            let page = self
+                .s3
+                .list_objects_v2(prefix, continuation.as_deref(), 1_000);
+            keys.extend(page.contents.into_iter().map(|(key, _, _)| key));
+            if !page.is_truncated {
+                break;
+            }
+            continuation = page.next_continuation_token;
+            if continuation.is_none() {
+                return Err(blockd_core::protocol::StoreFault::Unavailable);
+            }
+        }
+        Ok(keys)
+    }
 }
 
 #[async_trait::async_trait]
@@ -463,7 +490,7 @@ impl crate::store::ObjectStore for S3Store {
         self: std::sync::Arc<Self>,
         key: String,
         bytes: Vec<u8>,
-    ) -> Result<u64, blockd_core::seam::StoreFault> {
+    ) -> Result<u64, blockd_core::protocol::StoreFault> {
         tokio::task::spawn_blocking(move || S3Store::put(&self, &key, bytes))
             .await
             .expect("S3 simulation task")
@@ -474,7 +501,7 @@ impl crate::store::ObjectStore for S3Store {
         key: String,
         expected: Option<u64>,
         bytes: Vec<u8>,
-    ) -> Result<u64, blockd_core::seam::StoreFault> {
+    ) -> Result<u64, blockd_core::protocol::StoreFault> {
         tokio::task::spawn_blocking(move || S3Store::put_cas(&self, &key, expected, bytes))
             .await
             .expect("S3 simulation task")
@@ -502,12 +529,21 @@ impl crate::store::ObjectStore for S3Store {
             .await
             .expect("S3 simulation task");
     }
+
+    async fn list_prefix(
+        self: std::sync::Arc<Self>,
+        prefix: String,
+    ) -> Result<Vec<String>, blockd_core::protocol::StoreFault> {
+        tokio::task::spawn_blocking(move || S3Store::list_prefix(&self, &prefix))
+            .await
+            .expect("S3 simulation task")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blockd_core::seam::StoreFault;
+    use blockd_core::protocol::StoreFault;
 
     #[test]
     fn injected_outage_rejects_reads_and_writes_without_mutating_objects() {
@@ -546,5 +582,19 @@ mod tests {
         assert_eq!(store.get("v/1/segment"), Err(StoreFault::Unavailable));
         assert_eq!(store.get(head), Ok(Some((version, vec![1]))));
         assert_eq!(store.put_cas(head, Some(version), vec![3]), Ok(version + 1));
+    }
+
+    #[test]
+    fn prefix_listing_paginates_and_filters() {
+        let store = S3Store::new();
+        for index in 0..1_005 {
+            store
+                .put(&format!("v/1/{index:04}"), vec![1])
+                .expect("put object");
+        }
+        store.put("v/2/other", vec![1]).expect("put other prefix");
+        let keys = store.list_prefix("v/1/").expect("list prefix");
+        assert_eq!(keys.len(), 1_005);
+        assert!(keys.iter().all(|key| key.starts_with("v/1/")));
     }
 }

@@ -205,6 +205,61 @@ guest loudly — inventing a page is the defining forbidden failure (R8.1).
 Pressure — memory or NVMe — slows guests and raises observable signals;
 it never kills and never corrupts (R2.5/R2.7).
 
+### One actor runtime in simulation and production
+
+The core protocol is expressed as current-thread async actors over the
+contracts in `crates/core/src/world.rs`. Fault service, capture, publication,
+restore, migration, replication, database I/O, compaction, and store garbage
+collection are straight-line futures sharing host state only between await
+points. A host owns those children as one cancellation tree: a simulated crash
+or production teardown drops the root, then recovery reconstructs state from
+durable bytes rather than continuing an in-memory conversation.
+
+`crates/exec` is the scheduler in both environments. Simulation owns virtual
+time, seeded randomness, fault-point decisions, and a closed ready queue;
+production adds monotonic timers and a thread-safe external-event injector.
+FIFO wake ordering and declaration-order selection are fixed. Every simulated
+poll folds virtual time, task identity, and wake source into the trace hash, so
+R10.1 replay checks the actual actor interleaving rather than a second model of
+the protocol. Simulation and production differ only in their world trait
+implementations for blobs, object storage, peers, guest memory, and admin I/O.
+
+In-process operations use typed request envelopes. Each administrative,
+database, and guest-sync call carries its own one-shot reply promise, so
+completion routing has no shared reply stream, request table, or scan for a
+matching identifier. The synchronous Firecracker and VFS adapters block on
+that call's promise only. Checkpoint keeps a request identity because durable
+retry idempotency is part of its protocol; database and peer identifiers
+remain only at their wire boundaries. Recovery and inbound migration are not
+request completions and therefore arrive on a separate typed lifecycle-event
+stream.
+
+Dynamic children live in structured actor collections. Completion reaps a
+child even while ingress is idle, dropping an owner cancels the complete
+subtree, and child failures propagate to the host supervisor. Core operations
+return typed rejection, stale, unavailable, and fatal outcomes. The root alone
+turns a host-fatal outcome into process termination in production or a
+deterministic host failure in simulation. Fallible guest-memory calls follow
+the same rule; mandatory unservable pages are reported to the root rather than
+terminating from a world callback.
+
+Each vset has typed ownership slots for mutation, migration, publication, and
+replication. A mutation owner is capture (writeback, checkpoint, or migration),
+database persistence, or hydration; only capture can own a page-drain state,
+and cancellation leases release exactly the owner they acquired. This makes
+overlapping invalid flag combinations unrepresentable through the operation
+API while retaining orthogonal publication and replication progress.
+
+Writeback cadence uses one host timer plus a deterministic ordered work set.
+Faults, lifecycle transitions, peer progress, and operation completion enqueue
+only affected vsets; each timer turn drains that set in bounded poll batches.
+Idle vsets allocate no actor, timer, device, thread, or provisioned-size
+buffer. Startup store reconciliation is separately limited to 32 children and
+emits externally visible lifecycle outcomes in vset order. Peer RPC call sites
+await a typed client future whose broker owns wire-ID allocation, authenticated
+reply matching, timeout cleanup, and retry; duplicated and late replies cannot
+complete a different call.
+
 ## Verification
 
 Three tiers, in the repo and green:
@@ -218,7 +273,7 @@ Three tiers, in the repo and green:
   targeted crash grids cover each replica commit, publication, release, and
   replacement boundary before large deterministic seed ensembles run.
 - **Real-kernel machinery** (`crates/hostmem`, `crates/runtime`): the same
-  daemon state machine driven against real userfaultfd, memfds, O_DIRECT
+  actor tree driven against real userfaultfd, memfds, O_DIRECT
   disk I/O and an S3-shaped store in a Linux VM, with physical memory
   measured and asserted.
 - **Real Firecracker** (`crates/runtime` fc tests, `crates/fc-guest`):

@@ -5,7 +5,7 @@
 //! serialized with warm VM snapshots. This module covers only the durable
 //! main, WAL, and rollback-journal namespaces.
 
-use crate::seam::ReqId;
+use crate::protocol::ReqId;
 use crate::types::{PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
 
 /// Largest byte payload accepted in one request or returned in one reply.
@@ -55,6 +55,28 @@ pub struct DatabaseRequest {
     pub vset: VsetId,
     pub attachment: AttachmentId,
     pub op: DatabaseOp,
+}
+
+/// Internal operation after the transport adapter removes its wire request
+/// identifier. Completion is routed by the owned reply capability.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DatabaseCall {
+    pub vset: VsetId,
+    pub attachment: AttachmentId,
+    pub op: DatabaseOp,
+}
+
+impl DatabaseRequest {
+    pub fn into_call(self) -> (ReqId, DatabaseCall) {
+        (
+            self.req,
+            DatabaseCall {
+                vset: self.vset,
+                attachment: self.attachment,
+                op: self.op,
+            },
+        )
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -117,6 +139,22 @@ pub enum DatabaseError {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DatabaseSuccess {
+    Opened,
+    Closed,
+    Read { bytes: Vec<u8>, eof: bool },
+    Written { sequence: u64 },
+    Truncated { sequence: u64 },
+    FileSize { size: u64 },
+    Access { exists: bool },
+    Stat { exists: bool, size: u64 },
+    Deleted { sequence: u64 },
+    Synced { sequence: u64 },
+}
+
+pub type DatabaseResult = Result<DatabaseSuccess, DatabaseError>;
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DatabaseReply {
     Opened {
         req: ReqId,
@@ -165,6 +203,22 @@ pub enum DatabaseReply {
 }
 
 impl DatabaseReply {
+    pub fn from_result(req: ReqId, result: DatabaseResult) -> Self {
+        match result {
+            Ok(DatabaseSuccess::Opened) => Self::Opened { req },
+            Ok(DatabaseSuccess::Closed) => Self::Closed { req },
+            Ok(DatabaseSuccess::Read { bytes, eof }) => Self::Read { req, bytes, eof },
+            Ok(DatabaseSuccess::Written { sequence }) => Self::Written { req, sequence },
+            Ok(DatabaseSuccess::Truncated { sequence }) => Self::Truncated { req, sequence },
+            Ok(DatabaseSuccess::FileSize { size }) => Self::FileSize { req, size },
+            Ok(DatabaseSuccess::Access { exists }) => Self::Access { req, exists },
+            Ok(DatabaseSuccess::Stat { exists, size }) => Self::Stat { req, exists, size },
+            Ok(DatabaseSuccess::Deleted { sequence }) => Self::Deleted { req, sequence },
+            Ok(DatabaseSuccess::Synced { sequence }) => Self::Synced { req, sequence },
+            Err(error) => Self::Failed { req, error },
+        }
+    }
+
     pub const fn req(&self) -> ReqId {
         match *self {
             DatabaseReply::Opened { req }
@@ -179,26 +233,5 @@ impl DatabaseReply {
             | DatabaseReply::Synced { req, .. }
             | DatabaseReply::Failed { req, .. } => req,
         }
-    }
-
-    /// Replace transport-local correlation with the caller's request id.
-    /// Runtime adapters use a host-unique id inside the daemon so equal guest
-    /// ids from different VMs or connections can never share a waiter.
-    #[must_use]
-    pub fn with_req(mut self, replacement: ReqId) -> Self {
-        match &mut self {
-            DatabaseReply::Opened { req }
-            | DatabaseReply::Closed { req }
-            | DatabaseReply::Read { req, .. }
-            | DatabaseReply::Written { req, .. }
-            | DatabaseReply::Truncated { req, .. }
-            | DatabaseReply::FileSize { req, .. }
-            | DatabaseReply::Access { req, .. }
-            | DatabaseReply::Stat { req, .. }
-            | DatabaseReply::Deleted { req, .. }
-            | DatabaseReply::Synced { req, .. }
-            | DatabaseReply::Failed { req, .. } => *req = replacement,
-        }
-        self
     }
 }

@@ -3,10 +3,10 @@
 //! local durable state is destroyed (R6.1 on one host). Exact assertions —
 //! runs are deterministic.
 
-use blockd_core::daemon::{ArchivePolicy, DaemonConfig};
+use blockd_core::hostmeta::{ArchivePolicy, HostConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
-use blockd_core::types::{HostId, VsetId, millis, secs};
+use blockd_core::types::{HostId, VsetId, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::rng::Ppm;
 use blockd_sim::world::blobdev::BlobDevConfig;
@@ -14,7 +14,7 @@ use blockd_sim::world::store::{StoreConfig, StoreObjectKind};
 
 fn base_config() -> HarnessConfig {
     HarnessConfig {
-        daemon: DaemonConfig {
+        daemon: HostConfig {
             archive: ArchivePolicy {
                 interval: secs(1),
                 ..Default::default()
@@ -66,7 +66,9 @@ fn every_vset_publishes_through_its_passive_peer() {
                 .filter(|key| key.starts_with(&format!("{prefix}m/")))
                 .count(),
             1,
-            "superseded manifests are reclaimed"
+            "superseded manifests are reclaimed: counters={:?} keys={:?}",
+            report.counters,
+            report.store_keys
         );
     }
 }
@@ -111,7 +113,12 @@ fn hot_working_set_reports_archive_amplification_baseline() {
     assert!(attempted_bytes >= successful_bytes);
     assert!(report.store.unique_bytes <= report.store.bytes_put);
     assert!(report.store.retry_bytes <= attempted_bytes);
-    assert!(report.store.puts_by_kind[StoreObjectKind::Manifest as usize].successes > 0);
+    assert!(
+        report.store.puts_by_kind[StoreObjectKind::Manifest as usize].successes > 0,
+        "counters={:?} keys={:?}",
+        report.counters,
+        report.store_keys
+    );
     assert!(report.store.logical_changed_bytes > 0);
     assert!(report.published_segment_bytes > 0);
     eprintln!(
@@ -203,12 +210,16 @@ fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
     let mut config = base_config();
     config.vset_count = 1;
     config.daemon.cache_pages = 24;
-    config.daemon.disk_capacity = Some(256 * 1024);
-    config.daemon.disk_headroom = 64 * 1024;
+    config.daemon.disk_capacity = Some(16 * page_size() as u64);
+    config.daemon.disk_headroom = 4 * page_size() as u64;
     let report = run(14, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    assert!(report.counters.nvme_reclaims > 0);
+    assert!(
+        report.counters.nvme_reclaims > 0,
+        "counters: {:?}",
+        report.counters
+    );
     assert!(report.counters.nvme_stalls > 0);
     assert!(report.completed_ops > 0);
 }

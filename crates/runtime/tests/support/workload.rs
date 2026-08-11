@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::Verdict;
+use blockd_core::protocol::Verdict;
 use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_runtime::{Runtime, RuntimeConfig, S3Store};
 use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};
@@ -31,17 +31,24 @@ pub struct RuntimeLifecycleBackend {
     config: RuntimeConfig,
     store: Arc<S3Store>,
     runtime: Option<Runtime>,
+    passive_runtimes: Vec<Runtime>,
     vset: VsetId,
     vset_config: Option<VsetConfig>,
     metrics: RuntimeWorkloadMetrics,
 }
 
 impl RuntimeLifecycleBackend {
-    pub fn new(config: RuntimeConfig, store: Arc<S3Store>, vset: VsetId) -> Self {
+    pub fn new(
+        config: RuntimeConfig,
+        store: Arc<S3Store>,
+        passive_runtimes: Vec<Runtime>,
+        vset: VsetId,
+    ) -> Self {
         Self {
             config,
             store,
             runtime: None,
+            passive_runtimes,
             vset,
             vset_config: None,
             metrics: RuntimeWorkloadMetrics::default(),
@@ -54,6 +61,10 @@ impl RuntimeLifecycleBackend {
 
     pub fn runtime(&self) -> &Runtime {
         self.runtime.as_ref().expect("runtime is active")
+    }
+
+    pub fn passive_runtimes(&self) -> &[Runtime] {
+        &self.passive_runtimes
     }
 
     fn page_id(&self, page: LogicalPage) -> PageId {
@@ -99,11 +110,7 @@ impl Backend for RuntimeLifecycleBackend {
             Operation::Create => {
                 let started = Instant::now();
                 let shape = model.shape();
-                let config = VsetConfig::compute(
-                    shape.disk_volumes,
-                    shape.pages_per_volume,
-                    shape.backed_up,
-                );
+                let config = VsetConfig::compute(shape.disk_volumes, shape.pages_per_volume);
                 let runtime = Runtime::new(&self.config, self.store.clone());
                 runtime.create_vset(self.vset, config);
                 self.vset_config = Some(config);
@@ -149,15 +156,20 @@ impl Backend for RuntimeLifecycleBackend {
             Operation::Restore => {
                 let started = Instant::now();
                 let config = self.vset_config.expect("vset was created");
-                let (runtime, verdicts) = Runtime::recover(
+                let (runtime, immediate) = Runtime::recover(
                     &self.config,
                     self.store.clone(),
                     &BTreeMap::from([(self.vset, config)]),
                 );
-                if !matches!(verdicts.get(&self.vset), Some(Verdict::Resume { .. })) {
+                if !immediate.is_empty() {
                     return Err(format!(
-                        "restore did not resume the checkpoint: {:?}",
-                        verdicts.get(&self.vset)
+                        "recovery unexpectedly completed synchronously: {immediate:?}"
+                    ));
+                }
+                let verdict = runtime.wait_recovered(self.vset);
+                if !matches!(verdict, Verdict::Resume { .. }) {
+                    return Err(format!(
+                        "restore did not resume the checkpoint: {verdict:?}"
                     ));
                 }
                 self.runtime = Some(runtime);
@@ -267,11 +279,7 @@ impl Backend for RuntimeDataBackend<'_> {
                 let shape = model.shape();
                 self.runtime.create_vset(
                     self.vset,
-                    VsetConfig::compute(
-                        shape.disk_volumes,
-                        shape.pages_per_volume,
-                        shape.backed_up,
-                    ),
+                    VsetConfig::compute(shape.disk_volumes, shape.pages_per_volume),
                 );
                 self.metrics.create_time += started.elapsed();
                 self.metrics.creates += 1;

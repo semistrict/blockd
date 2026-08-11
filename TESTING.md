@@ -3,8 +3,11 @@
 The normal suite is:
 
 ```sh
-cargo test --workspace
+cargo nextest run
 ```
+
+Use `cargo test --workspace` when nextest is unavailable; doc tests run
+separately with `cargo test --doc --workspace`.
 
 Linux-only tests exercise userfaultfd, real disk behavior, peer transport,
 loop interference, migration, and Firecracker. They compile to empty test
@@ -21,14 +24,11 @@ latency thresholds. Run them in release mode with output enabled:
 # Hardware/SIMD CRC-32C versus the previous bytewise table loop.
 cargo test --release -p blockd-core --test perf_crc -- --ignored --nocapture
 
-# One MiB database request: total work, slice count, and worst loop step.
-cargo test --release -p blockd-core profile_one_mib_database_write_slices -- --ignored --nocapture
-
-# 300k-page capture: total throughput and the worst bounded continuation.
+# 300k-page actor capture: throughput and maximum page reads in one poll.
 cargo test --release -p blockd-runtime --test perf_decider profile_huge_vset_capture_stall -- --nocapture
 
-# 300k-page migration hydration: one bounded map slice and fetch batch.
-cargo test --release -p blockd-core profile_300k_page_hydration_tick -- --ignored --nocapture
+# Actor scheduler: total polls and maximum page reads in one poll.
+cargo test --release -p blockd-runtime --test perf_decider profile_actor_poll_ceiling -- --nocapture
 
 # Replica artifact preparation: old inline-equivalent time versus bounded
 # peer-I/O queue submission and worker completion.
@@ -147,7 +147,26 @@ cargo run --release -p blockd-sim --bin sweep -- migration 0 250
 
 Set `BLOCKD_SWEEP_REQUIRE_COVERAGE=1` to enable aggregate coverage gates and
 `BLOCKD_SWEEP_ARTIFACT_DIR=<path>` to retain failure evidence without using the
-wrapper.
+wrapper. `BLOCKD_SWEEP_REQUIRE_REPLAY=1` runs every seed twice and compares the
+complete outcome and trace hash. `BLOCKD_SWEEP_REQUIRE_DISTINCT=1` additionally
+rejects a trace-hash collision within the range. The R10.1 gate is:
+
+```sh
+for scenario in chaos cluster migration; do
+  BLOCKD_SWEEP_REQUIRE_REPLAY=1 BLOCKD_SWEEP_REQUIRE_DISTINCT=1 \
+    target/release/sweep "$scenario" 0 100
+done
+```
+
+Run simulation coverage at both supported page granularities by setting the
+test-only platform override before building and invoking the sweep:
+
+```sh
+BLOCKD_TEST_PAGE_SIZE=4096 scripts/run-sim-ensemble.sh chaos 0 1000 artifacts/sim-4k
+BLOCKD_TEST_PAGE_SIZE=16384 scripts/run-sim-ensemble.sh chaos 0 1000 artifacts/sim-16k
+```
+
+Use a separate artifact directory and repeat for `cluster` and `migration`.
 
 Scenario `outcomes` are checked on every seed even when aggregate coverage is
 disabled. They express exact or bounded verdicts such as zero surviving parked

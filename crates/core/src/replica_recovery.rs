@@ -8,8 +8,8 @@ use crate::head::HeadRecord;
 use crate::journal::JournalRecord;
 use crate::layout;
 use crate::mapleaf::MapLeaf;
+use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::replica_spool::{ReplicaCommitFrame, ReplicaSpoolScan, scan_replica_spool};
-use crate::seam::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::segment::scan_segment;
 use crate::types::{HostId, VsetId};
 

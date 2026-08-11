@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{DetachMode, StoreFault, Verdict};
+use blockd_core::protocol::{DetachMode, StoreFault, Verdict};
 use blockd_core::types::{HostId, VmId, VsetId, millis};
 use blockd_runtime::database::DatabaseEndpoint;
 use blockd_runtime::{GetResult, ObjectStore, Runtime, RuntimeConfig};
@@ -45,7 +45,7 @@ impl ObjectStore for EmptyStore {
 
 fn config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
-        daemon: DaemonConfig {
+        daemon: HostConfig {
             archive: Default::default(),
             host: HostId(0),
             cache_pages: 32,

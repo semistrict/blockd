@@ -1,0 +1,34 @@
+#![forbid(unsafe_code)]
+
+//! Deterministic current-thread async actors.
+//!
+//! The executor owns task ordering, virtual time, randomness, and fault
+//! injection. Simulation has no external injector; production admits events
+//! through the explicit two-lane injector while running the same futures.
+
+pub mod bridge;
+pub mod channel;
+pub mod fault;
+pub mod inject;
+pub mod request;
+pub mod rng;
+pub mod select;
+pub mod task_set;
+pub mod trace;
+
+mod runtime;
+
+pub use bridge::{
+    BridgeReceiver, BridgeRecvError, BridgeReply, BridgeRequest, BridgeSender, ReplyTarget, bridge,
+    bridge_request,
+};
+pub use fault::{FaultConfig, FaultPoint};
+pub use request::{Reply, Request, request};
+pub use runtime::{
+    Cancelled, Delay, Executor, Mode, MonotonicClock, TaskHandle, TaskId, WakeSource, current_poll,
+    delay, fault_point, now, observe, random_u64, spawn, yield_now,
+};
+pub use select::{
+    Either, Join2, OneOf3, Select2, Select3, Timeout, join2, select2, select3, timeout,
+};
+pub use task_set::{ActorCollection, TaskSet};

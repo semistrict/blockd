@@ -10,8 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use blockd_core::daemon::Counters;
-use blockd_core::daemon::{DaemonStats, VsetOperations, VsetRole};
+use blockd_core::hostmeta::{Counters, DaemonStats, VsetOperations, VsetRole};
 use blockd_runtime::{
     CapacitySignal, CapacityState, FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS,
     LatencySeries,
@@ -201,8 +200,8 @@ pub struct MetricsSnapshot {
     pub incidents: u64,
     pub daemon: DaemonStats,
     pub capacity: CapacitySignal,
-    pub loop_decide: Vec<(&'static str, u64, u64)>,
-    pub loop_effect: Vec<(&'static str, u64, u64)>,
+    pub loop_poll: Vec<(&'static str, u64, u64)>,
+    pub loop_world: Vec<(&'static str, u64, u64)>,
     pub loop_idle_ns: u64,
     pub loop_occupancy: f64,
     pub loop_queue_depths: (usize, usize),
@@ -749,7 +748,7 @@ fn append_loop_metrics(out: &mut String, snapshot: &MetricsSnapshot) {
     append_family(
         out,
         "blockd_event_loop_events_total",
-        "Event-loop decisions and effects by kind.",
+        "Actor polls and async world operations by kind.",
         "counter",
     );
     append_family(
@@ -759,8 +758,8 @@ fn append_loop_metrics(out: &mut String, snapshot: &MetricsSnapshot) {
         "counter",
     );
     for (phase, rows) in [
-        ("decide", snapshot.loop_decide.as_slice()),
-        ("effect", snapshot.loop_effect.as_slice()),
+        ("poll", snapshot.loop_poll.as_slice()),
+        ("world", snapshot.loop_world.as_slice()),
     ] {
         for (kind, count, ns) in rows {
             append_sample(
@@ -1096,7 +1095,7 @@ mod tests {
         let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        assert_eq!((custom.len(), custom_hash), (16_240, 0xac24_39a2_3478_a4ea));
+        assert_eq!((custom.len(), custom_hash), (16_240, 0xafa5_6da1_1650_4889));
     }
 
     #[test]
@@ -1126,7 +1125,7 @@ mod tests {
             daemon: DaemonStats {
                 cache_capacity_pages: 100,
                 dirty_pages: 3,
-                vsets: vec![blockd_core::daemon::VsetStats {
+                vsets: vec![blockd_core::hostmeta::VsetStats {
                     vset: blockd_core::types::VsetId(42),
                     role: VsetRole::Hydrating,
                     fence: 8,
@@ -1145,8 +1144,8 @@ mod tests {
                 ..DaemonStats::default()
             },
             capacity: constrained_capacity(),
-            loop_decide: vec![("GuestFault", 2, 1_000)],
-            loop_effect: Vec::new(),
+            loop_poll: vec![("ActorPoll", 2, 1_000)],
+            loop_world: Vec::new(),
             loop_idle_ns: 0,
             loop_occupancy: 0.0,
             loop_queue_depths: (0, 0),
@@ -1195,8 +1194,9 @@ mod tests {
         );
         assert!(text.contains("blockd_page_fault_duration_seconds_count{source=\"local_nvme\"} 1"));
         assert!(
-            text.contains("blockd_event_loop_events_total{phase=\"decide\",kind=\"GuestFault\"} 2")
+            text.contains("blockd_event_loop_events_total{phase=\"poll\",kind=\"ActorPoll\"} 2")
         );
+        assert!(!text.contains("phase=\"effect\""));
         assert!(!text.contains("/vm/42/work"));
     }
 

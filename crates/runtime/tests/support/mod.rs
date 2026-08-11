@@ -3,7 +3,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
 use blockd_core::types::millis;
@@ -30,8 +30,9 @@ pub(crate) fn temp_root(tag: &str) -> PathBuf {
 }
 
 #[allow(dead_code)]
-pub(crate) fn base_daemon_config(host: u16) -> DaemonConfig {
-    DaemonConfig {
+pub(crate) fn base_daemon_config(host: u16) -> HostConfig {
+    HostConfig {
+        archive: blockd_core::hostmeta::ArchivePolicy::default(),
         host: HostId(host),
         cache_pages: 64,
         writeback_interval: millis(5),
@@ -82,7 +83,16 @@ pub(crate) fn three_host_runtime_config(
         peer: Some(PeerConfig {
             listen: addresses[usize::from(host)],
             peers: three_host_roster(addresses),
-            outbound_protocol_versions: BTreeMap::new(),
+            outbound_protocol_versions: addresses
+                .into_iter()
+                .enumerate()
+                .map(|(peer, _)| {
+                    (
+                        HostId(u16::try_from(peer).expect("fits")),
+                        blockd_core::peer::CURRENT_PEER_VERSION,
+                    )
+                })
+                .collect(),
             tls: Some(peer_tls(usize::from(host), MAX_TEST_HOSTS)),
         }),
     }

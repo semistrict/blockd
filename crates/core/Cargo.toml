@@ -13,5 +13,6 @@ workspace = true
 
 [dependencies]
 blockd-platform = { path = "../platform" }
+blockd-exec = { path = "../exec" }
 crc-fast = "1.10.0"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-encode", "safe-decode", "std"] }

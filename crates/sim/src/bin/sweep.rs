@@ -23,7 +23,9 @@ fn usage() -> ExitCode {
         "usage: sweep <{}> <start-seed> <count>\n\
          optional environment:\n\
          BLOCKD_SWEEP_ARTIFACT_DIR=<path>  retain replay data for failures\n\
-         BLOCKD_SWEEP_REQUIRE_COVERAGE=1   fail if the range misses scenario faults",
+         BLOCKD_SWEEP_REQUIRE_COVERAGE=1   fail if the range misses scenario faults\n\
+         BLOCKD_SWEEP_REQUIRE_REPLAY=1     replay and compare every seed\n\
+         BLOCKD_SWEEP_REQUIRE_DISTINCT=1   fail on a trace-hash collision",
         scenario::SWEEP_SCENARIOS.join("|")
     );
     ExitCode::from(2)
@@ -341,6 +343,7 @@ fn write_coverage_artifact(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let [_, scenario_name, start, count] = args.as_slice() else {
@@ -370,10 +373,13 @@ fn main() -> ExitCode {
 
     let artifact_dir = std::env::var_os("BLOCKD_SWEEP_ARTIFACT_DIR").map(PathBuf::from);
     let require_coverage = std::env::var_os("BLOCKD_SWEEP_REQUIRE_COVERAGE").is_some();
+    let require_replay = std::env::var_os("BLOCKD_SWEEP_REQUIRE_REPLAY").is_some();
+    let require_distinct = std::env::var_os("BLOCKD_SWEEP_REQUIRE_DISTINCT").is_some();
 
     let mut failed = 0u64;
     let mut artifact_errors = 0u64;
     let mut coverage = Coverage::default();
+    let mut trace_seeds = BTreeMap::new();
     for seed in start..end {
         let first = run_one(&scenario, seed);
         coverage.merge(&first.coverage);
@@ -383,18 +389,36 @@ fn main() -> ExitCode {
         if first.completed_ops == 0 {
             println!("seed {seed}: LIVENESS: zero guest ops completed");
         }
-        if first.failed() {
+        let replay = (require_replay || first.failed()).then(|| run_one(&scenario, seed));
+        let nondeterministic = replay.as_ref().is_some_and(|replay| first != *replay);
+        if nondeterministic {
+            let replay = replay.as_ref().expect("compared replay exists");
+            println!(
+                "seed {seed}: NONDETERMINISM: first trace {:#018x}, replay {:#018x}",
+                first.trace_hash, replay.trace_hash
+            );
+        }
+        let collision = if require_distinct {
+            trace_seeds
+                .insert(first.trace_hash, seed)
+                .filter(|previous| *previous != seed)
+        } else {
+            None
+        };
+        if let Some(previous) = collision {
+            println!(
+                "seed {seed}: TRACE COLLISION: seed {previous} also produced {:#018x}",
+                first.trace_hash
+            );
+        }
+        if first.failed() || nondeterministic || collision.is_some() {
             failed += 1;
-            let replay = run_one(&scenario, seed);
-            if first != replay {
-                println!(
-                    "seed {seed}: NONDETERMINISM: first trace {:#018x}, replay {:#018x}",
-                    first.trace_hash, replay.trace_hash
-                );
-            }
+        }
+        if first.failed() || nondeterministic {
+            let replay = replay.as_ref().expect("failed seed was replayed");
             if let Some(directory) = &artifact_dir
                 && let Err(error) =
-                    write_failure_artifact(directory, scenario_name, seed, &first, &replay)
+                    write_failure_artifact(directory, scenario_name, seed, &first, replay)
             {
                 artifact_errors += 1;
                 eprintln!("seed {seed}: failed to write replay artifact: {error}");

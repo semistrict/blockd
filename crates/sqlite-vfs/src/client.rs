@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use blockd_core::database::{AttachmentId, DatabaseOp, DatabaseReply, DatabaseRequest};
 use blockd_core::dbproto::{MAX_DATABASE_FRAME, decode_reply, encode_request};
 use blockd_core::format::FRAME_HEADER;
-use blockd_core::seam::ReqId;
+use blockd_core::protocol::ReqId;
 use blockd_core::types::VsetId;
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);

@@ -1,26 +1,31 @@
 //! Abrupt process death against a real filesystem spool, followed by the real
-//! daemon restart scanner. This test does not require guest memory/userfaultfd.
+//! actor recovery scanner. This test does not require guest memory/userfaultfd.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::{Daemon, DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::engine::{HostState, recover_local};
+use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
 use blockd_core::layout;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
+use blockd_core::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use blockd_core::replica_spool::{seal_replica_artifact, seal_replica_commit};
-use blockd_core::seam::{Effect, ReplicaArtifact, ReplicaCommitInfo};
 use blockd_core::segment::SegmentBuilder;
 use blockd_core::types::{
     Gen, HostId, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,
 };
+use blockd_exec::Executor;
+use blockd_runtime::world::FileBlobs;
 
 const VSET: VsetId = VsetId(7);
 
@@ -163,8 +168,8 @@ fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
         .find(|candidate| candidate.host == target)
         .expect("target")
         .failure_domain;
-    let daemon_config = DaemonConfig {
-        archive: Default::default(),
+    let host_config = HostConfig {
+        archive: blockd_core::hostmeta::ArchivePolicy::default(),
         host: target,
         cache_pages: 8,
         writeback_interval: 1_000_000,
@@ -178,35 +183,32 @@ fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
             roster,
         }),
     };
-    let (_, verdicts, effects) = Daemon::recover(
-        daemon_config.clone(),
-        [(name.as_str(), bytes.as_slice())].into_iter(),
-    );
-    assert!(verdicts.is_empty());
-    let truncate = effects
-        .iter()
-        .find_map(|effect| match effect {
-            Effect::ReplicaTruncate { len, .. } => Some(*len),
-            _ => None,
+    let blobs = Rc::new(FileBlobs::new(&root).expect("file actor world"));
+    let state = Rc::new(RefCell::new(HostState::new(host_config.clone())));
+    let mut executor = Executor::production();
+    let verdicts = executor
+        .block_on({
+            let state = Rc::clone(&state);
+            let blobs = Rc::clone(&blobs);
+            async move { recover_local(state, blobs.as_ref()).await }
         })
-        .expect("restart rejects and truncates the torn footer");
-    assert_eq!(truncate, artifact.len() as u64);
-
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .expect("open spool for truncation");
-    file.set_len(truncate).expect("truncate invalid tail");
-    file.sync_all().expect("fsync truncation");
+        .expect("actor recovery succeeds");
+    assert!(verdicts.is_empty());
     let repaired = std::fs::read(&path).expect("repaired spool");
-    let (_, _, effects) = Daemon::recover(
-        daemon_config,
-        [(name.as_str(), repaired.as_slice())].into_iter(),
-    );
-    assert!(
-        effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::ReplicaTruncate { .. }))
+    assert_eq!(repaired, artifact, "actor recovery did not trim torn tail");
+
+    let second_state = Rc::new(RefCell::new(HostState::new(host_config)));
+    executor
+        .block_on({
+            let state = Rc::clone(&second_state);
+            let blobs = Rc::clone(&blobs);
+            async move { recover_local(state, blobs.as_ref()).await }
+        })
+        .expect("second actor recovery succeeds");
+    assert_eq!(
+        std::fs::read(&path).expect("stable spool"),
+        artifact,
+        "a valid recovered spool was truncated again"
     );
 
     std::fs::remove_dir_all(root).expect("cleanup root");

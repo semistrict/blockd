@@ -13,10 +13,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::{DaemonConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
-use blockd_core::seam::Verdict;
+use blockd_core::protocol::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig, S3Store};
 use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};
@@ -50,8 +50,8 @@ fn free_addr() -> SocketAddr {
 
 fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
     RuntimeConfig {
-        daemon: DaemonConfig {
-            archive: Default::default(),
+        daemon: HostConfig {
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(host),
             cache_pages: 256,
             writeback_interval: millis(5),
@@ -210,13 +210,19 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
     let peer_a = PeerConfig {
         listen: addr_a,
         peers: roster.clone(),
-        outbound_protocol_versions: BTreeMap::new(),
+        outbound_protocol_versions: BTreeMap::from([(
+            HostId(1),
+            blockd_core::peer::CURRENT_PEER_VERSION,
+        )]),
         tls: Some(support::peer_tls(0, 2)),
     };
     let peer_b = PeerConfig {
         listen: addr_b,
         peers: roster,
-        outbound_protocol_versions: BTreeMap::new(),
+        outbound_protocol_versions: BTreeMap::from([(
+            HostId(0),
+            blockd_core::peer::CURRENT_PEER_VERSION,
+        )]),
         tls: Some(support::peer_tls(1, 2)),
     };
     let store = Arc::new(S3Store::new());
@@ -263,10 +269,17 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
         .expect("destination remains readable");
     assert_eq!(a.incidents(), Vec::<String>::new());
     assert_eq!(b.incidents(), Vec::<String>::new());
-    // The wire really carried the drain (hydration pulled pages from A).
+    // The wire really carried the drain. Foreground demand may win the race
+    // with background hydration, so either path is valid post-copy progress.
+    let peer_faults = b
+        .fault_latency()
+        .into_iter()
+        .filter(|series| series.vset == VSET && series.source == "peer")
+        .map(|series| series.histogram.count)
+        .sum::<u64>();
     assert!(
-        b.counters().hydrate_fills > 0,
-        "no hydration happened over the wire"
+        b.counters().hydrate_fills + peer_faults > 0,
+        "no post-copy page crossed the peer wire"
     );
     assert!(
         store.s3.stats.total_requests() > 0,

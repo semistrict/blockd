@@ -126,7 +126,7 @@ Peer TCP uses one readiness-driven Tokio loop per host with bounded outbound
 queues. Guest-memory and shared-memory userfaultfds, plus the Firecracker Unix
 handshakes, also use readiness-driven tasks instead of one reader thread per
 VM. GCS and OTLP use asynchronous DNS, TCP, TLS, and response-body streaming.
-Daemon object-store effects and cold snapshot fetches each have bounded async
+Daemon object-store operations and cold snapshot fetches each have bounded async
 queues with at most eight requests in flight. Local reads/writes, `fsync`,
 directory `fsync`, Firecracker process control, and local snapshot fills remain
 blocking kernel or library APIs; they run only on dedicated bounded lanes or

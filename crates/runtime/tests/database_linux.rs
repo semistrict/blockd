@@ -10,7 +10,7 @@ use blockd_core::database::{DatabaseFile, DatabaseOp, DatabaseReply, DatabaseReq
 use blockd_core::dbproto::{decode_reply, encode_request};
 use blockd_core::format::FRAME_HEADER;
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{ReqId, StoreFault};
+use blockd_core::protocol::{ReqId, StoreFault};
 use blockd_core::types::{HostId, VmId, VsetId, millis};
 use blockd_runtime::database::serve_database_stream;
 use blockd_runtime::{GetResult, ObjectStore, Runtime, RuntimeConfig};
@@ -74,8 +74,8 @@ fn unix_stream_runs_sqlite_shaped_io_through_the_real_daemon() {
     let _ = std::fs::remove_dir_all(&dir);
     let runtime = Arc::new(Runtime::new(
         &RuntimeConfig {
-            daemon: blockd_core::daemon::DaemonConfig {
-                archive: Default::default(),
+            daemon: blockd_core::hostmeta::HostConfig {
+                archive: blockd_core::hostmeta::ArchivePolicy::default(),
                 host: HostId(0),
                 cache_pages: 16,
                 writeback_interval: millis(10),

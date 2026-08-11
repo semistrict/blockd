@@ -12,8 +12,8 @@ use std::sync::mpsc::{channel, sync_channel};
 use std::time::Instant;
 
 use blockd_core::format::crc32c;
+use blockd_core::protocol::ReplicaArtifact;
 use blockd_core::replica_spool::seal_verified_replica_artifact;
-use blockd_core::seam::ReplicaArtifact;
 use blockd_core::segment::SegmentBuilder;
 use blockd_core::types::{
     Gen, HostId, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,

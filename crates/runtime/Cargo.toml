@@ -24,6 +24,7 @@ async-trait.workspace = true
 base64 = "0.22.1"
 bytes = "1.11.1"
 blockd-core = { path = "../core" }
+blockd-exec = { path = "../exec" }
 blockd-hostmem = { path = "../hostmem" }
 axum = { workspace = true, features = ["http1", "tokio"] }
 futures-util = "0.3.33"

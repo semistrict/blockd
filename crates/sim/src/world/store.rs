@@ -25,7 +25,7 @@ use crate::rng::Pcg64;
 /// R4.6: the largest object the contract guarantees.
 pub const MAX_OBJECT_BYTES: usize = 64 << 20;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct StoreConfig {
     pub latency_min: u64,
     pub latency_max: u64,

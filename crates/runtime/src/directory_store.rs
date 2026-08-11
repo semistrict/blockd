@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 
 use crate::{GetResult, ObjectStore};
 
@@ -137,6 +137,27 @@ impl DirectoryStore {
         }
         result
     }
+
+    fn list(root: &Path, directory: &Path, prefix: &str, keys: &mut Vec<String>) -> io::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                Self::list(root, &path, prefix, keys)?;
+            } else if file_type.is_file() {
+                let key = path
+                    .strip_prefix(root)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "object escaped root"))?
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                if !key.starts_with(".blockd-store-") && key.starts_with(prefix) {
+                    keys.push(key);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -224,6 +245,18 @@ impl ObjectStore for DirectoryStore {
         })
         .await;
     }
+
+    async fn list_prefix(self: Arc<Self>, prefix: String) -> Result<Vec<String>, StoreFault> {
+        tokio::task::spawn_blocking(move || {
+            let mut keys = Vec::new();
+            Self::list(&self.root, &self.root, &prefix, &mut keys)
+                .map_err(|_| StoreFault::Unavailable)?;
+            keys.sort();
+            Ok(keys)
+        })
+        .await
+        .map_err(|_| StoreFault::Unavailable)?
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +284,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(range, bytes[2_000_000..2_004_096]);
+    }
+
+    #[tokio::test]
+    async fn listing_returns_a_sorted_complete_prefix_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(DirectoryStore::new(root.path().to_owned()).unwrap());
+        store
+            .clone()
+            .put("v/2/b".to_owned(), vec![2])
+            .await
+            .unwrap();
+        store
+            .clone()
+            .put("v/1/a".to_owned(), vec![1])
+            .await
+            .unwrap();
+        store
+            .clone()
+            .put("other".to_owned(), vec![3])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.clone().list_prefix("v/".to_owned()).await.unwrap(),
+            vec!["v/1/a".to_owned(), "v/2/b".to_owned()]
+        );
     }
 
     #[tokio::test]

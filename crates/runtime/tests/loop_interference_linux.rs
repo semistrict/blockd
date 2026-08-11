@@ -17,10 +17,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::DaemonConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
+use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_runtime::{Runtime, RuntimeConfig, S3Store};
+
+mod support;
 
 const NOISY_FLEETS: [usize; 4] = [0, 4, 16, 48];
 const PAGES_PER_VOLUME: u32 = 2048; // 8 MiB working set per vset
@@ -80,22 +81,26 @@ struct PhaseResult {
 }
 
 fn run_phase(noisy: usize) -> PhaseResult {
-    let config = RuntimeConfig {
-        daemon: DaemonConfig {
-            archive: Default::default(),
-            host: HostId(0),
-            cache_pages: 1 << 20, // no eviction pressure: isolate loop contention
-            writeback_interval: millis(5),
-            backup_retry: millis(20),
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 500,
-            replica_placement: None,
-        },
-        blob_dir: scratch_dir(&format!("k{noisy}")),
-        peer: None,
-    };
-    let rt = Arc::new(Runtime::new(&config, Arc::new(S3Store::new())));
+    let addresses = [
+        support::free_addr(),
+        support::free_addr(),
+        support::free_addr(),
+    ];
+    let roots: [PathBuf; 3] = std::array::from_fn(|host| scratch_dir(&format!("k{noisy}-h{host}")));
+    let mut configs: [RuntimeConfig; 3] = std::array::from_fn(|host| {
+        support::three_host_runtime_config(
+            u16::try_from(host).expect("host fits"),
+            roots[host].clone(),
+            addresses,
+        )
+    });
+    configs[0].daemon.cache_pages = 1 << 20; // isolate loop contention, not eviction pressure
+    let store = Arc::new(S3Store::new());
+    let passives = vec![
+        Runtime::new(&configs[1], store.clone()),
+        Runtime::new(&configs[2], store.clone()),
+    ];
+    let rt = Arc::new(Runtime::new(&configs[0], store));
     for n in 0..noisy {
         rt.create_vset(VsetId(u64::try_from(n).expect("fits") + 1), vset_config());
     }
@@ -156,21 +161,27 @@ fn run_phase(noisy: usize) -> PhaseResult {
             .find(|(row, _, _)| *row == name)
             .map_or(0, |(_, count, _)| *count)
     };
-    let effects = stats.effect_totals();
+    let world_operations = stats.world_totals();
     let total_of = |rows: &[(&'static str, u64, u64)], name: &str| {
         rows.iter()
             .find(|(row, _, _)| *row == name)
             .map_or(0, |(_, _, ns)| *ns)
     };
-    PhaseResult {
+    let result = PhaseResult {
         probe_micros,
         noisy_ops: noisy_ops.load(Ordering::Relaxed),
         occupancy: stats.occupancy(),
-        fills: count_of(&effects, "Fill"),
-        fill_ns: total_of(&effects, "Fill"),
-        blob_writes: count_of(&effects, "BlobWrite"),
+        fills: count_of(&world_operations, "Fill"),
+        fill_ns: total_of(&world_operations, "Fill"),
+        blob_writes: count_of(&world_operations, "BlobWrite"),
         report: stats.report(),
+    };
+    drop(rt);
+    drop(passives);
+    for root in roots {
+        std::fs::remove_dir_all(root).expect("cleanup runtime root");
     }
+    result
 }
 
 #[test]

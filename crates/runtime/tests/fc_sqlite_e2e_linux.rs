@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::daemon::DaemonConfig;
+use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::seam::{DetachMode, StoreFault, Verdict};
+use blockd_core::protocol::{DetachMode, StoreFault, Verdict};
 use blockd_core::types::{HostId, VmId, VsetId, millis};
 use blockd_runtime::database::{DEFAULT_DATABASE_VSOCK_PORT, DatabaseEndpoint};
 use blockd_runtime::fc::FcVm;
@@ -78,8 +78,8 @@ fn artifacts() -> Artifacts {
 
 fn runtime_config(root: &Path) -> RuntimeConfig {
     RuntimeConfig {
-        daemon: DaemonConfig {
-            archive: Default::default(),
+        daemon: HostConfig {
+            archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
             cache_pages: 64,
             writeback_interval: millis(5),

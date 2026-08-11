@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 use blockd_runtime::fc::{FcVm, ShmemServer, upload_mem_parts, upload_mem_parts_async};
 use blockd_runtime::{GetResult, ObjectStore, S3LatencyModel, S3Store};
 

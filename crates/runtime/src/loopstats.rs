@@ -1,50 +1,18 @@
-//! Where the event loop's time goes. The loop thread is the daemon's one
-//! core: every guest fault on this host waits behind whatever it is doing.
-//! These counters attribute its wall time three ways — deciding (inside
-//! `Daemon::step`, keyed by event kind), executing effects (keyed by
-//! effect kind — this is where on-loop byte-work like `Fill` copies and
-//! `BlobWrite` fsyncs show up), and idle (blocked on the event channel).
+//! Where the actor executor's thread and production-world operations spend
+//! wall time. Actor polls are the straight-line protocol work; world calls
+//! are the async I/O boundary. Guest faults wait behind runnable actors, but
+//! never behind the blocking I/O itself.
 //!
 //! Recording happens only on the loop thread; reads may come from
 //! anywhere, so cells are relaxed atomics. Costs two `Instant::now()`
-//! calls per event and two per effect — noise next to a syscall, cheap
-//! enough to leave on always.
+//! calls per actor poll and two per world operation — noise next to a syscall,
+//! cheap enough to leave on always.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use blockd_core::seam::{Effect, Event};
+pub(crate) const POLL_KINDS: [&str; 1] = ["ActorPoll"];
 
-pub(crate) const EVENT_KINDS: [&str; 11] = [
-    "GuestFault",
-    "GuestSync",
-    "GuestPaused",
-    "PeerDelivered",
-    "Admin",
-    "BlobWriteDone",
-    "BlobReadDone",
-    "StorePutDone",
-    "StoreGetDone",
-    "Timer",
-    "Database",
-];
-
-pub(crate) fn event_kind(event: &Event) -> usize {
-    match event {
-        Event::GuestFault { .. } => 0,
-        Event::GuestSync { .. } => 1,
-        Event::GuestPaused { .. } => 2,
-        Event::PeerDelivered { .. } | Event::ReplicaPutPrepared { .. } => 3,
-        Event::Admin(_) => 4,
-        Event::BlobWriteDone { .. } | Event::ReplicaDeleteFailed { .. } => 5,
-        Event::BlobReadDone { .. } => 6,
-        Event::StorePutDone { .. } => 7,
-        Event::StoreGetDone { .. } => 8,
-        Event::Timer(_) => 9,
-        Event::Database(_) => 10,
-    }
-}
-
-pub(crate) const EFFECT_KINDS: [&str; 30] = [
+pub(crate) const WORLD_KINDS: [&str; 25] = [
     "Fill",
     "FillShared",
     "FillFailed",
@@ -53,8 +21,6 @@ pub(crate) const EFFECT_KINDS: [&str; 30] = [
     "Evict",
     "PauseGuest",
     "ResumeGuest",
-    "SyncOk",
-    "SyncFailed",
     "BlobWrite",
     "ReplicaAppend",
     "ReplicaDelete",
@@ -62,7 +28,6 @@ pub(crate) const EFFECT_KINDS: [&str; 30] = [
     "BlobRead",
     "BlobReadRange",
     "BlobDelete",
-    "SetTimer",
     "StorePut",
     "StoreCas",
     "StoreGet",
@@ -73,43 +38,34 @@ pub(crate) const EFFECT_KINDS: [&str; 30] = [
     "PeerSend",
     "Abort",
     "DatabaseInstall",
-    "Database",
-    "VsetUnservable",
 ];
 
-pub(crate) fn effect_kind(effect: &Effect) -> usize {
-    match effect {
-        Effect::Fill { .. } => 0,
-        Effect::FillShared { .. } => 1,
-        Effect::FillFailed { .. } => 2,
-        Effect::Unprotect { .. } => 3,
-        Effect::WriteProtect { .. } => 4,
-        Effect::Evict { .. } => 5,
-        Effect::PauseGuest { .. } => 6,
-        Effect::ResumeGuest { .. } => 7,
-        Effect::SyncOk { .. } => 8,
-        Effect::SyncFailed { .. } => 9,
-        Effect::BlobWrite { .. } => 10,
-        Effect::ReplicaAppend { .. } => 11,
-        Effect::ReplicaDelete { .. } => 12,
-        Effect::ReplicaTruncate { .. } => 13,
-        Effect::BlobRead { .. } => 14,
-        Effect::BlobReadRange { .. } => 15,
-        Effect::BlobDelete { .. } => 16,
-        Effect::SetTimer { .. } => 17,
-        Effect::StorePut { .. } => 18,
-        Effect::StoreCas { .. } => 19,
-        Effect::StoreGet { .. } => 20,
-        Effect::StoreGetRange { .. } => 21,
-        Effect::StoreDelete { .. } => 22,
-        Effect::VsetFenced { .. } => 23,
-        Effect::Admin(_) => 24,
-        Effect::PeerSend { .. } => 25,
-        Effect::Abort { .. } => 26,
-        Effect::DatabaseInstall { .. } => 27,
-        Effect::Database(_) => 28,
-        Effect::VsetUnservable { .. } => 29,
-    }
+pub(crate) mod world_kind {
+    pub const FILL: usize = 0;
+    pub const FILL_SHARED: usize = 1;
+    pub const FILL_FAILED: usize = 2;
+    pub const UNPROTECT: usize = 3;
+    pub const WRITE_PROTECT: usize = 4;
+    pub const EVICT: usize = 5;
+    pub const PAUSE_GUEST: usize = 6;
+    pub const RESUME_GUEST: usize = 7;
+    pub const BLOB_WRITE: usize = 8;
+    pub const REPLICA_APPEND: usize = 9;
+    pub const REPLICA_DELETE: usize = 10;
+    pub const REPLICA_TRUNCATE: usize = 11;
+    pub const BLOB_READ: usize = 12;
+    pub const BLOB_READ_RANGE: usize = 13;
+    pub const BLOB_DELETE: usize = 14;
+    pub const STORE_PUT: usize = 15;
+    pub const STORE_CAS: usize = 16;
+    pub const STORE_GET: usize = 17;
+    pub const STORE_GET_RANGE: usize = 18;
+    pub const STORE_DELETE: usize = 19;
+    pub const VSET_FENCED: usize = 20;
+    pub const ADMIN: usize = 21;
+    pub const PEER_SEND: usize = 22;
+    pub const ABORT: usize = 23;
+    pub const DATABASE_INSTALL: usize = 24;
 }
 
 #[derive(Default)]
@@ -134,29 +90,29 @@ impl Cell {
 
 #[derive(Default)]
 pub struct LoopStats {
-    decide: [Cell; EVENT_KINDS.len()],
-    effect: [Cell; EFFECT_KINDS.len()],
+    poll: [Cell; POLL_KINDS.len()],
+    world: [Cell; WORLD_KINDS.len()],
     idle_ns: AtomicU64,
 }
 
 impl LoopStats {
-    pub(crate) fn record_decide(&self, kind: usize, ns: u64) {
-        self.decide[kind].add(ns);
+    pub(crate) fn record_actor_poll(&self, ns: u64) {
+        self.poll[0].add(ns);
     }
 
-    pub(crate) fn record_effect(&self, kind: usize, ns: u64) {
-        self.effect[kind].add(ns);
+    pub(crate) fn record_world(&self, kind: usize, ns: u64) {
+        self.world[kind].add(ns);
     }
 
     pub(crate) fn record_idle(&self, ns: u64) {
         self.idle_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
-    /// (name, count, total ns) per event kind, decide time only.
-    pub fn decide_totals(&self) -> Vec<(&'static str, u64, u64)> {
-        EVENT_KINDS
+    /// (name, count, total ns) per actor-poll kind.
+    pub fn poll_totals(&self) -> Vec<(&'static str, u64, u64)> {
+        POLL_KINDS
             .iter()
-            .zip(&self.decide)
+            .zip(&self.poll)
             .map(|(name, cell)| {
                 let (count, ns) = cell.read();
                 (*name, count, ns)
@@ -164,11 +120,11 @@ impl LoopStats {
             .collect()
     }
 
-    /// (name, count, total ns) per effect kind, execution time on the loop.
-    pub fn effect_totals(&self) -> Vec<(&'static str, u64, u64)> {
-        EFFECT_KINDS
+    /// (name, count, total ns) per async world-operation kind.
+    pub fn world_totals(&self) -> Vec<(&'static str, u64, u64)> {
+        WORLD_KINDS
             .iter()
-            .zip(&self.effect)
+            .zip(&self.world)
             .map(|(name, cell)| {
                 let (count, ns) = cell.read();
                 (*name, count, ns)
@@ -176,9 +132,9 @@ impl LoopStats {
             .collect()
     }
 
-    /// Loop time spent deciding plus executing effects.
+    /// Loop time spent polling actors plus completing world operations.
     pub fn busy_ns(&self) -> u64 {
-        let cells = self.decide.iter().chain(&self.effect);
+        let cells = self.poll.iter().chain(&self.world);
         cells.map(|cell| cell.ns.load(Ordering::Relaxed)).sum()
     }
 
@@ -222,11 +178,8 @@ impl LoopStats {
                 );
             }
         };
-        section(
-            "decide (Daemon::step, by event kind):",
-            self.decide_totals(),
-        );
-        section("effects (on-loop execution):", self.effect_totals());
+        section("actor polls:", self.poll_totals());
+        section("production world operations:", self.world_totals());
         let _ = writeln!(
             out,
             "  occupancy {:.1}% (busy {:.1}ms, idle {:.1}ms)",

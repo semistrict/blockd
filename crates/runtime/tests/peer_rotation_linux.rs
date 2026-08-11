@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use blockd_core::seam::PeerMsg;
+use blockd_core::protocol::PeerMsg;
 use blockd_core::types::{HostId, VsetId};
 use blockd_runtime::{PeerConfig, PeerNet, PeerTlsConfig};
 
@@ -65,7 +65,10 @@ fn delivered(
     to: HostId,
     receiver: &Receiver<(HostId, PeerMsg)>,
 ) {
-    let msg = PeerMsg::Released { vset: VsetId(7) };
+    let msg = PeerMsg::Released {
+        vset: VsetId(7),
+        release_fence: 3,
+    };
     for _ in 0..30 {
         sender.send(from, to, &msg);
         if receiver.recv_timeout(Duration::from_millis(100)) == Ok((from, msg.clone())) {
@@ -80,6 +83,7 @@ fn settle_rebind() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn rolling_certificate_rotation_requires_overlap_then_removes_old_identity() {
     let addresses = [free_addr(), free_addr()];
     let (mut a, mut a_rx) = start(
@@ -177,11 +181,23 @@ fn rolling_certificate_rotation_requires_overlap_then_removes_old_identity() {
     // can prove the old identity authenticated — drain the stale
     // duplicates and reject on that payload alone.
     while b_rx.try_recv().is_ok() {}
-    old_a.send(HostId(0), HostId(1), &PeerMsg::Released { vset: VsetId(9) });
+    old_a.send(
+        HostId(0),
+        HostId(1),
+        &PeerMsg::Released {
+            vset: VsetId(9),
+            release_fence: 4,
+        },
+    );
     let deadline = std::time::Instant::now() + Duration::from_millis(200);
     while let Some(wait) = deadline.checked_duration_since(std::time::Instant::now()) {
         match b_rx.recv_timeout(wait) {
-            Ok((_, PeerMsg::Released { vset: VsetId(9) })) => {
+            Ok((
+                _,
+                PeerMsg::Released {
+                    vset: VsetId(9), ..
+                },
+            )) => {
                 panic!("old leaf identity must be rejected after overlap removal");
             }
             Ok(_) => {} // a straggling duplicate of an earlier legitimate send

@@ -5,4 +5,5 @@
 
 pub mod blobdev;
 pub mod clock;
+pub mod executor;
 pub mod store;

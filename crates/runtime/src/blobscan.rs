@@ -1,29 +1,17 @@
 //! The recovery scan: read every blob under a root directory, named by
-//! its root-relative path — exactly the bytes `Daemon::recover` sees
+//! its root-relative path — exactly the bytes actor recovery sees
 //! after a real crash. Portable (plain `std::fs`), so the differential
 //! recovery test can prove on any OS that this walk and the simulation's
 //! in-memory scan hand recovery identical worlds.
 
 use std::path::Path;
 
-use blockd_core::daemon::RecoveryBlob;
 use blockd_core::layout::{self, BlobName};
 
 pub(crate) struct ScannedBlob {
     pub(crate) name: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) len: u64,
-}
-
-impl ScannedBlob {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn recovery_blob(&self) -> RecoveryBlob<'_> {
-        RecoveryBlob {
-            name: &self.name,
-            bytes: &self.bytes,
-            len: self.len,
-        }
-    }
 }
 
 pub fn scan_blob_dir(root: &Path) -> Vec<(String, Vec<u8>)> {
@@ -35,7 +23,7 @@ pub fn scan_blob_dir(root: &Path) -> Vec<(String, Vec<u8>)> {
 /// Scan recovery metadata without pulling segment payloads into memory.
 /// Segments are immutable and verified lazily by the fill path; recovery only
 /// needs their names and lengths. Unknown files are ignored just as they are
-/// by `Daemon::recover`.
+/// by the recovery actor.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn scan_blob_dir_for_recovery(root: &Path) -> Vec<ScannedBlob> {
     let mut out = Vec::new();

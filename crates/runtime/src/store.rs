@@ -1,7 +1,5 @@
-//! The asynchronous object-store boundary of the runtime: exactly the five
-//! operations the daemon's `Effect::Store*` arms need. The effect interpreter
-//! remains synchronous, but it only enqueues requests; network completion is
-//! driven by Tokio and returns to the interpreter as an event. Versions are
+//! The asynchronous object-store boundary of the runtime. Network operations
+//! run on Tokio and their completions wake the shared actor executor. Versions are
 //! opaque u64s the store itself derives — a version must survive process
 //! restarts and be comparable across hosts, because the head CAS (R6.3) is the
 //! cluster's single-writer authority.
@@ -9,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use blockd_core::seam::StoreFault;
+use blockd_core::protocol::StoreFault;
 
 /// One get's outcome: `Ok(None)` means the key does not exist — a normal
 /// answer, not a fault.
@@ -39,4 +37,12 @@ pub trait ObjectStore: Send + Sync + 'static {
 
     /// Fire-and-forget delete (R4.5 reclamation); idempotent.
     async fn delete(self: Arc<Self>, key: String);
+
+    /// Enumerate keys below a prefix for actor-driven GC. A backend that
+    /// cannot provide a complete snapshot must fail closed: an empty
+    /// successful result would make a collector mistake live objects for an
+    /// empty namespace.
+    async fn list_prefix(self: Arc<Self>, _prefix: String) -> Result<Vec<String>, StoreFault> {
+        Err(StoreFault::Unavailable)
+    }
 }
