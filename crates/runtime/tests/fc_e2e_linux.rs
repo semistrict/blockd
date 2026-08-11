@@ -441,15 +441,8 @@ fn uffd_restore_serves_guest_memory_on_demand() {
     restored.cmd("off", "BYE");
 }
 
-/// The FULL blockd memory model under real Firecracker, via our FC patch
-/// (`MemBackendType::UffdShmem`): guest memory is a `MAP_PRIVATE` mapping of
-/// the handler-owned shared-memory file. One worked snapshot forks into
-/// three VMs; every clean page exists ONCE physically (each fault filled
-/// once, ever, and the shmem file's residency says exactly how many);
-/// writes diverge per fork via copy-on-write without touching the base;
-/// hole-punching the base is real backing reclaim — dirty fork state
-/// survives, clean pages refault and refill through the handler. No
-/// caveats left: fills, sharing, divergence, and reclaim are all ours.
+/// Verify shared clean pages, copy-on-write divergence, and backing reclaim
+/// with the patched `UffdShmem` Firecracker memory backend.
 #[test]
 fn shmem_forks_share_one_copy_diverge_and_survive_reclaim() {
     use blockd_runtime::fc::ShmemServer;
@@ -642,10 +635,7 @@ fn many_forks_each_do_small_work_and_memory_stays_marginal() {
         filled_pages < 3 * arena_host_pages(),
         "unique fills scaled with the fleet: {filled_pages} pages for {FORKS} forks"
     );
-    // … and the per-fork marginal memory is a small fraction of the
-    // 128 MiB nominal guest — the overcommit is real, measured on real
-    // VMM processes. (Pss splits shared pages, so the fleet total is the
-    // honest physical bill.)
+    // PSS measures the marginal physical memory used by each additional VM.
     let (_, pss_first) = rss_pss_of_pid(forks[0].pid());
     let fleet_pss: usize = forks.iter().map(|f| rss_pss_of_pid(f.pid()).1).sum();
     let marginal = (fleet_pss - pss_first) / (FORKS - 1);

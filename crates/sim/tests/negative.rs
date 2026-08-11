@@ -1,7 +1,4 @@
-//! Negative tests at the daemon/world level: deliberately break one rule
-//! and assert the oracle CATCHES it. A green suite is only meaningful if
-//! these fail red — an oracle that misses planted misbehavior would pass
-//! every honest run vacuously.
+//! Fault injection tests that verify oracle violations are detected.
 
 use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;

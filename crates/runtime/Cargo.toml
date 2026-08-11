@@ -5,9 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-# Not `workspace = true`: this is the nondeterministic side of the seam —
-# real threads, real clocks, real I/O. The determinism bans (no threads, no
-# Instant) exist to protect core/sim; here they ARE the implementation.
+# Runtime lint settings allow the clocks, threads, and I/O forbidden in core.
 [lints.rust]
 unsafe_code = "forbid"
 

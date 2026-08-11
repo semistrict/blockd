@@ -1,7 +1,4 @@
-//! Milestone 4, single-host slice: the backup pipeline (R4.2), the R4.4
-//! zero-objects contract, store outages (R8.3), and restore-from-store after
-//! local durable state is destroyed (R6.1 on one host). Exact assertions —
-//! runs are deterministic.
+//! Single-host simulation of archival, store outages, and remote recovery.
 
 use blockd_core::hostmeta::{ArchivePolicy, HostConfig};
 use blockd_core::journal::VsetConfig;
@@ -161,9 +158,7 @@ fn store_outage_queues_backups_and_drains_after() {
 
 #[test]
 fn journal_rot_is_survived_via_restore_from_backup() {
-    // Milestone 3 could not survive journal bit rot; with the backup tier
-    // the vset comes back from the store (R6.1) at the newest backed-up
-    // point, with catastrophic loss bounded by the archive horizon (R4.3).
+    // Recover from the newest archived point after local journal corruption.
     let mut config = base_config();
     config.vset_count = 1;
     config.horizon = secs(4);

@@ -1,9 +1,7 @@
 # blockd requirements
 
-What the system must do, stated apart from how it does it. [DESIGN.md](DESIGN.md)
-is the how; when a design choice and a requirement conflict, the requirement
-wins or is explicitly renegotiated here. Numbered so reviews and tests can cite
-them; grouped by what would break if they were dropped.
+This document defines the system contract. [DESIGN.md](DESIGN.md) records the
+implementation decisions. Requirements take precedence when the two conflict.
 
 ## R1 — The unit of everything is the volume set
 
@@ -38,7 +36,7 @@ them; grouped by what would break if they were dropped.
 - **R1.4** A vset has **exactly one writer** at any instant: the host that
   holds its assignment (R6.3). No volume is ever writable from two places;
   every other party that touches a vset's data — a peer serving a fetch, a
-  restore reading backup, GC — is a reader of immutable state. All
+  restore reading the archive, GC — is a reader of immutable state. All
   consistency in the system rests on this.
 
 ## R2 — Serving: the host is the page cache
@@ -58,8 +56,8 @@ them; grouped by what would break if they were dropped.
   has one device, mount, DAX window and backend connection regardless of its
   database attachment count.
 - **R2.3** Fault service targets by source: local NVMe in the ~100 µs class;
-  a peer host under ~1 ms; S3 as fallback in the tens of milliseconds. The
-  system must prefer sources in that order.
+  a peer host under ~1 ms; the object store as fallback in the tens of
+  milliseconds. The system must prefer sources in that order.
 - **R2.4** Host memory is overcommitted across vsets. A dirty page becomes
   evictable once background writeback has made it durable on local NVMe —
   writeback runs continuously, guest-invisibly, and independently of
@@ -110,7 +108,7 @@ them; grouped by what would break if they were dropped.
   built-in cadence and never will be a requirement for one — and the
   dependency is forbidden in the other direction too: nothing in the
   system may **rely** on a checkpoint ever arriving. Writeback (R2.4),
-  backup (R4.2), eviction and pressure relief all run in the background
+  archival (R4.2), eviction and pressure relief all run in the background
   whether a vset is checkpointed constantly or never; a never-checkpointed
   vset still recovers by cold boot at sync consistency (R3.8, R8.2). A
   checkpoint is an operation the system supports — a coherent
@@ -129,7 +127,7 @@ them; grouped by what would break if they were dropped.
   outcome.
 - **R3.6** A checkpoint is a **local** operation: it completes — durable and
   restorable on its host — using local resources only. The object store is
-  never on a checkpoint's path; copying state there is backup (R4),
+  never on a checkpoint's path; copying state there is archival (R4),
   asynchronous and separate.
 - **R3.7** In addition to whole-compute-vset checkpoints, the system supports
   **partial checkpoints**, driven by the guest's pmem sync operation: every
@@ -248,7 +246,7 @@ them; grouped by what would break if they were dropped.
   physical copy of every unmodified base page, RAM included**, and each
   fork pays only for what it changed. Total consumption is the base plus
   the sum of divergences — never the base times the fork count. This holds
-  locally (NVMe and host memory) and durably (backup).
+  locally (NVMe and host memory) and in the object-store archive.
 - **R5.4** Naming (which base is "python-3.13") lives outside the system;
   the storage layer deals in ids only.
 
@@ -328,8 +326,8 @@ them; grouped by what would break if they were dropped.
 - **R8.1** The system never serves bytes it cannot vouch for. Every unit
   read from disk, a peer, or the object store is checksum-verified before a
   guest can observe it; a failed check means try another source, and an
-  exhausted plan means one guest fails loudly. Inventing a page (serving
-  zeros for lost data) is the defining forbidden failure.
+  exhausted plan means one guest fails. The system must not substitute zeros
+  or other invented data for a lost page.
 - **R8.2** The daemon's failure mode is dying loudly. On unrecoverable local
   faults (journal device failure, invariant violations) the process aborts;
   guests hang on unserved faults and are killed by the node manager. No
@@ -340,9 +338,9 @@ them; grouped by what would break if they were dropped.
   writeback keeps producing the disk-only kind, so a never-checkpointed
   vset still recovers with at most sync-bounded loss. Each vset gets an
   explicit verdict (restorable / quarantined / unrestorable).
-- **R8.3** An object-store outage stalls backup and the cold path, never
+- **R8.3** An object-store outage stalls archival and the cold path, never
   local durability: writeback and checkpoints complete locally (R3.6) and
-  backup copies queue,
+  archive writes queue,
   with explicit backpressure before any loss of queued work. A guest
   stalls only if it genuinely needs bytes that exist nowhere but the
   store — mid-hydration after a cold restore, or an evicted page with no
@@ -354,7 +352,7 @@ them; grouped by what would break if they were dropped.
   compacted around the live recovery roots. Loss of that passive stalls new
   sync acknowledgments only until automatic replacement completes; it never
   permits an optimistic acknowledgment.
-- **R8.4** Bytes are stored compressed **on local disk and in S3 alike**.
+- **R8.4** Bytes are stored compressed on local disk and in the object store.
   Primary-to-passive transfer preserves the source segment bytes verbatim;
   an archive cycle may decode selected live entries and recompress them into
   fewer bounded packs. The current archive format deliberately keeps the
@@ -377,11 +375,9 @@ them; grouped by what would break if they were dropped.
   and capacity, stalled syncs, retries, integrity rejects, replacement bytes,
   and cleanup unlinks — as Prometheus series with a fixed, bounded label
   vocabulary. Steady-state bytes sent to non-active peers and bytes rewritten
-  by stash cleanup are invariant counters and must remain zero. The pressure
-  signals are load-bearing,
-  not best-effort: with no admission refusal (R2.5) and no kills, they are
-  the *only* trigger for relief, and their absence under pressure is
-  itself a defect.
+  by stash cleanup are invariant counters and must remain zero. Pressure
+  signals are required because they trigger capacity relief; missing signals
+  under pressure are a defect.
 - **R9.3** Cluster garbage collection runs as a separate process against the
   bucket alone, deletes only unreferenced objects past the in-flight grace,
   and can never delete a base, a live vset's state, or anything an explicit
@@ -399,10 +395,6 @@ them; grouped by what would break if they were dropped.
   silently. Two hosts (or two replays) encoding the same state produce
   identical bytes.
 - **R10.3** Rust; dependencies OSI-licensed only, verified at adoption.
-- **R10.4** Design documents are prose: decisions and contracts live in the
-  documents, signatures and shapes live in the implementation, and a doc
-  passage that merely mirrors code is deleted rather than maintained.
-
 ## R11 — Security and tenancy
 
 - **R11.1** All inter-host traffic is mutually authenticated and encrypted

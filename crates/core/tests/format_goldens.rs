@@ -1,10 +1,4 @@
-//! Golden storage formats: frozen encoded bytes, decoded back and compared
-//! against the values that produced them. The in-module byte pins catch an
-//! ENCODER that drifts; these catch a DECODER that stops reading bytes
-//! already durable on some disk. Whenever a format version bumps, these
-//! tests fail — that failure is the ratchet asking a deliberate question:
-//! keep a reader for the old version, migrate, or (pre-production only)
-//! consciously break and re-freeze.
+//! Storage-format compatibility tests against frozen encoded bytes.
 
 use std::collections::BTreeMap;
 

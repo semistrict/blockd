@@ -1,14 +1,5 @@
-//! The cold-path part-fetch engine, pinned against a latency-injected
-//! store: a fault storm must make progress at CONCURRENT fetch speed, not
-//! one store round-trip at a time. Before the `PartTable`, the shmem
-//! server held one global lock across each ~100ms `GetObject` — a storm
-//! over N parts cost N round-trips serially, ~10 pages/second of forward
-//! progress on unlucky access patterns.
-//!
-//! These tests drive the engine directly with channel wakers (no VM, no
-//! uffd — the wake wiring itself is exercised by the FC cold-restore
-//! test); the store's same-region latency model makes wall-clock the
-//! honest measure of concurrency.
+//! Concurrency tests for cold-path part fetching against a latency-injected
+//! store. These drive the fetch engine directly without a VM or userfaultfd.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]

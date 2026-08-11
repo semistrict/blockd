@@ -1,8 +1,5 @@
-//! Live post-copy migration between two REAL runtimes over REAL TCP: the
-//! exact protocol the deterministic simulation proved — offer, two-sided
-//! durable handoff, demand fetches from the source, background hydration,
-//! release, source reclamation — now with the wire in between. Every byte
-//! the destination serves is checked against the workload's model.
+//! Linux end-to-end test for post-copy migration over TCP, including durable
+//! handoff, hydration, release, and source reclamation.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]

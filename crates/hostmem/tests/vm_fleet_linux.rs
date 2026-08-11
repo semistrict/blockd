@@ -1,23 +1,9 @@
-//! A fleet of simulated VMs doing what real blockd guests do — boot from a
-//! shared base, read it, diverge by writing, get evicted, survive backing
-//! reclaim, shut down — with the ACTUAL physical memory measured and
-//! asserted after every phase.
-//!
-//! Physical truth comes from the kernel, two ways:
-//! - `fstat().st_blocks` on each memfd: the page-cache pages the backing
-//!   actually holds. For shmem this IS the physical footprint of the data.
-//! - `/proc/self/smaps` Pss over the fleet's mappings: the same total,
-//!   arrived at independently through the page tables.
-//!
-//! `mincore` separates PTE presence from residency (eviction drops the
-//! former, never the latter).
-//!
-//! The R1.3/R5.3 economics this proves on real hardware: N VMs sharing a
-//! base cost ONE base — plus exactly what each VM writes.
+//! Linux memory-accounting tests for shared bases, copy-on-write divergence,
+//! eviction, and backing reclaim. Physical use is measured through memfd
+//! block counts and `/proc/self/smaps` PSS.
 
 #![cfg(target_os = "linux")]
-// Threads and index-to-tag truncation are deliberate here — this is the
-// nondeterministic side of the seam.
+// Tests use threads and truncate page indexes into pattern tags.
 #![allow(clippy::cast_possible_truncation, clippy::disallowed_methods)]
 
 use std::io;
@@ -334,9 +320,8 @@ fn fleet_pays_for_the_base_once_and_for_divergence_only() {
             .all(|m| *m),
         "eviction freed backing pages — it must only drop PTEs"
     );
-    // Eviction freed NOTHING physical (the pages are the base's, R5.3) —
-    // and lost nothing: the PROOF the PTE dropped is the refault itself,
-    // a MINOR fault served zero-copy.
+    // The refault confirms that eviction dropped the PTE but retained the
+    // shared backing page.
     assert_eq!(
         base.resident_bytes().expect("resident"),
         BASE_PAGES * page_size()

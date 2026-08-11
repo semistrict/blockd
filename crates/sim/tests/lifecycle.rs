@@ -1,7 +1,5 @@
-//! Milestone 3: the real daemon under the single-host harness — guest load,
-//! writeback, syncs, checkpoints, daemon crashes with torn writes, recovery
-//! verdicts, pressure, and bit rot. Replay tests pin determinism; behavioral
-//! tests assert the safety and liveness properties that must remain stable.
+//! Single-host simulation of guest load, persistence, recovery, pressure, and
+//! corruption.
 
 use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
@@ -9,8 +7,6 @@ use blockd_core::types::{micros, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::rng::Ppm;
 
-/// The library preset, by reference: the `sweep` binary drives the same
-/// schedules, so corpus and sweep can never drift apart.
 fn base_config() -> HarnessConfig {
     blockd_sim::presets::single_host_base()
 }

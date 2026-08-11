@@ -1,73 +1,46 @@
-# The blockd demo
+# Demo
 
-Two hosts, one object store, real Firecracker microVMs. The story:
+The demo runs two blockd hosts, an object store, and Firecracker microVMs. It
+covers snapshot publication, demand restore, copy-on-write forks, post-copy
+migration, and recovery after host loss.
 
-1. **Bake**: boot a template guest, work it, snapshot it, publish the
-   snapshot to the store.
-2. **Start**: a microVM restores from the store-held snapshot on demand
-   (segment-granular fetches with readahead — no full download), paired
-   with a blockd **vset** that carries its durable state. Guest work is
-   mirrored into the vset and synced: every burst is a durable
-   consistency point.
-3. **Fork**: snapshot the live VM, start N forks off that one snapshot.
-   They share one physical memory copy on the host (kernel-verified:
-   ΣPss < ΣRss), diverging copy-on-write.
-4. **Migrate**: the vset moves to the other host **live** — post-copy
-   over TCP, ~10ms handoff, demand fetches from the source until
-   hydration drains and the source reclaims to zero. The microVM itself
-   re-restores from its snapshot via the store.
-5. **Host death**: kill a host outright. A backed vset restores on the
-   survivor **from the bucket alone**, byte-verified.
+## Local
 
-Stated limitation: VM RAM divergence is Firecracker-level (snapshots),
-not daemon-persisted — that needs a `MAP_SHARED`+uffd-wp memory backend,
-a later milestone. The vset (the durable state) is what blockd manages.
+Run the demo in a Lima VM with Firecracker installed:
 
-## Local (Lima, no cloud)
-
-Runs the whole story on one machine: a fake GCS (real HTTP, real
-`GcsStore` client), two demod processes, real Firecracker:
-
-```bash
+```sh
 limactl shell default -- bash -c \
   'CARGO_TARGET_DIR=/var/tmp/blockd-target BLOCKD_FC_DIR=/var/tmp/blockd-fc ./demo/smoke-lima.sh'
 ```
 
+This starts a local GCS-compatible server and two daemon processes.
+
 ## GCP
 
-Prereqs: `gcloud` authenticated, a project with the Compute and Storage
-APIs enabled, [OpenTofu](https://opentofu.org) installed.
+Prerequisites:
 
-```bash
-cd infra
-tofu init
-tofu apply -var project=YOUR_PROJECT_ID     # ~2× n2-standard-4 (Spot) + a bucket
-cd ..
-./demo/run.sh                               # waits out first-boot builds (~15 min), then the story
+- an authenticated `gcloud` CLI;
+- a project with the Compute and Storage APIs enabled;
+- [OpenTofu](https://opentofu.org).
+
+```sh
+tofu -chdir=infra init
+tofu -chdir=infra apply -var project=YOUR_PROJECT_ID
+./demo/run.sh
 ```
 
-Teardown (removes the VMs, network, service account, and the bucket
-with everything in it):
+Each VM uses a separate XFS data disk mounted at
+`/var/opt/blockd/blobs`. Provisioning does not format the boot disk. Set
+`-var data_disk_size_gb=N` to change the data-disk size.
 
-```bash
+The APIs are reachable only inside the VPC; the demo script connects through
+an IAP SSH tunnel.
+
+Destroy all demo resources when finished:
+
+```sh
 tofu -chdir=infra destroy -var project=YOUR_PROJECT_ID
 ```
 
-Each host has a 50GB SSD boot disk plus a separate 50GB SSD data disk.
-Provisioning formats only the dedicated data disk as XFS and mounts it at
-`/var/opt/blockd/blobs`; the boot filesystem is never reformatted. Override
-the data size with `-var data_disk_size_gb=N`.
-
-Cost while up: two Spot `n2-standard-4` (~$0.10/h each), four 50GB
-pd-ssd volumes, and cents of GCS. The APIs are VPC-internal only; `run.sh`
-reaches them through an IAP SSH tunnel.
-
-Extra validation on a VM (the store adapter against the real bucket):
-
-```bash
-gcloud compute ssh blockd-demo-0 --zone ZONE --tunnel-through-iap
-sudo su -; cd /opt/blockd
-BLOCKD_GCS_TEST_BUCKET=$(curl -sf -H 'Metadata-Flavor: Google' \
-  http://metadata.google.internal/computeMetadata/v1/instance/attributes/blockd-bucket) \
-  PATH=/opt/cargo/bin:$PATH cargo test -p blockd-runtime --test gcs_store -- --ignored
-```
+This deletes the VMs, disks, network, service account, bucket, and bucket
+contents.

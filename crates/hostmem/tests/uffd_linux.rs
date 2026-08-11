@@ -1,16 +1,8 @@
-//! The real-kernel proof of the guest-memory machinery (R9.1): every
-//! memory-manipulation primitive the deterministic core's seam models,
-//! exercised against live Linux — memfd dual views, minor faults,
-//! `UFFDIO_CONTINUE` fills (demand and prefetch), shared base pages,
-//! write-protect capture ordering, and both eviction flavors.
-//!
-//! Faults are taken by a touching thread and resolved by a handler thread,
-//! exactly the split the production daemon has.
+//! Linux integration tests for memfd mappings, userfaultfd fills,
+//! write-protection, shared pages, and eviction.
 
 #![cfg(target_os = "linux")]
-// Truncating page indexes into pattern tags is deliberate; threads are the
-// whole point here — this is the nondeterministic side of the seam, where
-// the core's single-thread rule does not apply.
+// Tests use threads and truncate page indexes into pattern tags.
 #![allow(clippy::cast_possible_truncation, clippy::disallowed_methods)]
 
 use std::sync::atomic::{AtomicU64, Ordering};

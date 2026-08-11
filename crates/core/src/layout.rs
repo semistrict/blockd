@@ -1,6 +1,4 @@
-//! The exact naming of every durable artifact — local blob names and object
-//! store keys. This *is* the production layout; the simulation and a real
-//! deployment use these byte-for-byte.
+//! Names for local durable blobs and object-store keys.
 //!
 //! Every segment and manifest is namespaced by the writer's **fence** — the
 //! head record's CAS version at claim time (R6.3). A fenced former holder
@@ -26,7 +24,7 @@
 //!   the manifest bytes retained until the head CAS makes them authoritative
 //! - `v/<vset:016x>/s/<fence:016x>-<seg:016x>` — source segment bytes or a
 //!   passive-derived archive pack, both in the same verified format
-//! - `b/<base:016x>/…` — bases (lineage milestone)
+//! - `b/<base:016x>/…` — bases
 
 use crate::types::{HostId, JournalSeq, SegId, VsetId};
 

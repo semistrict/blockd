@@ -1,11 +1,6 @@
-//! Performance profiles of REAL Firecracker workloads: restore latency and
-//! per-fault service profiles for BOTH memory backends (upstream `File`
-//! and the patched `UffdShmem`), and a cold restore served from the
-//! S3-shaped store with realistic same-region latency injected — recording
-//! exactly how many S3 calls of which types the scenario cost.
-//!
-//! Profiles print to stderr (`--no-capture`); assertions pin the shape
-//! (call counts, sanity bounds), not machine-dependent microseconds.
+//! Firecracker performance profiles for restore, page-fault service, memory
+//! backends, and cold object-store reads. Assertions check workload shape,
+//! not machine-dependent latency.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]

@@ -1,18 +1,8 @@
-# blockd
+# blockd design
 
-Storage backend for the Firecracker sandbox fleet. Replaces JuiceFS.
-
-One daemon per host owns compute state — guest RAM and pmem disks — and
-independently attachable SQLite databases as page-granular volume sets. Local
-NVMe is the primary store; S3 is async backup and cold tier. Compute bytes use
-userfaultfd; database bytes use the stock SQLite Unix VFS over one VM-wide
-virtio-fs mount, with an optional DAX shared-memory window. Both converge on
-the same verified local/peer/store page path.
-
-[REQUIREMENTS.md](REQUIREMENTS.md) is the contract; this document records
-the standing design decisions and their reasons. Formats, protocols and
-signatures live in the implementation (`crates/core`) and are byte-pinned
-by tests — passages that merely mirrored them have been deleted, per R10.4.
+[REQUIREMENTS.md](REQUIREMENTS.md) is the contract. This document records
+standing design decisions and their rationale. Formats and protocols live in
+`crates/core` and are pinned by tests.
 
 ## Non-goals
 
@@ -26,13 +16,10 @@ by tests — passages that merely mirrored them have been deleted, per R10.4.
 
 ## Why a daemon (not a library)
 
-Host-wide shared state: base pages cached once per host and shared by every
-sandbox forked from them, one NVMe pool, one backup queue, one peer
-endpoint. The hot path (fault serving, capture, verification) belongs in
-one Rust process; the node manager keeps owning Firecracker lifecycle and
-the control plane keeps deciding placement. Note UFFD gives no crash
-isolation either way — if the fault server dies, its VMs are dead — so the
-daemon buys ops separation, not safety.
+The daemon owns host-wide state: shared base pages, the NVMe pool, archival
+work, and peer connections. The node manager retains Firecracker lifecycle,
+and the control plane decides placement. Userfaultfd provides no process-crash
+isolation; if the fault server dies, its VMs stop.
 
 ## Standing decisions
 
@@ -98,9 +85,9 @@ detached.
 The external backend implements the FUSE operations, POSIX byte-range locks,
 WAL shared memory, and DAX mapping lifecycle expected by the stock Unix VFS.
 `FUSE_FSYNC` is the durable door: it completes only after a mirrored local
-record covers all accepted file and metadata mutations through its barrier.
-Backup stays asynchronous, so a locally acknowledged transaction may still
-fall inside host-loss backup lag.
+record covers all accepted file and metadata mutations through its barrier and
+the recovery closure is durable on the assigned passive or already archived.
+Object-store archival remains asynchronous.
 
 ### VM snapshots coordinate attached databases
 
@@ -125,7 +112,7 @@ queue memory while the source snapshot stays immutable. This mode is for a
 unique restore; restoring the snapshot again still requires the database-vset
 branching rule above before either VM can become writable.
 
-### One fill door
+### Shared-memory fault handling
 
 Guest memory is shared memory the daemon populates; faults resolve by
 populating the backing and letting the mapping find the page — never by
@@ -144,21 +131,20 @@ patched `UffdShmem` memory backend
 handler-owned shared-memory file MAP_PRIVATE, so clean pages are shared
 page-cache pages and divergence is kernel copy-on-write.
 
-### Durability is local; the store is backup; protected sync uses one peer
+### Local capture, peer-protected sync, asynchronous archival
 
-Captures complete on local NVMe only (R3.6); backup copies locally durable
-state to the store continuously as writeback commits it, never gated on
-checkpoints (R4.2). Loss on host death is the measured backup lag (R4.3).
-Restore fetches a bounded number of small objects (head, manifest, resume
-set) before the guest's first instruction; pages follow on demand with a
-recorded resume set prefetched (R6.2). Fault sources prefer local NVMe,
-then a peer, then the store (R2.3).
+Captures complete on local NVMe (R3.6), while guest sync acknowledgement also
+requires a durable passive copy (R4.1). The passive archives committed state
+asynchronously, independent of checkpoints (R4.2). Restore fetches only the
+head, manifest, and resume set before the guest's first instruction; pages
+follow on demand (R6.2). Fault sources prefer local NVMe, then a peer, then the
+store (R2.3).
 
 Peer-stashed durability changes only the acknowledgment point of guest disk
 sync. The primary appends the exact compressed recovery closure to one passive
-peer and waits for that peer's durable commit footer. It does not wait for S3,
-does not copy guest RAM, and does not fan out to the peer's placement
-candidates. The passive peer subsequently uploads those same stored bytes;
+peer and waits for that peer's durable commit footer. It does not wait for the
+object store, copy guest RAM, or fan out to the peer's placement candidates.
+The passive peer subsequently uploads those same stored bytes;
 the primary performs only the small fenced manifest/head publication. Once the
 head covers the peer commit, cleanup unlinks wholly covered sealed spool files
 without compaction or data rewrite.
@@ -171,14 +157,12 @@ the list is placement preference, never replication. A failed active stash
 puts the vset in degraded mode: new sync replies queue, one replacement is
 named by head CAS, only the outstanding closure is seeded there, and a second
 head CAS activates it after a covering durable commit. Recovery inventories
-the head's active and transition peers plus S3 and accepts only a complete,
-verified closure. A stash never gains permission to run the guest.
+the head's active and transition peers plus the object store and accepts only a
+complete, verified closure. A stash never gains permission to run the guest.
 
-Peer traffic is mutually authenticated TLS. The exact verified leaf
-certificate maps to a roster host ID, and a frame whose claimed sender differs
-from that identity closes the connection. Peer-stashed durability is selected
-explicitly per vset; rollout orchestration and production-readiness policy are
-control-plane responsibilities outside this daemon.
+Peer traffic uses mutually authenticated TLS. The verified leaf certificate
+maps to a roster host ID; a frame claiming a different sender closes the
+connection.
 
 The recovery drill inventories only peers named by the fenced head, verifies a
 complete closure in quarantine, claims ownership by head CAS, refences and
@@ -195,15 +179,13 @@ before resuming a compute guest or declaring a database ready and detached.
 Whichever side crashes, at most one host can own the vset (R6.3/R7.2); a source
 recovering with an intact marker serves fetches and never runs or attaches it.
 
-### Failure philosophy
+### Failure behavior
 
-The daemon dies loudly and recovers from durable state alone, giving each
-vset an explicit verdict; a resumed vset continues from its newest whole
-checkpoint, anything else cold-boots at sync consistency (R8.2). Bytes are
-verified before a guest can observe them, and an unservable page kills one
-guest loudly — inventing a page is the defining forbidden failure (R8.1).
-Pressure — memory or NVMe — slows guests and raises observable signals;
-it never kills and never corrupts (R2.5/R2.7).
+The daemon recovers from durable state alone and gives each vset an explicit
+verdict. A vset resumes from its newest whole checkpoint or cold-boots at sync
+consistency (R8.2). Bytes are verified before use; an unservable page fails its
+guest rather than substituting data (R8.1). Memory or NVMe pressure stalls work
+and emits signals without discarding state (R2.5/R2.7).
 
 ### One actor runtime in simulation and production
 
@@ -259,27 +241,3 @@ emits externally visible lifecycle outcomes in vset order. Peer RPC call sites
 await a typed client future whose broker owns wire-ID allocation, authenticated
 reply matching, timeout cleanup, and retry; duplicated and late replies cannot
 complete a different call.
-
-## Verification
-
-Three tiers, in the repo and green:
-
-- **Deterministic simulation** (`crates/sim`): the whole distributed core —
-  multi-host clusters, crashes, torn writes, bit rot, store outages, CAS
-  races, unsynchronized clocks — replayable byte-for-byte from a seed
-  (R10.1), checked against ghost-history oracles with negative tests
-  proving the oracles bite. Correctness workloads compose with independently
-  verified network, attrition, disk, store, and placement fault workloads;
-  targeted crash grids cover each replica commit, publication, release, and
-  replacement boundary before large deterministic seed ensembles run.
-- **Real-kernel machinery** (`crates/hostmem`, `crates/runtime`): the same
-  actor tree driven against real userfaultfd, memfds, O_DIRECT
-  disk I/O and an S3-shaped store in a Linux VM, with physical memory
-  measured and asserted.
-- **Real Firecracker** (`crates/runtime` fc tests, `crates/fc-guest`):
-  boot, snapshot, restore, fork-after-work and demand-paged restore of
-  real microVMs, the guest itself checksumming its memory; the fork fleet
-  proves one-physical-copy sharing through the patched memory backend. The
-  database gate additionally runs the current supported SQLite release inside
-  a guest through virtio-fs, including WAL, durability, hot detach/attach, and
-  snapshot/restore with an open connection.

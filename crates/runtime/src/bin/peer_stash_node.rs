@@ -1,7 +1,4 @@
-//! Small production-interpreter node used by the destructive multi-machine
-//! soak. It intentionally exposes only a fixed validation vset and a tiny
-//! line protocol; storage, peer transport, fencing, and guest memory are the
-//! real runtime implementations.
+//! Runtime node used by the multi-machine peer-stash soak test.
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
