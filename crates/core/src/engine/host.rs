@@ -728,7 +728,7 @@ mod tests {
     use crate::engine::migration::{available_inbound_fence, migrate_in};
     use crate::engine::peer_source;
     use crate::engine::state::{CaptureKind, MutationOwner, PendingSync};
-    use crate::engine::{HostFatal, HostState, cleanup_local, migrate_out};
+    use crate::engine::{HostFatal, HostState, cleanup_local};
     use crate::head::{HeadRecord, StashAssignment};
     use crate::hostmeta::{HostConfig as DaemonConfig, ReplicaPlacementConfig};
     use crate::journal::{JournalRecord, RecordKind, VsetConfig};
@@ -803,7 +803,6 @@ mod tests {
         shared_pages: RefCell<BTreeMap<crate::cache::BaseKey, Vec<u8>>>,
         peer_inbox: RefCell<VecDeque<(HostId, PeerMsg)>>,
         peer_outbox: RefCell<Vec<(HostId, PeerMsg)>>,
-        peer_protocol_versions: RefCell<BTreeMap<HostId, u16>>,
         peer_send_delay: Cell<u64>,
         database_requests: RefCell<VecDeque<DatabaseRequest>>,
         database_replies: Rc<RefCell<Vec<DatabaseReply>>>,
@@ -967,14 +966,6 @@ mod tests {
     }
 
     impl Peers for ModelWorld {
-        fn protocol_version(&self, to: HostId) -> u16 {
-            self.peer_protocol_versions
-                .borrow()
-                .get(&to)
-                .copied()
-                .unwrap_or(crate::peer::CURRENT_PEER_VERSION)
-        }
-
         async fn send(&self, to: HostId, message: PeerMsg) {
             if self.peer_send_delay.get() != 0 {
                 delay(self.peer_send_delay.get()).await;
@@ -2760,6 +2751,7 @@ mod tests {
     fn database_actor_persists_byte_io_sync_truncate_and_delete() {
         let vset = VsetId(70);
         let world = Rc::new(ModelWorld::default());
+        world.peer_send_delay.set(5);
         world.admin.borrow_mut().push_back(AdminCall::CreateVset {
             vset,
             config: VsetConfig::database(8),
@@ -3551,64 +3543,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_duplicate_accept_survives_a_peer_upgrade() {
-        let vset = VsetId(17);
-        let source = HostId(8);
-        let world = Rc::new(ModelWorld::default());
-        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
-            archive: Default::default(),
-            host: HostId(9),
-            cache_pages: 1,
-            writeback_interval: 100,
-            backup_retry: 1,
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 0,
-            replica_placement: None,
-        })));
-        {
-            let mut host = state.borrow_mut();
-            host.insert_fresh(vset, VsetConfig::compute(1, 1));
-            let existing = host.vsets.get_mut(&vset).expect("inserted vset");
-            existing.ready = true;
-            existing.peer_source = Some(source);
-            existing.peer_source_offer_fence = None;
-        }
-        let offered = JournalRecord {
-            config: VsetConfig::compute(1, 1),
-            seq: crate::types::JournalSeq(3),
-            fence: 8,
-            kind: RecordKind::Commit,
-            capture_seq: 2,
-            sync_covered_through: 2,
-            database: Default::default(),
-            overlay: Default::default(),
-            leaves: Default::default(),
-            migrated_from: None,
-        };
-        let mut executor = Executor::simulation(104);
-
-        executor.block_on(migrate_in(
-            state,
-            Rc::clone(&world),
-            source,
-            vset,
-            offered.encode(vset),
-        ));
-
-        assert!(world.peer_outbox.borrow().iter().any(|(to, message)| {
-            *to == source
-                && matches!(
-                    message,
-                    PeerMsg::MigrateAccept {
-                        vset: accepted,
-                        offer_fence: 8,
-                    } if *accepted == vset
-                )
-        }));
-    }
-
-    #[test]
     fn outbound_migration_waits_across_retries_and_cancellation_releases_its_slot() {
         let vset = VsetId(150);
         let destination = HostId(9);
@@ -3938,144 +3872,6 @@ mod tests {
         assert_eq!(executor.block_on(hydration_done), Ok(true));
         drop(actor);
         executor.run_ready();
-    }
-
-    #[test]
-    fn legacy_outbound_handoff_accepts_its_v2_release() {
-        let vset = VsetId(158);
-        let destination = HostId(7);
-        let world = Rc::new(ModelWorld::default());
-        world
-            .peer_protocol_versions
-            .borrow_mut()
-            .insert(destination, 2);
-        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
-            archive: Default::default(),
-            host: HostId(8),
-            cache_pages: 1,
-            writeback_interval: 100_000_000,
-            backup_retry: 2,
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 0,
-            replica_placement: None,
-        })));
-        {
-            let mut host = state.borrow_mut();
-            host.insert_fresh(vset, VsetConfig::compute(1, 1));
-            let vset_state = host.vsets.get_mut(&vset).expect("inserted vset");
-            vset_state.ready = false;
-            vset_state.fence = 9;
-            vset_state.outbound = Some(destination);
-        }
-        world.peer_inbox.borrow_mut().push_back((
-            destination,
-            PeerMsg::Released {
-                vset,
-                release_fence: 0,
-            },
-        ));
-
-        let mut executor = Executor::simulation(86);
-        let actor = executor.spawn(peer_source(Rc::clone(&state), Rc::clone(&world)));
-        executor.run_until(1);
-
-        assert!(!state.borrow().vsets.contains_key(&vset));
-        assert!(world.peer_outbox.borrow().iter().any(|(to, message)| {
-            *to == destination
-                && matches!(
-                    message,
-                    PeerMsg::ReleasedAck {
-                        vset: released,
-                        release_fence: 0,
-                    } if *released == vset
-                )
-        }));
-        drop(actor);
-        executor.run_ready();
-    }
-
-    #[test]
-    fn legacy_inbound_handoff_accepts_its_v2_release_ack() {
-        let vset = VsetId(159);
-        let source = HostId(7);
-        let world = Rc::new(ModelWorld::default());
-        world.peer_protocol_versions.borrow_mut().insert(source, 2);
-        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
-            archive: Default::default(),
-            host: HostId(8),
-            cache_pages: 1,
-            writeback_interval: 100_000_000,
-            backup_retry: 2,
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 0,
-            replica_placement: None,
-        })));
-        let hydration_done = {
-            let mut host = state.borrow_mut();
-            host.insert_fresh(vset, VsetConfig::compute(1, 1));
-            let vset_state = host.vsets.get_mut(&vset).expect("inserted vset");
-            vset_state.ready = true;
-            vset_state.fence = 9;
-            vset_state.peer_source = Some(source);
-            let (wake, wait) = oneshot();
-            vset_state.hydration_waiters.push(wake);
-            wait
-        };
-        world.peer_inbox.borrow_mut().push_back((
-            source,
-            PeerMsg::ReleasedAck {
-                vset,
-                release_fence: 0,
-            },
-        ));
-
-        let mut executor = Executor::simulation(87);
-        let actor = executor.spawn(peer_source(Rc::clone(&state), Rc::clone(&world)));
-        executor.run_until(1);
-
-        assert_eq!(state.borrow().vsets[&vset].peer_source, None);
-        assert_eq!(executor.block_on(hydration_done), Ok(true));
-        drop(actor);
-        executor.run_ready();
-    }
-
-    #[test]
-    fn migration_rejects_a_peer_without_the_fenced_release_protocol() {
-        let vset = VsetId(158);
-        let destination = HostId(9);
-        let world = Rc::new(ModelWorld::default());
-        world
-            .peer_protocol_versions
-            .borrow_mut()
-            .insert(destination, 2);
-        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
-            archive: Default::default(),
-            host: HostId(8),
-            cache_pages: 1,
-            writeback_interval: 100_000_000,
-            backup_retry: 2,
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 0,
-            replica_placement: None,
-        })));
-        {
-            let mut host = state.borrow_mut();
-            host.insert_fresh(vset, VsetConfig::compute(1, 1));
-            host.vsets.get_mut(&vset).expect("inserted vset").ready = true;
-        }
-        let mut executor = Executor::simulation(86);
-        let result = executor.block_on({
-            let state = Rc::clone(&state);
-            let world = Rc::clone(&world);
-            async move { migrate_out(state, world, vset, destination).await }
-        });
-
-        assert_eq!(result, Some(Err(AdminError::Rejected)));
-        assert!(!state.borrow().vsets[&vset].operations.migration_running());
-        assert!(world.paused_vsets.borrow().is_empty());
     }
 
     #[test]

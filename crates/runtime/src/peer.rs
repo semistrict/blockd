@@ -17,9 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use blockd_core::format::{Dec, FRAME_HEADER};
-use blockd_core::peer::{
-    MAGIC_PEER, MAX_PEER_PAYLOAD, PEER_STASH_VERSION, decode_peer, encode_peer_version,
-};
+use blockd_core::peer::{MAGIC_PEER, MAX_PEER_PAYLOAD, decode_peer, encode_peer};
 use blockd_core::protocol::PeerMsg;
 use blockd_core::types::HostId;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -45,10 +43,6 @@ pub struct PeerConfig {
     /// The cluster roster: peer identity → address (R6.5: the control
     /// plane's knowledge, carried here by static config).
     pub peers: BTreeMap<HostId, SocketAddr>,
-    /// Per-destination wire version during a rolling deployment. Omitted
-    /// peers use version 2, the last version compatible with an unannotated
-    /// pre-fencing peer. Version 1 cannot carry passive durability data.
-    pub outbound_protocol_versions: BTreeMap<HostId, u16>,
     /// Required for passive durability. The server config must require
     /// client certificates and the client config must present this host's
     /// certificate. Exact leaf DER binds certificates to roster identities.
@@ -125,7 +119,6 @@ const DECODE_OFFLOAD_THRESHOLD: usize = 1024 * 1024;
 
 pub struct PeerNet {
     senders: BTreeMap<HostId, Sender<Vec<u8>>>,
-    outbound_protocol_versions: BTreeMap<HostId, u16>,
     /// Frames dropped on the floor (queue full or peer down) — the demo's
     /// visibility into how hard the retry timers are working.
     pub dropped_sends: Arc<AtomicU64>,
@@ -136,13 +129,6 @@ pub struct PeerNet {
 }
 
 impl PeerNet {
-    pub fn protocol_version(&self, to: HostId) -> u16 {
-        self.outbound_protocol_versions
-            .get(&to)
-            .copied()
-            .unwrap_or(PEER_STASH_VERSION)
-    }
-
     /// Start the listener and one lazy sender per configured peer;
     /// verified inbound frames reach `deliver` (the runtime injects them
     /// into the actor peer inbox).
@@ -215,7 +201,6 @@ impl PeerNet {
             .unwrap_or_else(|error| panic!("peer listen: {error}"));
         Arc::new(PeerNet {
             senders,
-            outbound_protocol_versions: config.outbound_protocol_versions.clone(),
             dropped_sends,
             connected,
             shutdown: Mutex::new(Some(shutdown)),
@@ -235,11 +220,7 @@ impl PeerNet {
             self.dropped_sends.fetch_add(1, Ordering::SeqCst);
             return;
         };
-        let version = self.protocol_version(to);
-        let Ok(frame) = encode_peer_version(self_id, msg, version) else {
-            self.dropped_sends.fetch_add(1, Ordering::SeqCst);
-            return;
-        };
+        let frame = encode_peer(self_id, msg);
         if let Err(TrySendError::Full(_) | TrySendError::Closed(_)) = sender.try_send(frame) {
             self.dropped_sends.fetch_add(1, Ordering::SeqCst);
         }
@@ -542,22 +523,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_peer_defaults_to_the_last_rolling_compatible_version() {
-        let net = PeerNet::start(
-            &PeerConfig {
-                listen: free_addr(),
-                peers: BTreeMap::new(),
-                outbound_protocol_versions: BTreeMap::new(),
-                tls: None,
-            },
-            HostId(0),
-            |_, _| {},
-        );
-
-        assert_eq!(net.protocol_version(HostId(1)), PEER_STASH_VERSION);
-    }
-
-    #[test]
     fn mutual_tls_derives_identity_and_rejects_a_spoofed_envelope() {
         let addresses = [free_addr(), free_addr()];
         let roster = BTreeMap::from([(HostId(0), addresses[0]), (HostId(1), addresses[1])]);
@@ -566,10 +531,6 @@ mod tests {
             &PeerConfig {
                 listen: addresses[1],
                 peers: roster.clone(),
-                outbound_protocol_versions: BTreeMap::from([(
-                    HostId(0),
-                    blockd_core::peer::CURRENT_PEER_VERSION,
-                )]),
                 tls: Some(tls(1)),
             },
             HostId(1),
@@ -581,10 +542,6 @@ mod tests {
             &PeerConfig {
                 listen: addresses[0],
                 peers: roster,
-                outbound_protocol_versions: BTreeMap::from([(
-                    HostId(1),
-                    blockd_core::peer::CURRENT_PEER_VERSION,
-                )]),
                 tls: Some(tls(0)),
             },
             HostId(0),

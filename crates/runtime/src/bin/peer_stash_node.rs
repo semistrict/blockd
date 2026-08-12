@@ -39,7 +39,6 @@ mod linux {
         control: SocketAddr,
         peer_listen: SocketAddr,
         peers: BTreeMap<HostId, SocketAddr>,
-        protocol_versions: BTreeMap<HostId, u16>,
         server_names: BTreeMap<HostId, String>,
         identities: BTreeMap<HostId, Vec<PathBuf>>,
         certificate: PathBuf,
@@ -64,7 +63,6 @@ mod linux {
         }
         let get = |key: &str| values.get(key).unwrap_or_else(|| panic!("missing {key}"));
         let mut peers = BTreeMap::new();
-        let mut protocol_versions = BTreeMap::new();
         let mut server_names = BTreeMap::new();
         let mut identities = BTreeMap::new();
         for (key, value) in &values {
@@ -72,11 +70,6 @@ mod linux {
                 peers.insert(
                     HostId(id.parse().expect("peer id")),
                     value.parse().expect("peer address"),
-                );
-            } else if let Some(id) = key.strip_prefix("protocol.") {
-                protocol_versions.insert(
-                    HostId(id.parse().expect("protocol host id")),
-                    value.parse().expect("protocol version"),
                 );
             } else if let Some(id) = key.strip_prefix("server_name.") {
                 server_names.insert(
@@ -96,7 +89,6 @@ mod linux {
             control: get("control").parse().expect("control address"),
             peer_listen: get("peer_listen").parse().expect("peer listen"),
             peers,
-            protocol_versions,
             server_names,
             identities,
             certificate: get("certificate").into(),
@@ -173,7 +165,6 @@ mod linux {
             peer: Some(PeerConfig {
                 listen: config.peer_listen,
                 peers: config.peers.clone(),
-                outbound_protocol_versions: config.protocol_versions.clone(),
                 tls: Some(tls(config)),
             }),
         }

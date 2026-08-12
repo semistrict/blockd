@@ -4,8 +4,8 @@
 //! daemon's retry timers re-drive anything a transport drops — so a frame
 //! that fails verification is simply discarded, never repaired.
 //!
-//! Payload layout after the standard frame header: `version u16 | from u16
-//! | discriminant u8 | fields`, fields in [`PeerMsg`] declaration order.
+//! Payload layout after the standard frame header: `from u16 | discriminant
+//! u8 | fields`, fields in [`PeerMsg`] declaration order.
 //! `Vec<u8>` encodes as `len u32 | bytes`; `Option<Vec<u8>>` prefixes a
 //! presence byte. Embedded blobs (records, segment entries, leaves) are
 //! already framed and verified by their consumers — they pass through
@@ -19,10 +19,6 @@ use crate::replica_wire::{
 use crate::types::{HostId, SegId, VsetId};
 
 pub const MAGIC_PEER: u32 = u32::from_le_bytes(*b"BPM1");
-pub const CURRENT_PEER_VERSION: u16 = 4;
-pub const PEER_STASH_VERSION: u16 = 2;
-pub const FENCED_MIGRATION_VERSION: u16 = 3;
-pub const VNODE_AUTHORITY_VERSION: u16 = 4;
 
 /// Frame payload cap for transports: R4.6's 64 MiB object cap bounds every
 /// embedded blob, so anything larger is a desynced or hostile stream.
@@ -53,51 +49,7 @@ fn decode_opt_bytes(d: &mut Dec) -> Result<Option<Vec<u8>>, DecodeError> {
 /// Encode one message as a sealed frame carrying the sender's identity.
 #[allow(clippy::too_many_lines)]
 pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
-    encode_peer_version(from, msg, CURRENT_PEER_VERSION)
-        .expect("current protocol encodes every message")
-}
-
-/// Encode for a peer whose rolling-deployment protocol version is known by
-/// the control plane. Version 1 carries only the original migration messages,
-/// version 2 adds peer-stash messages, and version 3 fences migration
-/// acceptance and release. Older versions retain their exact rolling-upgrade
-/// wire shapes.
-#[allow(clippy::too_many_lines)]
-pub fn encode_peer_version(
-    from: HostId,
-    msg: &PeerMsg,
-    version: u16,
-) -> Result<Vec<u8>, DecodeError> {
-    if !(1..=CURRENT_PEER_VERSION).contains(&version)
-        || (version < VNODE_AUTHORITY_VERSION
-            && matches!(
-                msg,
-                PeerMsg::VnodeAdopt { .. }
-                    | PeerMsg::VnodeAdoptAck { .. }
-                    | PeerMsg::VnodeFetchClosure { .. }
-                    | PeerMsg::VnodeClosure { .. }
-                    | PeerMsg::VnodeCommit { .. }
-                    | PeerMsg::VnodeCommitAck { .. }
-            ))
-        || (version == 1
-            && matches!(
-                msg,
-                PeerMsg::ReplicaPut { .. }
-                    | PeerMsg::ReplicaPutAck { .. }
-                    | PeerMsg::ReplicaCommit { .. }
-                    | PeerMsg::ReplicaCommitAck { .. }
-                    | PeerMsg::ReplicaStatus { .. }
-                    | PeerMsg::ReplicaStatusReply { .. }
-                    | PeerMsg::ReplicaUploadDone { .. }
-                    | PeerMsg::ReplicaArchive { .. }
-                    | PeerMsg::ReplicaRelease { .. }
-                    | PeerMsg::ReplicaReleaseAck { .. }
-            ))
-    {
-        return Err(DecodeError);
-    }
     let mut e = Enc::new();
-    e.u16(version);
     e.u16(from.0);
     match msg {
         PeerMsg::MigrateOffer { vset, record } => {
@@ -109,9 +61,7 @@ pub fn encode_peer_version(
         PeerMsg::MigrateAccept { vset, offer_fence } => {
             e.u8(1);
             e.u64(vset.0);
-            if version >= FENCED_MIGRATION_VERSION {
-                e.u64(*offer_fence);
-            }
+            e.u64(*offer_fence);
         }
         PeerMsg::FetchRange {
             io,
@@ -159,9 +109,7 @@ pub fn encode_peer_version(
         } => {
             e.u8(6);
             e.u64(vset.0);
-            if version >= FENCED_MIGRATION_VERSION {
-                e.u64(*release_fence);
-            }
+            e.u64(*release_fence);
         }
         PeerMsg::ReleasedAck {
             vset,
@@ -169,9 +117,7 @@ pub fn encode_peer_version(
         } => {
             e.u8(7);
             e.u64(vset.0);
-            if version >= FENCED_MIGRATION_VERSION {
-                e.u64(*release_fence);
-            }
+            e.u64(*release_fence);
         }
         PeerMsg::ReplicaPut {
             vset,
@@ -348,13 +294,12 @@ pub fn encode_peer_version(
             encode_protected_closure(&mut e, *closure);
         }
     }
-    Ok(seal_frame(MAGIC_PEER, &e.finish()))
+    seal_frame(MAGIC_PEER, &e.finish())
 }
 
-/// Verify and decode one frame. Any damage, unknown version, unknown
-/// discriminant, or trailing bytes is one answer: corrupt — the transport
-/// drops the frame (and typically the connection) and the retry timers
-/// re-drive.
+/// Verify and decode one frame. Any damage, unknown discriminant, or trailing
+/// bytes is one answer: corrupt — the transport drops the frame (and typically
+/// the connection) and the retry timers re-drive.
 #[allow(clippy::too_many_lines)]
 pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
     if bytes.len() > crate::format::FRAME_HEADER + MAX_PEER_PAYLOAD as usize {
@@ -362,10 +307,6 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
     }
     let payload = open_frame(MAGIC_PEER, bytes)?;
     let mut d = Dec::new(payload);
-    let version = d.u16()?;
-    if !(1..=CURRENT_PEER_VERSION).contains(&version) {
-        return Err(DecodeError);
-    }
     let from = HostId(d.u16()?);
     let msg = match d.u8()? {
         0 => {
@@ -376,10 +317,7 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
         }
         1 => PeerMsg::MigrateAccept {
             vset: VsetId(d.u64()?),
-            offer_fence: (version >= FENCED_MIGRATION_VERSION)
-                .then(|| d.u64())
-                .transpose()?
-                .unwrap_or(0),
+            offer_fence: d.u64()?,
         },
         2 => PeerMsg::FetchRange {
             io: PeerRequestId(d.u64()?),
@@ -406,19 +344,13 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
         },
         6 => PeerMsg::Released {
             vset: VsetId(d.u64()?),
-            release_fence: (version >= FENCED_MIGRATION_VERSION)
-                .then(|| d.u64())
-                .transpose()?
-                .unwrap_or(0),
+            release_fence: d.u64()?,
         },
         7 => PeerMsg::ReleasedAck {
             vset: VsetId(d.u64()?),
-            release_fence: (version >= FENCED_MIGRATION_VERSION)
-                .then(|| d.u64())
-                .transpose()?
-                .unwrap_or(0),
+            release_fence: d.u64()?,
         },
-        8 if version >= PEER_STASH_VERSION => {
+        8 => {
             let vset = VsetId(d.u64()?);
             let assignment_epoch = d.u64()?;
             let artifact = decode_artifact(&mut d)?;
@@ -432,13 +364,13 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
                 bytes: d.bytes(len)?.to_vec(),
             }
         }
-        9 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaPutAck {
+        9 => PeerMsg::ReplicaPutAck {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             artifact: decode_artifact(&mut d)?,
             checksum: d.u32()?,
         },
-        10 if version >= PEER_STASH_VERSION => {
+        10 => {
             let vset = VsetId(d.u64()?);
             let assignment_epoch = d.u64()?;
             let info = decode_commit_info(&mut d)?;
@@ -459,16 +391,16 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
                 record: d.bytes(len)?.to_vec(),
             }
         }
-        11 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaCommitAck {
+        11 => PeerMsg::ReplicaCommitAck {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             info: decode_commit_info(&mut d)?,
         },
-        12 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaStatus {
+        12 => PeerMsg::ReplicaStatus {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
         },
-        13 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaStatusReply {
+        13 => PeerMsg::ReplicaStatusReply {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             committed: match d.u8()? {
@@ -477,7 +409,7 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
                 _ => return Err(DecodeError),
             },
         },
-        14 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaUploadDone {
+        14 => PeerMsg::ReplicaUploadDone {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             info: decode_commit_info(&mut d)?,
@@ -486,26 +418,26 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
                 d.bytes(len)?.to_vec()
             },
         },
-        15 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaRelease {
+        15 => PeerMsg::ReplicaRelease {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
         },
-        16 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaReleaseAck {
+        16 => PeerMsg::ReplicaReleaseAck {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
         },
-        17 if version >= PEER_STASH_VERSION => PeerMsg::ReplicaArchive {
+        17 => PeerMsg::ReplicaArchive {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
         },
-        18 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeAdopt {
+        18 => PeerMsg::VnodeAdopt {
             io: PeerRequestId(d.u64()?),
             proof: decode_authority_proof(&mut d)?,
         },
-        19 if version >= VNODE_AUTHORITY_VERSION => {
+        19 => {
             let io = PeerRequestId(d.u64()?);
             let proof = decode_authority_proof(&mut d)?;
             let count = d.u32()?;
@@ -527,16 +459,16 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
                 closures,
             }
         }
-        20 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeFetchClosure {
+        20 => PeerMsg::VnodeFetchClosure {
             io: PeerRequestId(d.u64()?),
             vnode: crate::authority::VnodeId(d.u32()?),
             closure: decode_protected_closure(&mut d)?,
         },
-        21 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeClosure {
+        21 => PeerMsg::VnodeClosure {
             io: PeerRequestId(d.u64()?),
             bytes: decode_opt_bytes(&mut d)?,
         },
-        22 if version >= VNODE_AUTHORITY_VERSION => {
+        22 => {
             let io = PeerRequestId(d.u64()?);
             let proof = decode_authority_proof(&mut d)?;
             let vset = VsetId(d.u64()?);
@@ -550,7 +482,7 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
                 bytes: d.bytes(len)?.to_vec(),
             }
         }
-        23 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeCommitAck {
+        23 => PeerMsg::VnodeCommitAck {
             io: PeerRequestId(d.u64()?),
             closure: decode_protected_closure(&mut d)?,
         },
@@ -792,101 +724,6 @@ mod tests {
     }
 
     #[test]
-    fn rolling_version_one_carries_old_messages_and_rejects_peer_stash() {
-        let samples = samples();
-        for msg in samples.iter().take(8) {
-            let framed = encode_peer_version(HostId(2), msg, 1).expect("v1 migration message");
-            assert_eq!(
-                &framed[crate::format::FRAME_HEADER..crate::format::FRAME_HEADER + 2],
-                &1u16.to_le_bytes()
-            );
-            assert_eq!(decode_peer(&framed), Ok((HostId(2), msg.clone())));
-        }
-        for msg in samples.iter().skip(10) {
-            assert!(
-                encode_peer_version(HostId(2), msg, 1).is_err(),
-                "peer-stash message must fail closed for a v1 destination: {msg:?}"
-            );
-        }
-        assert!(encode_peer_version(HostId(2), &samples[0], 0).is_err());
-        assert!(encode_peer_version(HostId(2), &samples[0], 5).is_err());
-
-        for message in [
-            PeerMsg::Released {
-                vset: VsetId(7),
-                release_fence: 3,
-            },
-            PeerMsg::ReleasedAck {
-                vset: VsetId(7),
-                release_fence: 3,
-            },
-        ] {
-            let framed = encode_peer_version(HostId(2), &message, 1)
-                .expect("v1 preserves the original release handshake");
-            let expected = match message {
-                PeerMsg::Released { vset, .. } => PeerMsg::Released {
-                    vset,
-                    release_fence: 0,
-                },
-                PeerMsg::ReleasedAck { vset, .. } => PeerMsg::ReleasedAck {
-                    vset,
-                    release_fence: 0,
-                },
-                _ => unreachable!(),
-            };
-            assert_eq!(decode_peer(&framed), Ok((HostId(2), expected)));
-        }
-    }
-
-    #[test]
-    fn rolling_version_two_retains_legacy_migration_frames_and_peer_stash() {
-        for (message, expected) in [
-            (
-                PeerMsg::MigrateAccept {
-                    vset: VsetId(7),
-                    offer_fence: 11,
-                },
-                PeerMsg::MigrateAccept {
-                    vset: VsetId(7),
-                    offer_fence: 0,
-                },
-            ),
-            (
-                PeerMsg::Released {
-                    vset: VsetId(7),
-                    release_fence: 12,
-                },
-                PeerMsg::Released {
-                    vset: VsetId(7),
-                    release_fence: 0,
-                },
-            ),
-            (
-                PeerMsg::ReleasedAck {
-                    vset: VsetId(7),
-                    release_fence: 12,
-                },
-                PeerMsg::ReleasedAck {
-                    vset: VsetId(7),
-                    release_fence: 0,
-                },
-            ),
-        ] {
-            let framed =
-                encode_peer_version(HostId(2), &message, PEER_STASH_VERSION).expect("v2 frame");
-            assert_eq!(decode_peer(&framed), Ok((HostId(2), expected)));
-        }
-
-        let replica = samples()
-            .into_iter()
-            .find(|message| matches!(message, PeerMsg::ReplicaPut { .. }))
-            .expect("replica sample");
-        let framed = encode_peer_version(HostId(2), &replica, PEER_STASH_VERSION)
-            .expect("v2 peer-stash frame");
-        assert_eq!(decode_peer(&framed), Ok((HostId(2), replica)));
-    }
-
-    #[test]
     fn frames_are_byte_pinned() {
         // The concatenation of every sample frame pins the whole layout
         // (R10.2): any encoding change must be seen and decided.
@@ -894,8 +731,8 @@ mod tests {
             .iter()
             .flat_map(|msg| encode_peer(HostId(2), msg))
             .collect();
-        assert_eq!(bytes.len(), 2520);
-        assert_eq!(crc32c(&bytes), 0x0CAF_F59E);
+        assert_eq!(bytes.len(), 2466);
+        assert_eq!(crc32c(&bytes), 0x7EE1_4580);
     }
 
     #[test]
@@ -914,24 +751,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_versions_discriminants_and_trailers_are_rejected() {
-        // Version 4 does not exist.
+    fn unknown_discriminants_and_trailers_are_rejected() {
+        // Discriminant 24 does not exist.
         let mut e = Enc::new();
-        e.u16(4);
         e.u16(2);
-        e.u8(1);
-        e.u64(7);
-        assert!(decode_peer(&seal_frame(MAGIC_PEER, &e.finish())).is_err());
-        // Discriminant 18 does not exist.
-        let mut e = Enc::new();
-        e.u16(CURRENT_PEER_VERSION);
-        e.u16(2);
-        e.u8(18);
+        e.u8(24);
         e.u64(7);
         assert!(decode_peer(&seal_frame(MAGIC_PEER, &e.finish())).is_err());
         // A presence byte outside {0, 1} is corrupt.
         let mut e = Enc::new();
-        e.u16(1);
         e.u16(1);
         e.u8(3); // Page
         e.u64(9);
@@ -940,31 +768,10 @@ mod tests {
         // Trailing bytes after a complete message are corrupt.
         let mut e = Enc::new();
         e.u16(1);
-        e.u16(1);
         e.u8(6); // Released
         e.u64(7);
+        e.u64(3);
         e.u8(0xFF);
         assert!(decode_peer(&seal_frame(MAGIC_PEER, &e.finish())).is_err());
-    }
-
-    #[test]
-    fn version_one_frames_remain_readable_but_cannot_claim_replica_messages() {
-        let msg = PeerMsg::MigrateAccept {
-            vset: VsetId(7),
-            offer_fence: 0,
-        };
-        let legacy = encode_peer_version(HostId(2), &msg, 1).expect("v1 accept encodes");
-        assert_eq!(decode_peer(&legacy), Ok((HostId(2), msg)));
-
-        let replica = PeerMsg::ReplicaStatus {
-            vset: VsetId(7),
-            assignment_epoch: 3,
-        };
-        let encoded = encode_peer(HostId(2), &replica);
-        let mut payload = open_frame(MAGIC_PEER, &encoded)
-            .expect("new peer frame opens")
-            .to_vec();
-        payload[0..2].copy_from_slice(&1u16.to_le_bytes());
-        assert!(decode_peer(&seal_frame(MAGIC_PEER, &payload)).is_err());
     }
 }

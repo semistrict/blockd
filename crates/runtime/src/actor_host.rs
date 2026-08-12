@@ -661,12 +661,6 @@ impl Store for ProductionWorld {
 }
 
 impl Peers for ProductionWorld {
-    fn protocol_version(&self, to: HostId) -> u16 {
-        self.peers
-            .as_ref()
-            .map_or(0, |peers| peers.protocol_version(to))
-    }
-
     async fn send(&self, to: HostId, message: PeerMsg) {
         let started = Instant::now();
         if let Some(peers) = &self.peers {

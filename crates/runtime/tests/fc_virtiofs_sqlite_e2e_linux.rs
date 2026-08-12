@@ -4,46 +4,21 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::protocol::{DetachMode, StoreFault};
-use blockd_core::types::{HostId, VmId, VsetId, millis};
+use blockd_core::protocol::{DetachMode, Verdict};
+use blockd_core::types::{VmId, VsetId};
 use blockd_runtime::fc::FcVm;
 use blockd_runtime::vsetfs::VsetFsEndpoint;
-use blockd_runtime::{GetResult, ObjectStore, Runtime, RuntimeConfig};
+use blockd_runtime::{Runtime, S3Store};
 
 const MEM_MIB: u32 = 128;
 
-struct EmptyStore;
-
-#[async_trait::async_trait]
-impl ObjectStore for EmptyStore {
-    async fn put(self: Arc<Self>, _key: String, _bytes: Vec<u8>) -> Result<u64, StoreFault> {
-        Ok(1)
-    }
-
-    async fn put_cas(
-        self: Arc<Self>,
-        _key: String,
-        _expected: Option<u64>,
-        _bytes: Vec<u8>,
-    ) -> Result<u64, StoreFault> {
-        Ok(1)
-    }
-
-    async fn get(self: Arc<Self>, _key: String) -> GetResult {
-        Ok(None)
-    }
-
-    async fn get_range(self: Arc<Self>, _key: String, _offset: u64, _len: u64) -> GetResult {
-        Ok(None)
-    }
-
-    async fn delete(self: Arc<Self>, _key: String) {}
-}
+mod support;
 
 struct Artifacts {
     firecracker: PathBuf,
@@ -74,21 +49,59 @@ fn artifacts(test_name: &str) -> Artifacts {
     }
 }
 
-fn runtime_config(root: &Path) -> RuntimeConfig {
-    RuntimeConfig {
-        daemon: HostConfig {
-            archive: blockd_core::hostmeta::ArchivePolicy::default(),
-            host: HostId(0),
-            cache_pages: 64,
-            writeback_interval: millis(5),
-            backup_retry: millis(20),
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 25,
-            replica_placement: None,
-        },
-        blob_dir: root.join("blobs"),
-        peer: None,
+struct RuntimeCluster {
+    root: PathBuf,
+    addresses: [SocketAddr; 3],
+    store: Arc<S3Store>,
+    runtimes: Vec<Option<Arc<Runtime>>>,
+}
+
+impl RuntimeCluster {
+    fn new(root: &Path) -> Self {
+        let addresses = [
+            support::free_addr(),
+            support::free_addr(),
+            support::free_addr(),
+        ];
+        let store = Arc::new(S3Store::new());
+        let runtimes = (0..3)
+            .map(|host| {
+                Some(Arc::new(Runtime::new(
+                    &support::three_host_runtime_config(
+                        host,
+                        root.join(format!("host-{host}")),
+                        addresses,
+                    ),
+                    store.clone(),
+                )))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        Self {
+            root: root.to_owned(),
+            addresses,
+            store,
+            runtimes,
+        }
+    }
+
+    fn primary(&self) -> Arc<Runtime> {
+        Arc::clone(self.runtimes[0].as_ref().expect("primary runtime"))
+    }
+
+    fn take_primary(&mut self) -> Arc<Runtime> {
+        self.runtimes[0].take().expect("primary runtime")
+    }
+
+    fn recover(
+        &self,
+        configs: &BTreeMap<VsetId, VsetConfig>,
+    ) -> (Runtime, BTreeMap<VsetId, Verdict>) {
+        Runtime::recover(
+            &support::three_host_runtime_config(0, self.root.join("host-0"), self.addresses),
+            self.store.clone(),
+            configs,
+        )
     }
 }
 
@@ -111,7 +124,8 @@ fn boot_with_vcpus(
     vcpu_count: u8,
 ) -> (FcVm, VsetFsEndpoint, blockd_core::database::AttachmentId) {
     let socket = artifacts.scratch.join(format!("{name}.vhost-user-fs"));
-    let endpoint = VsetFsEndpoint::bind(runtime, vm, &socket, "vsets").expect("vsetfs endpoint");
+    let endpoint =
+        VsetFsEndpoint::bind(Arc::clone(&runtime), vm, &socket, "vsets").expect("vsetfs endpoint");
     let export = endpoint.attach("orders", vset).expect("database export");
     let mut machine = FcVm::spawn(
         &artifacts.firecracker,
@@ -134,11 +148,10 @@ fn boot_with_vcpus(
 #[test]
 fn stock_sqlite_wal_survives_hot_unplug_restart_and_replug() {
     let artifacts = artifacts("hotplug");
-    let config = runtime_config(&artifacts.scratch);
-    let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
+    let mut cluster = RuntimeCluster::new(&artifacts.scratch);
     let vset = VsetId(61);
 
-    let runtime = Arc::new(Runtime::new(&config, Arc::clone(&store)));
+    let runtime = cluster.take_primary();
     runtime.create_vset(vset, VsetConfig::database(512));
     let (mut first, first_fs, first_attachment) =
         boot(&artifacts, Arc::clone(&runtime), VmId(81), "first", vset);
@@ -175,12 +188,13 @@ fn stock_sqlite_wal_survives_hot_unplug_restart_and_replug() {
     drop(runtime);
 
     let configs = BTreeMap::from([(vset, VsetConfig::database(512))]);
-    let (restarted, verdicts) = Runtime::recover(&config, store, &configs);
-    assert!(matches!(
-        verdicts.get(&vset),
-        Some(blockd_core::protocol::Verdict::DatabaseReady { .. })
-    ));
+    let (restarted, verdicts) = cluster.recover(&configs);
+    assert!(verdicts.is_empty());
     let restarted = Arc::new(restarted);
+    assert!(matches!(
+        restarted.wait_recovered(vset),
+        Verdict::DatabaseReady { .. }
+    ));
     let (mut second, second_fs, _second_attachment) =
         boot(&artifacts, restarted, VmId(82), "second", vset);
     let second_status = second.cmd("fs-status", "FSSTATUS ");
@@ -199,9 +213,8 @@ fn stock_sqlite_wal_survives_hot_unplug_restart_and_replug() {
 #[test]
 fn forced_detach_makes_a_retained_dax_mapping_inaccessible() {
     let artifacts = artifacts("forced-revoke");
-    let config = runtime_config(&artifacts.scratch);
-    let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
-    let runtime = Arc::new(Runtime::new(&config, store));
+    let cluster = RuntimeCluster::new(&artifacts.scratch);
+    let runtime = cluster.primary();
     let vset = VsetId(63);
     let vm = VmId(84);
     runtime.create_vset(vset, VsetConfig::database(512));
@@ -258,9 +271,8 @@ fn forced_detach_makes_a_retained_dax_mapping_inaccessible() {
 #[test]
 fn repeated_graceful_hotplug_reuses_the_dax_aperture() {
     let artifacts = artifacts("graceful-reuse");
-    let config = runtime_config(&artifacts.scratch);
-    let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
-    let runtime = Arc::new(Runtime::new(&config, store));
+    let cluster = RuntimeCluster::new(&artifacts.scratch);
+    let runtime = cluster.primary();
     let vm = VmId(85);
     let first_vset = VsetId(70);
     runtime.create_vset(first_vset, VsetConfig::database(512));
@@ -303,9 +315,8 @@ fn repeated_graceful_hotplug_reuses_the_dax_aperture() {
 #[test]
 fn open_sqlite_connection_survives_firecracker_memory_snapshot() {
     let artifacts = artifacts("snapshot");
-    let config = runtime_config(&artifacts.scratch);
-    let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
-    let runtime = Arc::new(Runtime::new(&config, Arc::clone(&store)));
+    let mut cluster = RuntimeCluster::new(&artifacts.scratch);
+    let runtime = cluster.take_primary();
     let vset = VsetId(62);
     let vm = VmId(83);
     runtime.create_vset(vset, VsetConfig::database(512));
@@ -331,12 +342,13 @@ fn open_sqlite_connection_survives_firecracker_memory_snapshot() {
     // the validated filesystem snapshot; retaining the original daemon would
     // conceal stale attachment generations and unopened durable handles.
     let configs = BTreeMap::from([(vset, VsetConfig::database(512))]);
-    let (recovered, verdicts) = Runtime::recover(&config, store, &configs);
-    assert!(matches!(
-        verdicts.get(&vset),
-        Some(blockd_core::protocol::Verdict::DatabaseReady { .. })
-    ));
+    let (recovered, verdicts) = cluster.recover(&configs);
+    assert!(verdicts.is_empty());
     let runtime = Arc::new(recovered);
+    assert!(matches!(
+        runtime.wait_recovered(vset),
+        Verdict::DatabaseReady { .. }
+    ));
 
     let socket = artifacts.scratch.join("snapshot.vhost-user-fs");
     let restored_fs = VsetFsEndpoint::bind(Arc::clone(&runtime), vm, &socket, "vsets")
@@ -361,9 +373,8 @@ fn open_sqlite_connection_survives_firecracker_memory_snapshot() {
 #[ignore = "performance profile; requires staged Firecracker artifacts"]
 fn profile_parallel_virtiofs_request_queues() {
     let artifacts = artifacts("parallel-queues");
-    let config = runtime_config(&artifacts.scratch);
-    let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
-    let runtime = Arc::new(Runtime::new(&config, store));
+    let cluster = RuntimeCluster::new(&artifacts.scratch);
+    let runtime = cluster.primary();
     let exports = [
         ("orders", VsetId(90)),
         ("users", VsetId(91)),

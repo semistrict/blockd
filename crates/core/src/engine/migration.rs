@@ -194,9 +194,6 @@ pub async fn migrate_out<W>(
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
-    if Peers::protocol_version(world.as_ref(), to) < crate::peer::FENCED_MIGRATION_VERSION {
-        return Some(Err(AdminError::Rejected));
-    }
     let incarnation = loop {
         enum Decision {
             Invalid,
@@ -378,15 +375,9 @@ async fn offer_once<W: Peers>(
     offer_fence: u64,
     bytes: Vec<u8>,
 ) -> bool {
-    let expected_fence =
-        if Peers::protocol_version(world, to) < crate::peer::FENCED_MIGRATION_VERSION {
-            0
-        } else {
-            offer_fence
-        };
     let client = state.borrow().peer_client.clone();
     client
-        .offer_migration_once(world, to, vset, expected_fence, bytes, OFFER_RETRY)
+        .offer_migration_once(world, to, vset, offer_fence, bytes, OFFER_RETRY)
         .await
 }
 
@@ -644,20 +635,12 @@ where
                 vset,
                 release_fence,
             } => {
-                // A v1/v2 peer cannot carry the destination fence on the
-                // wire, so a handoff begun before upgrading acknowledges its
-                // release with zero. New v3 handoffs still require the exact
-                // destination fence below.
-                let legacy_release = release_fence == 0
-                    && Peers::protocol_version(world.as_ref(), from)
-                        < crate::peer::FENCED_MIGRATION_VERSION;
                 let waiters = state
                     .borrow_mut()
                     .vsets
                     .get_mut(&vset)
                     .filter(|vset_state| {
-                        vset_state.peer_source == Some(from)
-                            && (vset_state.fence == release_fence || legacy_release)
+                        vset_state.peer_source == Some(from) && vset_state.fence == release_fence
                     })
                     .map(|vset_state| {
                         vset_state.peer_source = None;
@@ -865,16 +848,9 @@ pub(super) async fn migrate_in<W>(
         return;
     };
     let existing = state.borrow().vsets.get(&vset).map(|existing| {
-        // A pre-v7 journal cannot remember the source offer fence. Keep
-        // recognizing that installed handoff as legacy even after the peer
-        // itself upgrades to v3, otherwise a lost acceptance can never be
-        // retried after restart.
-        let legacy = existing.peer_source_offer_fence.is_none()
-            || Peers::protocol_version(world.as_ref(), from)
-                < crate::peer::FENCED_MIGRATION_VERSION;
         existing.peer_source == Some(from)
             && existing.ready
-            && (legacy || existing.peer_source_offer_fence == Some(offered.fence))
+            && existing.peer_source_offer_fence == Some(offered.fence)
     });
     if let Some(ready) = existing {
         if ready {
@@ -1567,12 +1543,8 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
     vset: VsetId,
     release_fence: u64,
 ) {
-    // New outbound migrations require fenced protocol v3, so a configured
-    // v1/v2 peer can only be finishing a handoff that predates fenced releases.
-    let legacy_release = release_fence == 0
-        && Peers::protocol_version(world, from) < crate::peer::FENCED_MIGRATION_VERSION;
     let authorized = state.borrow().vsets.get(&vset).is_none_or(|vset_state| {
-        vset_state.outbound == Some(from) && (release_fence > vset_state.fence || legacy_release)
+        vset_state.outbound == Some(from) && release_fence > vset_state.fence
     });
     let (removed, resident) = if authorized {
         let mut host = state.borrow_mut();

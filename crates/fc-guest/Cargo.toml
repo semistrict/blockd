@@ -23,4 +23,4 @@ blockd-platform = { path = "../platform" }
 libc.workspace = true
 blockd-core = { path = "../core" }
 blockd-sqlite-vfs = { path = "../sqlite-vfs" }
-rusqlite = { workspace = true, features = ["bundled"] }
+rusqlite.workspace = true

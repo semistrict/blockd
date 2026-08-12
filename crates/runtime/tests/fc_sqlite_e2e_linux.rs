@@ -5,47 +5,21 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
-use blockd_core::protocol::{DetachMode, StoreFault, Verdict};
-use blockd_core::types::{HostId, VmId, VsetId, millis};
+use blockd_core::protocol::{DetachMode, Verdict};
+use blockd_core::types::{VmId, VsetId};
 use blockd_runtime::database::{DEFAULT_DATABASE_VSOCK_PORT, DatabaseEndpoint};
 use blockd_runtime::fc::FcVm;
-use blockd_runtime::{GetResult, ObjectStore, Runtime, RuntimeConfig};
+use blockd_runtime::{Runtime, S3Store};
 
 const MEM_MIB: u32 = 128;
 
-struct EmptyStore;
-
-#[async_trait::async_trait]
-impl ObjectStore for EmptyStore {
-    async fn put(self: Arc<Self>, _key: String, _bytes: Vec<u8>) -> Result<u64, StoreFault> {
-        Ok(1)
-    }
-
-    async fn put_cas(
-        self: Arc<Self>,
-        _key: String,
-        _expected: Option<u64>,
-        _bytes: Vec<u8>,
-    ) -> Result<u64, StoreFault> {
-        Ok(1)
-    }
-
-    async fn get(self: Arc<Self>, _key: String) -> GetResult {
-        Ok(None)
-    }
-
-    async fn get_range(self: Arc<Self>, _key: String, _offset: u64, _len: u64) -> GetResult {
-        Ok(None)
-    }
-
-    async fn delete(self: Arc<Self>, _key: String) {}
-}
+mod support;
 
 struct Artifacts {
     firecracker: PathBuf,
@@ -76,22 +50,27 @@ fn artifacts() -> Artifacts {
     }
 }
 
-fn runtime_config(root: &Path) -> RuntimeConfig {
-    RuntimeConfig {
-        daemon: HostConfig {
-            archive: blockd_core::hostmeta::ArchivePolicy::default(),
-            host: HostId(0),
-            cache_pages: 64,
-            writeback_interval: millis(5),
-            backup_retry: millis(20),
-            disk_capacity: None,
-            disk_headroom: 0,
-            wedge_ticks: 25,
-            replica_placement: None,
-        },
-        blob_dir: root.join("blobs"),
-        peer: None,
-    }
+fn runtime_cluster(root: &Path) -> ([SocketAddr; 3], Arc<S3Store>, Vec<Option<Arc<Runtime>>>) {
+    let addresses = [
+        support::free_addr(),
+        support::free_addr(),
+        support::free_addr(),
+    ];
+    let store = Arc::new(S3Store::new());
+    let runtimes = (0..3)
+        .map(|host| {
+            Some(Arc::new(Runtime::new(
+                &support::three_host_runtime_config(
+                    host,
+                    root.join(format!("host-{host}")),
+                    addresses,
+                ),
+                store.clone(),
+            )))
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(100));
+    (addresses, store, runtimes)
 }
 
 fn boot(
@@ -128,12 +107,11 @@ fn finish_detach(runtime: &Runtime, vset: VsetId, attachment: blockd_core::datab
 #[test]
 fn sqlite_inside_firecracker_survives_detach_daemon_restart_and_new_vm() {
     let artifacts = artifacts();
-    let config = runtime_config(&artifacts.scratch);
-    let store: Arc<dyn ObjectStore> = Arc::new(EmptyStore);
+    let (addresses, store, mut runtimes) = runtime_cluster(&artifacts.scratch);
     let vset = VsetId(51);
     let database_config = VsetConfig::database(512);
 
-    let runtime = Arc::new(Runtime::new(&config, store.clone()));
+    let runtime = runtimes[0].take().expect("primary runtime");
     runtime.create_vset(vset, database_config);
     let first_vm = VmId(77);
     let first_attachment = runtime.attach_database(vset, first_vm);
@@ -158,12 +136,17 @@ fn sqlite_inside_firecracker_survives_detach_daemon_restart_and_new_vm() {
     drop(runtime);
 
     let configs = BTreeMap::from([(vset, database_config)]);
-    let (recovered, verdicts) = Runtime::recover(&config, store, &configs);
-    assert!(matches!(
-        verdicts.get(&vset),
-        Some(Verdict::DatabaseReady { .. })
-    ));
+    let (recovered, verdicts) = Runtime::recover(
+        &support::three_host_runtime_config(0, artifacts.scratch.join("host-0"), addresses),
+        store,
+        &configs,
+    );
+    assert!(verdicts.is_empty());
     let recovered = Arc::new(recovered);
+    assert!(matches!(
+        recovered.wait_recovered(vset),
+        Verdict::DatabaseReady { .. }
+    ));
     let second_vm = VmId(78);
     let second_attachment = recovered.attach_database(vset, second_vm);
     let (mut second, second_endpoint) = boot(&artifacts, recovered.clone(), second_vm, "second");
@@ -185,5 +168,6 @@ fn sqlite_inside_firecracker_survives_detach_daemon_restart_and_new_vm() {
     second.kill();
     drop(second_endpoint);
     drop(recovered);
+    drop(runtimes);
     let _ = std::fs::remove_dir_all(artifacts.scratch);
 }

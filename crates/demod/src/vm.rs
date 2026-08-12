@@ -198,7 +198,6 @@ impl Demod {
             peer: Some(PeerConfig {
                 listen: cfg.peer_listen,
                 peers: cfg.peers.clone(),
-                outbound_protocol_versions: BTreeMap::new(),
                 tls: Some(Self::peer_tls(&cfg)),
             }),
         };

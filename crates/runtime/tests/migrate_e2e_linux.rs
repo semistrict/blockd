@@ -208,19 +208,11 @@ fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
     let peer_a = PeerConfig {
         listen: addr_a,
         peers: roster.clone(),
-        outbound_protocol_versions: BTreeMap::from([(
-            HostId(1),
-            blockd_core::peer::CURRENT_PEER_VERSION,
-        )]),
         tls: Some(support::peer_tls(0, 2)),
     };
     let peer_b = PeerConfig {
         listen: addr_b,
         peers: roster,
-        outbound_protocol_versions: BTreeMap::from([(
-            HostId(0),
-            blockd_core::peer::CURRENT_PEER_VERSION,
-        )]),
         tls: Some(support::peer_tls(1, 2)),
     };
     let store = Arc::new(S3Store::new());

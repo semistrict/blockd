@@ -125,10 +125,6 @@ pub trait Store {
 }
 
 pub trait Peers {
-    fn protocol_version(&self, _to: HostId) -> u16 {
-        crate::peer::CURRENT_PEER_VERSION
-    }
-
     /// Fire-and-forget. Delivery is at-least-once, not reliable or ordered.
     async fn send(&self, to: HostId, message: PeerMsg);
     async fn recv(&self) -> Option<(HostId, PeerMsg)>;

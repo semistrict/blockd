@@ -32,16 +32,9 @@ fn net(
     peers: BTreeMap<HostId, SocketAddr>,
 ) -> (Arc<PeerNet>, Receiver<(HostId, PeerMsg)>) {
     let (tx, rx) = channel();
-    let outbound_protocol_versions = peers
-        .keys()
-        .copied()
-        .filter(|peer| *peer != self_id)
-        .map(|peer| (peer, blockd_core::peer::CURRENT_PEER_VERSION))
-        .collect();
     let config = PeerConfig {
         listen,
         peers,
-        outbound_protocol_versions,
         tls: None,
     };
     // The net must know its own roster identity: sender state is seeded

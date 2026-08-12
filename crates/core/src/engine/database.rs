@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use blockd_exec::channel::{Receiver, unbounded};
-use blockd_exec::{Either, OneOf3, TaskSet, select2, select3, yield_now};
+use blockd_exec::{Either, OneOf3, TaskSet, delay, select2, select3, yield_now};
 
 use super::capture::{shard_map, write_record_copies};
 use super::fault::load_page_for_database;
@@ -531,7 +531,7 @@ async fn ensure_database_sync<W>(
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
-    let (covered, acknowledged, database, peer_stashed) = {
+    let (covered, acknowledged, database) = {
         let host = state.borrow();
         let vset_state = host
             .vsets
@@ -541,7 +541,6 @@ where
             vset_state.local_covered_through,
             vset_state.sync_ack_through,
             vset_state.database,
-            true,
         )
     };
     if acknowledged < barrier && covered < barrier {
@@ -558,22 +557,29 @@ where
         .await
         .map_err(|_| DatabaseError::Io)?;
     }
-    if peer_stashed
-        && state
+    loop {
+        let retry = {
+            let host = state.borrow();
+            let vset_state = host
+                .vsets
+                .get(&vset)
+                .ok_or(DatabaseError::StaleAttachment)?;
+            if vset_state.sync_ack_through >= barrier {
+                return Ok(());
+            }
+            host.config.backup_retry.max(1)
+        };
+        replicate_latest(Rc::clone(state), Rc::clone(&world), vset).await;
+        if state
             .borrow()
             .vsets
             .get(&vset)
-            .is_some_and(|vset_state| vset_state.sync_ack_through < barrier)
-    {
-        replicate_latest(Rc::clone(state), world, vset).await;
+            .is_some_and(|vset_state| vset_state.sync_ack_through >= barrier)
+        {
+            return Ok(());
+        }
+        delay(retry).await;
     }
-    state
-        .borrow()
-        .vsets
-        .get(&vset)
-        .is_some_and(|vset_state| vset_state.sync_ack_through >= barrier)
-        .then_some(())
-        .ok_or(DatabaseError::Io)
 }
 
 async fn write<W>(

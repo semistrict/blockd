@@ -84,16 +84,6 @@ pub(crate) fn three_host_runtime_config(
         peer: Some(PeerConfig {
             listen: addresses[usize::from(host)],
             peers: three_host_roster(addresses),
-            outbound_protocol_versions: addresses
-                .into_iter()
-                .enumerate()
-                .map(|(peer, _)| {
-                    (
-                        HostId(u16::try_from(peer).expect("fits")),
-                        blockd_core::peer::CURRENT_PEER_VERSION,
-                    )
-                })
-                .collect(),
             tls: Some(peer_tls(usize::from(host), MAX_TEST_HOSTS)),
         }),
     }
