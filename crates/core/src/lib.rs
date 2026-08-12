@@ -4,6 +4,7 @@
 //! interfaces and run under the blockd executor; no host clock, thread, or
 //! external I/O is reachable from this crate.
 
+pub mod authority;
 pub mod cache;
 pub mod database;
 pub mod dbproto;
@@ -23,5 +24,6 @@ pub mod replica_spool;
 mod replica_wire;
 pub mod segment;
 pub mod types;
+pub mod vnode_member;
 pub mod vsetfs;
 pub mod world;

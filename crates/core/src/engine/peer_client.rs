@@ -13,6 +13,7 @@ use crate::protocol::{PeerMsg, PeerRequestId, ReplicaArtifact, ReplicaCommitInfo
 use crate::segment::PageLoc;
 use crate::types::{HostId, JournalSeq, VsetId};
 use crate::world::Peers;
+use crate::{authority::AuthorityProof, vnode_member::ProtectedClosureRef};
 
 type ReplicaStatusKey = (HostId, VsetId, u64);
 type ReplicaPutKey = (HostId, VsetId, u64, ReplicaArtifact, u32);
@@ -34,6 +35,9 @@ enum PendingKey {
     Status(ReplicaStatusKey),
     Put(ReplicaPutKey),
     Commit(ReplicaCommitKey),
+    Adoption(PeerRequestId),
+    VnodeClosure(PeerRequestId),
+    VnodeCommit(PeerRequestId),
 }
 
 #[derive(Default)]
@@ -48,6 +52,9 @@ struct Broker {
     replica_status: BTreeMap<ReplicaStatusKey, PendingGroup<Option<ReplicaCommitInfo>>>,
     replica_put: BTreeMap<ReplicaPutKey, PendingGroup<()>>,
     replica_commit: BTreeMap<ReplicaCommitKey, PendingGroup<()>>,
+    adoptions: BTreeMap<PeerRequestId, Pending<(AuthorityProof, Vec<ProtectedClosureRef>)>>,
+    vnode_closures: BTreeMap<PeerRequestId, Pending<Option<Vec<u8>>>>,
+    vnode_commits: BTreeMap<PeerRequestId, Pending<ProtectedClosureRef>>,
 }
 
 /// One authenticated peer reply. Dropping the future unregisters it, so a
@@ -290,6 +297,154 @@ impl PeerClient {
         }
     }
 
+    pub async fn adopt_vnode<W: Peers>(
+        &self,
+        world: &W,
+        target: HostId,
+        proof: AuthorityProof,
+        retry: u64,
+    ) -> Result<Vec<ProtectedClosureRef>, PeerRpcError> {
+        let mut attempts = 0_u8;
+        loop {
+            attempts = attempts.saturating_add(1);
+            let (io, receive) = self.register_adoption(target);
+            Peers::send(world, target, PeerMsg::VnodeAdopt { io, proof }).await;
+            if let Ok(Ok((received, closures))) = timeout(retry, receive).await
+                && received == proof
+            {
+                return Ok(closures);
+            }
+            if attempts >= 3 {
+                return Err(PeerRpcError { attempts });
+            }
+        }
+    }
+
+    fn register_adoption(
+        &self,
+        target: HostId,
+    ) -> (
+        PeerRequestId,
+        PeerReply<(AuthorityProof, Vec<ProtectedClosureRef>)>,
+    ) {
+        let request = self.broker.borrow_mut().allocate_request();
+        let (pending, reply) = self.pending(target, PendingKey::Adoption(request));
+        self.broker.borrow_mut().adoptions.insert(request, pending);
+        (request, reply)
+    }
+
+    pub fn resolve_adoption(
+        &self,
+        request: PeerRequestId,
+        from: HostId,
+        proof: AuthorityProof,
+        closures: Vec<ProtectedClosureRef>,
+    ) {
+        resolve(
+            &mut self.broker.borrow_mut().adoptions,
+            &request,
+            from,
+            (proof, closures),
+        );
+    }
+
+    pub async fn fetch_vnode_closure<W: Peers>(
+        &self,
+        world: &W,
+        target: HostId,
+        vnode: crate::authority::VnodeId,
+        closure: ProtectedClosureRef,
+        retry: u64,
+    ) -> Option<Vec<u8>> {
+        for _ in 0..3 {
+            let request = self.broker.borrow_mut().allocate_request();
+            let (pending, receive) = self.pending(target, PendingKey::VnodeClosure(request));
+            self.broker
+                .borrow_mut()
+                .vnode_closures
+                .insert(request, pending);
+            Peers::send(
+                world,
+                target,
+                PeerMsg::VnodeFetchClosure {
+                    io: request,
+                    vnode,
+                    closure,
+                },
+            )
+            .await;
+            if let Ok(Ok(Some(bytes))) = timeout(retry, receive).await {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    pub fn resolve_vnode_closure(
+        &self,
+        request: PeerRequestId,
+        from: HostId,
+        bytes: Option<Vec<u8>>,
+    ) {
+        resolve(
+            &mut self.broker.borrow_mut().vnode_closures,
+            &request,
+            from,
+            bytes,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_vnode_closure<W: Peers>(
+        &self,
+        world: &W,
+        target: HostId,
+        proof: AuthorityProof,
+        vset: VsetId,
+        sequence: u64,
+        bytes: Vec<u8>,
+        retry: u64,
+    ) -> Option<ProtectedClosureRef> {
+        for _ in 0..3 {
+            let request = self.broker.borrow_mut().allocate_request();
+            let (pending, receive) = self.pending(target, PendingKey::VnodeCommit(request));
+            self.broker
+                .borrow_mut()
+                .vnode_commits
+                .insert(request, pending);
+            Peers::send(
+                world,
+                target,
+                PeerMsg::VnodeCommit {
+                    io: request,
+                    proof,
+                    vset,
+                    sequence,
+                    bytes: bytes.clone(),
+                },
+            )
+            .await;
+            if let Ok(Ok(closure)) = timeout(retry, receive).await {
+                return Some(closure);
+            }
+        }
+        None
+    }
+
+    pub fn resolve_vnode_commit(
+        &self,
+        request: PeerRequestId,
+        from: HostId,
+        closure: ProtectedClosureRef,
+    ) {
+        resolve(
+            &mut self.broker.borrow_mut().vnode_commits,
+            &request,
+            from,
+            closure,
+        );
+    }
+
     #[cfg(test)]
     pub(super) fn page(&self, source: HostId) -> (PeerRequestId, PeerReply<Option<Vec<u8>>>) {
         self.register_page(source)
@@ -458,6 +613,15 @@ impl Broker {
             }
             PendingKey::Commit(key) => {
                 remove_group_generation(&mut self.replica_commit, &key, generation);
+            }
+            PendingKey::Adoption(key) => {
+                remove_generation(&mut self.adoptions, &key, generation);
+            }
+            PendingKey::VnodeClosure(key) => {
+                remove_generation(&mut self.vnode_closures, &key, generation);
+            }
+            PendingKey::VnodeCommit(key) => {
+                remove_generation(&mut self.vnode_commits, &key, generation);
             }
         }
     }

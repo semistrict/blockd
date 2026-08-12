@@ -407,6 +407,7 @@ fn main_branch_fixture_recovers_under_the_actor_runtime() {
                 drained: false,
             },
         ],
+        authority: None,
     });
     let state = Rc::new(RefCell::new(HostState::new(config)));
     let mut executor = Executor::production();

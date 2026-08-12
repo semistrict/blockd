@@ -7,6 +7,7 @@ use std::rc::Rc;
 use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::head::{HeadRecord, ManifestPtr};
 use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
+use blockd_core::journal::JournalRecord;
 use blockd_core::layout;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{AdminCall, AdminEvent, AdminResult, AdminSuccess, ReqId, Verdict};
@@ -106,6 +107,7 @@ pub(crate) fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
                     drained: false,
                 })
                 .collect(),
+            authority: None,
         });
     }
     let (network, worlds) = SimWorld::cluster(config.hosts, config.bdev, config.store);
@@ -227,6 +229,20 @@ pub(crate) fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
     });
     executor.run_until(simulation_end);
 
+    let audit = executor.block_on(audit_cluster(
+        Rc::clone(&config),
+        Rc::clone(&worlds),
+        Rc::clone(&states),
+        Rc::clone(&control),
+    ));
+    {
+        let mut control = control.borrow_mut();
+        control.report.audit_runs = 1;
+        control.report.audited_vsets = audit.vsets;
+        control.report.audited_pages = audit.pages;
+        control.report.violations.extend(audit.violations);
+    }
+
     for guest in guest_slots.borrow_mut().values_mut() {
         if let Some(mut guest) = guest.take() {
             guest.cancel();
@@ -292,6 +308,186 @@ pub(crate) fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
     std::mem::take(&mut control.report)
 }
 
+#[derive(Default)]
+struct AuditReport {
+    vsets: u64,
+    pages: u64,
+    violations: Vec<String>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn audit_cluster(
+    config: Rc<ClusterConfig>,
+    worlds: Rc<Vec<Rc<SimWorld>>>,
+    states: StateSlots,
+    control: Rc<RefCell<Control>>,
+) -> AuditReport {
+    let mut audit = AuditReport::default();
+    let store = worlds[0].store_snapshot();
+    for number in 1..=config.vset_count {
+        let vset = VsetId(u64::from(number));
+        let Some(placed) = control.borrow().placement.get(&vset).copied() else {
+            audit
+                .violations
+                .push(format!("final audit found no placement for {vset:?}"));
+            continue;
+        };
+        if !control.borrow().live[usize::from(placed)] || !control.borrow().up[usize::from(placed)]
+        {
+            audit.violations.push(format!(
+                "final audit placement for {vset:?} points at unavailable host {placed}"
+            ));
+            continue;
+        }
+
+        let mut authorities = Vec::new();
+        for host in 0..config.hosts {
+            let live_and_up = {
+                let control = control.borrow();
+                control.live[usize::from(host)] && control.up[usize::from(host)]
+            };
+            if !live_and_up {
+                continue;
+            }
+            let state = states[usize::from(host)].borrow();
+            let state = state.borrow();
+            if state
+                .vsets
+                .get(&vset)
+                .is_some_and(|vset_state| vset_state.ready && vset_state.outbound.is_none())
+            {
+                authorities.push(host);
+            }
+        }
+        if authorities.len() > 1 {
+            audit.violations.push(format!(
+                "final audit found multiple authorities for {vset:?}: {authorities:?}"
+            ));
+            continue;
+        }
+        let lifecycle_in_progress = {
+            let control = control.borrow();
+            control.migrations.contains_key(&vset)
+                || control.quiescing_guests.contains(&vset)
+                || control.migration_cuts.contains(&vset)
+                || control.deferred_source_recoveries.contains_key(&vset)
+                || control.deferred_destination_recoveries.contains_key(&vset)
+        };
+        let Some(&authority) = authorities.first() else {
+            if !lifecycle_in_progress {
+                audit.violations.push(format!(
+                    "final audit expected authority {placed} for {vset:?}, found none"
+                ));
+            }
+            continue;
+        };
+        if authority != placed && !lifecycle_in_progress {
+            audit.violations.push(format!(
+                "final audit expected authority {placed} for {vset:?}, found {authority}"
+            ));
+            continue;
+        }
+
+        {
+            let state = states[usize::from(authority)].borrow();
+            let state = state.borrow();
+            let Some(vset_state) = state.vsets.get(&vset) else {
+                audit.violations.push(format!(
+                    "final audit authority {placed} has no state for {vset:?}"
+                ));
+                continue;
+            };
+            if vset_state.local_covered_through < vset_state.sync_ack_through {
+                audit.violations.push(format!(
+                    "final audit found local coverage {} behind acknowledged sync {} for {vset:?}",
+                    vset_state.local_covered_through, vset_state.sync_ack_through
+                ));
+            }
+            let archived_through = vset_state
+                .backed
+                .and_then(|pointer| {
+                    store.get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
+                })
+                .and_then(|bytes| JournalRecord::decode(vset, bytes).ok())
+                .map_or(0, |record| record.sync_covered_through);
+            let protected_through = vset_state.peer_committed_through.max(archived_through);
+            if protected_through < vset_state.sync_ack_through {
+                audit.violations.push(format!(
+                    "final audit found protected coverage {protected_through} behind acknowledged sync {} for {vset:?}",
+                    vset_state.sync_ack_through
+                ));
+            }
+        }
+
+        if let Some(head_bytes) = store.get(&layout::head_key(vset)) {
+            match HeadRecord::decode(vset, head_bytes) {
+                Ok(head) => {
+                    if head.holder != HostId(placed) {
+                        audit.violations.push(format!(
+                            "final audit head for {vset:?} names {:?}, placement names {:?}",
+                            head.holder,
+                            HostId(placed)
+                        ));
+                    }
+                    if let Some(pointer) = head.manifest {
+                        let key = layout::manifest_key(vset, pointer.fence, pointer.seq);
+                        match store
+                            .get(&key)
+                            .and_then(|bytes| JournalRecord::decode(vset, bytes).ok())
+                        {
+                            Some(record)
+                                if (record.fence, record.seq, record.capture_seq)
+                                    == (pointer.fence, pointer.seq, pointer.capture_seq) => {}
+                            _ => audit.violations.push(format!(
+                                "final audit could not verify head manifest {key} for {vset:?}"
+                            )),
+                        }
+                    }
+                }
+                Err(_) => audit
+                    .violations
+                    .push(format!("final audit could not decode head for {vset:?}")),
+            }
+        }
+
+        let guest = Rc::clone(&control.borrow().guest_state[&vset]);
+        let world = &worlds[usize::from(authority)];
+        let violations_before = audit.violations.len();
+        for volume in config.vset_config.volumes(vset) {
+            for page_number in 0..config.vset_config.pages_per_volume {
+                let page = PageId {
+                    volume,
+                    page: PageNo(page_number),
+                };
+                let faulted = match select2(world.fault(page, false), delay(millis(250))).await {
+                    Either::First(faulted) => faulted,
+                    Either::Second(()) => false,
+                };
+                world.set_vmstate(vset, guest.completed.get());
+                if !faulted {
+                    audit.violations.push(format!(
+                        "final audit could not fault {page:?} on authority {authority}"
+                    ));
+                    continue;
+                }
+                audit.pages = audit.pages.saturating_add(1);
+                let actual = world
+                    .page_bytes(page)
+                    .unwrap_or_else(|| vec![0; page_size()]);
+                if let Err(reason) = validate_page_bytes(&guest, page, &actual) {
+                    audit.violations.push(format!(
+                        "final audit rejected {page:?} on authority {authority}: {reason}"
+                    ));
+                }
+            }
+        }
+        if audit.violations.len() == violations_before {
+            audit.vsets = audit.vsets.saturating_add(1);
+        }
+    }
+    audit
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn abort_monitor(
     host: u16,
@@ -329,6 +525,7 @@ fn host_config(config: &ClusterConfig, host: u16) -> HostConfig {
                 membership_epoch: placement.membership_epoch,
                 local_failure_domain,
                 roster: placement.roster.clone(),
+                authority: placement.authority,
             }
         }),
     }
@@ -1040,48 +1237,57 @@ async fn guest_actor(
             let actual = world
                 .page_bytes(page)
                 .unwrap_or_else(|| vec![0; page_size()]);
-            let expected = state
-                .expected
-                .borrow()
-                .get(&page)
-                .cloned()
-                .unwrap_or_else(|| vec![0; page_size()]);
-            let expected_claimed = crate::guest::claimed_vol_seq(&expected);
-            let recovering = state.recovering.borrow_mut().remove(&page);
-            let claimed = crate::guest::claimed_vol_seq(&actual);
-            let durable_floor = state
-                .durable
-                .borrow()
-                .get(&page)
-                .map_or(0, |bytes| crate::guest::claimed_vol_seq(bytes));
-            let possible = (claimed == 0 && !state.durable.borrow().contains_key(&page))
-                || state
-                    .written
-                    .borrow()
-                    .get(&page)
-                    .is_some_and(|sequences| sequences.contains(&claimed));
-            let valid_recovery = recovering
-                && possible
-                && claimed >= durable_floor
-                && actual == page_pattern(page, claimed);
-            if actual != expected && !valid_recovery {
+            if let Err(reason) = validate_page_bytes(&state, page, &actual) {
                 state
                     .violations
                     .borrow_mut()
                     .push(format!(
-                        "read returned stale or foreign bytes on {:?} for {page:?}: actual sequence {claimed}, expected {expected_claimed}, durable floor {durable_floor}, recovering {recovering}, possible {possible}, vmstate {} at {}",
+                        "read returned stale or foreign bytes on {:?} for {page:?}: {reason}, vmstate {} at {}",
                         world.host_id(),
                         state.completed.get(),
                         now(),
                     ));
                 return;
             }
-            if valid_recovery {
-                state.expected.borrow_mut().insert(page, actual);
-            }
         }
         finish_operation(&world, &state, &control, vset);
     }
+}
+
+fn validate_page_bytes(state: &GuestState, page: PageId, actual: &[u8]) -> Result<(), String> {
+    let expected = state
+        .expected
+        .borrow()
+        .get(&page)
+        .cloned()
+        .unwrap_or_else(|| vec![0; page_size()]);
+    let expected_claimed = crate::guest::claimed_vol_seq(&expected);
+    let recovering = state.recovering.borrow_mut().remove(&page);
+    let claimed = crate::guest::claimed_vol_seq(actual);
+    let (durable_floor, has_durable) = state
+        .durable
+        .borrow()
+        .get(&page)
+        .map_or((0, false), |bytes| {
+            (crate::guest::claimed_vol_seq(bytes), true)
+        });
+    let possible = (claimed == 0 && !has_durable)
+        || state
+            .written
+            .borrow()
+            .get(&page)
+            .is_some_and(|sequences| sequences.contains(&claimed));
+    let valid_recovery =
+        recovering && possible && claimed >= durable_floor && actual == page_pattern(page, claimed);
+    if actual != expected && !valid_recovery {
+        return Err(format!(
+            "actual sequence {claimed}, expected {expected_claimed}, durable floor {durable_floor}, recovering {recovering}, possible {possible}"
+        ));
+    }
+    if valid_recovery {
+        state.expected.borrow_mut().insert(page, actual.to_vec());
+    }
+    Ok(())
 }
 
 fn finish_operation(

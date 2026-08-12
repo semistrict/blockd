@@ -5,6 +5,7 @@ use std::rc::Rc;
 use blockd_exec::ReplyTarget;
 use blockd_exec::channel::{OneSender, UnboundedSender};
 
+use crate::authority::{AuthorityProof, PlacementRecord, VnodeId};
 use crate::cache::Cache;
 use crate::database::{AttachmentId, DatabaseFile};
 use crate::head::ManifestPtr;
@@ -37,6 +38,12 @@ pub struct HostState {
     pub replicas: BTreeMap<ReplicaKey, ReplicaState>,
     pub replica_latest_epoch: BTreeMap<(HostId, VsetId), u64>,
     pub replica_releases: Vec<(HostId, VsetId, u64, crate::protocol::ReplicaCommitInfo)>,
+    pub(crate) authority_session: Option<u64>,
+    pub(crate) authority_host_epoch: u64,
+    pub(crate) authority_serving: bool,
+    pub(crate) authority_last_poll: u64,
+    pub(crate) authority_placement: Option<PlacementRecord>,
+    pub(crate) active_vnodes: BTreeMap<VnodeId, AuthorityProof>,
     scheduled_vsets: BTreeSet<VsetId>,
     scheduled_cursor: Option<VsetId>,
     disk_reclaim_scan_cursor: Option<VsetId>,
@@ -56,6 +63,11 @@ impl HostState {
             config.archive.spool_headroom_bytes < config.archive.spool_capacity_bytes,
             "archive spool headroom must be smaller than capacity"
         );
+        let authority_serving = config
+            .replica_placement
+            .as_ref()
+            .and_then(|placement| placement.authority)
+            .is_none();
         Self {
             cache: Cache::new(config.cache_pages),
             config,
@@ -71,6 +83,12 @@ impl HostState {
             replicas: BTreeMap::new(),
             replica_latest_epoch: BTreeMap::new(),
             replica_releases: Vec::new(),
+            authority_session: None,
+            authority_host_epoch: 0,
+            authority_serving,
+            authority_last_poll: 0,
+            authority_placement: None,
+            active_vnodes: BTreeMap::new(),
             scheduled_vsets: BTreeSet::new(),
             scheduled_cursor: None,
             disk_reclaim_scan_cursor: None,
@@ -79,6 +97,31 @@ impl HostState {
             next_attachment_generation: 0,
             next_incarnation: 0,
         }
+    }
+
+    pub fn authority_serving(&self) -> bool {
+        self.authority_serving
+    }
+
+    pub fn authority_session(&self) -> Option<u64> {
+        self.authority_session
+    }
+
+    pub fn vset_authorized(&self, vset: VsetId) -> bool {
+        let authority_enabled = self
+            .config
+            .replica_placement
+            .as_ref()
+            .and_then(|placement| placement.authority)
+            .is_some();
+        if !authority_enabled {
+            return self.authority_serving;
+        }
+        self.authority_serving
+            && self
+                .authority_placement
+                .as_ref()
+                .is_some_and(|placement| self.active_vnodes.contains_key(&placement.vnode(vset)))
     }
 
     pub(crate) fn install_fatal_signal(&mut self, signal: OneSender<HostFatal>) {

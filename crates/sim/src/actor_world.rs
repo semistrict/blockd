@@ -1583,6 +1583,12 @@ fn peer_tag(message: &PeerMsg) -> u8 {
         PeerMsg::ReplicaArchive { .. } => 15,
         PeerMsg::ReplicaRelease { .. } => 16,
         PeerMsg::ReplicaReleaseAck { .. } => 17,
+        PeerMsg::VnodeAdopt { .. } => 18,
+        PeerMsg::VnodeAdoptAck { .. } => 19,
+        PeerMsg::VnodeFetchClosure { .. } => 20,
+        PeerMsg::VnodeClosure { .. } => 21,
+        PeerMsg::VnodeCommit { .. } => 22,
+        PeerMsg::VnodeCommitAck { .. } => 23,
     }
 }
 
@@ -1880,15 +1886,598 @@ impl AdminIo for SimWorld {
 #[cfg(test)]
 #[allow(clippy::default_trait_access)]
 mod tests {
+    use blockd_core::authority::{
+        HostSessionRecord, PlacementRecord, VnodeAuthority, VnodeId, VnodePlacement,
+    };
+    use blockd_core::engine::{
+        AuthorityError, PollSession, activate_host_session, adopt_vnode_generation, cas_placement,
+        cas_vnode_authority, challenge_host_session, claim_vnode_authority,
+        commit_active_vnode_quorum, commit_vnode_closure, create_host_session, failover_vnode,
+        poll_or_defend_host_session, read_host_session, read_vnode_closure, revoke_host_session,
+        verify_authority_proof,
+    };
     use blockd_core::engine::{HostState, host_actor_with_state};
-    use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
+    use blockd_core::hostmeta::{AuthorityHostConfig, HostConfig, ReplicaPlacementConfig};
     use blockd_core::journal::VsetConfig;
     use blockd_core::placement::PeerCandidate;
     use blockd_core::protocol::{AdminCall, AdminSuccess, ReqId};
     use blockd_core::types::VsetId;
+    use blockd_core::vnode_member::adoption_quorum;
     use blockd_exec::Executor;
 
     use super::*;
+
+    fn authority_placement() -> PlacementRecord {
+        PlacementRecord::new(
+            41,
+            7,
+            vec![VnodePlacement {
+                vnode: VnodeId(0),
+                members: [HostId(1), HostId(2), HostId(3)],
+                next_members: None,
+            }],
+        )
+        .expect("valid test placement")
+    }
+
+    #[test]
+    fn healthy_session_polling_uses_reads_without_lease_writes() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let mut executor = Executor::simulation(8);
+
+        let actor_world = Rc::clone(&world);
+        executor
+            .block_on(async move {
+                create_host_session(actor_world.as_ref(), HostId(1), 101).await?;
+                for _ in 0..4 {
+                    let polled =
+                        poll_or_defend_host_session(actor_world.as_ref(), HostId(1), 101).await?;
+                    assert!(matches!(polled, PollSession::Active(_)));
+                }
+                Ok::<_, AuthorityError>(())
+            })
+            .expect("healthy holder remains active");
+
+        let metrics = world.store_metrics();
+        assert_eq!(metrics.gets, 4);
+        assert_eq!(metrics.cas_attempts, 1);
+        assert_eq!(metrics.cas_successes, 1);
+    }
+
+    #[test]
+    fn exact_challenge_cas_fences_the_losing_side() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let mut executor = Executor::simulation(9);
+
+        let actor_world = Rc::clone(&world);
+        executor.block_on(async move {
+            create_host_session(actor_world.as_ref(), HostId(1), 101)
+                .await
+                .expect("create session");
+            let challenged =
+                challenge_host_session(actor_world.as_ref(), HostId(1), HostId(2), 9001, 50)
+                    .await
+                    .expect("install challenge");
+
+            let joined =
+                challenge_host_session(actor_world.as_ref(), HostId(1), HostId(3), 9002, 51)
+                    .await
+                    .expect("concurrent suspect joins existing challenge");
+            assert_eq!(joined, challenged);
+
+            assert!(matches!(
+                poll_or_defend_host_session(actor_world.as_ref(), HostId(1), 101).await,
+                Ok(PollSession::Defended(_))
+            ));
+            assert_eq!(
+                revoke_host_session(actor_world.as_ref(), challenged, 9001).await,
+                Err(AuthorityError::Conflict)
+            );
+        });
+
+        let metrics = world.store_metrics();
+        assert_eq!(metrics.cas_successes, 3);
+        assert_eq!(metrics.cas_conflicts, 1);
+    }
+
+    #[test]
+    fn revocation_must_land_before_replacement_session_activates() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let mut executor = Executor::simulation(10);
+
+        executor.block_on(async move {
+            create_host_session(world.as_ref(), HostId(1), 101)
+                .await
+                .expect("create session");
+            let challenged = challenge_host_session(world.as_ref(), HostId(1), HostId(2), 9001, 50)
+                .await
+                .expect("install challenge");
+            let revoked = revoke_host_session(world.as_ref(), challenged, 9001)
+                .await
+                .expect("revoke old session");
+            let replacement = activate_host_session(world.as_ref(), revoked, 202)
+                .await
+                .expect("activate replacement");
+            assert_eq!(
+                replacement.record,
+                HostSessionRecord::Active {
+                    host: HostId(1),
+                    session: 202,
+                    epoch: 2,
+                }
+            );
+            assert_eq!(
+                poll_or_defend_host_session(world.as_ref(), HostId(1), 101).await,
+                Err(AuthorityError::Fenced)
+            );
+        });
+    }
+
+    #[test]
+    fn replicas_reread_vnode_authority_and_reject_stale_proofs() {
+        let network = Rc::new(SimNetwork::default());
+        let world = SimWorld::new(
+            HostId(1),
+            BlobDevConfig::nvme(),
+            StoreConfig::s3(),
+            &network,
+        );
+        let placement = authority_placement();
+        let mut executor = Executor::simulation(11);
+
+        executor.block_on(async move {
+            create_host_session(world.as_ref(), HostId(1), 101)
+                .await
+                .expect("create initial primary session");
+            let initial = VnodeAuthority {
+                cluster_id: placement.cluster_id,
+                placement_epoch: placement.epoch,
+                vnode: VnodeId(0),
+                generation: 1,
+                primary: HostId(1),
+                primary_session: 101,
+                primary_host_epoch: 1,
+            };
+            let old_proof = cas_vnode_authority(world.as_ref(), &placement, None, initial)
+                .await
+                .expect("create vnode authority");
+            verify_authority_proof(world.as_ref(), &placement, old_proof)
+                .await
+                .expect("current proof verifies");
+
+            create_host_session(world.as_ref(), HostId(2), 202)
+                .await
+                .expect("create replacement primary session");
+            let next = initial
+                .advance(HostId(2), 202, 1)
+                .expect("advance authority");
+            let current = cas_vnode_authority(world.as_ref(), &placement, Some(old_proof), next)
+                .await
+                .expect("advance vnode authority");
+
+            assert_eq!(
+                verify_authority_proof(world.as_ref(), &placement, old_proof).await,
+                Err(AuthorityError::Fenced)
+            );
+            verify_authority_proof(world.as_ref(), &placement, current)
+                .await
+                .expect("new proof verifies");
+            assert_eq!(
+                cas_vnode_authority(world.as_ref(), &placement, Some(old_proof), next).await,
+                Err(AuthorityError::Conflict)
+            );
+        });
+    }
+
+    #[test]
+    fn intersecting_adoption_quorum_preserves_the_latest_protected_closure() {
+        let (_, worlds) = SimWorld::cluster(4, BlobDevConfig::nvme(), StoreConfig::s3());
+        let placement = authority_placement();
+        let old = VnodeAuthority {
+            cluster_id: placement.cluster_id,
+            placement_epoch: placement.epoch,
+            vnode: VnodeId(0),
+            generation: 1,
+            primary: HostId(1),
+            primary_session: 101,
+            primary_host_epoch: 1,
+        };
+        let mut executor = Executor::simulation(12);
+
+        executor.block_on(async move {
+            create_host_session(worlds[1].as_ref(), HostId(1), 101)
+                .await
+                .expect("create old primary session");
+            let old_proof = cas_vnode_authority(worlds[1].as_ref(), &placement, None, old)
+                .await
+                .expect("create old authority");
+            adopt_vnode_generation(worlds[1].as_ref(), &placement, HostId(1), old_proof)
+                .await
+                .expect("member one adopts");
+            adopt_vnode_generation(worlds[2].as_ref(), &placement, HostId(2), old_proof)
+                .await
+                .expect("member two adopts");
+
+            let gets_before_commit = worlds[1].store_metrics().gets;
+            let closure = b"latest acknowledged recovery closure".to_vec();
+            commit_vnode_closure(
+                worlds[2].as_ref(),
+                &placement,
+                old,
+                VsetId(7),
+                44,
+                closure.clone(),
+            )
+            .await
+            .expect("first member commits");
+            commit_vnode_closure(
+                worlds[1].as_ref(),
+                &placement,
+                old,
+                VsetId(7),
+                44,
+                closure.clone(),
+            )
+            .await
+            .expect("second member commits");
+            assert_eq!(worlds[1].store_metrics().gets, gets_before_commit);
+
+            create_host_session(worlds[3].as_ref(), HostId(3), 303)
+                .await
+                .expect("create new primary session");
+            let next = old.advance(HostId(3), 303, 1).expect("advance authority");
+            let next_proof =
+                cas_vnode_authority(worlds[3].as_ref(), &placement, Some(old_proof), next)
+                    .await
+                    .expect("publish next authority");
+            let receipt_two =
+                adopt_vnode_generation(worlds[2].as_ref(), &placement, HostId(2), next_proof)
+                    .await
+                    .expect("intersection member adopts");
+            let receipt_three =
+                adopt_vnode_generation(worlds[3].as_ref(), &placement, HostId(3), next_proof)
+                    .await
+                    .expect("new primary member adopts");
+            let inventory = adoption_quorum(&placement, next_proof, &[receipt_two, receipt_three])
+                .expect("two members form adoption quorum");
+            let recovered = inventory[&VsetId(7)];
+            assert_eq!(recovered.sequence, 44);
+            assert_eq!(
+                read_vnode_closure(worlds[2].as_ref(), VnodeId(0), recovered).await,
+                Ok(closure)
+            );
+
+            assert_eq!(
+                commit_vnode_closure(
+                    worlds[2].as_ref(),
+                    &placement,
+                    old,
+                    VsetId(7),
+                    45,
+                    b"stale primary".to_vec(),
+                )
+                .await,
+                Err(AuthorityError::Fenced)
+            );
+        });
+    }
+
+    #[test]
+    fn host_self_fences_when_session_gets_exceed_the_staleness_bound() {
+        let (_, worlds) = SimWorld::cluster(
+            3,
+            BlobDevConfig {
+                read_latency_min: 1,
+                read_latency_max: 1,
+                write_latency_min: 1,
+                write_latency_max: 1,
+                ns_per_byte: 0,
+            },
+            StoreConfig {
+                latency_min: 1,
+                latency_max: 1,
+                ns_per_byte: 0,
+            },
+        );
+        let placement = PlacementRecord::new(
+            41,
+            1,
+            vec![VnodePlacement {
+                vnode: VnodeId(0),
+                members: [HostId(0), HostId(1), HostId(2)],
+                next_members: None,
+            }],
+        )
+        .expect("valid placement");
+        let roster = [HostId(0), HostId(1), HostId(2)]
+            .into_iter()
+            .map(|host| PeerCandidate {
+                host,
+                weight: 1,
+                failure_domain: host.0,
+                drained: false,
+            })
+            .collect();
+        let config = HostConfig {
+            archive: Default::default(),
+            host: HostId(0),
+            cache_pages: 8,
+            writeback_interval: 100,
+            backup_retry: 5,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: Some(ReplicaPlacementConfig {
+                membership_epoch: 1,
+                local_failure_domain: 0,
+                roster,
+                authority: Some(AuthorityHostConfig {
+                    cluster_id: 41,
+                    poll_interval: 10,
+                    max_poll_staleness: 30,
+                    challenge_interval: 40,
+                }),
+            }),
+        };
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        let mut executor = Executor::simulation(13);
+        executor
+            .block_on({
+                let world = Rc::clone(&worlds[0]);
+                async move { cas_placement(world.as_ref(), None, placement).await }
+            })
+            .expect("install placement");
+        let mut host = executor.spawn(host_actor_with_state(
+            Rc::clone(&state),
+            Rc::clone(&worlds[0]),
+        ));
+        let boot_horizon = executor.now().saturating_add(60);
+        executor.run_until(boot_horizon);
+        assert!(state.borrow().authority_serving());
+        assert!(state.borrow().counters.lease_gets > 0);
+
+        worlds[0].set_store_outage(true);
+        executor.run_until(boot_horizon.saturating_add(40));
+        assert!(!state.borrow().authority_serving());
+        assert_eq!(state.borrow().counters.lease_self_fences, 1);
+        assert_eq!(worlds[0].abort_reason(), Some("host session fenced"));
+        host.cancel();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failed_primary_advances_generation_on_a_quorum_before_recovery() {
+        let blob = BlobDevConfig {
+            read_latency_min: 1,
+            read_latency_max: 1,
+            write_latency_min: 1,
+            write_latency_max: 1,
+            ns_per_byte: 0,
+        };
+        let store = StoreConfig {
+            latency_min: 1,
+            latency_max: 1,
+            ns_per_byte: 0,
+        };
+        let (_, worlds) = SimWorld::cluster(3, blob, store);
+        let placement = PlacementRecord::new(
+            71,
+            1,
+            vec![VnodePlacement {
+                vnode: VnodeId(0),
+                members: [HostId(0), HostId(1), HostId(2)],
+                next_members: None,
+            }],
+        )
+        .expect("valid placement");
+        let roster = [HostId(0), HostId(1), HostId(2)]
+            .into_iter()
+            .map(|host| PeerCandidate {
+                host,
+                weight: 1,
+                failure_domain: host.0,
+                drained: false,
+            })
+            .collect::<Vec<_>>();
+        let states = (0..3)
+            .map(|host| {
+                Rc::new(RefCell::new(HostState::new(HostConfig {
+                    archive: Default::default(),
+                    host: HostId(host),
+                    cache_pages: 8,
+                    writeback_interval: 1_000,
+                    backup_retry: 5,
+                    disk_capacity: None,
+                    disk_headroom: 0,
+                    wedge_ticks: 0,
+                    replica_placement: Some(ReplicaPlacementConfig {
+                        membership_epoch: 1,
+                        local_failure_domain: host,
+                        roster: roster.clone(),
+                        authority: Some(AuthorityHostConfig {
+                            cluster_id: 71,
+                            poll_interval: 10,
+                            max_poll_staleness: 30,
+                            challenge_interval: 40,
+                        }),
+                    }),
+                })))
+            })
+            .collect::<Vec<_>>();
+        let mut executor = Executor::simulation(14);
+        executor
+            .block_on({
+                let world = Rc::clone(&worlds[0]);
+                let placement = placement.clone();
+                async move { cas_placement(world.as_ref(), None, placement).await }
+            })
+            .expect("install placement");
+        let mut hosts = states
+            .iter()
+            .zip(&worlds)
+            .map(|(state, world)| {
+                executor.spawn(host_actor_with_state(Rc::clone(state), Rc::clone(world)))
+            })
+            .collect::<Vec<_>>();
+        executor.run_until(executor.now().saturating_add(100));
+        assert!(
+            states
+                .iter()
+                .all(|state| state.borrow().authority_serving())
+        );
+
+        let old_record = executor
+            .block_on({
+                let world = Rc::clone(&worlds[0]);
+                async move { read_host_session(world.as_ref(), HostId(0)).await }
+            })
+            .expect("read old session")
+            .expect("old session exists")
+            .record;
+        let HostSessionRecord::Active {
+            session: old_session,
+            epoch: old_epoch,
+            ..
+        } = old_record
+        else {
+            panic!("old session must be active");
+        };
+        let old = VnodeAuthority {
+            cluster_id: 71,
+            placement_epoch: 1,
+            vnode: VnodeId(0),
+            generation: 1,
+            primary: HostId(0),
+            primary_session: old_session,
+            primary_host_epoch: old_epoch,
+        };
+        let old_proof = executor
+            .block_on({
+                let state = Rc::clone(&states[0]);
+                let world = Rc::clone(&worlds[0]);
+                async move { claim_vnode_authority(&state, world.as_ref(), VnodeId(0)).await }
+            })
+            .expect("claim initial authority on a quorum");
+        assert_eq!(old_proof.authority, old);
+        executor
+            .block_on({
+                let worlds = worlds.clone();
+                let placement = placement.clone();
+                async move {
+                    adopt_vnode_generation(worlds[2].as_ref(), &placement, HostId(2), old_proof)
+                        .await?;
+                    let bytes = b"quorum protected before failover".to_vec();
+                    commit_vnode_closure(
+                        worlds[0].as_ref(),
+                        &placement,
+                        old,
+                        VsetId(7),
+                        88,
+                        bytes.clone(),
+                    )
+                    .await?;
+                    commit_vnode_closure(worlds[2].as_ref(), &placement, old, VsetId(7), 88, bytes)
+                        .await?;
+                    Ok::<_, AuthorityError>(())
+                }
+            })
+            .expect("commit old quorum closure");
+
+        hosts[0].cancel();
+        executor.run_ready();
+        let (proof, inventory) =
+            executor
+                .block_on({
+                    let state = Rc::clone(&states[1]);
+                    let world = Rc::clone(&worlds[1]);
+                    async move {
+                        failover_vnode(&state, world.as_ref(), VnodeId(0), HostId(0), 91).await
+                    }
+                })
+                .expect("fail over to host one");
+        assert_eq!(proof.authority.generation, 2);
+        assert_eq!(proof.authority.primary, HostId(1));
+        assert_eq!(inventory[&VsetId(7)].sequence, 88);
+        assert_eq!(
+            read_vnode_closure_sync(&mut executor, &worlds[1], inventory[&VsetId(7)]),
+            b"quorum protected before failover"
+        );
+        let store_before = worlds[1].store_metrics();
+        let committed = executor
+            .block_on({
+                let state = Rc::clone(&states[1]);
+                let world = Rc::clone(&worlds[1]);
+                async move {
+                    commit_active_vnode_quorum(
+                        &state,
+                        world.as_ref(),
+                        VsetId(7),
+                        89,
+                        b"new primary hot-path closure".to_vec(),
+                    )
+                    .await
+                }
+            })
+            .expect("commit on new two-member quorum");
+        let store_after = worlds[1].store_metrics();
+        assert_eq!(store_after.put_attempts, store_before.put_attempts);
+        assert_eq!(
+            read_vnode_closure_sync(&mut executor, &worlds[2], committed),
+            b"new primary hot-path closure"
+        );
+        assert_eq!(
+            executor.block_on({
+                let world = Rc::clone(&worlds[1]);
+                let placement = placement.clone();
+                async move {
+                    commit_vnode_closure(
+                        world.as_ref(),
+                        &placement,
+                        old,
+                        VsetId(7),
+                        90,
+                        b"stale".to_vec(),
+                    )
+                    .await
+                }
+            }),
+            Err(AuthorityError::Fenced)
+        );
+        for host in &mut hosts[1..] {
+            host.cancel();
+        }
+    }
+
+    fn read_vnode_closure_sync(
+        executor: &mut Executor,
+        world: &Rc<SimWorld>,
+        closure: blockd_core::vnode_member::ProtectedClosureRef,
+    ) -> Vec<u8> {
+        executor
+            .block_on({
+                let world = Rc::clone(world);
+                async move { read_vnode_closure(world.as_ref(), VnodeId(0), closure).await }
+            })
+            .expect("read protected closure")
+    }
 
     #[test]
     fn unservable_page_failure_matches_the_production_fatal_signal() {
@@ -1932,6 +2521,7 @@ mod tests {
                     drained: false,
                 })
                 .collect(),
+            authority: None,
         };
         let config = HostConfig {
             archive: Default::default(),

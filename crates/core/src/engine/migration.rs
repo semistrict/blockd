@@ -9,6 +9,7 @@ use super::keyed_queue::KeyedQueue;
 use super::replica::publish_replica_head;
 use super::state::MutationOwner;
 use super::{SharedHost, VsetState, replica_message, replicate_latest};
+use super::{adopt_vnode_generation, commit_vnode_closure, read_vnode_closure};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::head::HeadRecord;
 use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetKind};
@@ -477,6 +478,84 @@ where
             }
         };
         match message {
+            PeerMsg::VnodeAdopt { io, proof } => {
+                let placement = state.borrow().authority_placement.clone();
+                let member = state.borrow().config.host;
+                if let Some(placement) = placement
+                    && let Ok(receipt) =
+                        adopt_vnode_generation(world.as_ref(), &placement, member, proof).await
+                {
+                    state.borrow_mut().counters.vnode_adoptions += 1;
+                    Peers::send(
+                        world.as_ref(),
+                        from,
+                        PeerMsg::VnodeAdoptAck {
+                            io,
+                            proof: receipt.proof,
+                            closures: receipt.closures,
+                        },
+                    )
+                    .await;
+                }
+            }
+            PeerMsg::VnodeAdoptAck {
+                io,
+                proof,
+                closures,
+            } => {
+                state
+                    .borrow_mut()
+                    .peer_client
+                    .resolve_adoption(io, from, proof, closures);
+            }
+            PeerMsg::VnodeFetchClosure { io, vnode, closure } => {
+                let bytes = read_vnode_closure(world.as_ref(), vnode, closure)
+                    .await
+                    .ok();
+                Peers::send(world.as_ref(), from, PeerMsg::VnodeClosure { io, bytes }).await;
+            }
+            PeerMsg::VnodeClosure { io, bytes } => {
+                state
+                    .borrow_mut()
+                    .peer_client
+                    .resolve_vnode_closure(io, from, bytes);
+            }
+            PeerMsg::VnodeCommit {
+                io,
+                proof,
+                vset,
+                sequence,
+                bytes,
+            } => {
+                let placement = state.borrow().authority_placement.clone();
+                if from == proof.authority.primary
+                    && let Some(placement) = placement
+                    && let Ok(closure) = commit_vnode_closure(
+                        world.as_ref(),
+                        &placement,
+                        proof.authority,
+                        vset,
+                        sequence,
+                        bytes,
+                    )
+                    .await
+                {
+                    Peers::send(
+                        world.as_ref(),
+                        from,
+                        PeerMsg::VnodeCommitAck { io, closure },
+                    )
+                    .await;
+                } else {
+                    state.borrow_mut().counters.vnode_stale_rejections += 1;
+                }
+            }
+            PeerMsg::VnodeCommitAck { io, closure } => {
+                state
+                    .borrow_mut()
+                    .peer_client
+                    .resolve_vnode_commit(io, from, closure);
+            }
             PeerMsg::MigrateOffer { vset, record } => {
                 if lifecycle.pending_len() < PEER_LIFECYCLE_QUEUE_CAPACITY
                     && !lifecycle.contains_key(vset)

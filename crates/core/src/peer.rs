@@ -19,9 +19,10 @@ use crate::replica_wire::{
 use crate::types::{HostId, SegId, VsetId};
 
 pub const MAGIC_PEER: u32 = u32::from_le_bytes(*b"BPM1");
-pub const CURRENT_PEER_VERSION: u16 = 3;
+pub const CURRENT_PEER_VERSION: u16 = 4;
 pub const PEER_STASH_VERSION: u16 = 2;
 pub const FENCED_MIGRATION_VERSION: u16 = 3;
+pub const VNODE_AUTHORITY_VERSION: u16 = 4;
 
 /// Frame payload cap for transports: R4.6's 64 MiB object cap bounds every
 /// embedded blob, so anything larger is a desynced or hostile stream.
@@ -68,6 +69,16 @@ pub fn encode_peer_version(
     version: u16,
 ) -> Result<Vec<u8>, DecodeError> {
     if !(1..=CURRENT_PEER_VERSION).contains(&version)
+        || (version < VNODE_AUTHORITY_VERSION
+            && matches!(
+                msg,
+                PeerMsg::VnodeAdopt { .. }
+                    | PeerMsg::VnodeAdoptAck { .. }
+                    | PeerMsg::VnodeFetchClosure { .. }
+                    | PeerMsg::VnodeClosure { .. }
+                    | PeerMsg::VnodeCommit { .. }
+                    | PeerMsg::VnodeCommitAck { .. }
+            ))
         || (version == 1
             && matches!(
                 msg,
@@ -284,6 +295,58 @@ pub fn encode_peer_version(
             e.u64(*assignment_epoch);
             encode_commit_info(&mut e, *through);
         }
+        PeerMsg::VnodeAdopt { io, proof } => {
+            e.u8(18);
+            e.u64(io.0);
+            encode_authority_proof(&mut e, *proof);
+        }
+        PeerMsg::VnodeAdoptAck {
+            io,
+            proof,
+            closures,
+        } => {
+            e.u8(19);
+            e.u64(io.0);
+            encode_authority_proof(&mut e, *proof);
+            e.u32(u32::try_from(closures.len()).expect("closure count fits"));
+            for closure in closures {
+                e.u64(closure.vset.0);
+                e.u64(closure.sequence);
+                e.u32(closure.checksum);
+                e.u32(closure.len);
+            }
+        }
+        PeerMsg::VnodeFetchClosure { io, vnode, closure } => {
+            e.u8(20);
+            e.u64(io.0);
+            e.u32(vnode.0);
+            encode_protected_closure(&mut e, *closure);
+        }
+        PeerMsg::VnodeClosure { io, bytes } => {
+            e.u8(21);
+            e.u64(io.0);
+            opt_bytes(&mut e, bytes.as_deref());
+        }
+        PeerMsg::VnodeCommit {
+            io,
+            proof,
+            vset,
+            sequence,
+            bytes,
+        } => {
+            e.u8(22);
+            e.u64(io.0);
+            encode_authority_proof(&mut e, *proof);
+            e.u64(vset.0);
+            e.u64(*sequence);
+            e.u32(u32::try_from(bytes.len()).expect("closure fits u32"));
+            e.bytes(bytes);
+        }
+        PeerMsg::VnodeCommitAck { io, closure } => {
+            e.u8(23);
+            e.u64(io.0);
+            encode_protected_closure(&mut e, *closure);
+        }
     }
     Ok(seal_frame(MAGIC_PEER, &e.finish()))
 }
@@ -438,10 +501,100 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
         },
+        18 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeAdopt {
+            io: PeerRequestId(d.u64()?),
+            proof: decode_authority_proof(&mut d)?,
+        },
+        19 if version >= VNODE_AUTHORITY_VERSION => {
+            let io = PeerRequestId(d.u64()?);
+            let proof = decode_authority_proof(&mut d)?;
+            let count = d.u32()?;
+            if count > 1_000_000 {
+                return Err(DecodeError);
+            }
+            let mut closures = Vec::with_capacity(usize::try_from(count).expect("count fits"));
+            for _ in 0..count {
+                closures.push(crate::vnode_member::ProtectedClosureRef {
+                    vset: VsetId(d.u64()?),
+                    sequence: d.u64()?,
+                    checksum: d.u32()?,
+                    len: d.u32()?,
+                });
+            }
+            PeerMsg::VnodeAdoptAck {
+                io,
+                proof,
+                closures,
+            }
+        }
+        20 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeFetchClosure {
+            io: PeerRequestId(d.u64()?),
+            vnode: crate::authority::VnodeId(d.u32()?),
+            closure: decode_protected_closure(&mut d)?,
+        },
+        21 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeClosure {
+            io: PeerRequestId(d.u64()?),
+            bytes: decode_opt_bytes(&mut d)?,
+        },
+        22 if version >= VNODE_AUTHORITY_VERSION => {
+            let io = PeerRequestId(d.u64()?);
+            let proof = decode_authority_proof(&mut d)?;
+            let vset = VsetId(d.u64()?);
+            let sequence = d.u64()?;
+            let len = usize::try_from(d.u32()?).map_err(|_| DecodeError)?;
+            PeerMsg::VnodeCommit {
+                io,
+                proof,
+                vset,
+                sequence,
+                bytes: d.bytes(len)?.to_vec(),
+            }
+        }
+        23 if version >= VNODE_AUTHORITY_VERSION => PeerMsg::VnodeCommitAck {
+            io: PeerRequestId(d.u64()?),
+            closure: decode_protected_closure(&mut d)?,
+        },
         _ => return Err(DecodeError),
     };
     d.finish()?;
     Ok((from, msg))
+}
+
+fn encode_authority_proof(e: &mut Enc, proof: crate::authority::AuthorityProof) {
+    e.u64(proof.store_version);
+    let bytes = proof.authority.encode();
+    e.u32(u32::try_from(bytes.len()).expect("authority proof fits"));
+    e.bytes(&bytes);
+}
+
+fn encode_protected_closure(e: &mut Enc, closure: crate::vnode_member::ProtectedClosureRef) {
+    e.u64(closure.vset.0);
+    e.u64(closure.sequence);
+    e.u32(closure.checksum);
+    e.u32(closure.len);
+}
+
+fn decode_protected_closure(
+    d: &mut Dec<'_>,
+) -> Result<crate::vnode_member::ProtectedClosureRef, DecodeError> {
+    Ok(crate::vnode_member::ProtectedClosureRef {
+        vset: VsetId(d.u64()?),
+        sequence: d.u64()?,
+        checksum: d.u32()?,
+        len: d.u32()?,
+    })
+}
+
+fn decode_authority_proof(
+    d: &mut Dec<'_>,
+) -> Result<crate::authority::AuthorityProof, DecodeError> {
+    let store_version = d.u64()?;
+    let len = usize::try_from(d.u32()?).map_err(|_| DecodeError)?;
+    let authority = crate::authority::VnodeAuthority::decode(d.bytes(len)?)?;
+    Ok(crate::authority::AuthorityProof {
+        store_version,
+        authority,
+    })
 }
 
 #[cfg(test)]
@@ -462,6 +615,18 @@ mod tests {
             writer_fence: 4,
             seq: JournalSeq(13),
             sync_covered_through: 99,
+        };
+        let proof = crate::authority::AuthorityProof {
+            store_version: 17,
+            authority: crate::authority::VnodeAuthority {
+                cluster_id: 8,
+                placement_epoch: 4,
+                vnode: crate::authority::VnodeId(2),
+                generation: 9,
+                primary: HostId(2),
+                primary_session: 55,
+                primary_host_epoch: 3,
+            },
         };
         vec![
             PeerMsg::MigrateOffer {
@@ -571,6 +736,50 @@ mod tests {
                 assignment_epoch: 3,
                 through: info,
             },
+            PeerMsg::VnodeAdopt {
+                io: PeerRequestId(103),
+                proof,
+            },
+            PeerMsg::VnodeAdoptAck {
+                io: PeerRequestId(103),
+                proof,
+                closures: vec![crate::vnode_member::ProtectedClosureRef {
+                    vset: VsetId(7),
+                    sequence: 44,
+                    checksum: 0x1234_5678,
+                    len: 99,
+                }],
+            },
+            PeerMsg::VnodeFetchClosure {
+                io: PeerRequestId(104),
+                vnode: crate::authority::VnodeId(2),
+                closure: crate::vnode_member::ProtectedClosureRef {
+                    vset: VsetId(7),
+                    sequence: 44,
+                    checksum: 0x1234_5678,
+                    len: 99,
+                },
+            },
+            PeerMsg::VnodeClosure {
+                io: PeerRequestId(104),
+                bytes: Some(vec![0xE5; 99]),
+            },
+            PeerMsg::VnodeCommit {
+                io: PeerRequestId(105),
+                proof,
+                vset: VsetId(7),
+                sequence: 45,
+                bytes: vec![0xA6; 101],
+            },
+            PeerMsg::VnodeCommitAck {
+                io: PeerRequestId(105),
+                closure: crate::vnode_member::ProtectedClosureRef {
+                    vset: VsetId(7),
+                    sequence: 45,
+                    checksum: 0x8765_4321,
+                    len: 101,
+                },
+            },
         ]
     }
 
@@ -600,7 +809,7 @@ mod tests {
             );
         }
         assert!(encode_peer_version(HostId(2), &samples[0], 0).is_err());
-        assert!(encode_peer_version(HostId(2), &samples[0], 4).is_err());
+        assert!(encode_peer_version(HostId(2), &samples[0], 5).is_err());
 
         for message in [
             PeerMsg::Released {
@@ -685,8 +894,8 @@ mod tests {
             .iter()
             .flat_map(|msg| encode_peer(HostId(2), msg))
             .collect();
-        assert_eq!(bytes.len(), 1849);
-        assert_eq!(crc32c(&bytes), 0xF7CE_D541);
+        assert_eq!(bytes.len(), 2520);
+        assert_eq!(crc32c(&bytes), 0x0CAF_F59E);
     }
 
     #[test]

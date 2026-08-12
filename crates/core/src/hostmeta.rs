@@ -38,6 +38,15 @@ pub struct ReplicaPlacementConfig {
     pub membership_epoch: u64,
     pub local_failure_domain: u16,
     pub roster: Vec<PeerCandidate>,
+    pub authority: Option<AuthorityHostConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthorityHostConfig {
+    pub cluster_id: u64,
+    pub poll_interval: u64,
+    pub max_poll_staleness: u64,
+    pub challenge_interval: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +99,12 @@ pub struct Counters {
     pub archive_cycles: u64,
     pub archive_commits_coalesced: u64,
     pub replica_capacity_backpressure: u64,
+    pub lease_gets: u64,
+    pub lease_challenges: u64,
+    pub lease_defenses: u64,
+    pub lease_self_fences: u64,
+    pub vnode_adoptions: u64,
+    pub vnode_stale_rejections: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

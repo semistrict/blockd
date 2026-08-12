@@ -42,6 +42,7 @@
     "race_restore": true
   },
   "coverage": [
+    { "metric": "exhaustive-audit", "label": "exhaustive final audit" },
     { "metric": "orphan-restore", "label": "orphan restore" },
     { "metric": "restore-claim-race", "label": "restore claim race" }
   ]

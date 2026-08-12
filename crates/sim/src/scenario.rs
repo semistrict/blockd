@@ -145,6 +145,7 @@ pub enum ScenarioKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CoverageMetric {
+    ExhaustiveAudit,
     DaemonCrash,
     BitFlip,
     StoreRetry,
@@ -860,6 +861,7 @@ impl PlacementSpec {
                         drained: false,
                     })
                     .collect(),
+                authority: None,
             }),
         }
     }

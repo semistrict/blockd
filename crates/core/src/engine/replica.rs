@@ -5,6 +5,7 @@ use blockd_exec::{FaultPoint, delay, fault_point, now, spawn};
 
 use super::backup::claim_new_head_with_stash;
 use super::capture::finish_creation;
+use super::commit_active_vnode_quorum;
 use super::peer_client::PeerRpcError;
 use super::reclaim::reclaim_backed_segments;
 use super::state::{PublicationOwner, ReplicaArchiveCut, ReplicaKey, SharedHost};
@@ -20,6 +21,7 @@ use crate::replica_spool::{
     seal_replica_commit, seal_verified_replica_artifact, verify_replica_artifact,
 };
 use crate::types::{HostId, VsetId};
+use crate::vnode_member::VnodeRecoveryClosure;
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
 
 /// Rotation happens before an append. A single verified frame may therefore
@@ -1410,7 +1412,16 @@ where
         let _ = transition_stash(&state, world.as_ref(), vset, incarnation).await;
         return;
     };
-    if status.is_some_and(|committed| commit_rank(committed) >= commit_rank(info)) {
+    let vnode_authority_enabled = state
+        .borrow()
+        .config
+        .replica_placement
+        .as_ref()
+        .and_then(|placement| placement.authority)
+        .is_some();
+    if !vnode_authority_enabled
+        && status.is_some_and(|committed| commit_rank(committed) >= commit_rank(info))
+    {
         finish_primary_commit(&state, vset, incarnation, info);
         return;
     }
@@ -1425,6 +1436,7 @@ where
         state.borrow_mut().fail("injected primary crash");
         return;
     }
+    let mut closure_artifacts = Vec::with_capacity(required.len());
     for &artifact in &required {
         let name = match artifact {
             ReplicaArtifact::Segment { fence, seg } => layout::segment_blob(vset, fence, seg),
@@ -1448,6 +1460,7 @@ where
                 .saturating_add(bytes.len() as u64);
         }
         let checksum = crc32c(&bytes);
+        closure_artifacts.push((artifact, bytes.clone()));
         if wait_put_ack(
             &state,
             world.as_ref(),
@@ -1466,6 +1479,7 @@ where
             return;
         }
     }
+    let record_bytes = record.encode(vset);
     if wait_commit_ack(
         &state,
         world.as_ref(),
@@ -1474,7 +1488,7 @@ where
         assignment_epoch,
         info,
         required,
-        record.encode(vset),
+        record_bytes.clone(),
         retry,
     )
     .await
@@ -1482,6 +1496,27 @@ where
     {
         let _ = transition_stash(&state, world.as_ref(), vset, incarnation).await;
         return;
+    }
+    if vnode_authority_enabled && info.sync_covered_through > 0 {
+        let Ok(closure) = (VnodeRecoveryClosure {
+            record: record_bytes,
+            artifacts: closure_artifacts,
+        })
+        .encode(vset) else {
+            return;
+        };
+        if commit_active_vnode_quorum(
+            &state,
+            world.as_ref(),
+            vset,
+            info.sync_covered_through,
+            closure,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
     }
     let transitioning = state.borrow().vsets.get(&vset).is_some_and(|vset_state| {
         vset_state.stash_assignment.is_some_and(|stash| {
@@ -1915,6 +1950,7 @@ fn finish_primary_commit(
 ) {
     let completed = {
         let mut host = state.borrow_mut();
+        let authority_serving = host.vset_authorized(vset);
         let Some(vset_state) = host
             .vsets
             .get_mut(&vset)
@@ -1931,6 +1967,9 @@ fn finish_primary_commit(
         vset_state.peer_committed_through = vset_state
             .peer_committed_through
             .max(info.sync_covered_through);
+        if !authority_serving {
+            return;
+        }
         vset_state.sync_ack_through = vset_state.sync_ack_through.max(info.sync_covered_through);
         let mut completed = Vec::new();
         let pending = std::mem::take(&mut vset_state.pending_syncs);
@@ -2362,6 +2401,7 @@ mod tests {
                 .expect("ranked host is in roster")
                 .failure_domain,
             roster,
+            authority: None,
         });
         state
             .borrow_mut()

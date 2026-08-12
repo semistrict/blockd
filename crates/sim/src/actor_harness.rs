@@ -550,6 +550,7 @@ fn harness_placement(primary: HostId, passive: HostId) -> Option<ReplicaPlacemen
                 drained: false,
             },
         ],
+        authority: None,
     })
 }
 

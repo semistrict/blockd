@@ -180,6 +180,37 @@ pub enum PeerMsg {
         assignment_epoch: u64,
         through: ReplicaCommitInfo,
     },
+    /// Cold-path vnode failover. The receiver independently GETs and verifies
+    /// the object-store proof before durably adopting its generation.
+    VnodeAdopt {
+        io: PeerRequestId,
+        proof: crate::authority::AuthorityProof,
+    },
+    VnodeAdoptAck {
+        io: PeerRequestId,
+        proof: crate::authority::AuthorityProof,
+        closures: Vec<crate::vnode_member::ProtectedClosureRef>,
+    },
+    VnodeFetchClosure {
+        io: PeerRequestId,
+        vnode: crate::authority::VnodeId,
+        closure: crate::vnode_member::ProtectedClosureRef,
+    },
+    VnodeClosure {
+        io: PeerRequestId,
+        bytes: Option<Vec<u8>>,
+    },
+    VnodeCommit {
+        io: PeerRequestId,
+        proof: crate::authority::AuthorityProof,
+        vset: VsetId,
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
+    VnodeCommitAck {
+        io: PeerRequestId,
+        closure: crate::vnode_member::ProtectedClosureRef,
+    },
 }
 
 /// In-process administrative call. Completion is routed by its owned reply

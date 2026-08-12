@@ -58,6 +58,9 @@ fn workload_horizon_begins_after_initial_creation() {
 fn host_death_restores_one_authoritative_runner() {
     let report = run(31, restore_config());
     assert_clean(&report);
+    assert_eq!(report.audit_runs, 1);
+    assert_eq!(report.audited_vsets, 3);
+    assert_eq!(report.audited_pages, 3 * 3 * 16);
     assert_eq!(report.restores, 1);
     assert_eq!(report.claims_lost, 1);
     assert_eq!(report.loss_bound_verified, 1);

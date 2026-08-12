@@ -28,6 +28,29 @@
 
 use crate::types::{HostId, JournalSeq, SegId, VsetId};
 
+pub fn placement_key() -> String {
+    "cluster/placement".to_owned()
+}
+
+pub fn host_session_key(host: HostId) -> String {
+    format!("hosts/{:04x}/session", host.0)
+}
+
+pub fn vnode_authority_key(vnode: crate::authority::VnodeId) -> String {
+    format!("vnodes/{:08x}/authority", vnode.0)
+}
+
+pub fn vnode_member_blob(vnode: crate::authority::VnodeId) -> String {
+    format!("authority/vnodes/{:08x}.state", vnode.0)
+}
+
+pub fn vnode_closure_blob(vnode: crate::authority::VnodeId, vset: VsetId, sequence: u64) -> String {
+    format!(
+        "authority/vnodes/{:08x}/vsets/{:016x}/{sequence:016x}.closure",
+        vnode.0, vset.0
+    )
+}
+
 pub fn journal_blob(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
     format!("v/{:016x}/j/{fence:016x}-{:016x}.rec", vset.0, seq.0)
 }

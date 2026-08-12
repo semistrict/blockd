@@ -71,6 +71,9 @@ pub struct ClusterConfig {
 pub struct ClusterReport {
     pub trace_hash: u64,
     pub violations: Vec<String>,
+    pub audit_runs: u64,
+    pub audited_vsets: u64,
+    pub audited_pages: u64,
     pub completed_ops: u64,
     pub restores: u64,
     pub claims_lost: u64,

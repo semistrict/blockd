@@ -34,6 +34,7 @@ fn usage() -> ExitCode {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Coverage {
     runs: u64,
+    audits: u64,
     completed_ops: u64,
     crashes: u64,
     bitflips: u64,
@@ -68,6 +69,7 @@ struct Coverage {
 impl Coverage {
     fn merge(&mut self, other: &Self) {
         self.runs += other.runs;
+        self.audits += other.audits;
         self.completed_ops += other.completed_ops;
         self.crashes += other.crashes;
         self.bitflips += other.bitflips;
@@ -105,6 +107,7 @@ impl Coverage {
 
     fn hits(&self, metric: CoverageMetric, fault_point: Option<FaultPointSpec>) -> u64 {
         match metric {
+            CoverageMetric::ExhaustiveAudit => self.audits,
             CoverageMetric::DaemonCrash => self.crashes,
             CoverageMetric::BitFlip => self.bitflips,
             CoverageMetric::StoreRetry => self.store_retries,
@@ -241,6 +244,7 @@ fn run_one(scenario: &Scenario, seed: u64) -> Outcome {
             let report = cluster::run(seed, config);
             let coverage = Coverage {
                 runs: 1,
+                audits: report.audit_runs,
                 completed_ops: report.completed_ops,
                 crashes: report.host_crashes,
                 store_retries: report.store_retries,
@@ -465,6 +469,15 @@ mod tests {
         assert_eq!(
             Coverage::default().missing_for(chaos.coverage()),
             ["daemon crash", "bit flip", "store retry"]
+        );
+        let cluster = scenario::load("cluster").expect("cluster scenario");
+        assert_eq!(
+            Coverage::default().missing_for(cluster.coverage()),
+            [
+                "exhaustive final audit",
+                "orphan restore",
+                "restore claim race"
+            ]
         );
         let migration = scenario::load("migration").expect("migration scenario");
         assert_eq!(

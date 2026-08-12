@@ -5,6 +5,7 @@ use blockd_exec::inject::{Lane, injector};
 use blockd_exec::{Either, OneOf3, TaskSet, delay, select2, select3, yield_now};
 
 use super::database::DetachedDatabaseDrain;
+use super::lease::{bootstrap_host_authority, host_session_monitor};
 use super::state::PendingSync;
 use super::{
     HostFatal, SharedHost, advance_archive_age, archive_latest, archives_ready, attach_database,
@@ -74,6 +75,9 @@ pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>
 
 async fn host_work<W: HostWorld>(state: SharedHost, world: Rc<W>) -> Result<(), HostFatal> {
     let config = state.borrow().config.clone();
+    bootstrap_host_authority(&state, world.as_ref())
+        .await
+        .map_err(|_| HostFatal::new("host authority bootstrap failed"))?;
     let Ok(verdicts) = recover_local(Rc::clone(&state), world.as_ref()).await else {
         return Err(HostFatal::new("local recovery scan failed"));
     };
@@ -100,6 +104,7 @@ async fn host_work<W: HostWorld>(state: SharedHost, world: Rc<W>) -> Result<(), 
         state.borrow_mut().schedule_vset(vset);
     }
     let mut children = TaskSet::new();
+    children.spawn(host_session_monitor(Rc::clone(&state), Rc::clone(&world)));
     let (database_drains, pending_database_drains) = unbounded();
     children.spawn(admin_source(
         Rc::clone(&state),
@@ -414,6 +419,12 @@ async fn handle_admin<W: HostWorld>(
         let _ = cancel.push(Lane::Critical, ());
     });
     let (call, mut reply) = request.into_parts();
+    if !state.borrow().authority_serving()
+        || admin_vset(call).is_some_and(|vset| !state.borrow().vset_authorized(vset))
+    {
+        let _ = reply.send(Err(crate::protocol::AdminError::Unavailable));
+        return None;
+    }
     let response = match call {
         AdminCall::CreateVset {
             vset,
@@ -476,6 +487,20 @@ async fn handle_admin<W: HostWorld>(
     None
 }
 
+fn admin_vset(call: AdminCall) -> Option<crate::types::VsetId> {
+    match call {
+        AdminCall::CreateVset { vset, .. }
+        | AdminCall::KeepBase { vset, .. }
+        | AdminCall::Checkpoint { vset, .. }
+        | AdminCall::RestoreVset { vset }
+        | AdminCall::MigrateOut { vset, .. }
+        | AdminCall::AttachDatabase { vset, .. }
+        | AdminCall::BeginDetachDatabase { vset, .. }
+        | AdminCall::FinishDetachDatabase { vset, .. } => Some(vset),
+        AdminCall::DeleteBase { .. } => None,
+    }
+}
+
 async fn fault_source<W: HostWorld>(state: SharedHost, world: Rc<W>) {
     let mut faults = TaskSet::new();
     let (completed, mut completions) = unbounded();
@@ -495,7 +520,11 @@ async fn fault_source<W: HostWorld>(state: SharedHost, world: Rc<W>) {
         let world = Rc::clone(&world);
         let completed = completed.clone();
         faults.spawn(async move {
-            serve_fault(state, world, fault.page, fault.write).await;
+            if state.borrow().vset_authorized(fault.page.volume.vset) {
+                serve_fault(state, world, fault.page, fault.write).await;
+            } else {
+                let _ = GuestMem::fail(world.as_ref(), fault.page).await;
+            }
             let _ = completed.send(());
         });
         active += 1;
@@ -610,7 +639,10 @@ async fn handle_sync<W: HostWorld>(
     }
     let action = {
         let mut host = state.borrow_mut();
-        if let Some(vset) = host.vsets.get_mut(&sync.volume.vset) {
+        if !host.vset_authorized(sync.volume.vset) {
+            host.counters.guest_rejected += 1;
+            None
+        } else if let Some(vset) = host.vsets.get_mut(&sync.volume.vset) {
             if !vset.ready
                 || vset.config.kind != VsetKind::Compute
                 || sync.volume.idx.is_memory()
@@ -738,6 +770,7 @@ mod tests {
                     drained: false,
                 },
             ],
+            authority: None,
         })
     }
 
@@ -1495,6 +1528,7 @@ mod tests {
                         drained: false,
                     },
                 ],
+                authority: None,
             }),
         })));
         let (page_io, page_reply) = state.borrow().peer_client.page(HostId(9));
@@ -4840,6 +4874,7 @@ mod tests {
                         drained: false,
                     },
                 ],
+                authority: None,
             }),
         };
         let mut executor = Executor::simulation(10);
@@ -4932,6 +4967,7 @@ mod tests {
                 membership_epoch: 9,
                 local_failure_domain: domain,
                 roster: roster.clone(),
+                authority: None,
             }),
         };
         let primary = Rc::new(ModelWorld::default());
@@ -5067,6 +5103,7 @@ mod tests {
                 membership_epoch: 10,
                 local_failure_domain,
                 roster: roster.clone(),
+                authority: None,
             }),
         };
         let primary = Rc::new(ModelWorld::default());
