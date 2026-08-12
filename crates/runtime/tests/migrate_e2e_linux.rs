@@ -67,6 +67,7 @@ fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
                         drained: false,
                     })
                     .collect(),
+                authority: None,
             }),
         },
         blob_dir: temp_dir(tag),

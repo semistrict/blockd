@@ -166,6 +166,7 @@ mod linux {
                     membership_epoch: 1,
                     local_failure_domain: config.host.0 + 1,
                     roster,
+                    authority: None,
                 }),
             },
             blob_dir: config.blob_dir.clone(),

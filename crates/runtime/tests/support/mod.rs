@@ -76,6 +76,7 @@ pub(crate) fn three_host_runtime_config(
                 }
             })
             .collect(),
+        authority: None,
     });
     RuntimeConfig {
         daemon,

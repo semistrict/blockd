@@ -181,6 +181,7 @@ fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
             membership_epoch: 6,
             local_failure_domain: target_domain,
             roster,
+            authority: None,
         }),
     };
     let blobs = Rc::new(FileBlobs::new(&root).expect("file actor world"));

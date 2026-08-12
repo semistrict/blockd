@@ -191,6 +191,7 @@ impl Demod {
                     membership_epoch: 1,
                     local_failure_domain: cfg.host.0,
                     roster,
+                    authority: None,
                 }),
             },
             blob_dir: cfg.blob_dir.clone(),

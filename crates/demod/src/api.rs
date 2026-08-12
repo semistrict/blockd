@@ -449,7 +449,7 @@ fn metrics_text(state: &Arc<Demod>) -> String {
         blob_filesystem_space: state.rt.blob_filesystem_space(),
         archive_lag_age: state
             .rt
-            .archive_lag_age()
+            .backup_lag_age()
             .into_iter()
             .map(|(vset, age)| (vset.0, age.as_secs_f64()))
             .collect(),

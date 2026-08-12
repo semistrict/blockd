@@ -3,49 +3,21 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use blockd_core::database::{DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest};
+use blockd_core::database::{
+    DatabaseError, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest,
+};
 use blockd_core::dbproto::{decode_reply, encode_request};
 use blockd_core::format::FRAME_HEADER;
 use blockd_core::journal::VsetConfig;
-use blockd_core::protocol::{ReqId, StoreFault};
-use blockd_core::types::{HostId, VmId, VsetId, millis};
+use blockd_core::protocol::ReqId;
+use blockd_core::types::{VmId, VsetId};
 use blockd_runtime::database::serve_database_stream;
-use blockd_runtime::{GetResult, ObjectStore, Runtime, RuntimeConfig};
+use blockd_runtime::{Runtime, S3Store};
 
-struct EmptyStore;
-
-#[async_trait::async_trait]
-impl ObjectStore for EmptyStore {
-    async fn put(self: Arc<Self>, _key: String, _bytes: Vec<u8>) -> Result<u64, StoreFault> {
-        Ok(1)
-    }
-
-    async fn put_cas(
-        self: Arc<Self>,
-        _key: String,
-        _expected: Option<u64>,
-        _bytes: Vec<u8>,
-    ) -> Result<u64, StoreFault> {
-        Ok(1)
-    }
-
-    async fn get(self: Arc<Self>, _key: String) -> GetResult {
-        Ok(None)
-    }
-
-    async fn get_range(self: Arc<Self>, _key: String, _offset: u64, _len: u64) -> GetResult {
-        Ok(None)
-    }
-
-    async fn delete(self: Arc<Self>, _key: String) {}
-}
-
-fn temp_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("blockd-database-{}", std::process::id()))
-}
+mod support;
 
 fn round_trip(stream: &mut UnixStream, request: &DatabaseRequest) -> DatabaseReply {
     let frame = encode_request(request);
@@ -70,26 +42,28 @@ fn round_trip(stream: &mut UnixStream, request: &DatabaseRequest) -> DatabaseRep
 
 #[test]
 fn unix_stream_runs_sqlite_shaped_io_through_the_real_daemon() {
-    let dir = temp_dir();
-    let _ = std::fs::remove_dir_all(&dir);
-    let runtime = Arc::new(Runtime::new(
-        &RuntimeConfig {
-            daemon: blockd_core::hostmeta::HostConfig {
-                archive: blockd_core::hostmeta::ArchivePolicy::default(),
-                host: HostId(0),
-                cache_pages: 16,
-                writeback_interval: millis(10),
-                backup_retry: millis(20),
-                disk_capacity: None,
-                disk_headroom: 0,
-                wedge_ticks: 25,
-                replica_placement: None,
-            },
-            blob_dir: dir.clone(),
-            peer: None,
-        },
-        Arc::new(EmptyStore),
-    ));
+    let addresses = [
+        support::free_addr(),
+        support::free_addr(),
+        support::free_addr(),
+    ];
+    let roots: [std::path::PathBuf; 3] =
+        std::array::from_fn(|host| support::temp_root(&format!("database-{host}")));
+    let store = Arc::new(S3Store::new());
+    let runtimes = (0..3)
+        .map(|host| {
+            Arc::new(Runtime::new(
+                &support::three_host_runtime_config(
+                    host,
+                    roots[usize::from(host)].clone(),
+                    addresses,
+                ),
+                store.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    std::thread::sleep(Duration::from_millis(100));
+    let runtime = Arc::clone(&runtimes[0]);
     let vset = VsetId(88);
     let vm = VmId(4);
     runtime.create_vset(vset, VsetConfig::database(32));
@@ -151,12 +125,26 @@ fn unix_stream_runs_sqlite_shaped_io_through_the_real_daemon() {
             eof: false,
         }
     );
-    assert!(matches!(
-        round_trip(&mut client, &request(4, DatabaseOp::Sync { handle: 7 }),),
-        DatabaseReply::Synced { req: ReqId(4), .. }
-    ));
+    let mut synced = false;
+    for req in 4..=64 {
+        match round_trip(&mut client, &request(req, DatabaseOp::Sync { handle: 7 })) {
+            DatabaseReply::Synced { .. } => {
+                synced = true;
+                break;
+            }
+            DatabaseReply::Failed {
+                error: DatabaseError::Io,
+                ..
+            } => std::thread::sleep(Duration::from_millis(20)),
+            reply => panic!("unexpected sync reply: {reply:?}"),
+        }
+    }
+    assert!(synced, "database sync did not become durable");
     drop(client);
     thread.join().expect("server thread").expect("clean EOF");
     drop(runtime);
-    let _ = std::fs::remove_dir_all(dir);
+    drop(runtimes);
+    for root in roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
