@@ -38,6 +38,10 @@ use crate::types::{HostId, PageId, VolumeId, VsetId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlobError {
+    /// The operation left durable storage exactly as it was before the call,
+    /// so retrying the same write, append, or truncate is safe.
+    Full,
+    /// The device outcome is not trustworthy; the host must fail-stop.
     Io,
 }
 

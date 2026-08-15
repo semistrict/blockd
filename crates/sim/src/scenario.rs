@@ -332,6 +332,9 @@ impl Scenario {
                 &self.spec.storage.blob_device.ns_per_byte,
                 "storage.blob-device.ns-per-byte",
             )?,
+            full_window: None,
+            handoff_full_writes: 0,
+            eio_at: None,
         };
         if bdev.read_latency_min > bdev.read_latency_max
             || bdev.write_latency_min > bdev.write_latency_max

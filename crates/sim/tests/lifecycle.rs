@@ -144,6 +144,31 @@ fn pressure_slows_guests_but_never_kills() {
 }
 
 #[test]
+fn full_disk_stalls_captures_until_space_returns_without_killing_guests() {
+    let mut config = base_config();
+    config.horizon = secs(3);
+    config.checkpoint_interval = Some(millis(200));
+    config.bdev.full_window = Some((millis(600), millis(1400)));
+    let report = run(21, config);
+    assert_clean(&report);
+    assert_eq!(report.guest_deaths, 0);
+    assert!(report.counters.nvme_stalls > 0, "{report:?}");
+    assert!(report.counters.checkpoints_done > 0, "{report:?}");
+    assert!(report.counters.syncs_acked > 0, "{report:?}");
+}
+
+#[test]
+fn non_capacity_write_failure_fail_stops_the_host() {
+    let mut config = base_config();
+    config.horizon = secs(2);
+    config.bdev.eio_at = Some(millis(700));
+    let report = run(23, config);
+    assert_clean(&report);
+    assert_eq!(report.crashes, 1, "{report:?}");
+    assert_eq!(report.guest_deaths, 0, "{report:?}");
+}
+
+#[test]
 fn bit_rot_never_serves_corrupt_bytes() {
     // R8.1: damaged segments must never serve bytes. Random damage may land
     // on obsolete data, but any unservable read must fail its guest loudly.

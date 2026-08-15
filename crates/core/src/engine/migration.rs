@@ -335,9 +335,14 @@ where
         }
         return Some(Err(AdminError::Unavailable));
     }
-    if Blobs::write(world.as_ref(), handoff_name.clone(), handoff_bytes.clone())
-        .await
-        .is_err()
+    if super::blob::write(
+        &state,
+        world.as_ref(),
+        handoff_name.clone(),
+        handoff_bytes.clone(),
+    )
+    .await
+    .is_err()
     {
         state.borrow_mut().fail("migration handoff write failed");
         return None;
@@ -909,7 +914,7 @@ pub(super) async fn migrate_in<W>(
         {
             return;
         }
-        if Blobs::write(world.as_ref(), name.clone(), bytes.clone())
+        if super::blob::write(&state, world.as_ref(), name.clone(), bytes.clone())
             .await
             .is_err()
         {
@@ -1418,7 +1423,7 @@ where
     }
     for (segment, bytes, _) in &segments {
         let name = layout::segment_blob(vset, fence, *segment);
-        if Blobs::write(world.as_ref(), name.clone(), bytes.clone())
+        if super::blob::write(&state, world.as_ref(), name.clone(), bytes.clone())
             .await
             .is_err()
         {
@@ -1430,7 +1435,7 @@ where
     let mut new_leaf_blobs = Vec::new();
     for (pointer, bytes, segments) in &leaf_writes {
         let name = layout::leaf_blob(vset, pointer.fence, pointer.id);
-        if Blobs::write(world.as_ref(), name.clone(), bytes.clone())
+        if super::blob::write(&state, world.as_ref(), name.clone(), bytes.clone())
             .await
             .is_err()
         {

@@ -439,6 +439,8 @@ pub(crate) struct SimWorld {
     corrupt_fills: Cell<bool>,
     drop_write_protect: Cell<bool>,
     drop_handoff_writes: Cell<bool>,
+    handoff_full_remaining: Cell<u8>,
+    eio_fired: Cell<bool>,
     page_read_poll: Cell<Option<u64>>,
     page_reads_in_poll: Cell<u64>,
     max_page_reads_in_poll: Cell<u64>,
@@ -547,6 +549,8 @@ impl SimWorld {
             corrupt_fills: Cell::new(false),
             drop_write_protect: Cell::new(false),
             drop_handoff_writes: Cell::new(false),
+            handoff_full_remaining: Cell::new(blob_config.handoff_full_writes),
+            eio_fired: Cell::new(false),
             page_read_poll: Cell::new(None),
             page_reads_in_poll: Cell::new(0),
             max_page_reads_in_poll: Cell::new(0),
@@ -1226,6 +1230,24 @@ impl SimWorld {
             .saturating_add(self.blob_config.ns_per_byte.saturating_mul(bytes as u64))
     }
 
+    fn blob_write_fault(&self, name: &str) -> Option<BlobError> {
+        let submitted = now();
+        if self.blob_config.eio_at.is_some_and(|at| submitted >= at)
+            && !self.eio_fired.replace(true)
+        {
+            return Some(BlobError::Io);
+        }
+        let handoff_remaining = self.handoff_full_remaining.get();
+        if name.ends_with("/handoff") && handoff_remaining > 0 {
+            self.handoff_full_remaining.set(handoff_remaining - 1);
+            return Some(BlobError::Full);
+        }
+        self.blob_config
+            .full_window
+            .filter(|(start, stop)| (*start..*stop).contains(&submitted))
+            .map(|_| BlobError::Full)
+    }
+
     fn store_latency(&self, bytes: usize) -> u64 {
         random_between(self.store_config.latency_min, self.store_config.latency_max)
             .saturating_add(self.store_config.ns_per_byte.saturating_mul(bytes as u64))
@@ -1267,6 +1289,10 @@ impl Blobs for SimWorld {
 
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
         let latency = self.blob_latency(bytes.len(), true);
+        if let Some(error) = self.blob_write_fault(&name) {
+            delay(latency).await;
+            return Err(error);
+        }
         if self.drop_handoff_writes.get() && name.ends_with("/handoff") {
             delay(latency).await;
             return Ok(());
@@ -1281,6 +1307,10 @@ impl Blobs for SimWorld {
 
     async fn append(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
         let latency = self.blob_latency(bytes.len(), true);
+        if let Some(error) = self.blob_write_fault(&name) {
+            delay(latency).await;
+            return Err(error);
+        }
         let io = self.submit_blob(name, bytes, BlobWriteKind::Append);
         self.finish_blob(io, latency).await
     }
@@ -2190,6 +2220,9 @@ mod tests {
                 write_latency_min: 1,
                 write_latency_max: 1,
                 ns_per_byte: 0,
+                full_window: None,
+                handoff_full_writes: 0,
+                eio_at: None,
             },
             StoreConfig {
                 latency_min: 1,
@@ -2271,6 +2304,9 @@ mod tests {
             write_latency_min: 1,
             write_latency_max: 1,
             ns_per_byte: 0,
+            full_window: None,
+            handoff_full_writes: 0,
+            eio_at: None,
         };
         let store = StoreConfig {
             latency_min: 1,
@@ -2540,6 +2576,9 @@ mod tests {
             write_latency_min: 1,
             write_latency_max: 1,
             ns_per_byte: 0,
+            full_window: None,
+            handoff_full_writes: 0,
+            eio_at: None,
         };
         let store_config = StoreConfig {
             latency_min: 1,

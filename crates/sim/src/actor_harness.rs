@@ -1661,6 +1661,9 @@ mod tests {
                 write_latency_min: 100,
                 write_latency_max: 1_000,
                 ns_per_byte: 0,
+                full_window: None,
+                handoff_full_writes: 0,
+                eio_at: None,
             },
             store: StoreConfig {
                 latency_min: 1_000,

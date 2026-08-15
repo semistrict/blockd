@@ -50,6 +50,11 @@ missing_panics_doc = "allow"
 [profile.dev.package.blockd-core]
 opt-level = 2
 
+# A panicking production daemon must fail-stop instead of leaving other
+# threads running against partially unwound protocol state.
+[profile.release]
+panic = "abort"
+
 [profile.dev.package.blockd-exec]
 opt-level = 2
 

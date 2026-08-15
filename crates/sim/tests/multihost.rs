@@ -100,6 +100,19 @@ fn migration_is_lossless_and_background_hydration_releases_the_source() {
 }
 
 #[test]
+fn migration_retries_a_full_handoff_without_resuming_or_killing_the_source() {
+    let mut config = migration_config();
+    config.bdev.handoff_full_writes = 1;
+    config.horizon = secs(3);
+    let retry = config.daemon.writeback_interval;
+    let report = run(79, config);
+    assert_clean(&report);
+    assert_eq!(report.migrations, 1, "{report:?}");
+    assert_eq!(report.guest_deaths, 0, "{report:?}");
+    assert!(report.max_migration_pause_ns >= retry, "{report:?}");
+}
+
+#[test]
 fn lossy_duplicating_links_preserve_migration_and_replay() {
     let config = || ClusterConfig {
         peer_drop: (1, 4),

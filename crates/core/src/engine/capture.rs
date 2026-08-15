@@ -775,7 +775,7 @@ where
         {
             return None;
         }
-        if Blobs::write(world.as_ref(), name.clone(), bytes.clone())
+        if super::blob::write(&state, world.as_ref(), name.clone(), bytes.clone())
             .await
             .is_err()
         {
@@ -825,7 +825,7 @@ where
         {
             return None;
         }
-        if Blobs::write(world.as_ref(), name.clone(), bytes.clone())
+        if super::blob::write(&state, world.as_ref(), name.clone(), bytes.clone())
             .await
             .is_err()
         {
@@ -1170,8 +1170,8 @@ pub(super) async fn write_record_copies<W: Blobs>(
         (had_primary, had_mirror)
     };
     let (primary, mirror) = join2(
-        Blobs::write(world, primary_name.clone(), bytes.clone()),
-        Blobs::write(world, mirror_name.clone(), bytes),
+        super::blob::write(state, world, primary_name.clone(), bytes.clone()),
+        super::blob::write(state, world, mirror_name.clone(), bytes),
     )
     .await;
     if primary.is_ok() {

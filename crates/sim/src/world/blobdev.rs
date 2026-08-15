@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use blockd_core::types::SimTime;
+use blockd_core::world::BlobError;
 
 use crate::rng::Pcg64;
 
@@ -26,6 +27,14 @@ pub struct BlobDevConfig {
     pub write_latency_max: u64,
     /// Throughput term: added nanoseconds per byte moved.
     pub ns_per_byte: u64,
+    /// Every write submitted in this half-open interval reports `Full` and
+    /// leaves durable state unchanged.
+    pub full_window: Option<(u64, u64)>,
+    /// Fail this many migration handoff writes with `Full` before allowing
+    /// the marker to land; used to target cutover retry behavior.
+    pub handoff_full_writes: u8,
+    /// The first write at or after this instant reports a fatal I/O error.
+    pub eio_at: Option<u64>,
 }
 
 impl BlobDevConfig {
@@ -37,6 +46,9 @@ impl BlobDevConfig {
             write_latency_min: 30_000,
             write_latency_max: 400_000,
             ns_per_byte: 1,
+            full_window: None,
+            handoff_full_writes: 0,
+            eio_at: None,
         }
     }
 }
@@ -78,6 +90,7 @@ pub struct BlobDev {
     blobs: BTreeMap<String, Vec<u8>>,
     inflight: BTreeMap<BdevIo, (String, Vec<u8>, WriteKind)>,
     next_io: u64,
+    eio_fired: bool,
     pub counters: BlobDevCounters,
 }
 
@@ -94,8 +107,33 @@ impl BlobDev {
             blobs: BTreeMap::new(),
             inflight: BTreeMap::new(),
             next_io: 0,
+            eio_fired: false,
             counters: BlobDevCounters::default(),
         }
+    }
+
+    pub fn write_fault(&mut self, now: SimTime, name: &str) -> Option<BlobError> {
+        if self.config.eio_at.is_some_and(|at| now.nanos() >= at) && !self.eio_fired {
+            self.eio_fired = true;
+            return Some(BlobError::Io);
+        }
+        if name.ends_with("/handoff") && self.config.handoff_full_writes > 0 {
+            self.config.handoff_full_writes -= 1;
+            return Some(BlobError::Full);
+        }
+        self.config
+            .full_window
+            .filter(|(start, stop)| (*start..*stop).contains(&now.nanos()))
+            .map(|_| BlobError::Full)
+    }
+
+    pub fn failed_write_done(&self, now: SimTime, rng: &mut Pcg64, bytes: usize) -> SimTime {
+        now.after(self.latency(
+            rng,
+            self.config.write_latency_min,
+            self.config.write_latency_max,
+            bytes,
+        ))
     }
 
     fn latency(&self, rng: &mut Pcg64, min: u64, max: u64, bytes: usize) -> u64 {

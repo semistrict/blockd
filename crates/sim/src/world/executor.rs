@@ -54,8 +54,18 @@ impl Blobs for SimBlobs {
     }
 
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
+        let submitted = SimTime(now());
+        let fault = self.device.borrow_mut().write_fault(submitted, &name);
+        if let Some(error) = fault {
+            let done = {
+                let device = self.device.borrow();
+                device.failed_write_done(submitted, &mut self.rng.borrow_mut(), bytes.len())
+            };
+            delay(done.nanos().saturating_sub(now())).await;
+            return Err(error);
+        }
         let (io, done) = self.device.borrow_mut().submit_write(
-            SimTime(now()),
+            submitted,
             &mut self.rng.borrow_mut(),
             name,
             bytes,
@@ -66,8 +76,18 @@ impl Blobs for SimBlobs {
     }
 
     async fn append(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError> {
+        let submitted = SimTime(now());
+        let fault = self.device.borrow_mut().write_fault(submitted, &name);
+        if let Some(error) = fault {
+            let done = {
+                let device = self.device.borrow();
+                device.failed_write_done(submitted, &mut self.rng.borrow_mut(), bytes.len())
+            };
+            delay(done.nanos().saturating_sub(now())).await;
+            return Err(error);
+        }
         let (io, done) = self.device.borrow_mut().submit_append(
-            SimTime(now()),
+            submitted,
             &mut self.rng.borrow_mut(),
             name,
             bytes,

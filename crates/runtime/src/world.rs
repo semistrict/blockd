@@ -103,34 +103,98 @@ fn fsync_to_root(root: &Path, parent: &Path) -> std::io::Result<()> {
     }
 }
 
-fn write_blob(root: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let path = root.join(name);
-    let parent = path.parent().expect("blob has parent");
-    std::fs::create_dir_all(parent)?;
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return if std::fs::read(&path)? == bytes {
-                Ok(())
-            } else {
-                Err(error)
-            };
-        }
-        Err(error) => return Err(error),
-    };
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fsync_to_root(root, parent)
+fn blob_error(error: &std::io::Error) -> BlobError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) {
+        BlobError::Full
+    } else {
+        BlobError::Io
+    }
 }
 
-fn append_blob(root: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+fn remove_blob_durable(root: &Path, path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => fsync_to_root(root, path.parent().expect("blob has parent")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn rollback_append(root: &Path, path: &Path, original_len: Option<u64>) -> std::io::Result<()> {
+    if let Some(len) = original_len {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(len)?;
+        file.sync_all()?;
+        fsync_to_root(root, path.parent().expect("blob has parent"))
+    } else {
+        remove_blob_durable(root, path)
+    }
+}
+
+fn classify_write(
+    result: std::io::Result<()>,
+    rollback: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), BlobError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if blob_error(&error) == BlobError::Full => {
+            rollback().map_or(Err(BlobError::Io), |()| Err(BlobError::Full))
+        }
+        Err(_) => Err(BlobError::Io),
+    }
+}
+
+fn write_blob(root: &Path, name: &str, bytes: &[u8]) -> Result<(), BlobError> {
     let path = root.join(name);
     let parent = path.parent().expect("blob has parent");
-    std::fs::create_dir_all(parent)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fsync_to_root(root, parent)
+    let mut created = false;
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(parent)?;
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                created = true;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return if std::fs::read(&path)? == bytes {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fsync_to_root(root, parent)
+    })();
+    classify_write(result, || {
+        if created {
+            remove_blob_durable(root, &path)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn append_blob(root: &Path, name: &str, bytes: &[u8]) -> Result<(), BlobError> {
+    let path = root.join(name);
+    let parent = path.parent().expect("blob has parent");
+    let original_len = match std::fs::metadata(&path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(BlobError::Io),
+    };
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(parent)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fsync_to_root(root, parent)
+    })();
+    classify_write(result, || rollback_append(root, &path, original_len))
 }
 
 fn delete_many(root: &Path, names: Vec<String>) -> std::io::Result<()> {
@@ -168,16 +232,10 @@ fn file_worker(root: &Path, receiver: &Arc<Mutex<Receiver<FileJob>>>) {
                 send(&reply, Ok(blobs));
             }
             FileJob::Write { name, bytes, reply } => {
-                send(
-                    &reply,
-                    write_blob(root, &name, &bytes).map_err(|_| BlobError::Io),
-                );
+                send(&reply, write_blob(root, &name, &bytes));
             }
             FileJob::Append { name, bytes, reply } => {
-                send(
-                    &reply,
-                    append_blob(root, &name, &bytes).map_err(|_| BlobError::Io),
-                );
+                send(&reply, append_blob(root, &name, &bytes));
             }
             FileJob::Truncate { name, len, reply } => {
                 let result = OpenOptions::new()
@@ -187,7 +245,7 @@ fn file_worker(root: &Path, receiver: &Arc<Mutex<Receiver<FileJob>>>) {
                         file.set_len(len)?;
                         file.sync_all()
                     })
-                    .map_err(|_| BlobError::Io);
+                    .map_err(|error| blob_error(&error));
                 send(&reply, result);
             }
             FileJob::Read { name, reply } => {
@@ -431,10 +489,10 @@ mod tests {
     use std::sync::Arc;
 
     use blockd_core::protocol::StoreFault;
-    use blockd_core::world::{Blobs, Store, StoreError};
+    use blockd_core::world::{BlobError, Blobs, Store, StoreError};
     use blockd_exec::Executor;
 
-    use super::{FileBlobs, RuntimeStore};
+    use super::{FileBlobs, RuntimeStore, classify_write, remove_blob_durable, rollback_append};
     use crate::directory_store::DirectoryStore;
 
     #[test]
@@ -470,6 +528,43 @@ mod tests {
             assert_eq!(blobs.read("v/1/record").await.unwrap(), None);
             assert_eq!(blobs.read("v/1/marker").await.unwrap(), None);
         });
+    }
+
+    #[test]
+    fn retryable_write_failures_restore_the_exact_prior_filesystem_state() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("nested");
+        std::fs::create_dir_all(&parent).unwrap();
+
+        let immutable = parent.join("partial.blob");
+        std::fs::write(&immutable, b"partial").unwrap();
+        assert_eq!(
+            classify_write(
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+                || remove_blob_durable(root.path(), &immutable),
+            ),
+            Err(BlobError::Full),
+        );
+        assert!(!immutable.exists());
+
+        let spool = parent.join("existing.spool");
+        std::fs::write(&spool, b"goodpartial").unwrap();
+        assert_eq!(
+            classify_write(
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+                || rollback_append(root.path(), &spool, Some(4)),
+            ),
+            Err(BlobError::Full),
+        );
+        assert_eq!(std::fs::read(&spool).unwrap(), b"good");
+
+        assert_eq!(
+            classify_write(
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+                || Err(std::io::Error::other("rollback failed")),
+            ),
+            Err(BlobError::Io),
+        );
     }
 
     #[test]

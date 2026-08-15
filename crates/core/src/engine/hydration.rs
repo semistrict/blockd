@@ -255,7 +255,7 @@ where
     {
         return None;
     }
-    if Blobs::write(world, local_name.clone(), bytes.clone())
+    if super::blob::write(state, world, local_name.clone(), bytes.clone())
         .await
         .is_err()
     {

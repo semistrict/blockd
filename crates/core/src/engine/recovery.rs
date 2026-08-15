@@ -245,7 +245,7 @@ async fn recover_replica_blobs<W: Blobs>(
             return Ok(());
         }
         let valid = scan.valid_len.saturating_sub(*start) as u64;
-        Blobs::truncate(world, name, valid).await?;
+        super::blob::truncate(state, world, name, valid).await?;
         state.borrow_mut().truncate_blob(name, valid);
         valid
     } else {

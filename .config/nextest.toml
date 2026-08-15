@@ -1,0 +1,25 @@
+# Heavy Linux e2e tests boot real Firecracker VMs or multi-node replica
+# clusters (subprocesses); running several at once on a small VM starves
+# their internal deadlines (the operator drill's 30s sync ack blew twice
+# under full-suite load) and pollutes the perf profiles. Serialize them —
+# everything else still runs in parallel around them.
+[test-groups]
+heavy-e2e = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = '''
+package(blockd-runtime) and (
+    binary(fc_e2e_linux)
+    | binary(fc_perf_linux)
+    | binary(fc_sqlite_e2e_linux)
+    | binary(fc_virtiofs_sqlite_e2e_linux)
+    | binary(migrate_e2e_linux)
+    | binary(replica_e2e_linux)
+    | binary(replica_disk_linux)
+    | binary(replica_operator_drill_linux)
+    | binary(loop_interference_linux)
+    | binary(vnode_authority_linux)
+    | binary(workload_e2e_linux)
+)
+'''
+test-group = 'heavy-e2e'

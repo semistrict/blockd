@@ -950,7 +950,7 @@ where
     }
     for (segment, bytes, _) in &segments {
         let name = layout::segment_blob(vset, fence, *segment);
-        if Blobs::write(world, name.clone(), bytes.clone())
+        if super::blob::write(state, world, name.clone(), bytes.clone())
             .await
             .is_err()
         {
@@ -962,7 +962,7 @@ where
     let mut new_leaf_blobs = Vec::new();
     for (pointer, bytes, segments) in &leaf_writes {
         let name = layout::leaf_blob(vset, pointer.fence, pointer.id);
-        if Blobs::write(world, name.clone(), bytes.clone())
+        if super::blob::write(state, world, name.clone(), bytes.clone())
             .await
             .is_err()
         {

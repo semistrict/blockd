@@ -233,6 +233,11 @@ impl HostState {
         self.disk_reclaim_requested = true;
     }
 
+    pub(super) fn note_blob_full(&mut self) {
+        self.counters.nvme_stalls = self.counters.nvme_stalls.saturating_add(1);
+        self.request_disk_reclaim();
+    }
+
     pub fn wake_pressure_waiter(&mut self) {
         while let Some(waiter) = self.pressure_waiters.pop_front() {
             if waiter.send(()).is_ok() {
@@ -404,6 +409,16 @@ impl HostState {
     pub fn append_blob(&mut self, name: String, bytes: u64) {
         let stored = self.blob_sizes.entry(name).or_default();
         *stored = stored.saturating_add(bytes);
+    }
+
+    pub(super) fn rollback_append_reservation(&mut self, name: &str, bytes: u64) {
+        let Some(stored) = self.blob_sizes.get_mut(name) else {
+            return;
+        };
+        *stored = stored.saturating_sub(bytes);
+        if *stored == 0 {
+            self.blob_sizes.remove(name);
+        }
     }
 
     pub fn truncate_blob(&mut self, name: &str, bytes: u64) {

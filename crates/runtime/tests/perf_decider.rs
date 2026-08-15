@@ -39,6 +39,9 @@ fn config(vsets: u16, pages: u32) -> ActorHarnessConfig {
             write_latency_min: 1,
             write_latency_max: 1,
             ns_per_byte: 0,
+            full_window: None,
+            handoff_full_writes: 0,
+            eio_at: None,
         },
         store: StoreConfig {
             latency_min: 1,

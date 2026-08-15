@@ -2,6 +2,7 @@
 
 mod authority;
 mod backup;
+mod blob;
 mod capture;
 mod database;
 mod error;

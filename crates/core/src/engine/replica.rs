@@ -22,7 +22,7 @@ use crate::replica_spool::{
 };
 use crate::types::{HostId, VsetId};
 use crate::vnode_member::VnodeRecoveryClosure;
-use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
+use crate::world::{AdminIo, BlobError, Blobs, GuestMem, Peers, Store, StoreError};
 
 /// Rotation happens before an append. A single verified frame may therefore
 /// exceed this bound, but existing bytes are never copied between generations.
@@ -335,12 +335,18 @@ async fn replica_put<W>(
         state.borrow_mut().counters.replica_capacity_backpressure += 1;
         return;
     }
-    if Blobs::append(world, spool_name.clone(), frame.clone())
-        .await
-        .is_err()
-    {
-        state.borrow_mut().fail("replica artifact append failed");
-        return;
+    match Blobs::append(world, spool_name.clone(), frame.clone()).await {
+        Ok(()) => {}
+        Err(BlobError::Full) => {
+            let mut host = state.borrow_mut();
+            host.rollback_append_reservation(&spool_name, frame.len() as u64);
+            host.note_blob_full();
+            return;
+        }
+        Err(BlobError::Io) => {
+            state.borrow_mut().fail("replica artifact append failed");
+            return;
+        }
     }
     {
         let mut host = state.borrow_mut();
@@ -479,12 +485,18 @@ async fn replica_commit<W>(
         state.borrow_mut().counters.replica_capacity_backpressure += 1;
         return;
     }
-    if Blobs::append(world, spool_name.clone(), frame.clone())
-        .await
-        .is_err()
-    {
-        state.borrow_mut().fail("replica commit append failed");
-        return;
+    match Blobs::append(world, spool_name.clone(), frame.clone()).await {
+        Ok(()) => {}
+        Err(BlobError::Full) => {
+            let mut host = state.borrow_mut();
+            host.rollback_append_reservation(&spool_name, frame.len() as u64);
+            host.note_blob_full();
+            return;
+        }
+        Err(BlobError::Io) => {
+            state.borrow_mut().fail("replica commit append failed");
+            return;
+        }
     }
     {
         let mut host = state.borrow_mut();
