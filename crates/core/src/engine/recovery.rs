@@ -1,23 +1,33 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use blockd_exec::{FaultPoint, fault_point, now, yield_now};
+use blockd_exec::{FaultPoint, fault_point, yield_now};
 
 use super::state::ReplicaKey;
 use super::{SharedHost, VsetState};
+use crate::blx::{
+    BlxFooter, EntryKind, HEADER_BYTES, NamespaceKind, TRAILER_BYTES, open_footer, open_header,
+    open_trailer, scan_object,
+};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout::{self, BlobName};
-use crate::mapleaf::{LeafPtr, MapLeaf, span_is_memory};
+use crate::mapleaf::{LeafPtr, MapLeaf};
 use crate::protocol::Verdict;
 use crate::replica_spool::scan_replica_spool;
 use crate::segment::PageLoc;
-use crate::types::{JournalSeq, PageId, SegId, VolumeId, VsetId};
+use crate::types::{JournalSeq, PageId, SegId, VsetId};
 use crate::world::{BlobEntry, Blobs};
 
 #[derive(Default)]
 struct Found {
     records: Vec<JournalRecord>,
+    migration_checksums:
+        BTreeMap<(u64, JournalSeq), BTreeMap<crate::blx::BlockKey, (crate::types::Gen, u64)>>,
     journals: Vec<(u64, JournalSeq)>,
     segments: Vec<(u64, SegId, u64)>,
+    record_segments: BTreeMap<JournalSeq, BTreeSet<(u64, SegId)>>,
+    tombstone_segments: BTreeSet<(u64, SegId)>,
+    segment_refs: BTreeMap<(u64, SegId), crate::manifest::ObjectRef>,
+    segment_footers: BTreeMap<(u64, SegId), BlxFooter>,
     leaves: BTreeMap<LeafPtr, (u64, MapLeaf)>,
     names: Vec<String>,
     max_seq: u64,
@@ -60,6 +70,11 @@ pub async fn recover_local<W: Blobs>(
             continue;
         }
         collect_blob(&mut found, &blob);
+        if blob.bytes.is_empty()
+            && let Some(BlobName::Segment { vset, fence, seg }) = layout::parse_blob(&blob.name)
+        {
+            collect_segment_metadata(&mut found, world, &blob, vset, fence, seg).await?;
+        }
     }
     for (key, generations) in replica_blobs {
         recover_replica_blobs(&state, world, key, generations).await?;
@@ -76,16 +91,15 @@ pub async fn recover_local<W: Blobs>(
 
     let mut verdicts = BTreeMap::new();
     for (vset, found) in found {
-        let usable = |record: &&JournalRecord| {
-            record_usable(vset, record, &found.leaves, &available_segments)
-        };
+        let usable =
+            |record: &&JournalRecord| record_usable(vset, record, &found, &available_segments);
         let chosen = found
             .records
             .iter()
             .filter(usable)
             .max_by_key(|record| (record.capture_seq, record.seq))
             .cloned();
-        let Some(mut chosen) = chosen else {
+        let Some(chosen) = chosen else {
             verdicts.insert(vset, Verdict::Unrestorable);
             if found.handoff.is_none() {
                 Blobs::delete_many_durable(world, &found.names).await?;
@@ -116,21 +130,60 @@ pub async fn recover_local<W: Blobs>(
             continue;
         }
         let watermark = usable_watermark.max(durability_watermark);
+        let mut page_locs = if chosen.overlay.is_empty() {
+            materialize_files(vset, chosen.config, &chosen.files, &found)
+        } else {
+            chosen.overlay.clone()
+        };
+        let migration_checksums = found.migration_checksums.get(&(chosen.fence, chosen.seq));
+        let (mut block_checksums, materialized_state_checksum) =
+            if let Some(migration_checksums) = migration_checksums {
+                let checksum = migration_checksums.iter().fold(
+                    0,
+                    |checksum, (&key, &(generation, value_checksum))| {
+                        checksum ^ crate::blx::state_contribution(key, generation, value_checksum)
+                    },
+                );
+                (migration_checksums.clone(), checksum)
+            } else {
+                materialize_checksums(&chosen.files, &found)
+            };
+        let mut state_checksum = chosen.post_state_checksum;
+        let mut vmm_segments = materialize_vmm_segments(&chosen.files, &found);
+        let mut pending_tombstones = BTreeSet::new();
         let verdict = if chosen.config.kind == VsetKind::Database {
             Verdict::DatabaseReady {
                 synced_through: chosen.sync_covered_through,
             }
-        } else if let RecordKind::Checkpoint { epoch, vmstate } = chosen.kind
+        } else if let RecordKind::Checkpoint { epoch, vmstate, .. } = chosen.kind
             && chosen.capture_seq >= watermark
         {
             Verdict::Resume { epoch, vmstate }
         } else {
-            chosen
-                .overlay
-                .retain(|page, _| !chosen.config.is_memory(page.volume.idx));
-            chosen.leaves.retain(|span, _| !span_is_memory(*span));
+            pending_tombstones.extend(
+                block_checksums
+                    .keys()
+                    .filter(|key| key.space != crate::blx::BlockSpace::Data)
+                    .copied(),
+            );
+            page_locs.retain(|page, _| !chosen.config.is_memory(page.volume.idx));
+            block_checksums.retain(|key, _| key.space == crate::blx::BlockSpace::Data);
+            vmm_segments.clear();
+            state_checksum = block_checksums.iter().fold(
+                0,
+                |checksum, (&key, &(generation, value_checksum))| {
+                    checksum ^ crate::blx::state_contribution(key, generation, value_checksum)
+                },
+            );
             Verdict::ColdBoot
         };
+        if matches!(verdict, Verdict::Resume { .. })
+            && migration_checksums.is_some()
+            && materialized_state_checksum != chosen.post_state_checksum
+        {
+            verdicts.insert(vset, Verdict::Unrestorable);
+            continue;
+        }
 
         let backed = true;
         let mut host = state.borrow_mut();
@@ -146,36 +199,28 @@ pub async fn recover_local<W: Blobs>(
         recovered.next_seq = found.max_seq;
         recovered.next_seg = found.max_seg;
         recovered.next_leaf = found.max_leaf;
-        recovered.next_gen = chosen
-            .overlay
+        recovered.next_gen = found
+            .segment_footers
             .values()
-            .map(|(generation, _)| generation.0 + 1)
+            .flat_map(|footer| footer.entries.iter())
+            .map(|entry| entry.generation.0.saturating_add(1))
+            .chain(
+                block_checksums
+                    .values()
+                    .map(|(generation, _)| generation.0.saturating_add(1)),
+            )
             .max()
             .unwrap_or(0);
         recovered.local_covered_through = watermark.max(chosen.sync_covered_through);
-        recovered.overlay = chosen.overlay.clone();
-        recovered.leaf_table = chosen.leaves.clone();
-        recovered.hydrated_spans = chosen.leaves.keys().copied().collect();
-        recovered.page_locs = materialize(vset, &chosen, &found.leaves);
-        recovered.leaf_blobs = found
-            .leaves
-            .iter()
-            .map(|(&pointer, (size, leaf))| {
-                let segments = leaf
-                    .entries
-                    .iter()
-                    .filter(|(_, _, _, location)| location.base == 0)
-                    .map(|(_, _, _, location)| (location.fence, location.seg))
-                    .collect();
-                (pointer, (*size, segments))
-            })
-            .collect();
-        recovered.next_gen = recovered
-            .page_locs
-            .values()
-            .map(|(generation, _)| generation.0 + 1)
-            .max()
-            .unwrap_or(recovered.next_gen);
+        recovered.sync_ack_through = chosen.sync_covered_through;
+        recovered.peer_committed_through = chosen.sync_covered_through;
+        recovered.overlay = page_locs.clone();
+        recovered.page_locs = page_locs;
+        recovered.block_checksums = block_checksums;
+        recovered.state_checksum = state_checksum;
+        recovered.archived_memory_usable = !matches!(verdict, Verdict::ColdBoot);
+        recovered.pending_tombstones = pending_tombstones;
+        recovered.vmm_segments = vmm_segments;
         if let Verdict::Resume { epoch, .. } = verdict {
             recovered.epoch = epoch;
             recovered.pinned = Some(chosen.clone());
@@ -202,6 +247,9 @@ pub async fn recover_local<W: Blobs>(
                 (seq, (fence, watermark))
             })
             .collect();
+        recovered.record_segments = found.record_segments;
+        recovered.tombstone_segments = found.tombstone_segments;
+        recovered.segment_refs = found.segment_refs;
         recovered.segment_blobs = found.segments;
         let previous = host.vsets.insert(vset, recovered);
         assert!(previous.is_none(), "duplicate recovered vset");
@@ -257,14 +305,7 @@ async fn recover_replica_blobs<W: Blobs>(
     });
     let committed = committed_cut.map(|commit| commit.info);
     let committed_record = committed_cut.map(|commit| commit.record.clone());
-    let archive_pending = committed_cut.map(|commit| super::state::ReplicaArchiveCut {
-        info: commit.info,
-        required: commit.required.clone(),
-        record: commit.record.clone(),
-    });
-    let archive_due = archive_pending
-        .as_ref()
-        .map(|_| now().saturating_add(state.borrow().config.archive.interval));
+    let uncommitted_artifacts = scan.uncommitted_artifacts.clone();
     let artifacts = scan
         .artifacts
         .into_iter()
@@ -276,14 +317,9 @@ async fn recover_replica_blobs<W: Blobs>(
         .collect();
     let replica = super::state::ReplicaState {
         artifacts,
+        uncommitted_artifacts,
         committed,
         committed_record,
-        uploaded: None,
-        uploaded_record: None,
-        archive_pending,
-        archive_inflight: false,
-        archive_due,
-        unarchived_age: 0,
         bytes: scan.valid_len as u64,
         current_generation,
         current_file_bytes,
@@ -323,16 +359,49 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: &BlobEntry) {
         BlobName::Journal { fence, seq, .. } => {
             entry.journals.push((fence, seq));
             entry.max_seq = entry.max_seq.max(seq.0 + 1);
-            if let Ok(record) = JournalRecord::decode(vset, &blob.bytes)
+            if let Ok(record) = JournalRecord::decode(vset, &blob.bytes) {
+                if record.fence == fence && record.seq == seq {
+                    entry.records.push(record);
+                }
+            } else if let Ok((record, checksums)) =
+                JournalRecord::decode_migration_with_checksums(vset, &blob.bytes)
                 && record.fence == fence
                 && record.seq == seq
             {
+                entry.migration_checksums.insert((fence, seq), checksums);
                 entry.records.push(record);
             }
         }
         BlobName::Segment { fence, seg, .. } => {
             entry.max_seg = entry.max_seg.max(seg.0 + 1);
             entry.segments.push((fence, seg, blob.len));
+            if let Ok((header, _)) = open_header(&blob.bytes)
+                && header.namespace_kind == NamespaceKind::Vset
+                && header.namespace_id == vset.0
+                && header.writer_fence == fence
+                && header.object_id == seg.0
+                && header.min_seq == header.max_seq
+            {
+                entry
+                    .record_segments
+                    .entry(JournalSeq(header.max_seq))
+                    .or_default()
+                    .insert((fence, seg));
+            }
+            if scan_object(&blob.bytes).is_ok_and(|(_, footer)| {
+                footer
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == EntryKind::Tombstone)
+            }) {
+                entry.tombstone_segments.insert((fence, seg));
+            }
+            if let Ok(object) = crate::blx::open_object(&blob.bytes) {
+                entry
+                    .segment_refs
+                    .insert((fence, seg), crate::manifest::ObjectRef::from_blx(&object));
+                entry.segment_footers.insert((fence, seg), object.footer);
+            }
         }
         BlobName::Leaf { fence, id, .. } => {
             entry.max_leaf = entry.max_leaf.max(id + 1);
@@ -358,86 +427,258 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: &BlobEntry) {
     }
 }
 
+async fn collect_segment_metadata<W: Blobs>(
+    found: &mut BTreeMap<VsetId, Found>,
+    world: &W,
+    blob: &BlobEntry,
+    vset: VsetId,
+    fence: u64,
+    seg: SegId,
+) -> Result<(), crate::world::BlobError> {
+    let Some(header_bytes) = Blobs::read_range(world, &blob.name, 0, HEADER_BYTES as u64).await?
+    else {
+        return Ok(());
+    };
+    let Some(trailer_offset) = blob.len.checked_sub(TRAILER_BYTES as u64) else {
+        return Ok(());
+    };
+    let Some(trailer_bytes) =
+        Blobs::read_range(world, &blob.name, trailer_offset, TRAILER_BYTES as u64).await?
+    else {
+        return Ok(());
+    };
+    let (Ok((header, header_end)), Ok((footer_offset, footer_length))) =
+        (open_header(&header_bytes), open_trailer(&trailer_bytes))
+    else {
+        return Ok(());
+    };
+    let footer_end = u64::from(footer_offset) + u64::from(footer_length);
+    if header.namespace_kind != NamespaceKind::Vset
+        || header.namespace_id != vset.0
+        || header.writer_fence != fence
+        || header.object_id != seg.0
+        || header.min_seq != header.max_seq
+        || u64::from(footer_offset) < header_end as u64
+        || footer_end.checked_add(TRAILER_BYTES as u64) != Some(blob.len)
+    {
+        return Ok(());
+    }
+    let Some(footer_bytes) = Blobs::read_range(
+        world,
+        &blob.name,
+        u64::from(footer_offset),
+        u64::from(footer_length),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let Ok(footer) = open_footer(&footer_bytes) else {
+        return Ok(());
+    };
+    if footer.entries.len() != header.entry_count as usize
+        || footer.entries.first().map(|entry| entry.key) != Some(header.first_key)
+        || footer.entries.last().map(|entry| entry.key) != Some(header.last_key)
+        || footer
+            .entries
+            .last()
+            .and_then(|entry| entry.offset.checked_add(entry.length))
+            != Some(footer_offset)
+    {
+        return Ok(());
+    }
+    let Some(size) = u32::try_from(blob.len).ok() else {
+        return Ok(());
+    };
+    let object_ref = crate::manifest::ObjectRef {
+        identity: crate::manifest::ObjectIdentity {
+            namespace_kind: header.namespace_kind,
+            namespace_id: header.namespace_id,
+            writer_fence: header.writer_fence,
+            object_id: header.object_id,
+        },
+        min_seq: header.min_seq,
+        max_seq: header.max_seq,
+        batch_id: header.batch_id,
+        chunk_index: header.chunk_index,
+        chunk_count: header.chunk_count,
+        first_key: header.first_key,
+        last_key: header.last_key,
+        pre_state_checksum: header.pre_state_checksum,
+        post_state_checksum: header.post_state_checksum,
+        size,
+        footer_offset,
+        footer_length,
+        // Local recovery validates the header, trailer, and footer with bounded
+        // reads. Each selected entry remains independently checksummed when it
+        // is faulted; reading the whole object here would defeat lazy recovery.
+        object_checksum: 0,
+    };
+    let entry = found.entry(vset).or_default();
+    entry
+        .record_segments
+        .entry(JournalSeq(header.max_seq))
+        .or_default()
+        .insert((fence, seg));
+    if footer
+        .entries
+        .iter()
+        .any(|entry| entry.kind == EntryKind::Tombstone)
+    {
+        entry.tombstone_segments.insert((fence, seg));
+    }
+    entry.segment_refs.insert((fence, seg), object_ref);
+    entry.segment_footers.insert((fence, seg), footer);
+    Ok(())
+}
+
 fn record_usable(
     vset: VsetId,
     record: &JournalRecord,
-    leaves: &BTreeMap<LeafPtr, (u64, MapLeaf)>,
-    segments: &BTreeMap<(VsetId, u64, SegId), u64>,
+    found: &Found,
+    _segments: &BTreeMap<(VsetId, u64, SegId), u64>,
 ) -> bool {
-    let location_exists = |location: &PageLoc| {
-        let owner = if location.base == 0 {
-            vset
-        } else {
-            VsetId(location.base)
-        };
-        match segments.get(&(owner, location.fence, location.seg)) {
-            Some(bytes) => {
-                location.len != 0
-                    && u64::from(location.offset)
-                        .checked_add(u64::from(location.len))
-                        .is_some_and(|end| end <= *bytes)
-            }
-            None => {
-                location.base == 0
-                    && record.migrated_from.is_some()
-                    && location.fence < record.fence
-            }
+    if record.files.is_empty() {
+        return record.capture_seq == 0
+            || record.migrated_from.is_some()
+            || record.post_state_checksum != 0;
+    }
+    record.files.iter().all(|file| {
+        if file.identity.namespace_kind != NamespaceKind::Vset
+            || file.identity.namespace_id != vset.0
+        {
+            return false;
         }
-    };
-    record
-        .overlay
-        .values()
-        .all(|(_, location)| location_exists(location))
-        && record.leaves.values().all(|pointer| {
-            leaves.get(pointer).is_some_and(|(_, leaf)| {
-                leaf.entries
-                    .iter()
-                    .all(|(_, _, _, location)| location_exists(location))
-            })
-        })
+        let key = (file.identity.writer_fence, SegId(file.identity.object_id));
+        found.segment_refs.get(&key).is_some_and(|found_ref| {
+            found_ref == file
+                || (found_ref.object_checksum == 0 && {
+                    let mut expected = *file;
+                    expected.object_checksum = 0;
+                    *found_ref == expected
+                })
+        }) || (record.migrated_from.is_some() && file.identity.writer_fence < record.fence)
+    })
 }
 
-fn materialize(
+fn materialize_files(
     vset: VsetId,
-    record: &JournalRecord,
-    leaves: &BTreeMap<LeafPtr, (u64, MapLeaf)>,
-) -> BTreeMap<PageId, (crate::types::Gen, crate::segment::PageLoc)> {
-    let mut locations = BTreeMap::new();
-    for pointer in record.leaves.values() {
-        let leaf = &leaves[pointer].1;
-        for &(idx, page, generation, location) in &leaf.entries {
-            let page = PageId {
-                volume: VolumeId { vset, idx },
-                page,
+    config: crate::journal::VsetConfig,
+    files: &[crate::manifest::ObjectRef],
+    found: &Found,
+) -> BTreeMap<PageId, (crate::types::Gen, PageLoc)> {
+    let mut newest = BTreeMap::<PageId, (crate::types::Gen, Option<PageLoc>)>::new();
+    for file in files {
+        let key = (file.identity.writer_fence, SegId(file.identity.object_id));
+        let Some(footer) = found.segment_footers.get(&key) else {
+            continue;
+        };
+        for entry in &footer.entries {
+            let Some(page) = entry.key.to_page(config.kind, vset) else {
+                continue;
             };
-            if record.config.contains(page) {
-                locations.insert(page, (generation, location));
+            let location = (entry.kind == EntryKind::Data).then_some(PageLoc {
+                base: 0,
+                fence: file.identity.writer_fence,
+                seg: SegId(file.identity.object_id),
+                offset: entry.offset,
+                len: entry.length,
+            });
+            if newest
+                .get(&page)
+                .is_none_or(|(generation, _)| *generation <= entry.generation)
+            {
+                newest.insert(page, (entry.generation, location));
             }
         }
     }
-    for (&page, &location) in &record.overlay {
-        locations.insert(page, location);
+    newest
+        .into_iter()
+        .filter_map(|(page, (generation, location))| {
+            location.map(|location| (page, (generation, location)))
+        })
+        .collect()
+}
+
+fn materialize_checksums(
+    files: &[crate::manifest::ObjectRef],
+    found: &Found,
+) -> (
+    BTreeMap<crate::blx::BlockKey, (crate::types::Gen, u64)>,
+    u64,
+) {
+    let mut newest = BTreeMap::<crate::blx::BlockKey, (crate::types::Gen, EntryKind, u64)>::new();
+    for file in files {
+        let key = (file.identity.writer_fence, SegId(file.identity.object_id));
+        let Some(footer) = found.segment_footers.get(&key) else {
+            continue;
+        };
+        for entry in &footer.entries {
+            if newest
+                .get(&entry.key)
+                .is_none_or(|(generation, _, _)| *generation <= entry.generation)
+            {
+                newest.insert(
+                    entry.key,
+                    (entry.generation, entry.kind, entry.value_checksum),
+                );
+            }
+        }
     }
-    locations
+    let blocks = newest
+        .into_iter()
+        .filter_map(|(key, (generation, kind, value_checksum))| {
+            (kind == EntryKind::Data).then_some((key, (generation, value_checksum)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let checksum = blocks
+        .iter()
+        .fold(0, |checksum, (&key, &(generation, value))| {
+            checksum ^ crate::blx::state_contribution(key, generation, value)
+        });
+    (blocks, checksum)
+}
+
+fn materialize_vmm_segments(
+    files: &[crate::manifest::ObjectRef],
+    found: &Found,
+) -> BTreeSet<(u64, SegId)> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let segment = (file.identity.writer_fence, SegId(file.identity.object_id));
+            found
+                .segment_footers
+                .get(&segment)
+                .is_some_and(|footer| {
+                    footer
+                        .entries
+                        .iter()
+                        .any(|entry| entry.key.space == crate::blx::BlockSpace::Vmm)
+                })
+                .then_some(segment)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 #[allow(clippy::default_trait_access)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
 
     use blockd_exec::Executor;
 
     use super::*;
-    use crate::format::crc32c;
+    use crate::blx::BlockKey;
+    use crate::format::{checksum64, crc32c};
     use crate::hostmeta::HostConfig;
     use crate::journal::{DatabaseMeta, RecordKind, VsetConfig, VsetKind};
     use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
     use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
-    use crate::segment::SegmentBuilder;
-    use crate::types::{Gen, HostId, PageNo, VolumeIdx, page_size};
+    use crate::segment::{SegmentBatchBuilder, SegmentBuilder};
+    use crate::types::{Gen, HostId, PageNo, VolumeId, VolumeIdx, page_size};
     use crate::world::BlobError;
 
     #[derive(Default)]
@@ -566,6 +807,10 @@ mod tests {
         )))
     }
 
+    fn file_ref(bytes: &[u8]) -> crate::manifest::ObjectRef {
+        crate::manifest::ObjectRef::from_blx(&crate::blx::open_object(bytes).expect("valid BLX"))
+    }
+
     #[test]
     fn recovery_rejects_a_record_with_a_missing_segment() {
         let vset = VsetId(1);
@@ -578,7 +823,7 @@ mod tests {
         };
         let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
         builder.add(page, Gen(1), &vec![7; page_size()]);
-        let (_, locations) = builder.finish();
+        let (segment, locations) = builder.finish();
         let record = JournalRecord {
             config: VsetConfig::compute(1, 4),
             seq: JournalSeq(0),
@@ -586,7 +831,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 1,
             sync_covered_through: 1,
+            post_state_checksum: 0,
             database: DatabaseMeta::default(),
+            files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -627,7 +874,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 1,
             sync_covered_through: 1,
+            post_state_checksum: 0,
             database: DatabaseMeta::default(),
+            files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -655,6 +904,236 @@ mod tests {
 
         assert_eq!(verdicts.get(&vset), None);
         assert_eq!(state.borrow().vsets[&vset].local_covered_through, 1);
+    }
+
+    #[test]
+    fn recovery_accepts_a_local_delta_over_an_archived_baseline() {
+        let vset = VsetId(6);
+        let page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(0),
+            },
+            page: PageNo(0),
+        };
+        let bytes = vec![0x6a; page_size()];
+        let generation = Gen(4);
+        let contribution = crate::blx::state_contribution(
+            BlockKey::from_page(VsetKind::Compute, page),
+            generation,
+            checksum64(&bytes),
+        );
+        let archive_baseline = 0x1234_5678_9abc_def0;
+        let post_state_checksum = archive_baseline ^ contribution;
+        let mut builder = SegmentBatchBuilder::new_for_record_with_checksums(
+            VsetKind::Compute,
+            vset,
+            3,
+            SegId(0),
+            8,
+            archive_baseline,
+            post_state_checksum,
+        );
+        builder.add(page, generation, &bytes);
+        let [(segment, segment_bytes, _)] = builder.finish().try_into().expect("one segment");
+        let record = JournalRecord {
+            config: VsetConfig::compute(1, 4),
+            seq: JournalSeq(8),
+            fence: 3,
+            kind: RecordKind::Checkpoint {
+                epoch: crate::types::Epoch(2),
+                vmstate: 9,
+                vmstate_logical_length: 8,
+            },
+            capture_seq: 8,
+            sync_covered_through: 8,
+            post_state_checksum,
+            database: DatabaseMeta::default(),
+            files: vec![file_ref(&segment_bytes)],
+            overlay: BTreeMap::new(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let world = Rc::new(TestBlobs::default());
+        world
+            .0
+            .borrow_mut()
+            .insert(layout::segment_blob(vset, 3, segment), segment_bytes);
+        world.0.borrow_mut().insert(
+            layout::journal_blob(vset, 3, record.seq),
+            record.encode(vset),
+        );
+        let state = test_state();
+        let mut executor = Executor::simulation(8);
+
+        let verdicts = executor
+            .block_on({
+                let state = Rc::clone(&state);
+                let world = Rc::clone(&world);
+                async move { recover_local(state, world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+
+        assert_eq!(verdicts.get(&vset), None);
+        assert_eq!(
+            state.borrow().vsets[&vset].state_checksum,
+            post_state_checksum
+        );
+    }
+
+    #[test]
+    fn recovery_accepts_an_empty_local_delta_over_an_archived_baseline() {
+        let vset = VsetId(7);
+        let post_state_checksum = 0xfeed_face_cafe_beef;
+        let record = JournalRecord {
+            config: VsetConfig::compute(1, 4),
+            seq: JournalSeq(11),
+            fence: 5,
+            kind: RecordKind::Checkpoint {
+                epoch: crate::types::Epoch(3),
+                vmstate: 12,
+                vmstate_logical_length: 8,
+            },
+            capture_seq: 11,
+            sync_covered_through: 11,
+            post_state_checksum,
+            database: DatabaseMeta::default(),
+            files: Vec::new(),
+            overlay: BTreeMap::new(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let world = Rc::new(TestBlobs::default());
+        world.0.borrow_mut().insert(
+            layout::journal_blob(vset, 5, record.seq),
+            record.encode(vset),
+        );
+        let state = test_state();
+        let mut executor = Executor::simulation(9);
+
+        let verdicts = executor
+            .block_on({
+                let state = Rc::clone(&state);
+                let world = Rc::clone(&world);
+                async move { recover_local(state, world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+
+        assert_eq!(verdicts.get(&vset), None);
+        assert_eq!(
+            state.borrow().vsets[&vset].state_checksum,
+            post_state_checksum
+        );
+    }
+
+    #[test]
+    fn cold_boot_schedules_tombstones_for_discarded_state_in_mixed_batches() {
+        let vset = VsetId(5);
+        let config = VsetConfig::compute(1, 4);
+        let memory_page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(0),
+            },
+            page: PageNo(0),
+        };
+        let disk_page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(1),
+            },
+            page: PageNo(0),
+        };
+        let memory_bytes = vec![0x31; page_size()];
+        let disk_bytes = vec![0x42; page_size()];
+        let vmm_bytes = vec![0x53; page_size()];
+        let memory_key = BlockKey::from_page(VsetKind::Compute, memory_page);
+        let disk_key = BlockKey::from_page(VsetKind::Compute, disk_page);
+        let vmm_key = BlockKey {
+            space: crate::blx::BlockSpace::Vmm,
+            volume: 0,
+            block: 0,
+        };
+        let entries = [
+            (memory_key, Gen(1), checksum64(&memory_bytes)),
+            (disk_key, Gen(2), checksum64(&disk_bytes)),
+            (vmm_key, Gen(3), checksum64(&vmm_bytes)),
+        ];
+        let state_checksum = entries
+            .iter()
+            .fold(0, |checksum, &(key, generation, value)| {
+                checksum ^ crate::blx::state_contribution(key, generation, value)
+            });
+        let mut builder = SegmentBatchBuilder::new_for_record_with_checksums(
+            VsetKind::Compute,
+            vset,
+            1,
+            SegId(0),
+            0,
+            0,
+            state_checksum,
+        );
+        builder.add(memory_page, Gen(1), &memory_bytes);
+        builder.add(disk_page, Gen(2), &disk_bytes);
+        builder.add_vmm_block(0, Gen(3), &vmm_bytes);
+        let objects = builder.finish();
+        let record = JournalRecord {
+            config,
+            seq: JournalSeq(0),
+            fence: 1,
+            kind: RecordKind::Commit,
+            capture_seq: 1,
+            sync_covered_through: 1,
+            post_state_checksum: state_checksum,
+            database: DatabaseMeta::default(),
+            files: objects
+                .iter()
+                .map(|(_, bytes, _)| file_ref(bytes))
+                .collect(),
+            overlay: BTreeMap::new(),
+            leaves: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let world = Rc::new(TestBlobs::default());
+        for (segment, bytes, _) in objects {
+            world
+                .0
+                .borrow_mut()
+                .insert(layout::segment_blob(vset, 1, segment), bytes);
+        }
+        world.0.borrow_mut().insert(
+            layout::journal_blob(vset, 1, record.seq),
+            record.encode(vset),
+        );
+        let state = test_state();
+        let mut executor = Executor::simulation(6);
+        executor
+            .block_on({
+                let state = Rc::clone(&state);
+                let world = Rc::clone(&world);
+                async move { recover_local(state, world.as_ref()).await }
+            })
+            .expect("scan succeeds");
+
+        let host = state.borrow();
+        let recovered = &host.vsets[&vset];
+        assert_eq!(
+            recovered.page_locs.keys().copied().collect::<Vec<_>>(),
+            vec![disk_page]
+        );
+        assert_eq!(
+            recovered
+                .block_checksums
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![disk_key]
+        );
+        assert_eq!(
+            recovered.pending_tombstones,
+            BTreeSet::from([memory_key, vmm_key])
+        );
+        assert!(!recovered.archived_memory_usable);
     }
 
     #[test]
@@ -700,8 +1179,9 @@ mod tests {
             },
             page: PageNo(0),
         };
+        let page_bytes = vec![3; page_size()];
         let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
-        builder.add(page, Gen(1), &vec![3; page_size()]);
+        builder.add(page, Gen(1), &page_bytes);
         let (segment, locations) = builder.finish();
         let config = VsetConfig::compute(1, 4);
         let checkpoint = JournalRecord {
@@ -711,21 +1191,31 @@ mod tests {
             kind: RecordKind::Checkpoint {
                 epoch: crate::types::Epoch(1),
                 vmstate: 5,
+                vmstate_logical_length: 8,
             },
             capture_seq: 5,
             sync_covered_through: 5,
+            post_state_checksum: crate::blx::state_contribution(
+                crate::blx::BlockKey::from_page(VsetKind::Compute, page),
+                Gen(1),
+                checksum64(&page_bytes),
+            ),
             database: DatabaseMeta::default(),
+            files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
             leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let mut missing = locations[0].2;
         missing.seg = SegId(9);
+        let mut missing_file = checkpoint.files[0];
+        missing_file.identity.object_id = 9;
         let unusable = JournalRecord {
             seq: JournalSeq(2),
             kind: RecordKind::Commit,
             capture_seq: 6,
             sync_covered_through: 100,
+            files: vec![missing_file],
             overlay: BTreeMap::from([(page, (Gen(2), missing))]),
             ..checkpoint.clone()
         };
@@ -812,7 +1302,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 11,
             sync_covered_through: info.sync_covered_through,
+            post_state_checksum: 0,
             database: DatabaseMeta::default(),
+            files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
             leaves: BTreeMap::new(),
             migrated_from: None,

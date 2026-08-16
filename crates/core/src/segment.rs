@@ -1,23 +1,20 @@
-//! Segments: the unit of page storage and transfer. A segment is one
-//! write-once blob holding lz4-compressed page entries, each individually
-//! framed and checksummed. Primary-to-passive transfer moves source segments
-//! verbatim; the passive may decode live entries into archive-only packs in
-//! the same format (R8.4). The fault path pays exactly one decompression of
-//! one entry.
+//! Compatibility API for the live engine's page locations.
 //!
-//! Layout: `header frame | entry frame | entry frame | …`. Every frame is
-//! `format::seal_frame`; a torn tail fails a frame check and is detected as
-//! corruption (R8.1) — there is nothing to trust beyond the checksums.
+//! The durable bytes are BLX objects. The engine still calls them segments
+//! internally while the page-map removal is completed, but there is no second
+//! page-data encoding behind this module.
 
-use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, open_frame, seal_frame};
-use crate::types::{Gen, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size};
+use crate::blx::{
+    BatchMeta, BlockKey, BlxBatchBuilder, BlxEntry, NamespaceKind, TARGET_FILE_BYTES,
+    open_entry as open_blx_entry, scan_object,
+};
+use crate::format::DecodeError;
+use crate::journal::VsetKind;
+use crate::types::{Gen, PageId, SegId, VsetId, page_size};
 
-pub const MAGIC_SEG_HDR: u32 = u32::from_le_bytes(*b"BSH1");
-pub const MAGIC_SEG_ENT: u32 = u32::from_le_bytes(*b"BSE1");
-
-/// Hard ceiling shared by local capture, peer transfer, and object-store
-/// publication. It leaves ample envelope room below R4.6's 64 MiB cap.
-pub const MAX_SEGMENT_BYTES: usize = 32 * 1024 * 1024;
+/// The writer rotates near the BLX target. Every resulting object remains
+/// below the format's separate 64 MiB hard limit.
+pub const MAX_SEGMENT_BYTES: usize = TARGET_FILE_BYTES;
 
 /// Where a page's durable bytes live: a byte range of one segment blob
 /// covering the page's whole framed entry. Ranged reads of exactly this span
@@ -34,34 +31,38 @@ pub struct PageLoc {
     pub len: u32,
 }
 
-const HDR_PAYLOAD: usize = 2 + 4 + 8 + 8 + 8 + 4; // version, page size, vset, fence, seg, count
-const ENTRY_PAYLOAD_FIXED: usize = 1 + 4 + 8 + 4;
-
-fn max_entry_bytes() -> usize {
-    FRAME_HEADER + ENTRY_PAYLOAD_FIXED + lz4_flex::block::get_maximum_output_size(page_size())
-}
-
 /// Every page a segment holds: identity, generation, and byte range.
 pub type SegmentEntries = Vec<(PageId, Gen, PageLoc)>;
 
-/// Builds a segment blob, returning the exact byte range of every entry.
+#[derive(Clone, Debug)]
+struct PendingEntry {
+    page: PageId,
+    generation: Gen,
+    bytes: Option<Vec<u8>>,
+}
+
+/// Builds one BLX object, returning the exact byte range of every entry.
 #[derive(Debug)]
 pub struct SegmentBuilder {
+    kind: VsetKind,
     vset: VsetId,
     fence: u64,
     seg: SegId,
-    entries: Vec<(PageId, Gen, PageLoc)>,
-    body: Vec<u8>,
+    entries: Vec<PendingEntry>,
 }
 
 impl SegmentBuilder {
     pub fn new(vset: VsetId, fence: u64, seg: SegId) -> SegmentBuilder {
+        Self::new_for_kind(VsetKind::Compute, vset, fence, seg)
+    }
+
+    pub fn new_for_kind(kind: VsetKind, vset: VsetId, fence: u64, seg: SegId) -> SegmentBuilder {
         SegmentBuilder {
+            kind,
             vset,
             fence,
             seg,
             entries: Vec::new(),
-            body: Vec::new(),
         }
     }
 
@@ -69,47 +70,37 @@ impl SegmentBuilder {
     pub fn add(&mut self, page: PageId, generation: Gen, page_bytes: &[u8]) {
         assert_eq!(page_bytes.len(), page_size(), "segments store whole pages");
         assert_eq!(page.volume.vset, self.vset, "segment is per-vset");
-        let stored = lz4_flex::block::compress(page_bytes);
-        let mut e = Enc::new();
-        e.u8(page.volume.idx.0);
-        e.u32(page.page.0);
-        e.u64(generation.0);
-        e.u32(u32::try_from(stored.len()).expect("compressed page fits u32"));
-        e.bytes(&stored);
-        let entry = seal_frame(MAGIC_SEG_ENT, &e.finish());
-        let offset = FRAME_HEADER + HDR_PAYLOAD + self.body.len();
-        let loc = PageLoc {
-            base: 0,
-            fence: self.fence,
-            seg: self.seg,
-            offset: u32::try_from(offset).expect("segment fits u32"),
-            len: u32::try_from(entry.len()).expect("entry fits u32"),
-        };
-        self.entries.push((page, generation, loc));
-        self.body.extend_from_slice(&entry);
+        self.entries.push(PendingEntry {
+            page,
+            generation,
+            bytes: Some(page_bytes.to_vec()),
+        });
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    fn can_add_page(&self) -> bool {
-        FRAME_HEADER + HDR_PAYLOAD + self.body.len() + max_entry_bytes() <= MAX_SEGMENT_BYTES
-    }
-
     /// Finish the blob: bytes plus every entry's location.
     pub fn finish(self) -> (Vec<u8>, SegmentEntries) {
-        let mut h = Enc::new();
-        h.u16(2); // version
-        h.u32(u32::try_from(page_size()).expect("page size fits u32"));
-        h.u64(self.vset.0);
-        h.u64(self.fence);
-        h.u64(self.seg.0);
-        h.u32(u32::try_from(self.entries.len()).expect("entry count fits u32"));
-        let mut blob = seal_frame(MAGIC_SEG_HDR, &h.finish());
-        debug_assert_eq!(blob.len(), FRAME_HEADER + HDR_PAYLOAD);
-        blob.extend_from_slice(&self.body);
-        (blob, self.entries)
+        let mut batch = SegmentBatchBuilder::new_unpartitioned_for_kind(
+            self.kind, self.vset, self.fence, self.seg,
+        );
+        for entry in self.entries {
+            batch.add(
+                entry.page,
+                entry.generation,
+                entry.bytes.as_deref().expect("segment builder stores data"),
+            );
+        }
+        let mut objects = batch.finish();
+        assert_eq!(
+            objects.len(),
+            1,
+            "single segment builder exceeded BLX target"
+        );
+        let (_, bytes, entries) = objects.pop().expect("nonempty segment builder");
+        (bytes, entries)
     }
 }
 
@@ -117,10 +108,18 @@ impl SegmentBuilder {
 /// segment blobs. Rotation happens before an entry, so an entry is never split.
 #[derive(Debug)]
 pub struct SegmentBatchBuilder {
+    kind: VsetKind,
     vset: VsetId,
     fence: u64,
-    current: SegmentBuilder,
-    finished: Vec<(SegId, Vec<u8>, SegmentEntries)>,
+    first_seg: SegId,
+    sequence: u64,
+    entries: Vec<PendingEntry>,
+    vmm_entries: Vec<(u32, Gen, Option<Vec<u8>>)>,
+    estimated_current_bytes: usize,
+    estimated_chunks: u64,
+    pre_state_checksum: u64,
+    post_state_checksum: u64,
+    split_at_file_partitions: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,12 +127,57 @@ pub struct SegmentIdOverflow;
 
 impl SegmentBatchBuilder {
     pub fn new(vset: VsetId, fence: u64, first_seg: SegId) -> Self {
+        Self::new_for_kind(VsetKind::Compute, vset, fence, first_seg)
+    }
+
+    pub fn new_for_kind(kind: VsetKind, vset: VsetId, fence: u64, first_seg: SegId) -> Self {
+        Self::new_for_record(kind, vset, fence, first_seg, 0)
+    }
+
+    pub fn new_for_record(
+        kind: VsetKind,
+        vset: VsetId,
+        fence: u64,
+        first_seg: SegId,
+        sequence: u64,
+    ) -> Self {
+        Self::new_for_record_with_checksums(kind, vset, fence, first_seg, sequence, 0, 0)
+    }
+
+    pub fn new_for_record_with_checksums(
+        kind: VsetKind,
+        vset: VsetId,
+        fence: u64,
+        first_seg: SegId,
+        sequence: u64,
+        pre_state_checksum: u64,
+        post_state_checksum: u64,
+    ) -> Self {
         Self {
+            kind,
             vset,
             fence,
-            current: SegmentBuilder::new(vset, fence, first_seg),
-            finished: Vec::new(),
+            first_seg,
+            sequence,
+            entries: Vec::new(),
+            vmm_entries: Vec::new(),
+            estimated_current_bytes: 0,
+            estimated_chunks: 1,
+            pre_state_checksum,
+            post_state_checksum,
+            split_at_file_partitions: true,
         }
+    }
+
+    fn new_unpartitioned_for_kind(
+        kind: VsetKind,
+        vset: VsetId,
+        fence: u64,
+        first_seg: SegId,
+    ) -> Self {
+        let mut builder = Self::new_for_kind(kind, vset, fence, first_seg);
+        builder.split_at_file_partitions = false;
+        builder
     }
 
     pub fn add(&mut self, page: PageId, generation: Gen, page_bytes: &[u8]) {
@@ -147,121 +191,194 @@ impl SegmentBatchBuilder {
         generation: Gen,
         page_bytes: &[u8],
     ) -> Result<(), SegmentIdOverflow> {
-        if !self.current.is_empty() && !self.current.can_add_page() {
-            self.try_rotate()?;
+        assert_eq!(page_bytes.len(), page_size(), "BLX stores whole pages");
+        assert_eq!(page.volume.vset, self.vset, "BLX object is per-vset");
+        let estimate = page_size() + 128;
+        if self.estimated_current_bytes != 0
+            && self.estimated_current_bytes.saturating_add(estimate) > TARGET_FILE_BYTES
+        {
+            self.first_seg
+                .0
+                .checked_add(self.estimated_chunks)
+                .ok_or(SegmentIdOverflow)?;
+            self.estimated_chunks += 1;
+            self.estimated_current_bytes = 0;
         }
-        self.current.add(page, generation, page_bytes);
+        self.estimated_current_bytes += estimate;
+        self.entries.push(PendingEntry {
+            page,
+            generation,
+            bytes: Some(page_bytes.to_vec()),
+        });
         Ok(())
     }
 
-    fn try_rotate(&mut self) -> Result<(), SegmentIdOverflow> {
-        let next = SegId(self.current.seg.0.checked_add(1).ok_or(SegmentIdOverflow)?);
-        let current = std::mem::replace(
-            &mut self.current,
-            SegmentBuilder::new(self.vset, self.fence, next),
-        );
-        let seg = current.seg;
-        let (blob, entries) = current.finish();
-        debug_assert!(blob.len() <= MAX_SEGMENT_BYTES);
-        self.finished.push((seg, blob, entries));
+    pub fn try_add_tombstone(
+        &mut self,
+        page: PageId,
+        generation: Gen,
+    ) -> Result<(), SegmentIdOverflow> {
+        assert_eq!(page.volume.vset, self.vset, "BLX object is per-vset");
+        let estimate = 128;
+        if self.estimated_current_bytes != 0
+            && self.estimated_current_bytes.saturating_add(estimate) > TARGET_FILE_BYTES
+        {
+            self.first_seg
+                .0
+                .checked_add(self.estimated_chunks)
+                .ok_or(SegmentIdOverflow)?;
+            self.estimated_chunks += 1;
+            self.estimated_current_bytes = 0;
+        }
+        self.estimated_current_bytes += estimate;
+        self.entries.push(PendingEntry {
+            page,
+            generation,
+            bytes: None,
+        });
         Ok(())
     }
 
-    pub fn finish(mut self) -> Vec<(SegId, Vec<u8>, SegmentEntries)> {
-        if !self.current.is_empty() {
-            let seg = self.current.seg;
-            let (blob, entries) = self.current.finish();
-            debug_assert!(blob.len() <= MAX_SEGMENT_BYTES);
-            self.finished.push((seg, blob, entries));
+    /// Store a canonical VMM snapshot as padded BLX blocks. The manifest
+    /// carries the exact logical byte length.
+    pub fn add_vmm_snapshot(&mut self, generation: Gen, bytes: &[u8]) {
+        for (block, chunk) in bytes.chunks(page_size()).enumerate() {
+            let mut padded = vec![0; page_size()];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            self.vmm_entries.push((
+                u32::try_from(block).expect("VMM snapshot block fits u32"),
+                generation,
+                Some(padded),
+            ));
         }
-        self.finished
+    }
+
+    pub fn add_vmm_block(&mut self, block: u32, generation: Gen, bytes: &[u8]) {
+        assert_eq!(bytes.len(), page_size(), "BLX stores whole VMM blocks");
+        self.vmm_entries
+            .push((block, generation, Some(bytes.to_vec())));
+    }
+
+    pub fn add_vmm_tombstone(&mut self, block: u32, generation: Gen) {
+        self.vmm_entries.push((block, generation, None));
+    }
+
+    pub fn finish(self) -> Vec<(SegId, Vec<u8>, SegmentEntries)> {
+        if self.entries.is_empty() && self.vmm_entries.is_empty() {
+            return Vec::new();
+        }
+        let meta = BatchMeta {
+            namespace_kind: NamespaceKind::Vset,
+            namespace_id: self.vset.0,
+            writer_fence: self.fence,
+            first_object_id: self.first_seg.0,
+            min_seq: self.sequence,
+            max_seq: self.sequence,
+            batch_id: self.sequence,
+            pre_state_checksum: self.pre_state_checksum,
+            post_state_checksum: self.post_state_checksum,
+        };
+        let mut builder = if self.split_at_file_partitions {
+            BlxBatchBuilder::new_partitioned(meta)
+        } else {
+            BlxBatchBuilder::new(meta)
+        };
+        for entry in self.entries {
+            let key = BlockKey::from_page(self.kind, entry.page);
+            match entry.bytes {
+                Some(bytes) => builder.add_data(key, entry.generation, bytes),
+                None => builder.add_tombstone(key, entry.generation),
+            }
+        }
+        for (block, generation, bytes) in self.vmm_entries {
+            let key = BlockKey {
+                space: crate::blx::BlockSpace::Vmm,
+                volume: 0,
+                block,
+            };
+            match bytes {
+                Some(bytes) => builder.add_data(key, generation, bytes),
+                None => builder.add_tombstone(key, generation),
+            }
+        }
+        builder
+            .finish()
+            .into_iter()
+            .map(|object| {
+                let seg = SegId(object.header.object_id);
+                let entries = object
+                    .footer
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind == crate::blx::EntryKind::Data)
+                    .filter_map(|entry| {
+                        let page = entry.key.to_page_id(self.vset)?;
+                        Some((
+                            page,
+                            entry.generation,
+                            PageLoc {
+                                base: 0,
+                                fence: self.fence,
+                                seg,
+                                offset: entry.offset,
+                                len: entry.length,
+                            },
+                        ))
+                    })
+                    .collect();
+                (seg, object.bytes, entries)
+            })
+            .collect()
     }
 }
 
 /// Decode and verify one entry read by ranged read (the fault path). Returns
 /// the page identity, generation and the decompressed page bytes.
 pub fn open_entry(vset: VsetId, bytes: &[u8]) -> Result<(PageId, Gen, Vec<u8>), DecodeError> {
-    let (page, generation, stored) = parse_entry(vset, bytes)?;
-    let raw = lz4_flex::block::decompress(stored, page_size()).map_err(|_| DecodeError)?;
-    if raw.len() != page_size() {
-        return Err(DecodeError);
+    match open_blx_entry(bytes)? {
+        BlxEntry::Data {
+            key,
+            generation,
+            bytes,
+        } => Ok((key.to_page_id(vset).ok_or(DecodeError)?, generation, bytes)),
+        BlxEntry::Tombstone { .. } => Err(DecodeError),
     }
-    Ok((page, generation, raw))
-}
-
-/// Verify an entry's frame and metadata without expanding its payload.
-/// Whole-segment scans use this path: the frame CRC validates the stored
-/// compressed bytes, while page decompression stays on the selected-entry
-/// path instead of multiplying capture, compaction, and publish CPU cost.
-fn parse_entry(vset: VsetId, bytes: &[u8]) -> Result<(PageId, Gen, &[u8]), DecodeError> {
-    let payload = open_frame(MAGIC_SEG_ENT, bytes)?;
-    let mut d = Dec::new(payload);
-    let volume = VolumeIdx(d.u8()?);
-    let page_no = PageNo(d.u32()?);
-    let generation = Gen(d.u64()?);
-    let stored_len = usize::try_from(d.u32()?).expect("u32 fits usize");
-    let stored = d.bytes(stored_len)?;
-    d.finish()?;
-    let page = PageId {
-        volume: VolumeId { vset, idx: volume },
-        page: page_no,
-    };
-    Ok((page, generation, stored))
 }
 
 /// Scan a whole segment blob (recovery, hydration, backup verification),
 /// checksumming the header and every stored entry and returning identities
 /// and locations. Individual entries are decompressed only when consumed.
 pub fn scan_segment(bytes: &[u8]) -> Result<(VsetId, u64, SegId, SegmentEntries), DecodeError> {
-    let hdr_end = FRAME_HEADER + HDR_PAYLOAD;
-    if bytes.len() < hdr_end {
+    let (header, footer) = scan_object(bytes)?;
+    if header.namespace_kind != NamespaceKind::Vset {
         return Err(DecodeError);
     }
-    let payload = open_frame(MAGIC_SEG_HDR, &bytes[..hdr_end])?;
-    let mut d = Dec::new(payload);
-    let version = d.u16()?;
-    if version != 2 {
-        return Err(DecodeError);
-    }
-    if d.u32()? != u32::try_from(page_size()).expect("page size fits u32") {
-        return Err(DecodeError);
-    }
-    let vset = VsetId(d.u64()?);
-    let fence = d.u64()?;
-    let seg = SegId(d.u64()?);
-    let count = usize::try_from(d.u32()?).expect("u32 fits usize");
-    d.finish()?;
-
-    let mut entries = Vec::with_capacity(count);
-    let mut offset = hdr_end;
-    while offset < bytes.len() {
-        let rest = &bytes[offset..];
-        if rest.len() < FRAME_HEADER {
-            return Err(DecodeError);
-        }
-        let mut fd = Dec::new(&rest[4..8]);
-        let payload_len = usize::try_from(fd.u32().expect("slice of 4")).expect("u32 fits usize");
-        let entry_len = FRAME_HEADER + payload_len;
-        if rest.len() < entry_len {
-            return Err(DecodeError);
-        }
-        let (page, generation, _) = parse_entry(vset, &rest[..entry_len])?;
-        entries.push((
-            page,
-            generation,
-            PageLoc {
-                base: 0,
-                fence,
-                seg,
-                offset: u32::try_from(offset).expect("segment fits u32"),
-                len: u32::try_from(entry_len).expect("entry fits u32"),
-            },
-        ));
-        offset += entry_len;
-    }
-    if entries.len() != count {
-        return Err(DecodeError);
-    }
+    let vset = VsetId(header.namespace_id);
+    let fence = header.writer_fence;
+    let seg = SegId(header.object_id);
+    let entries = footer
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == crate::blx::EntryKind::Data)
+        .filter_map(|entry| {
+            let page = match entry.key.to_page_id(vset) {
+                Some(page) => page,
+                None if entry.key.space == crate::blx::BlockSpace::Vmm => return None,
+                None => return Some(Err(DecodeError)),
+            };
+            Some(Ok((
+                page,
+                entry.generation,
+                PageLoc {
+                    base: 0,
+                    fence,
+                    seg,
+                    offset: entry.offset,
+                    len: entry.length,
+                },
+            )))
+        })
+        .collect::<Result<Vec<_>, DecodeError>>()?;
     Ok((vset, fence, seg, entries))
 }
 
@@ -270,7 +387,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::blx::{MAGIC_HEADER, open_header};
     use crate::format::{crc32c, open_frame, seal_frame};
+    use crate::types::{PageNo, VolumeId, VolumeIdx};
 
     fn sample_page(volume: u8, page: u32) -> PageId {
         PageId {
@@ -336,12 +455,19 @@ mod tests {
     #[test]
     fn batch_rotation_reports_segment_id_overflow_before_building_a_successor() {
         let mut batch = SegmentBatchBuilder::new(VsetId(0xA1), 6, SegId(u64::MAX));
-        batch
-            .current
-            .add(sample_page(0, 0), Gen(0), &pattern_page(0x55));
-        assert_eq!(batch.try_rotate(), Err(SegmentIdOverflow));
-        assert!(batch.finished.is_empty());
-        assert_eq!(batch.current.seg, SegId(u64::MAX));
+        let page = pattern_page(0x55);
+        let mut result = Ok(());
+        for n in 0..(TARGET_FILE_BYTES / page_size() + 2) {
+            result = batch.try_add(
+                sample_page(0, u32::try_from(n).expect("page fits")),
+                Gen(u64::try_from(n).expect("generation fits")),
+                &page,
+            );
+            if result.is_err() {
+                break;
+            }
+        }
+        assert_eq!(result, Err(SegmentIdOverflow));
     }
 
     #[test]
@@ -411,8 +537,8 @@ mod tests {
         // update that changes compressed bytes is a storage format change
         // and must be seen.
         let expected = match page_size() {
-            4096 => (668, 0xDF52_B4D5),
-            16_384 => (766, 0xE87B_B6DD),
+            4096 => (863, 0x4219_DF1A),
+            16_384 => (961, 0x301D_DAAF),
             size => panic!("byte pin missing for {size}-byte pages"),
         };
         assert_eq!((blob.len(), crc32c(&blob)), expected);
@@ -421,8 +547,8 @@ mod tests {
     #[test]
     fn segments_reject_a_different_system_page_size() {
         let (blob, _) = sample_segment();
-        let header_len = FRAME_HEADER + HDR_PAYLOAD;
-        let mut payload = open_frame(MAGIC_SEG_HDR, &blob[..header_len])
+        let (_, header_len) = open_header(&blob).expect("BLX header");
+        let mut payload = open_frame(MAGIC_HEADER, &blob[..header_len])
             .expect("segment header")
             .to_vec();
         let incompatible = if page_size() == 4096 {
@@ -431,7 +557,7 @@ mod tests {
             4096u32
         };
         payload[2..6].copy_from_slice(&incompatible.to_le_bytes());
-        let mut incompatible = seal_frame(MAGIC_SEG_HDR, &payload);
+        let mut incompatible = seal_frame(MAGIC_HEADER, &payload);
         incompatible.extend_from_slice(&blob[header_len..]);
         assert!(scan_segment(&incompatible).is_err());
     }

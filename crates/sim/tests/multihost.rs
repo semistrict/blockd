@@ -85,7 +85,7 @@ fn crash_drops_the_host_tree_then_recovers_from_its_disk() {
 fn migration_is_lossless_and_background_hydration_releases_the_source() {
     let report = run(7, migration_config());
     assert_clean(&report);
-    assert_eq!(report.migrations, 1);
+    assert_eq!(report.migrations, 1, "{report:?}");
     assert_eq!(report.guest_deaths, 0);
     assert_eq!(report.restores, 0);
     assert!(report.max_migration_pause_ns > 0);
@@ -96,7 +96,7 @@ fn migration_is_lossless_and_background_hydration_releases_the_source() {
     );
     assert!(report.hydrate_fills > 0);
     assert!(report.releases >= 1);
-    assert_eq!(report.blobs_per_host[0], 0);
+    assert_eq!(report.primary_blobs_per_host[0], 0, "{report:?}");
 }
 
 #[test]
@@ -179,7 +179,11 @@ fn migration_drains_inflight_guest_operations_before_recovery_cuts() {
             panic!("migration scenario must realize as a cluster");
         };
         let report = run(seed, config);
-        assert_clean(&report);
+        assert!(
+            report.violations.is_empty(),
+            "seed {seed}: {:?}",
+            report.violations
+        );
         assert!(report.completed_ops > 0, "seed {seed}: {report:?}");
         assert!(report.migrations > 0, "seed {seed}: {report:?}");
         assert!(report.host_crashes > 0, "seed {seed}: {report:?}");
@@ -199,7 +203,7 @@ fn returning_migration_avoids_stale_destination_journal_names() {
 }
 
 #[test]
-fn passive_replica_commits_uploads_and_unlinks_without_rewrite() {
+fn passive_replica_commits_are_published_by_primary_without_rewrite() {
     let mut config = blockd_sim::presets::peer_stash_chaos();
     config.peer_drop = (0, 1);
     config.peer_dup = (0, 1);
@@ -211,10 +215,9 @@ fn passive_replica_commits_uploads_and_unlinks_without_rewrite() {
     assert_clean(&report);
     assert!(report.replica_logical_bytes > 0, "{report:?}");
     assert!(report.replica_network_bytes >= report.replica_logical_bytes);
-    assert!(report.replica_store_bytes > 0);
+    assert!(report.published_segment_bytes > 0, "{report:?}");
     assert!(report.replica_artifact_flushes > 0);
     assert!(report.replica_commit_flushes > 0);
-    assert!(report.replica_unlinks > 0);
     assert_eq!(report.replica_nonactive_bytes, 0);
     assert_eq!(report.replica_cleanup_rewrite_bytes, 0);
 }

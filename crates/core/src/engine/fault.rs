@@ -4,11 +4,14 @@ use blockd_exec::channel::oneshot;
 use blockd_exec::delay;
 
 use super::state::{CacheReservation, PageFillLease, SharedHost};
-use super::{hydrate_mapping, peer_fetch_page};
+use super::{hydrate_mapping, peer_fetch_page, peer_fetch_replica_page};
+use crate::blx::{BlockKey, EntryKind, NamespaceKind, open_footer};
+use crate::format::checksum64;
 use crate::journal::VsetKind;
 use crate::layout;
+use crate::manifest::ObjectRef;
 use crate::segment::{PageLoc, open_entry};
-use crate::types::{Gen, PageId, page_size};
+use crate::types::{Gen, PageId, VsetId, page_size};
 use crate::world::{Blobs, FillSource, GuestMem, Peers, Store, StoreError};
 
 #[derive(Clone, Copy)]
@@ -148,6 +151,9 @@ async fn serve_missing_fault<W>(
     if hydrate_mapping(&state, world.as_ref(), page, incarnation)
         .await
         .is_err()
+        || resolve_archive_mapping(&state, world.as_ref(), page, incarnation)
+            .await
+            .is_err()
     {
         state.borrow_mut().counters.faults_unservable += 1;
         let _ = GuestMem::fail(world.as_ref(), page).await;
@@ -384,6 +390,15 @@ async fn serve_missing_fault<W>(
             } else {
                 host.cache.fill_slot(page, write, memory);
             }
+            let kind = host.vsets[&page.volume.vset].config.kind;
+            host.vsets
+                .get_mut(&page.volume.vset)
+                .expect("validated vset")
+                .block_checksums
+                .insert(
+                    BlockKey::from_page(kind, page),
+                    (generation, checksum64(&raw)),
+                );
             if write {
                 host.vsets
                     .get_mut(&page.volume.vset)
@@ -472,14 +487,59 @@ async fn fetch_page<W: Blobs + Store + Peers>(
     {
         return Some((raw, FillSource::Peer));
     }
+    let replica = state
+        .borrow()
+        .vsets
+        .get(&page.volume.vset)
+        .and_then(|vset| vset.stash_assignment)
+        .map(|stash| {
+            (
+                stash.transition_peer.unwrap_or(stash.active_peer),
+                stash.assignment_epoch,
+            )
+        });
+    if location.base == 0
+        && let Some((passive, assignment_epoch)) = replica
+        && let Some(bytes) = peer_fetch_replica_page(
+            state,
+            world,
+            passive,
+            assignment_epoch,
+            page.volume.vset,
+            location,
+        )
+        .await
+        && let Some(raw) = verify_entry(page, generation, Some(bytes))
+    {
+        return Some((raw, FillSource::Peer));
+    }
     if !backed && location.base == 0 {
         return None;
     }
-    let key = if location.base == 0 {
-        layout::segment_key(page.volume.vset, location.fence, location.seg)
-    } else {
-        layout::base_segment_key(location.base, location.fence, location.seg)
-    };
+    let archive_key = state
+        .borrow()
+        .vsets
+        .get(&page.volume.vset)
+        .and_then(|vset| {
+            vset.archive_objects.iter().find(|object| {
+                object.identity.writer_fence == location.fence
+                    && object.identity.object_id == location.seg.0
+                    && if location.base == 0 {
+                        object.identity.namespace_kind == NamespaceKind::Vset
+                            && object.identity.namespace_id == page.volume.vset.0
+                    } else {
+                        object.identity.namespace_id == location.base
+                    }
+            })
+        })
+        .map(|object| object.identity.store_key());
+    let key = archive_key.unwrap_or_else(|| {
+        if location.base == 0 {
+            layout::segment_key(page.volume.vset, location.fence, location.seg)
+        } else {
+            layout::blx_key(VsetId(location.base), location.fence, location.seg.0)
+        }
+    });
     loop {
         match Store::get_range(
             world,
@@ -499,6 +559,178 @@ async fn fetch_page<W: Blobs + Store + Peers>(
             }
             Err(StoreError::Fault(crate::protocol::StoreFault::CasConflict { .. })) => {
                 return None;
+            }
+        }
+    }
+}
+
+/// Resolve one archived page without materializing a durable or in-memory map
+/// for the whole vset. Object key ranges select at most the configured overlap
+/// bound; only those footers are fetched, and each verified footer is cached.
+async fn resolve_archive_mapping<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    page: PageId,
+    incarnation: u64,
+) -> Result<(), ()> {
+    enum Action {
+        Ready,
+        Fetch { object: ObjectRef, retry: u64 },
+        Resolve,
+    }
+
+    loop {
+        let action = {
+            let host = state.borrow();
+            let Some(vset) = host
+                .vsets
+                .get(&page.volume.vset)
+                .filter(|vset| vset.incarnation == incarnation && vset.ready)
+            else {
+                return Err(());
+            };
+            if vset.page_locs.contains_key(&page) || vset.archive_resolved_pages.contains(&page) {
+                Action::Ready
+            } else if !vset.archived_memory_usable && vset.config.is_memory(page.volume.idx) {
+                Action::Resolve
+            } else {
+                let key = BlockKey::from_page(vset.config.kind, page);
+                let candidate = vset
+                    .archive_objects
+                    .iter()
+                    .filter(|object| object.first_key <= key && key <= object.last_key)
+                    .find(|object| !vset.archive_footers.contains_key(&object.identity))
+                    .copied();
+                candidate.map_or(Action::Resolve, |object| Action::Fetch {
+                    object,
+                    retry: host.config.backup_retry,
+                })
+            }
+        };
+        match action {
+            Action::Ready => return Ok(()),
+            Action::Fetch { object, retry } => {
+                let bytes = loop {
+                    match Store::get_range(
+                        world,
+                        &object.identity.store_key(),
+                        u64::from(object.footer_offset),
+                        u64::from(object.footer_length),
+                    )
+                    .await
+                    {
+                        Ok(Some((_, bytes))) => break bytes,
+                        Ok(None)
+                        | Err(StoreError::TooLarge)
+                        | Err(StoreError::Fault(crate::protocol::StoreFault::CasConflict {
+                            ..
+                        })) => return Err(()),
+                        Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
+                            delay(retry).await;
+                        }
+                    }
+                };
+                let footer = open_footer(&bytes).map_err(|_| ())?;
+                let valid = footer.entries.first().is_some_and(|entry| {
+                    entry.key == object.first_key
+                        && footer
+                            .entries
+                            .last()
+                            .is_some_and(|last| last.key == object.last_key)
+                }) && footer.entries.iter().all(|entry| {
+                    entry
+                        .offset
+                        .checked_add(entry.length)
+                        .is_some_and(|end| end <= object.footer_offset)
+                });
+                if !valid {
+                    return Err(());
+                }
+                let mut host = state.borrow_mut();
+                let Some(vset) = host
+                    .vsets
+                    .get_mut(&page.volume.vset)
+                    .filter(|vset| vset.incarnation == incarnation && vset.ready)
+                else {
+                    return Err(());
+                };
+                if vset.archive_objects.contains(&object) {
+                    vset.archive_footers.insert(object.identity, footer);
+                }
+            }
+            Action::Resolve => {
+                let mut host = state.borrow_mut();
+                let Some(vset) = host
+                    .vsets
+                    .get_mut(&page.volume.vset)
+                    .filter(|vset| vset.incarnation == incarnation && vset.ready)
+                else {
+                    return Err(());
+                };
+                if vset.page_locs.contains_key(&page) || vset.archive_resolved_pages.contains(&page)
+                {
+                    continue;
+                }
+                if !vset.archived_memory_usable && vset.config.is_memory(page.volume.idx) {
+                    vset.archive_resolved_pages.insert(page);
+                    return Ok(());
+                }
+                let key = BlockKey::from_page(vset.config.kind, page);
+                let mut winner = None;
+                for object in vset
+                    .archive_objects
+                    .iter()
+                    .filter(|object| object.first_key <= key && key <= object.last_key)
+                {
+                    let Some(entry) = vset
+                        .archive_footers
+                        .get(&object.identity)
+                        .and_then(|footer| footer.find(key))
+                    else {
+                        continue;
+                    };
+                    let own = object.identity.namespace_kind == NamespaceKind::Vset
+                        && object.identity.namespace_id == page.volume.vset.0;
+                    let replace = winner.as_ref().is_none_or(
+                        |(old_entry, old_own, old_object): &(
+                            crate::blx::FooterEntry,
+                            bool,
+                            ObjectRef,
+                        )| {
+                            (entry.generation, own, object.identity)
+                                > (old_entry.generation, *old_own, old_object.identity)
+                        },
+                    );
+                    if replace {
+                        winner = Some((entry, own, *object));
+                    }
+                }
+                vset.archive_resolved_pages.insert(page);
+                if let Some((entry, own, object)) = winner {
+                    vset.next_gen = vset.next_gen.max(entry.generation.0.saturating_add(1));
+                    if entry.kind == EntryKind::Data {
+                        vset.block_checksums
+                            .insert(key, (entry.generation, entry.value_checksum));
+                        vset.page_locs.insert(
+                            page,
+                            (
+                                entry.generation,
+                                PageLoc {
+                                    base: if own { 0 } else { object.identity.namespace_id },
+                                    fence: object.identity.writer_fence,
+                                    seg: crate::types::SegId(object.identity.object_id),
+                                    offset: entry.offset,
+                                    len: entry.length,
+                                },
+                            ),
+                        );
+                    } else {
+                        vset.block_checksums.remove(&key);
+                        vset.page_locs.remove(&page);
+                        vset.overlay.remove(&page);
+                    }
+                }
+                return Ok(());
             }
         }
     }
@@ -527,6 +759,9 @@ where
     hydrate_mapping(state, world, page, incarnation)
         .await
         .ok()?;
+    resolve_archive_mapping(state, world, page, incarnation)
+        .await
+        .ok()?;
     let (location, backed, source, retry) = {
         let host = state.borrow();
         let vset = host
@@ -543,7 +778,7 @@ where
     let Some((generation, location)) = location else {
         return Some(vec![0; page_size()]);
     };
-    fetch_page(
+    let raw = fetch_page(
         state,
         world,
         page,
@@ -555,6 +790,18 @@ where
             retry_delay: retry,
         },
     )
-    .await
-    .map(|(raw, _)| raw)
+    .await?
+    .0;
+    if let Some(vset) = state
+        .borrow_mut()
+        .vsets
+        .get_mut(&page.volume.vset)
+        .filter(|vset| vset.incarnation == incarnation)
+    {
+        vset.block_checksums.insert(
+            BlockKey::from_page(vset.config.kind, page),
+            (generation, checksum64(&raw)),
+        );
+    }
+    Some(raw)
 }

@@ -4,11 +4,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
+use blockd_core::blx::{BatchMeta, NamespaceKind, compact_objects, open_object};
 use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::head::{HeadRecord, ManifestPtr};
 use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::JournalRecord;
+use blockd_core::journal::{RecordKind, VsetKind};
 use blockd_core::layout;
+use blockd_core::manifest::{CompleteFileList, Manifest, ObjectRef, RecoveryKind};
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{AdminCall, AdminEvent, AdminResult, AdminSuccess, ReqId, Verdict};
 use blockd_core::replica_recovery::{
@@ -303,8 +305,19 @@ pub(crate) fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
     let (unavailable, conflicts) = worlds[0].store_counters();
     control.report.store_unavailable = unavailable;
     control.report.store_cas_conflicts = conflicts;
+    control.report.store = worlds[0].store_metrics();
+    (
+        control.report.published_segment_bytes,
+        control.report.published_live_entry_bytes,
+        control.report.published_dead_entry_bytes,
+        control.report.published_segment_overhead_bytes,
+    ) = worlds[0].published_archive_metrics();
     control.report.disk_bitflips = worlds.iter().map(|world| world.bitflips()).sum();
     control.report.blobs_per_host = worlds.iter().map(|world| world.blob_count()).collect();
+    control.report.primary_blobs_per_host = worlds
+        .iter()
+        .map(|world| world.primary_blob_count())
+        .collect();
     std::mem::take(&mut control.report)
 }
 
@@ -408,8 +421,8 @@ async fn audit_cluster(
                 .and_then(|pointer| {
                     store.get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
                 })
-                .and_then(|bytes| JournalRecord::decode(vset, bytes).ok())
-                .map_or(0, |record| record.sync_covered_through);
+                .and_then(|bytes| Manifest::decode(vset, bytes).ok())
+                .map_or(0, |manifest| manifest.sync_covered_through);
             let protected_through = vset_state.peer_committed_through.max(archived_through);
             if protected_through < vset_state.sync_ack_through {
                 audit.violations.push(format!(
@@ -433,11 +446,14 @@ async fn audit_cluster(
                         let key = layout::manifest_key(vset, pointer.fence, pointer.seq);
                         match store
                             .get(&key)
-                            .and_then(|bytes| JournalRecord::decode(vset, bytes).ok())
+                            .and_then(|bytes| Manifest::decode(vset, bytes).ok())
                         {
-                            Some(record)
-                                if (record.fence, record.seq, record.capture_seq)
-                                    == (pointer.fence, pointer.seq, pointer.capture_seq) => {}
+                            Some(manifest)
+                                if (
+                                    manifest.writer_fence,
+                                    manifest.archive_seq,
+                                    manifest.capture_seq,
+                                ) == (pointer.fence, pointer.seq.0, pointer.capture_seq) => {}
                             _ => audit.violations.push(format!(
                                 "final audit could not verify head manifest {key} for {vset:?}"
                             )),
@@ -625,7 +641,7 @@ async fn lifecycle_actor(
                         control.report.max_migration_pause_ns = control
                             .report
                             .max_migration_pause_ns
-                            .max(now().saturating_sub(attempt.started));
+                            .max(worlds[usize::from(attempt.from)].max_pause_ns());
                     }
                     control.placement.insert(vset, host);
                 }
@@ -1086,7 +1102,7 @@ fn finalize_destination_migration(
         control.report.max_migration_pause_ns = control
             .report
             .max_migration_pause_ns
-            .max(now().saturating_sub(attempt.started));
+            .max(worlds[usize::from(attempt.from)].max_pause_ns());
     }
     if runnable {
         start_guest(vset, host, control, worlds, config);
@@ -1736,13 +1752,15 @@ async fn promote_orphan(
     else {
         return false;
     };
+    let mut inputs = Vec::new();
     for (name, bytes) in &export.blobs {
         let key = match layout::parse_blob(name) {
             Some(layout::BlobName::Segment { fence, seg, .. }) => {
+                let Ok(object) = open_object(bytes) else {
+                    return false;
+                };
+                inputs.push(object);
                 Some(layout::segment_key(vset, fence, seg))
-            }
-            Some(layout::BlobName::Leaf { fence, id, .. }) => {
-                Some(layout::leaf_key(vset, fence, id))
             }
             _ => None,
         };
@@ -1759,16 +1777,107 @@ async fn promote_orphan(
             }
         }
     }
+    let Ok(compacted) = compact_objects(
+        BatchMeta {
+            namespace_kind: NamespaceKind::Vset,
+            namespace_id: vset.0,
+            writer_fence: retired_version,
+            first_object_id: u64::MAX - 1024,
+            min_seq: record.seq.0,
+            max_seq: record.seq.0,
+            batch_id: u64::MAX - 1024,
+            pre_state_checksum: record.post_state_checksum,
+            post_state_checksum: record.post_state_checksum,
+        },
+        &inputs,
+        true,
+    ) else {
+        return false;
+    };
+    let mut objects = Vec::new();
+    for object in compacted {
+        let reference = ObjectRef::from_blx(&object);
+        loop {
+            match Store::put(
+                worlds[0].as_ref(),
+                reference.identity.store_key(),
+                object.bytes.clone(),
+            )
+            .await
+            {
+                Ok(_) => break,
+                Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                    delay(config.daemon.backup_retry).await;
+                }
+                Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
+            }
+        }
+        objects.push(reference);
+    }
+    let list = CompleteFileList {
+        vset,
+        writer_fence: retired_version,
+        list_id: record.seq.0,
+        objects,
+    };
+    loop {
+        match Store::put(
+            worlds[0].as_ref(),
+            layout::complete_file_list_key(vset, retired_version, record.seq.0),
+            list.encode(),
+        )
+        .await
+        {
+            Ok(_) => break,
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                delay(config.daemon.backup_retry).await;
+            }
+            Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
+        }
+    }
+    let (recovery_kind, checkpoint_epoch, vmstate_logical_length) = match record.kind {
+        RecordKind::Checkpoint {
+            epoch,
+            vmstate_logical_length,
+            ..
+        } => (RecoveryKind::Whole, epoch, vmstate_logical_length),
+        RecordKind::Commit if record.config.kind == VsetKind::Database => {
+            (RecoveryKind::Database, blockd_core::types::Epoch(0), 0)
+        }
+        RecordKind::Commit => (RecoveryKind::DiskOnly, blockd_core::types::Epoch(0), 0),
+    };
+    let archive = Manifest {
+        vset,
+        writer_fence: retired_version,
+        journal_seq: record.seq.0,
+        archive_seq: record.seq.0,
+        capture_seq: record.capture_seq,
+        sync_covered_through: record.sync_covered_through,
+        recovery_kind,
+        checkpoint_epoch,
+        config: record.config,
+        database: record.database,
+        vmstate_logical_length,
+        base: None,
+        complete_list: Some(list.reference()),
+        post_state_checksum: record.post_state_checksum,
+        metadata_checksum: blockd_core::format::checksum64(&record.encode(vset)),
+        added: Vec::new(),
+        removed: Vec::new(),
+    };
+    let archive_bytes = archive.encode().expect("recovery manifest is bounded");
     let manifest = ManifestPtr {
         fence: retired_version,
+        journal_seq: record.seq,
         seq: record.seq,
         capture_seq: record.capture_seq,
+        checksum: blockd_core::format::checksum64(&archive_bytes),
     };
     loop {
         match Store::put(
             worlds[0].as_ref(),
             layout::manifest_key(vset, manifest.fence, manifest.seq),
-            record.encode(vset),
+            archive_bytes.clone(),
         )
         .await
         {
@@ -2207,7 +2316,6 @@ fn summarize_counters(report: &mut ClusterReport, counters: &[Counters]) {
     report.wedged_outbound = sum(|value| value.wedged_outbound);
     report.replica_bytes = sum(|value| value.replica_bytes);
     report.replica_commits = sum(|value| value.replica_commits);
-    report.replica_store_bytes = sum(|value| value.replica_store_bytes);
     report.replica_unlinks = sum(|value| value.replica_unlinks);
     report.replica_network_bytes = sum(|value| value.replica_network_bytes);
     report.replica_logical_bytes = sum(|value| value.replica_logical_bytes);

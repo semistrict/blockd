@@ -66,6 +66,9 @@ pub enum PeerMsg {
     MigrateOffer {
         vset: VsetId,
         record: Vec<u8>,
+        /// Canonical VMM bytes when they fit in the offer. A recovered source
+        /// may omit them; the destination then fetches the verified BLX ranges.
+        vmstate: Option<Vec<u8>>,
     },
     /// The destination's accept: its side of the handoff is durable and its
     /// guest is resuming. The source now serves fetches and never runs the
@@ -79,6 +82,9 @@ pub enum PeerMsg {
     FetchRange {
         io: PeerRequestId,
         vset: VsetId,
+        /// Present when the requester is the primary reading its committed
+        /// copy from the assigned passive. Absent for migration-source reads.
+        replica_assignment_epoch: Option<u64>,
         fence: u64,
         seg: SegId,
         offset: u32,
@@ -154,21 +160,6 @@ pub enum PeerMsg {
         vset: VsetId,
         assignment_epoch: u64,
         committed: Option<ReplicaCommitInfo>,
-    },
-    /// The passive peer uploaded every object needed by this commit. The
-    /// primary may now perform the small fenced head publication.
-    ReplicaUploadDone {
-        vset: VsetId,
-        assignment_epoch: u64,
-        info: ReplicaCommitInfo,
-        record: Vec<u8>,
-    },
-    /// The primary needs the covering committed cut archived before an
-    /// explicit lifecycle transition (for example migration) can finish.
-    ReplicaArchive {
-        vset: VsetId,
-        assignment_epoch: u64,
-        through: ReplicaCommitInfo,
     },
     ReplicaRelease {
         vset: VsetId,

@@ -8,12 +8,11 @@ use super::database::DetachedDatabaseDrain;
 use super::lease::{bootstrap_host_authority, host_session_monitor};
 use super::state::PendingSync;
 use super::{
-    HostFatal, SharedHost, advance_archive_age, archive_latest, archives_ready, attach_database,
-    begin_detach_database, capture_local, checkpoint_local, create_fork, create_peer_stashed,
-    database_source, delete_base, finish_detach_database, hydrate_tail, keep_base, migrate_out,
-    peer_source, publish_replica_head, reclaim_backed_segments, reconcile_backed_recovery_event,
-    recover_local, reoffer_outbound, replicate_latest, request_replica_archive, restore_vset,
-    retry_archive_notices, retry_replica_releases, serve_fault,
+    HostFatal, SharedHost, attach_database, begin_detach_database, capture_local, checkpoint_local,
+    create_fork, create_peer_stashed, database_source, delete_base, finish_detach_database,
+    hydrate_tail, keep_base, migrate_out, peer_source, publish_latest, reclaim_backed_segments,
+    reconcile_backed_recovery_event, recover_local, reoffer_outbound, replicate_latest,
+    restore_vset, retry_replica_releases, serve_fault,
 };
 use crate::hostmeta::HostConfig;
 use crate::journal::VsetKind;
@@ -37,7 +36,6 @@ enum ScheduledWork {
     Capture,
     Hydrate,
     Replicate,
-    Publish,
     Release,
     Archive,
     Reoffer,
@@ -131,11 +129,6 @@ async fn host_work<W: HostWorld>(state: SharedHost, world: Rc<W>) -> Result<(), 
     ));
     loop {
         delay(config.writeback_interval).await;
-        advance_archive_age(&state, config.writeback_interval);
-        for key in archives_ready(&state) {
-            children.spawn(archive_latest(Rc::clone(&state), Rc::clone(&world), key));
-        }
-        children.spawn(retry_archive_notices(Rc::clone(&state), Rc::clone(&world)));
         if reclaim_backed_segments(Rc::clone(&state), world.as_ref())
             .await
             .is_err()
@@ -192,6 +185,7 @@ fn work_ready(host: &super::HostState, vset: crate::types::VsetId) -> Vec<Schedu
     if vset_state.ready
         && idle_commit
         && (host.cache.has_dirty_of(vset)
+            || !vset_state.pending_tombstones.is_empty()
             || vset_state
                 .pending_syncs
                 .iter()
@@ -216,10 +210,22 @@ fn work_ready(host: &super::HostState, vset: crate::types::VsetId) -> Vec<Schedu
         work.push(ScheduledWork::Hydrate);
     }
     let replication_needed = vset_state.best_record.as_ref().is_some_and(|record| {
-        let record_is_backed = vset_state.backed.is_some_and(|pointer| {
-            (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
-        });
-        !record_is_backed || record.sync_covered_through > vset_state.sync_ack_through
+        let required = crate::protocol::ReplicaCommitInfo {
+            writer_fence: record.fence,
+            seq: record.seq,
+            sync_covered_through: record.sync_covered_through,
+        };
+        vset_state.peer_committed.is_none_or(|committed| {
+            (
+                committed.writer_fence,
+                committed.seq,
+                committed.sync_covered_through,
+            ) < (
+                required.writer_fence,
+                required.seq,
+                required.sync_covered_through,
+            )
+        })
     });
     if vset_state.ready
         && !vset_state.operations.replication_running()
@@ -228,12 +234,6 @@ fn work_ready(host: &super::HostState, vset: crate::types::VsetId) -> Vec<Schedu
     {
         work.push(ScheduledWork::Replicate);
     }
-    if vset_state.operations.publication_owner().is_none()
-        && vset_state.peer_upload_done.is_some()
-        && vset_state.best_record.is_some()
-    {
-        work.push(ScheduledWork::Publish);
-    }
     if host
         .replica_releases
         .iter()
@@ -241,11 +241,13 @@ fn work_ready(host: &super::HostState, vset: crate::types::VsetId) -> Vec<Schedu
     {
         work.push(ScheduledWork::Release);
     }
-    if host.disk_reclaim_requested
+    if vset_state.operations.publication_owner().is_none()
+        && !vset_state.operations.migration_running()
+        && vset_state.outbound.is_none()
         && vset_state.stash_assignment.is_some()
         && vset_state.peer_committed.is_some_and(|committed| {
-            vset_state.backed.is_none_or(|pointer| {
-                (pointer.fence, pointer.seq) < (committed.writer_fence, committed.seq)
+            vset_state.peer_published.is_none_or(|published| {
+                (published.writer_fence, published.seq) < (committed.writer_fence, committed.seq)
             })
         })
     {
@@ -296,14 +298,11 @@ fn schedule_vset_work<W: HostWorld>(
                     ScheduledWork::Replicate => {
                         replicate_latest(Rc::clone(&state), world, vset).await;
                     }
-                    ScheduledWork::Publish => {
-                        publish_replica_head(Rc::clone(&state), world, vset).await;
-                    }
                     ScheduledWork::Release => {
                         retry_replica_releases(Rc::clone(&state), world, vset).await;
                     }
                     ScheduledWork::Archive => {
-                        request_replica_archive(Rc::clone(&state), world, vset).await;
+                        publish_latest(Rc::clone(&state), world, vset).await;
                     }
                     ScheduledWork::Reoffer => {
                         reoffer_outbound(Rc::clone(&state), world, vset).await;
@@ -722,21 +721,23 @@ mod tests {
         reclaim_backed_segments, reconcile_backed_vsets, schedule_vset_work, scheduled_work_source,
         sync_source, work_ready,
     };
+    use crate::blx::{BlockKey, open_object};
     use crate::database::{
         AttachmentId, DatabaseError, DatabaseFile, DatabaseOp, DatabaseReply, DatabaseRequest,
     };
     use crate::engine::migration::{available_inbound_fence, migrate_in};
     use crate::engine::peer_source;
-    use crate::engine::state::{CaptureKind, MutationOwner, PendingSync};
+    use crate::engine::state::{CaptureKind, MutationOwner, PendingSync, ReplicaKey, ReplicaState};
     use crate::engine::{HostFatal, HostState, cleanup_local};
     use crate::head::{HeadRecord, StashAssignment};
     use crate::hostmeta::{HostConfig as DaemonConfig, ReplicaPlacementConfig};
     use crate::journal::{JournalRecord, RecordKind, VsetConfig};
     use crate::layout;
+    use crate::manifest::{Manifest, RecoveryKind};
     use crate::mapleaf::{LeafPtr, span_of};
     use crate::protocol::{
         AdminCall, AdminError, AdminEvent, AdminResult, AdminSuccess, DetachMode, PeerMsg,
-        PeerRequestId, ReqId, StoreFault,
+        PeerRequestId, ReplicaArtifact, ReplicaCommitInfo, ReqId, StoreFault,
     };
     use crate::segment::{PageLoc, open_entry};
     use crate::types::{
@@ -798,7 +799,10 @@ mod tests {
         store_get_delay: Cell<u64>,
         store_get_inflight: Cell<usize>,
         store_get_max_inflight: Cell<usize>,
+        store_gets: RefCell<Vec<String>>,
+        store_range_gets: RefCell<Vec<String>>,
         memory: RefCell<BTreeMap<PageId, Vec<u8>>>,
+        installed_vmstate: RefCell<BTreeMap<VsetId, Vec<u8>>>,
         paused_vsets: RefCell<BTreeSet<VsetId>>,
         shared_pages: RefCell<BTreeMap<crate::cache::BaseKey, Vec<u8>>>,
         peer_inbox: RefCell<VecDeque<(HostId, PeerMsg)>>,
@@ -924,6 +928,7 @@ mod tests {
         }
 
         async fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+            self.store_gets.borrow_mut().push(key.to_owned());
             let inflight = self.store_get_inflight.get() + 1;
             self.store_get_inflight.set(inflight);
             self.store_get_max_inflight
@@ -943,6 +948,7 @@ mod tests {
             offset: u64,
             len: u64,
         ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+            self.store_range_gets.borrow_mut().push(key.to_owned());
             Ok(self.store.borrow().get(key).map(|(version, bytes)| {
                 let start = usize::try_from(offset.min(bytes.len() as u64)).expect("fits");
                 let end = usize::try_from((offset + len).min(bytes.len() as u64)).expect("fits");
@@ -990,17 +996,7 @@ mod tests {
                         checksum,
                         bytes,
                     } => {
-                        let key = match artifact {
-                            crate::protocol::ReplicaArtifact::Segment { fence, seg } => {
-                                layout::segment_key(vset, fence, seg)
-                            }
-                            crate::protocol::ReplicaArtifact::Leaf { fence, id } => {
-                                layout::leaf_key(vset, fence, id)
-                            }
-                        };
-                        Store::put(self, key, bytes)
-                            .await
-                            .expect("test archive put");
+                        let _ = bytes;
                         self.peer_inbox.borrow_mut().push_back((
                             TEST_PASSIVE,
                             PeerMsg::ReplicaPutAck {
@@ -1018,32 +1014,15 @@ mod tests {
                         record,
                         ..
                     } => {
-                        Store::put(
-                            self,
-                            layout::manifest_key(vset, info.writer_fence, info.seq),
-                            record.clone(),
-                        )
-                        .await
-                        .expect("test manifest put");
-                        self.peer_inbox.borrow_mut().extend([
-                            (
-                                TEST_PASSIVE,
-                                PeerMsg::ReplicaCommitAck {
-                                    vset,
-                                    assignment_epoch,
-                                    info,
-                                },
-                            ),
-                            (
-                                TEST_PASSIVE,
-                                PeerMsg::ReplicaUploadDone {
-                                    vset,
-                                    assignment_epoch,
-                                    info,
-                                    record,
-                                },
-                            ),
-                        ]);
+                        let _ = record;
+                        self.peer_inbox.borrow_mut().push_back((
+                            TEST_PASSIVE,
+                            PeerMsg::ReplicaCommitAck {
+                                vset,
+                                assignment_epoch,
+                                info,
+                            },
+                        ));
                     }
                     PeerMsg::ReplicaRelease {
                         vset,
@@ -1057,7 +1036,6 @@ mod tests {
                             through,
                         },
                     )),
-                    PeerMsg::ReplicaArchive { .. } => {}
                     _ => {}
                 }
                 return;
@@ -1146,6 +1124,15 @@ mod tests {
             unreachable!()
         }
 
+        async fn install_vmstate(
+            &self,
+            vset: VsetId,
+            bytes: Vec<u8>,
+        ) -> Result<(), GuestMemoryError> {
+            self.installed_vmstate.borrow_mut().insert(vset, bytes);
+            Ok(())
+        }
+
         async fn pause(&self, vset: VsetId) -> Result<crate::world::GuestPause, GuestMemoryError> {
             let generation = self
                 .pause_generation
@@ -1156,6 +1143,7 @@ mod tests {
             self.paused_vsets.borrow_mut().insert(vset);
             Ok(crate::world::GuestPause {
                 vmstate: 77,
+                vmstate_bytes: 77_u64.to_le_bytes().to_vec(),
                 generation,
             })
         }
@@ -1172,6 +1160,15 @@ mod tests {
                 return Ok(());
             }
             self.paused_vsets.borrow_mut().remove(&vset);
+            Ok(())
+        }
+
+        async fn commit_pause(
+            &self,
+            _vset: VsetId,
+            pause: crate::world::GuestPause,
+        ) -> Result<(), GuestMemoryError> {
+            let _current = pause.generation == self.pause_generation.get();
             Ok(())
         }
 
@@ -1410,6 +1407,7 @@ mod tests {
                 PeerMsg::FetchRange {
                     io: PeerRequestId(100),
                     vset,
+                    replica_assignment_epoch: None,
                     fence: 1,
                     seg: SegId(1),
                     offset: 0,
@@ -1434,6 +1432,93 @@ mod tests {
         );
         source.cancel();
         executor.run_ready();
+    }
+
+    #[test]
+    fn passive_range_reads_require_the_committed_assignment() {
+        let world = Rc::new(ModelWorld::default());
+        let source = HostId(2);
+        let vset = VsetId(7);
+        let assignment_epoch = 9;
+        let artifact = ReplicaArtifact::Segment {
+            fence: 4,
+            seg: SegId(3),
+        };
+        let bytes = vec![10, 11, 12, 13, 14];
+        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
+            archive: Default::default(),
+            host: HostId(1),
+            cache_pages: 1,
+            writeback_interval: 1_000,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: test_replica_placement(HostId(1)),
+        })));
+        state.borrow_mut().replicas.insert(
+            ReplicaKey {
+                source,
+                vset,
+                assignment_epoch,
+            },
+            ReplicaState {
+                artifacts: BTreeMap::from([(artifact, (0, bytes))]),
+                committed: Some(ReplicaCommitInfo {
+                    writer_fence: 4,
+                    seq: crate::types::JournalSeq(5),
+                    sync_covered_through: 6,
+                }),
+                ..ReplicaState::default()
+            },
+        );
+        world.peer_inbox.borrow_mut().extend([
+            (
+                source,
+                PeerMsg::FetchRange {
+                    io: PeerRequestId(1),
+                    vset,
+                    replica_assignment_epoch: Some(assignment_epoch),
+                    fence: 4,
+                    seg: SegId(3),
+                    offset: 1,
+                    len: 3,
+                },
+            ),
+            (
+                source,
+                PeerMsg::FetchRange {
+                    io: PeerRequestId(2),
+                    vset,
+                    replica_assignment_epoch: Some(assignment_epoch + 1),
+                    fence: 4,
+                    seg: SegId(3),
+                    offset: 1,
+                    len: 3,
+                },
+            ),
+        ]);
+
+        let mut executor = Executor::simulation(94);
+        let mut peer = executor.spawn(peer_source(Rc::clone(&state), Rc::clone(&world)));
+        executor.run_until(100);
+        peer.cancel();
+        executor.run_ready();
+
+        assert!(world.peer_outbox.borrow().contains(&(
+            source,
+            PeerMsg::Page {
+                io: PeerRequestId(1),
+                bytes: Some(vec![11, 12, 13]),
+            },
+        )));
+        assert!(world.peer_outbox.borrow().contains(&(
+            source,
+            PeerMsg::Page {
+                io: PeerRequestId(2),
+                bytes: None,
+            },
+        )));
     }
 
     #[test]
@@ -1465,6 +1550,7 @@ mod tests {
                 PeerMsg::FetchRange {
                     io: PeerRequestId(io),
                     vset,
+                    replica_assignment_epoch: None,
                     fence: 1,
                     seg: SegId(1),
                     offset: 0,
@@ -1940,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn host_wide_pressure_scans_idle_archive_candidates() {
+    fn host_wide_pressure_never_asks_the_passive_to_archive() {
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
@@ -1981,13 +2067,6 @@ mod tests {
             false,
         ));
         executor.run_until(2);
-        assert!(world.peer_outbox.borrow().iter().any(|(to, message)| {
-            *to == HostId(2)
-                && matches!(
-                    message,
-                    PeerMsg::ReplicaArchive { vset: archived, .. } if *archived == vset
-                )
-        }));
         source.cancel();
         executor.run_ready();
     }
@@ -2456,7 +2535,8 @@ mod tests {
         };
         let mut executor = Executor::simulation(4);
         let actor_world = Rc::clone(&world);
-        let actor = executor.spawn(host_actor(config.clone(), actor_world));
+        let actor_state = Rc::new(RefCell::new(HostState::new(config.clone())));
+        let actor = executor.spawn(host_actor_with_state(Rc::clone(&actor_state), actor_world));
         executor.run_until(5);
         assert_eq!(
             *world.replies.borrow(),
@@ -2483,6 +2563,17 @@ mod tests {
         executor.run_until(19);
         assert!(world.unprotected.borrow().is_empty());
 
+        world
+            .faults
+            .borrow_mut()
+            .push_back(GuestFault { page, write: true });
+        executor.run_until(21);
+        let checkpoint_expected = vec![0xa5; page_size()];
+        world
+            .memory
+            .borrow_mut()
+            .insert(page, checkpoint_expected.clone());
+
         world.admin.borrow_mut().push_back(AdminCall::Checkpoint {
             retry: ReqId(3),
             vset,
@@ -2498,6 +2589,7 @@ mod tests {
                 })
             ]
         );
+        executor.run_until(300);
 
         let blobs = world.blobs.borrow();
         let (fence, seq, record_bytes) = blobs
@@ -2524,8 +2616,17 @@ mod tests {
             &blobs[&layout::journal_mirror_blob(vset, fence, seq)]
         );
         let record = JournalRecord::decode(vset, record_bytes).expect("valid record");
-        assert_eq!(record.capture_seq, 1);
+        assert_eq!(record.capture_seq, 2);
         assert_eq!(record.sync_covered_through, 1);
+        for reference in &record.files {
+            let bytes = &blobs[&layout::segment_blob(
+                vset,
+                reference.identity.writer_fence,
+                SegId(reference.identity.object_id),
+            )];
+            let object = open_object(bytes).expect("journal file must be a valid BLX object");
+            assert_eq!(crate::manifest::ObjectRef::from_blx(&object), *reference);
+        }
         let durable_manifest = {
             let store = world.store.borrow();
             let (_, head_bytes) = &store[&layout::head_key(vset)];
@@ -2533,26 +2634,156 @@ mod tests {
             let pointer = head.manifest.expect("published manifest");
             let (_, manifest_bytes) =
                 &store[&layout::manifest_key(vset, pointer.fence, pointer.seq)];
-            JournalRecord::decode(vset, manifest_bytes).expect("valid durable manifest")
+            let manifest = Manifest::decode(vset, manifest_bytes).expect("valid durable manifest");
+            let list = manifest.complete_list.map(|reference| {
+                let (_, bytes) = &store[&layout::complete_file_list_key(
+                    vset,
+                    reference.writer_fence,
+                    reference.list_id,
+                )];
+                crate::manifest::CompleteFileList::decode(reference, vset, bytes)
+                    .expect("valid durable file list")
+            });
+            assert!(
+                manifest.current_files(list.as_ref()).is_ok(),
+                "durable manifest has an invalid current file set: manifest={manifest:?} list={list:?}"
+            );
+            manifest
         };
         let expected_peer_publication = crate::protocol::ReplicaCommitInfo {
-            writer_fence: durable_manifest.fence,
-            seq: durable_manifest.seq,
-            sync_covered_through: durable_manifest.sync_covered_through,
+            writer_fence: record.fence,
+            seq: record.seq,
+            sync_covered_through: record.sync_covered_through,
         };
+        assert_eq!(
+            durable_manifest.capture_seq,
+            record.capture_seq,
+            "store keys: {:?}; store gets: {:?}; blob keys: {:?}; peer committed: {:?}; peer record: {:?}; peer published: {:?}; best record: {:?}; failures: {:?}",
+            world.store.borrow().keys().collect::<Vec<_>>(),
+            world.store_gets.borrow(),
+            world.blobs.borrow().keys().collect::<Vec<_>>(),
+            actor_state.borrow().vsets[&vset].peer_committed,
+            actor_state.borrow().vsets[&vset]
+                .peer_committed_record
+                .as_ref()
+                .map(|record| (
+                    record.fence,
+                    record.seq,
+                    record.capture_seq,
+                    record.files.clone()
+                )),
+            actor_state.borrow().vsets[&vset].peer_published,
+            actor_state.borrow().vsets[&vset]
+                .best_record
+                .as_ref()
+                .map(|record| (
+                    record.fence,
+                    record.seq,
+                    record.capture_seq,
+                    record.files.len()
+                )),
+            world.host_failures.borrow()
+        );
+        assert_eq!(
+            durable_manifest.metadata_checksum,
+            crate::format::checksum64(&record.encode(vset)),
+            "the manifest must identify the exact journal record it publishes"
+        );
         assert_eq!(
             record.kind,
             crate::journal::RecordKind::Checkpoint {
                 epoch: crate::types::Epoch(1),
-                vmstate: 77
+                vmstate: 77,
+                vmstate_logical_length: 8,
             }
         );
-        let (_, location) = record.overlay[&page];
-        let segment = &blobs[&layout::segment_blob(vset, location.fence, location.seg)];
-        let start = usize::try_from(location.offset).expect("fits");
-        let end = start + usize::try_from(location.len).expect("fits");
+        let checkpoint_object = record
+            .files
+            .iter()
+            .find_map(|file| {
+                let segment = &blobs[&layout::segment_blob(
+                    vset,
+                    file.identity.writer_fence,
+                    SegId(file.identity.object_id),
+                )];
+                let object = open_object(segment).ok()?;
+                object
+                    .footer
+                    .entries
+                    .iter()
+                    .any(|entry| entry.key.space == crate::blx::BlockSpace::Vmm)
+                    .then_some(object)
+            })
+            .expect("checkpoint stores VMM bytes in BLX");
+        assert_ne!(checkpoint_object.header.pre_state_checksum, 0);
+        assert_ne!(checkpoint_object.header.post_state_checksum, 0);
+        assert_ne!(
+            checkpoint_object.header.pre_state_checksum,
+            checkpoint_object.header.post_state_checksum
+        );
+        assert_eq!(
+            durable_manifest.post_state_checksum,
+            checkpoint_object.header.post_state_checksum,
+            "manifest={durable_manifest:?}; record checksum={}; peer committed={:?}; peer published={:?}; stash={:?}; publication owner={:?}; scheduled={}; store keys={:?}",
+            record.post_state_checksum,
+            actor_state.borrow().vsets[&vset].peer_committed,
+            actor_state.borrow().vsets[&vset].peer_published,
+            actor_state.borrow().vsets[&vset].stash_assignment,
+            actor_state.borrow().vsets[&vset]
+                .operations
+                .publication_owner(),
+            actor_state.borrow().scheduled_vset_count(),
+            world.store.borrow().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(durable_manifest.vmstate_logical_length, 8);
+        let archived_files = {
+            let store = world.store.borrow();
+            let list = durable_manifest.complete_list.map(|reference| {
+                let (_, bytes) = &store[&layout::complete_file_list_key(
+                    vset,
+                    reference.writer_fence,
+                    reference.list_id,
+                )];
+                crate::manifest::CompleteFileList::decode(reference, vset, bytes)
+                    .expect("complete file list")
+            });
+            durable_manifest
+                .current_files(list.as_ref())
+                .expect("current archive files")
+        };
+        assert!(
+            crate::manifest::max_object_overlap(&archived_files)
+                <= crate::blx::MAX_OVERLAPPING_FILES,
+            "publication must compact before the archive overlap limit is exceeded"
+        );
+        assert!(
+            !blobs.keys().any(|name| name.ends_with(".leaf")),
+            "the current journal must not persist page-map leaves"
+        );
+        let key = BlockKey::from_page(record.config.kind, page);
+        let (file, indexed) = record
+            .files
+            .iter()
+            .filter_map(|file| {
+                let segment = &blobs[&layout::segment_blob(
+                    vset,
+                    file.identity.writer_fence,
+                    SegId(file.identity.object_id),
+                )];
+                let object = open_object(segment).ok()?;
+                Some((file, object.footer.find(key)?))
+            })
+            .max_by_key(|(_, entry)| entry.generation)
+            .expect("checkpoint BLX entry");
+        let segment = &blobs[&layout::segment_blob(
+            vset,
+            file.identity.writer_fence,
+            SegId(file.identity.object_id),
+        )];
+        let start = usize::try_from(indexed.offset).expect("fits");
+        let end = start + usize::try_from(indexed.length).expect("fits");
         let (_, _, raw) = open_entry(vset, &segment[start..end]).expect("valid page entry");
-        assert_eq!(raw, expected);
+        assert_eq!(raw, checkpoint_expected);
 
         drop(blobs);
         drop(actor);
@@ -2567,7 +2798,7 @@ mod tests {
             Rc::clone(&recovered_state),
             recovered_world,
         ));
-        executor.run_until(27);
+        executor.run_until(350);
         assert_eq!(
             *world.events.borrow(),
             [AdminEvent::VsetRecovered {
@@ -2591,8 +2822,8 @@ mod tests {
             .faults
             .borrow_mut()
             .push_back(GuestFault { page, write: false });
-        executor.run_until(29);
-        assert_eq!(world.memory.borrow().get(&page), Some(&expected));
+        executor.run_until(352);
+        assert_eq!(world.memory.borrow().get(&page), Some(&checkpoint_expected));
 
         drop(recovered);
         executor.run_ready();
@@ -2911,7 +3142,7 @@ mod tests {
             .database_requests
             .borrow_mut()
             .push_back(request(111, DatabaseOp::Close { handle: 1 }));
-        executor.run_until(100);
+        executor.run_until(125);
         assert!(
             world
                 .replies
@@ -2932,12 +3163,15 @@ mod tests {
             .admin
             .borrow_mut()
             .push_back(AdminCall::FinishDetachDatabase { vset, attachment });
-        executor.run_until(104);
+        executor.run_until(130);
         assert!(
             world
                 .replies
                 .borrow()
-                .contains(&Ok(AdminSuccess::DatabaseDetached { vset, attachment }))
+                .contains(&Ok(AdminSuccess::DatabaseDetached { vset, attachment })),
+            "replies={:?} failures={:?}",
+            world.replies.borrow(),
+            world.host_failures.borrow()
         );
         world.database_requests.borrow_mut().push_back(request(
             113,
@@ -2945,7 +3179,7 @@ mod tests {
                 file: DatabaseFile::Main,
             },
         ));
-        executor.run_until(106);
+        executor.run_until(132);
         assert!(
             world
                 .database_replies
@@ -2962,7 +3196,7 @@ mod tests {
         world.events.borrow_mut().clear();
         world.database_replies.borrow_mut().clear();
         let recovered = executor.spawn(host_actor(config, Rc::clone(&world)));
-        executor.run_until(110);
+        executor.run_until(140);
         assert!(
             world.events.borrow().contains(&AdminEvent::VsetRecovered {
                 vset,
@@ -3016,9 +3250,9 @@ mod tests {
         assert_eq!(manifest.fence, 1);
         assert_eq!(manifest.seq, crate::types::JournalSeq(0));
         let (_, manifest_bytes) = &store[&layout::manifest_key(vset, 1, manifest.seq)];
-        let record = JournalRecord::decode(vset, manifest_bytes).expect("valid manifest");
-        assert_eq!(record.fence, 1);
-        assert_eq!(record.seq, manifest.seq);
+        let record = Manifest::decode(vset, manifest_bytes).expect("valid manifest");
+        assert_eq!(record.writer_fence, 1);
+        assert_eq!(record.archive_seq, manifest.seq.0);
 
         drop(store);
         drop(actor);
@@ -3095,7 +3329,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn restore_hydrates_only_the_faulted_map_leaf() {
+    fn restore_reads_metadata_then_only_the_faulted_blx_file() {
         let vset = VsetId(12);
         let world = Rc::new(ModelWorld::default());
         world.admin.borrow_mut().push_back(AdminCall::CreateVset {
@@ -3130,10 +3364,18 @@ mod tests {
                 page: PageNo(number),
             })
             .collect::<Vec<_>>();
+        let memory_page = PageId {
+            volume: VolumeId {
+                vset,
+                idx: VolumeIdx(0),
+            },
+            page: PageNo(7),
+        };
         world.faults.borrow_mut().extend(
             pages
                 .iter()
                 .copied()
+                .chain([memory_page])
                 .map(|page| GuestFault { page, write: true }),
         );
         executor.run_until(7);
@@ -3143,6 +3385,10 @@ mod tests {
                 vec![u8::try_from(number).expect("bounded"); page_size()],
             );
         }
+        world
+            .memory
+            .borrow_mut()
+            .insert(memory_page, vec![0xa5; page_size()]);
         world.syncs.borrow_mut().push_back(GuestSync {
             req: ReqId(21),
             volume: pages[0].volume,
@@ -3154,14 +3400,29 @@ mod tests {
         let head = HeadRecord::decode(vset, head_bytes).expect("valid head");
         let manifest = head.manifest.expect("capture published");
         let (_, manifest_bytes) = &store[&layout::manifest_key(vset, manifest.fence, manifest.seq)];
-        let record = JournalRecord::decode(vset, manifest_bytes).expect("valid manifest");
-        let pointer = record
-            .leaves
-            .values()
-            .next()
-            .copied()
-            .expect("rolled map leaf");
-        let local_leaf = layout::leaf_blob(vset, pointer.fence, pointer.id);
+        let record = Manifest::decode(vset, manifest_bytes).expect("valid manifest");
+        assert_eq!(record.recovery_kind, RecoveryKind::DiskOnly);
+        let list = record.complete_list.map(|reference| {
+            let (_, bytes) = &store
+                [&layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id)];
+            crate::manifest::CompleteFileList::decode(reference, vset, bytes)
+                .expect("valid complete file list")
+        });
+        let archived_files = record
+            .current_files(list.as_ref())
+            .expect("valid archive file set");
+        let memory_key = BlockKey::from_page(record.config.kind, memory_page);
+        assert!(
+            archived_files.iter().any(|reference| {
+                let (_, bytes) = &store[&reference.identity.store_key()];
+                open_object(bytes)
+                    .expect("valid archived BLX object")
+                    .footer
+                    .find(memory_key)
+                    .is_some()
+            }),
+            "test setup must archive the pre-boot memory value"
+        );
         drop(store);
         drop(actor);
         executor.run_ready();
@@ -3178,6 +3439,8 @@ mod tests {
         world.blobs.borrow_mut().clear();
         world.memory.borrow_mut().clear();
         world.replies.borrow_mut().clear();
+        world.store_gets.borrow_mut().clear();
+        world.store_range_gets.borrow_mut().clear();
         world
             .admin
             .borrow_mut()
@@ -3202,7 +3465,9 @@ mod tests {
                 verdict: crate::protocol::Verdict::ColdBoot
             })]
         );
-        assert!(!world.blobs.borrow().contains_key(&local_leaf));
+        assert!(world.blobs.borrow().is_empty());
+        assert_eq!(world.store_gets.borrow().len(), 3);
+        assert!(world.store_range_gets.borrow().is_empty());
 
         let faulted = pages[42];
         world.faults.borrow_mut().push_back(GuestFault {
@@ -3210,12 +3475,144 @@ mod tests {
             write: false,
         });
         executor.run_until(110);
-        assert!(world.blobs.borrow().contains_key(&local_leaf));
+        assert!(world.blobs.borrow().is_empty());
+        assert_eq!(world.store_range_gets.borrow().len(), 2);
         assert_eq!(
             world.memory.borrow().get(&faulted),
             Some(&vec![42; page_size()])
         );
 
+        let range_reads_after_disk_fault = world.store_range_gets.borrow().len();
+        world.faults.borrow_mut().push_back(GuestFault {
+            page: memory_page,
+            write: false,
+        });
+        executor.run_until(115);
+        assert_eq!(
+            world.store_range_gets.borrow().len(),
+            range_reads_after_disk_fault,
+            "cold-boot memory fault must not read archived memory"
+        );
+        assert_eq!(
+            world.memory.borrow().get(&memory_page),
+            Some(&vec![0; page_size()])
+        );
+
+        drop(restored);
+        executor.run_ready();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn whole_restore_seeds_vmm_checksum_state() {
+        let vset = VsetId(32);
+        let world = Rc::new(ModelWorld::default());
+        world.admin.borrow_mut().push_back(AdminCall::CreateVset {
+            vset,
+            config: VsetConfig::compute(1, 8),
+            from_base: None,
+        });
+        let source_config = DaemonConfig {
+            archive: crate::hostmeta::ArchivePolicy {
+                interval: 1,
+                ..Default::default()
+            },
+            host: HostId(20),
+            cache_pages: 8,
+            writeback_interval: 10,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: test_replica_placement(HostId(20)),
+        };
+        let mut executor = Executor::simulation(61);
+        let source = executor.spawn(host_actor(source_config, Rc::clone(&world)));
+        executor.run_until(4);
+        world.admin.borrow_mut().push_back(AdminCall::Checkpoint {
+            retry: ReqId(32),
+            vset,
+        });
+        executor.run_until(80);
+        let head_key = layout::head_key(vset);
+        let (version, head_bytes) = world.store.borrow()[&head_key].clone();
+        let mut head = HeadRecord::decode(vset, &head_bytes).expect("valid head");
+        assert_eq!(
+            head.manifest
+                .and_then(|pointer| {
+                    let (_, bytes) = world
+                        .store
+                        .borrow()
+                        .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))?
+                        .clone();
+                    Manifest::decode(vset, &bytes).ok()
+                })
+                .map(|manifest| manifest.recovery_kind),
+            Some(RecoveryKind::Whole)
+        );
+        drop(source);
+        executor.run_ready();
+
+        head.stash = None;
+        world
+            .store
+            .borrow_mut()
+            .insert(head_key, (version, head.encode()));
+        world.blobs.borrow_mut().clear();
+        world.replies.borrow_mut().clear();
+        world.installed_vmstate.borrow_mut().clear();
+        world
+            .admin
+            .borrow_mut()
+            .push_back(AdminCall::RestoreVset { vset });
+        let restore_config = DaemonConfig {
+            archive: Default::default(),
+            host: HostId(21),
+            cache_pages: 8,
+            writeback_interval: 10,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: test_replica_placement(HostId(21)),
+        };
+        let restored_state = Rc::new(RefCell::new(HostState::new(restore_config)));
+        let restored = executor.spawn(host_actor_with_state(
+            Rc::clone(&restored_state),
+            Rc::clone(&world),
+        ));
+        executor.run_until(100);
+
+        assert!(world.replies.borrow().iter().any(|reply| {
+            matches!(
+                reply,
+                Ok(AdminSuccess::VsetRestored {
+                    vset: restored,
+                    verdict: crate::protocol::Verdict::Resume { vmstate: 77, .. }
+                }) if *restored == vset
+            )
+        }));
+        assert_eq!(
+            world.installed_vmstate.borrow().get(&vset),
+            Some(&77_u64.to_le_bytes().to_vec())
+        );
+        let state = restored_state.borrow();
+        let restored_vset = &state.vsets[&vset];
+        let vmm = restored_vset
+            .block_checksums
+            .iter()
+            .filter(|(key, _)| key.space == crate::blx::BlockSpace::Vmm)
+            .collect::<Vec<_>>();
+        assert!(!vmm.is_empty());
+        assert_eq!(
+            vmm.into_iter()
+                .fold(0, |checksum, (key, (generation, value))| {
+                    checksum ^ crate::blx::state_contribution(*key, *generation, *value)
+                }),
+            restored_vset.state_checksum
+        );
+
+        drop(state);
         drop(restored);
         executor.run_ready();
     }
@@ -3285,8 +3682,16 @@ mod tests {
             world
                 .store
                 .borrow()
-                .contains_key(&layout::base_record_key(base))
+                .contains_key(&layout::base_root_key(base))
         );
+
+        let blx_before_fork = world
+            .store
+            .borrow()
+            .keys()
+            .filter(|key| key.ends_with(".blx"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
 
         world.admin.borrow_mut().push_back(AdminCall::CreateVset {
             vset: fork,
@@ -3294,6 +3699,14 @@ mod tests {
             from_base: Some(base),
         });
         executor.run_until(23);
+        let blx_after_fork = world
+            .store
+            .borrow()
+            .keys()
+            .filter(|key| key.ends_with(".blx"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(blx_after_fork, blx_before_fork);
         assert!(
             world
                 .replies
@@ -3302,7 +3715,7 @@ mod tests {
                     vset: fork,
                     verdict: crate::protocol::Verdict::Resume {
                         epoch: crate::types::Epoch(0),
-                        vmstate: 77,
+                        vmstate: 8,
                     },
                 }))
         );
@@ -3337,7 +3750,7 @@ mod tests {
             !world
                 .store
                 .borrow()
-                .contains_key(&layout::base_record_key(base))
+                .contains_key(&layout::base_root_key(base))
         );
 
         drop(actor);
@@ -3385,8 +3798,9 @@ mod tests {
         };
         let mut executor = Executor::simulation(8);
         let source_actor = executor.spawn(host_actor(config(source_host), Rc::clone(&source)));
-        let destination_actor = executor.spawn(host_actor(
-            config(destination_host),
+        let destination_state = Rc::new(RefCell::new(HostState::new(config(destination_host))));
+        let destination_actor = executor.spawn(host_actor_with_state(
+            Rc::clone(&destination_state),
             Rc::clone(&destination),
         ));
         executor.run_until(5);
@@ -3416,9 +3830,7 @@ mod tests {
                 .borrow()
                 .contains(&Ok(AdminSuccess::MigratedOut { vset }))
         );
-        deliver(source_host, &source, &destination, destination_host);
-        executor.run_until(20);
-        assert!(
+        let migrated_in = |destination: &ModelWorld| {
             destination
                 .events
                 .borrow()
@@ -3429,9 +3841,38 @@ mod tests {
                         vmstate: 77,
                     },
                 })
+        };
+        let mut tick = 20;
+        for _ in 0..20 {
+            deliver(source_host, &source, &destination, destination_host);
+            executor.run_until(tick);
+            tick += 4;
+            if migrated_in(&destination) {
+                break;
+            }
+            deliver(destination_host, &destination, &source, source_host);
+            executor.run_until(tick);
+            tick += 4;
+        }
+        assert!(
+            migrated_in(&destination),
+            "destination must durably install the offered cut before accepting it"
+        );
+        assert_eq!(
+            destination.installed_vmstate.borrow().get(&vset),
+            Some(&77_u64.to_le_bytes().to_vec()),
+            "destination must install the offered VMM snapshot before resuming"
+        );
+        assert!(
+            destination_state.borrow().vsets[&vset]
+                .block_checksums
+                .keys()
+                .any(|key| key.space == crate::blx::BlockSpace::Vmm),
+            "destination must retain the VMM checksum entries for its next checkpoint"
         );
         deliver(destination_host, &destination, &source, source_host);
-        executor.run_until(25);
+        executor.run_until(tick);
+        tick += 4;
         assert!(
             source
                 .replies
@@ -3442,23 +3883,34 @@ mod tests {
             .faults
             .borrow_mut()
             .push_back(GuestFault { page, write: false });
-        executor.run_until(28);
-        deliver(destination_host, &destination, &source, source_host);
-        executor.run_until(31);
-        deliver(source_host, &source, &destination, destination_host);
-        executor.run_until(34);
+        for _ in 0..20 {
+            executor.run_until(tick);
+            tick += 4;
+            if destination.memory.borrow().get(&page) == Some(&expected) {
+                break;
+            }
+            deliver(destination_host, &destination, &source, source_host);
+            executor.run_until(tick);
+            tick += 4;
+            deliver(source_host, &source, &destination, destination_host);
+        }
         assert_eq!(destination.memory.borrow().get(&page), Some(&expected));
 
-        executor.run_until(41);
+        executor.run_until(tick + 8);
+        tick += 8;
         deliver(destination_host, &destination, &source, source_host);
-        executor.run_until(44);
+        executor.run_until(tick + 4);
+        tick += 4;
         deliver(source_host, &source, &destination, destination_host);
-        executor.run_until(47);
-        executor.run_until(88);
+        executor.run_until(tick + 4);
+        tick += 4;
+        executor.run_until(tick + 40);
+        tick += 40;
         deliver(destination_host, &destination, &source, source_host);
-        executor.run_until(91);
+        executor.run_until(tick + 4);
+        tick += 4;
         deliver(source_host, &source, &destination, destination_host);
-        executor.run_until(94);
+        executor.run_until(tick + 4);
         assert!(
             !source
                 .blobs
@@ -3503,7 +3955,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 2,
             sync_covered_through: 2,
+            post_state_checksum: 0,
             database: Default::default(),
+            files: Vec::new(),
             overlay: Default::default(),
             leaves: Default::default(),
             migrated_from: None,
@@ -3515,7 +3969,8 @@ mod tests {
             Rc::clone(&world),
             source,
             vset,
-            offered.encode(vset),
+            offered.encode_migration(vset),
+            None,
         ));
         assert!(
             world.peer_outbox.borrow().is_empty(),
@@ -3528,7 +3983,8 @@ mod tests {
             Rc::clone(&world),
             source,
             vset,
-            offered.encode(vset),
+            offered.encode_migration(vset),
+            None,
         ));
         assert!(world.peer_outbox.borrow().iter().any(|(to, message)| {
             *to == source
@@ -3964,6 +4420,10 @@ mod tests {
         let handler = executor.spawn(handle_admin(Rc::clone(&state), Rc::clone(&world), request));
         executor.run_until(2);
         assert!(world.paused_vsets.borrow().contains(&vset));
+        assert!(
+            world.peer_outbox.borrow().is_empty(),
+            "migration must not start peer work while taking the local cut"
+        );
         assert_eq!(
             reply.blocking_recv_timeout(Duration::ZERO),
             Err(BridgeRecvError::Timeout)
@@ -4098,6 +4558,13 @@ mod tests {
             let vset_state = host.vsets.get_mut(&vset).expect("inserted vset");
             vset_state.ready = true;
             vset_state.mutation_seq = 1;
+            vset_state.stash_assignment = Some(StashAssignment {
+                assignment_epoch: 1,
+                active_peer: TEST_PASSIVE,
+                active_assignment_epoch: 1,
+                transition_peer: None,
+                membership_epoch: 1,
+            });
             assert_eq!(host.cache.reserve_slot(), Some(None));
             host.cache.fill_slot(page, true, false);
         }
@@ -4554,7 +5021,16 @@ mod tests {
             vset,
             to: HostId(11),
         });
-        executor.run_until(15);
+        for tick in 15..80 {
+            executor.run_until(tick);
+            if world
+                .blobs
+                .borrow()
+                .contains_key(&layout::handoff_blob(vset))
+            {
+                break;
+            }
+        }
         assert!(
             world
                 .blobs
@@ -4631,7 +5107,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 1,
             sync_covered_through: 1,
+            post_state_checksum: 0,
             database: DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: [(page, (crate::types::Gen(1), location))]
                 .into_iter()
                 .collect(),

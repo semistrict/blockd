@@ -828,6 +828,21 @@ impl GuestMem for ProductionWorld {
             .await
     }
 
+    async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
+        let raw: [u8; 8] = bytes
+            .get(..8)
+            .ok_or(GuestMemoryError::Unservable)?
+            .try_into()
+            .map_err(|_| GuestMemoryError::Unservable)?;
+        self.host(vset)
+            .ctl
+            .state
+            .lock()
+            .expect("guest control lock")
+            .applied = u64::from_le_bytes(raw);
+        Ok(())
+    }
+
     async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError> {
         let started = Instant::now();
         begin_pause(&self.shared, vset);
@@ -868,6 +883,7 @@ impl GuestMem for ProductionWorld {
             .record_world(world_kind::PAUSE_GUEST, elapsed_ns(started.elapsed()));
         Ok(GuestPause {
             vmstate: applied,
+            vmstate_bytes: applied.to_le_bytes().to_vec(),
             generation,
         })
     }
@@ -888,6 +904,19 @@ impl GuestMem for ProductionWorld {
         complete_pause(&self.shared, vset);
         host.ctl.cv.notify_all();
         self.shared.stats.record_world(world_kind::RESUME_GUEST, 0);
+        Ok(())
+    }
+
+    async fn commit_pause(&self, vset: VsetId, pause: GuestPause) -> Result<(), GuestMemoryError> {
+        let host = self.host(vset);
+        let mut state = host.ctl.state.lock().expect("guest control lock");
+        if pause.generation != state.pause_generation {
+            return Ok(());
+        }
+        state.pause_requested = false;
+        state.pause_waiter = None;
+        drop(state);
+        complete_pause(&self.shared, vset);
         Ok(())
     }
 

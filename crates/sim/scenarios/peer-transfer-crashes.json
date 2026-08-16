@@ -2,7 +2,7 @@
   "extends": ["peer-stash"],
   "schema": 1,
   "name": "peer-transfer-crashes",
-  "description": "Crash each recovery-closure capture, transfer, durable flush, and upload boundary.",
+  "description": "Crash each recovery-closure capture, transfer, and durable passive flush boundary.",
   "kind": "cluster",
   "topology": { "vset_count": 1 },
   "workload": { "horizon": "6s" },
@@ -13,16 +13,14 @@
       "crash-primary-before-closure-capture",
       "crash-primary-after-closure-capture",
       "crash-primary-during-artifact-transfer",
-      "crash-peer-after-data-flush-before-commit",
-      "crash-peer-during-upload"
+      "crash-peer-after-data-flush-before-commit"
     ]
   },
   "coverage": [
     { "metric": "peer-fault", "fault_point": "crash-primary-before-closure-capture", "label": "primary crash before closure capture" },
     { "metric": "peer-fault", "fault_point": "crash-primary-after-closure-capture", "label": "primary crash after closure capture" },
     { "metric": "peer-fault", "fault_point": "crash-primary-during-artifact-transfer", "label": "primary crash during artifact transfer" },
-    { "metric": "peer-fault", "fault_point": "crash-peer-after-data-flush-before-commit", "label": "peer crash after data flush" },
-    { "metric": "peer-fault", "fault_point": "crash-peer-during-upload", "label": "peer crash during upload" }
+    { "metric": "peer-fault", "fault_point": "crash-peer-after-data-flush-before-commit", "label": "peer crash after data flush" }
   ],
   "outcomes": [
     { "metric": "guest-death", "label": "guest deaths", "max": 0 }

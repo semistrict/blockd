@@ -60,6 +60,7 @@ fn sample_msgs() -> Vec<PeerMsg> {
         PeerMsg::MigrateOffer {
             vset: VsetId(7),
             record: vec![1, 2, 3],
+            vmstate: Some(vec![4, 5, 6]),
         },
         PeerMsg::MigrateAccept {
             vset: VsetId(7),
@@ -68,6 +69,7 @@ fn sample_msgs() -> Vec<PeerMsg> {
         PeerMsg::FetchRange {
             io: PeerRequestId(1),
             vset: VsetId(7),
+            replica_assignment_epoch: Some(8),
             fence: 2,
             seg: SegId(3),
             offset: 4,
@@ -129,12 +131,6 @@ fn sample_msgs() -> Vec<PeerMsg> {
             vset: VsetId(7),
             assignment_epoch: 2,
             committed: Some(info),
-        },
-        PeerMsg::ReplicaUploadDone {
-            vset: VsetId(7),
-            assignment_epoch: 2,
-            info,
-            record: vec![0xD4; 19],
         },
         PeerMsg::ReplicaRelease {
             vset: VsetId(7),

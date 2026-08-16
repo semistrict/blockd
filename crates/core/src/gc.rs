@@ -1,43 +1,34 @@
 //! Cluster garbage collection (R9.3): a host actor operating against the
 //! bucket alone. Mark from the only roots that exist — head records and
-//! base records — then sweep what nothing reachable references, and only
+//! base roots — then sweep what nothing reachable references, and only
 //! once it is older than the in-flight grace (which protects publishes
 //! whose manifest has not landed yet; the grace is never retention policy,
 //! R4.5).
 //!
-//! It can never delete a base (base records are roots until an explicit
+//! It can never delete a base (base roots are roots until an explicit
 //! `DeleteBase` removes them), never a live vset's state (its head roots
 //! its newest manifest and every segment that manifest references,
 //! including inherited base segments), and never anything an explicit
 //! delete has not unrooted. Undecodable roots are kept: GC refuses to act
 //! on anything it cannot vouch for (R8.1's spirit).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::head::HeadRecord;
-use crate::journal::JournalRecord;
 use crate::layout::{self, StoreKey};
-use crate::mapleaf::MapLeaf;
-use crate::types::{SimTime, VsetId};
+use crate::manifest::{BaseManifest, BaseRoot, CompleteFileList, Manifest, ObjectRef};
+use crate::types::SimTime;
 
 /// Compute the deletion list for one GC pass over a bucket listing.
 /// `objects` is the full LIST (key, last-write time, bytes); reads of
-/// manifests, base records and map leaves happen from these bytes exactly
+/// manifests and base roots happen from these bytes exactly
 /// as the real process would GET them.
 pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) -> Vec<String> {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let find = |key: &str| objects.iter().find(|(k, _, _)| k == key);
-    let heads = objects
-        .iter()
-        .filter_map(|(key, _, bytes)| {
-            let Some(StoreKey::Head { vset }) = layout::parse_key(key) else {
-                return None;
-            };
-            Some((vset, HeadRecord::decode(vset, bytes).ok()))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut unsafe_root = false;
 
-    // Mark. Roots: every head record and every base record — plus
+    // Mark. Roots: every head record and every base root — plus
     // everything undecodable among them (never act on what you can't read).
     for (key, _, bytes) in objects {
         match layout::parse_key(key) {
@@ -49,31 +40,47 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
                     keep.insert(k);
                 }
                 let Ok(head) = HeadRecord::decode(vset, bytes) else {
+                    unsafe_root = true;
                     continue;
                 };
                 let Some(ptr) = head.manifest else {
                     continue;
                 };
                 let manifest_key = layout::manifest_key(vset, ptr.fence, ptr.seq);
-                keep.insert(
-                    find(&manifest_key)
-                        .map(|(k, _, _)| k.as_str())
-                        .unwrap_or_default(),
-                );
-                if let Some((_, _, manifest_bytes)) = find(&manifest_key)
-                    && let Ok(record) = JournalRecord::decode(vset, manifest_bytes)
-                {
-                    mark_record(objects, &mut keep, &record, Namespace::Vset(vset));
-                }
-            }
-            Some(StoreKey::BaseRecord { base }) => {
-                keep.insert(key);
-                let Ok(record) = JournalRecord::decode(VsetId(base), bytes) else {
+                let Some((key, _, manifest_bytes)) = find(&manifest_key) else {
+                    unsafe_root = true;
                     continue;
                 };
-                // A base's own artifacts live in its namespace; inherited
-                // ones carry an ancestor base's id (flattened chains).
-                mark_record(objects, &mut keep, &record, Namespace::Base(base));
+                keep.insert(key);
+                if crate::format::checksum64(manifest_bytes) != ptr.checksum {
+                    unsafe_root = true;
+                    continue;
+                }
+                let Ok(manifest) = Manifest::decode(vset, manifest_bytes) else {
+                    unsafe_root = true;
+                    continue;
+                };
+                if !mark_manifest(objects, &mut keep, &manifest) {
+                    unsafe_root = true;
+                }
+            }
+            Some(StoreKey::BaseRoot { base }) => {
+                keep.insert(key);
+                let Ok(root) = BaseRoot::decode(base, bytes) else {
+                    unsafe_root = true;
+                    continue;
+                };
+                let manifest_key = layout::base_manifest_key(base, root.manifest_id);
+                let Some((manifest_key, _, manifest_bytes)) = find(&manifest_key) else {
+                    unsafe_root = true;
+                    continue;
+                };
+                keep.insert(manifest_key);
+                let Ok(manifest) = BaseManifest::decode(root, manifest_bytes) else {
+                    unsafe_root = true;
+                    continue;
+                };
+                mark_objects(objects, &mut keep, &manifest.objects);
             }
             _ => {}
         }
@@ -87,31 +94,41 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
         let Some(StoreKey::PendingManifest { vset, fence, seq }) = layout::parse_key(key) else {
             continue;
         };
-        let Ok(record) = JournalRecord::decode(vset, bytes) else {
+        let Ok(manifest) = Manifest::decode(vset, bytes) else {
             keep.insert(key);
+            unsafe_root = true;
             continue;
         };
-        if record.fence != fence || record.seq != seq {
+        if manifest.writer_fence != fence || manifest.archive_seq != seq.0 {
             keep.insert(key);
+            unsafe_root = true;
             continue;
         }
-        let active = match heads.get(&vset) {
-            None => false,
-            Some(None) => true,
-            Some(Some(head)) => {
-                let same_assignment = head.fence == 0 || head.fence == fence;
-                let published = head.manifest.is_some_and(|manifest| {
-                    (manifest.capture_seq, manifest.seq) >= (record.capture_seq, record.seq)
-                });
-                same_assignment && !published
-            }
-        };
-        if active {
-            keep.insert(key);
-            mark_record(objects, &mut keep, &record, Namespace::Vset(vset));
+        let published = find(&layout::head_key(vset)).is_some_and(|(_, _, bytes)| {
+            HeadRecord::decode(vset, bytes)
+                .ok()
+                .and_then(|head| head.manifest)
+                .is_some_and(|current| {
+                    (current.capture_seq, current.seq)
+                        >= (
+                            manifest.capture_seq,
+                            crate::types::JournalSeq(manifest.archive_seq),
+                        )
+                })
+        });
+        if published {
+            continue;
+        }
+        keep.insert(key);
+        if !mark_manifest(objects, &mut keep, &manifest) {
+            unsafe_root = true;
         }
     }
     keep.remove("");
+
+    if unsafe_root {
+        return Vec::new();
+    }
 
     // Sweep: unreferenced and older than the grace.
     objects
@@ -123,60 +140,63 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
         .collect()
 }
 
-/// Whose namespace a record's `base == 0` references resolve into.
-#[derive(Clone, Copy)]
-enum Namespace {
-    Vset(VsetId),
-    Base(u64),
-}
-
-/// Mark one record's reachable set: its overlay's segments, its leaf
-/// objects, and the segments those leaves hold.
-fn mark_record<'a>(
+fn mark_manifest<'a>(
     objects: &'a [(String, SimTime, Vec<u8>)],
     keep: &mut BTreeSet<&'a str>,
-    record: &JournalRecord,
-    namespace: Namespace,
-) {
+    manifest: &Manifest,
+) -> bool {
     let find = |key: &str| objects.iter().find(|(k, _, _)| k == key);
-    let seg_key = |loc: &crate::segment::PageLoc| {
-        if loc.base != 0 {
-            return layout::base_segment_key(loc.base, loc.fence, loc.seg);
-        }
-        match namespace {
-            Namespace::Vset(vset) => layout::segment_key(vset, loc.fence, loc.seg),
-            Namespace::Base(base) => layout::base_segment_key(base, loc.fence, loc.seg),
+    let list = match manifest.complete_list {
+        None => None,
+        Some(reference) => {
+            let key = layout::complete_file_list_key(
+                manifest.vset,
+                reference.writer_fence,
+                reference.list_id,
+            );
+            let Some((key, _, bytes)) = find(&key) else {
+                return false;
+            };
+            keep.insert(key);
+            let Ok(list) = CompleteFileList::decode(reference, manifest.vset, bytes) else {
+                return false;
+            };
+            Some(list)
         }
     };
-    for (_, loc) in record.overlay.values() {
-        if let Some((k, _, _)) = find(&seg_key(loc)) {
-            keep.insert(k);
-        }
+    let Ok(current) = manifest.current_files(list.as_ref()) else {
+        return false;
+    };
+    mark_objects(objects, keep, &current);
+    if let Some(base) = manifest.base {
+        let key = layout::base_manifest_key(base.base_id, base.manifest_id);
+        let Some((key, _, bytes)) = find(&key) else {
+            return false;
+        };
+        keep.insert(key);
+        let root = BaseRoot {
+            base_id: base.base_id,
+            manifest_id: base.manifest_id,
+            manifest_checksum: base.manifest_checksum,
+            post_state_checksum: base.post_state_checksum,
+        };
+        let Ok(base_manifest) = BaseManifest::decode(root, bytes) else {
+            return false;
+        };
+        mark_objects(objects, keep, &base_manifest.objects);
     }
-    for ptr in record.leaves.values() {
-        let (leaf_key, owner) = if ptr.base != 0 {
-            (
-                layout::base_leaf_key(ptr.base, ptr.fence, ptr.id),
-                VsetId(ptr.base),
-            )
-        } else {
-            match namespace {
-                Namespace::Vset(vset) => (layout::leaf_key(vset, ptr.fence, ptr.id), vset),
-                Namespace::Base(base) => {
-                    (layout::base_leaf_key(base, ptr.fence, ptr.id), VsetId(base))
-                }
-            }
-        };
-        let Some((k, _, leaf_bytes)) = find(&leaf_key) else {
-            continue;
-        };
-        keep.insert(k);
-        if let Ok(leaf) = MapLeaf::decode(owner, ptr.fence, ptr.id, leaf_bytes) {
-            for (_, _, _, loc) in &leaf.entries {
-                if let Some((seg, _, _)) = find(&seg_key(loc)) {
-                    keep.insert(seg);
-                }
-            }
+    true
+}
+
+fn mark_objects<'a>(
+    objects: &'a [(String, SimTime, Vec<u8>)],
+    keep: &mut BTreeSet<&'a str>,
+    references: &[ObjectRef],
+) {
+    for reference in references {
+        let key = reference.identity.store_key();
+        if let Some((key, _, _)) = objects.iter().find(|(candidate, _, _)| candidate == &key) {
+            keep.insert(key);
         }
     }
 }

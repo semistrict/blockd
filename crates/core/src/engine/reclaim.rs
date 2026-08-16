@@ -55,6 +55,9 @@ pub async fn reclaim_backed_segments<W: Blobs>(
                 .retain(|(stored_fence, stored_segment, _)| {
                     (*stored_fence, *stored_segment) != (fence, segment)
                 });
+            vset_state.tombstone_segments.remove(&(fence, segment));
+            vset_state.vmm_segments.remove(&(fence, segment));
+            vset_state.segment_refs.remove(&(fence, segment));
         }
         host.counters.nvme_reclaims += 1;
         host.counters.blobs_deleted += 1;
@@ -84,6 +87,7 @@ pub async fn cleanup_local<W: Blobs>(
             add_closure(
                 record,
                 &vset_state.leaf_blobs,
+                &vset_state.record_segments,
                 &mut keep_records,
                 &mut keep_segments,
                 &mut keep_leaves,
@@ -93,11 +97,31 @@ pub async fn cleanup_local<W: Blobs>(
             add_closure(
                 record,
                 &vset_state.leaf_blobs,
+                &vset_state.record_segments,
                 &mut keep_records,
                 &mut keep_segments,
                 &mut keep_leaves,
             );
         }
+        if let Some(record) = &vset_state.peer_committed_record {
+            add_closure(
+                record,
+                &vset_state.leaf_blobs,
+                &vset_state.record_segments,
+                &mut keep_records,
+                &mut keep_segments,
+                &mut keep_leaves,
+            );
+        }
+        keep_segments.extend(
+            vset_state
+                .tombstone_segments
+                .iter()
+                .filter(|segment| !vset_state.backed_segments.contains(segment))
+                .copied(),
+        );
+        keep_segments.extend(vset_state.publishing_segments.iter().copied());
+        keep_segments.extend(vset_state.replicating_segments.iter().copied());
         let records_to_remove = vset_state
             .record_writes
             .iter()
@@ -168,11 +192,21 @@ pub async fn cleanup_local<W: Blobs>(
     };
     for (_, seq) in records_to_remove {
         vset_state.record_writes.remove(&seq);
+        vset_state.record_segments.remove(&seq);
     }
     let segment_set = segments_to_remove.into_iter().collect::<BTreeSet<_>>();
     vset_state
         .segment_blobs
         .retain(|(fence, segment, _)| !segment_set.contains(&(*fence, *segment)));
+    vset_state
+        .tombstone_segments
+        .retain(|segment| !segment_set.contains(segment));
+    vset_state
+        .vmm_segments
+        .retain(|segment| !segment_set.contains(segment));
+    vset_state
+        .segment_refs
+        .retain(|segment, _| !segment_set.contains(segment));
     for pointer in leaves_to_remove {
         vset_state.leaf_blobs.remove(&pointer);
     }
@@ -190,11 +224,19 @@ pub async fn cleanup_local<W: Blobs>(
 fn add_closure(
     record: &JournalRecord,
     leaf_blobs: &LeafBlobs,
+    record_segments: &std::collections::BTreeMap<JournalSeq, BTreeSet<(u64, SegId)>>,
     records: &mut BTreeSet<(u64, JournalSeq)>,
     segments: &mut BTreeSet<(u64, SegId)>,
     leaves: &mut BTreeSet<LeafPtr>,
 ) {
     records.insert((record.fence, record.seq));
+    segments.extend(record.files.iter().filter_map(|file| {
+        (file.identity.namespace_kind == crate::blx::NamespaceKind::Vset)
+            .then_some((file.identity.writer_fence, SegId(file.identity.object_id)))
+    }));
+    if let Some(written) = record_segments.get(&record.seq) {
+        segments.extend(written);
+    }
     segments.extend(
         record
             .overlay

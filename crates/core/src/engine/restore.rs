@@ -1,14 +1,22 @@
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use blockd_exec::delay;
 
 use super::{SharedHost, VsetState};
-use crate::head::{HeadRecord, ManifestPtr};
+use crate::blx::{
+    BlockKey, BlockSpace, BlxEntry, EntryKind, NamespaceKind, open_entry, open_footer,
+};
+use crate::format::checksum64;
+use crate::head::{HeadRecord, ManifestPtr, RetiredStash, StashAssignment};
 use crate::journal::{JournalRecord, RecordKind, VsetKind};
 use crate::layout;
-use crate::mapleaf::span_is_memory;
+use crate::manifest::{
+    BaseManifest, BaseRef, BaseRoot, CompleteFileList, Manifest, ObjectRef, RecoveryKind,
+    validate_object_refs,
+};
 use crate::protocol::{AdminError, AdminResult, AdminSuccess, StoreFault, Verdict};
-use crate::types::VsetId;
+use crate::types::{JournalSeq, SegId, VsetId};
 use crate::world::{AdminIo, Blobs, GuestMem, Store, StoreError};
 
 #[allow(clippy::too_many_lines)]
@@ -20,12 +28,23 @@ where
         return Err(AdminError::Busy);
     }
     let retry = state.borrow().config.backup_retry;
-    let Some((fence, pointer)) = claim_restore(&state, world.as_ref(), vset, retry).await else {
+    let Some((fence, pointer, stash, retired_stashes)) =
+        claim_restore(&state, world.as_ref(), vset, retry).await
+    else {
         return Err(AdminError::NotFound);
     };
-    let Some(mut record) = get_manifest(world.as_ref(), vset, pointer, retry).await else {
+    let Some((mut record, archive_objects, archive_base, state_checksum, vmstate)) =
+        get_manifest(world.as_ref(), vset, pointer, retry).await
+    else {
         return Err(AdminError::Unavailable);
     };
+    if let Some(loaded) = vmstate.as_ref()
+        && GuestMem::install_vmstate(world.as_ref(), vset, loaded.bytes.clone())
+            .await
+            .is_err()
+    {
+        return Err(AdminError::Unavailable);
+    }
     let verdict = recovery_verdict(&mut record);
     if state.borrow().vsets.contains_key(&vset) {
         return Err(AdminError::Busy);
@@ -43,32 +62,37 @@ where
             restored.pinned = Some(record.clone());
         }
         restored.mutation_seq = record.capture_seq;
+        restored.state_checksum = state_checksum;
+        restored.archived_memory_usable = !matches!(verdict, Verdict::ColdBoot);
+        if let Some(loaded) = vmstate {
+            restored.block_checksums.extend(loaded.block_checksums);
+        }
         restored.next_seq = record.seq.0 + 1;
         restored.local_covered_through = record.sync_covered_through;
         restored.sync_ack_through = record.sync_covered_through;
         restored.overlay = record.overlay.clone();
         restored.leaf_table = record.leaves.clone();
         restored.page_locs = record.overlay.clone();
-        restored.next_gen = restored
-            .page_locs
-            .values()
-            .map(|(generation, _)| generation.0 + 1)
-            .max()
-            .unwrap_or(0);
+        restored.archive_objects = archive_objects.clone();
+        restored.archive_base = archive_base;
         restored.best_record = Some(record.clone());
         restored.head_version = Some(fence);
         restored.backed = Some(pointer);
-        restored.backed_segments = record
-            .overlay
-            .values()
-            .filter(|(_, location)| location.base == 0)
-            .map(|(_, location)| (location.fence, location.seg))
+        restored.stash_assignment = stash;
+        restored.retired_stashes = retired_stashes;
+        restored.backed_segments = archive_objects
+            .iter()
+            .filter(|object| {
+                object.identity.namespace_kind == NamespaceKind::Vset
+                    && object.identity.namespace_id == vset.0
+            })
+            .map(|object| {
+                (
+                    object.identity.writer_fence,
+                    SegId(object.identity.object_id),
+                )
+            })
             .collect();
-        for &pointer in record.leaves.values() {
-            if pointer.base == 0 {
-                restored.backed_leaves.insert((pointer.fence, pointer.id));
-            }
-        }
         host.vsets.insert(vset, restored);
         host.schedule_vset(vset);
         host.counters.assignment_claims += 1;
@@ -81,7 +105,7 @@ async fn claim_restore<W: Store>(
     world: &W,
     vset: VsetId,
     retry: u64,
-) -> Option<(u64, ManifestPtr)> {
+) -> Option<(u64, ManifestPtr, Option<StashAssignment>, Vec<RetiredStash>)> {
     loop {
         let (version, bytes) = match Store::get(world, &layout::head_key(vset)).await {
             Ok(Some(found)) => found,
@@ -96,7 +120,7 @@ async fn claim_restore<W: Store>(
             }
         };
         let head = HeadRecord::decode(vset, &bytes).ok()?;
-        if head.stash.is_some() {
+        if head.stash.is_some() && head.holder != state.borrow().config.host {
             return None;
         }
         let pointer = head.manifest?;
@@ -105,11 +129,11 @@ async fn claim_restore<W: Store>(
             holder: state.borrow().config.host,
             fence: 0,
             manifest: Some(pointer),
-            stash: None,
-            retired_stashes: head.retired_stashes,
+            stash: head.stash,
+            retired_stashes: head.retired_stashes.clone(),
         };
         match Store::put_cas(world, layout::head_key(vset), Some(version), claim.encode()).await {
-            Ok(fence) => return Some((fence, pointer)),
+            Ok(fence) => return Some((fence, pointer, head.stash, head.retired_stashes)),
             Err(StoreError::Fault(StoreFault::CasConflict { .. })) => {
                 state.borrow_mut().counters.assignment_claim_conflicts += 1;
                 return None;
@@ -123,12 +147,19 @@ async fn claim_restore<W: Store>(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn get_manifest<W: Store>(
     world: &W,
     vset: VsetId,
     pointer: ManifestPtr,
     retry: u64,
-) -> Option<JournalRecord> {
+) -> Option<(
+    JournalRecord,
+    Vec<ObjectRef>,
+    Option<BaseRef>,
+    u64,
+    Option<LoadedVmstate>,
+)> {
     loop {
         match Store::get(
             world,
@@ -137,10 +168,101 @@ async fn get_manifest<W: Store>(
         .await
         {
             Ok(Some((_, bytes))) => {
-                let record = JournalRecord::decode(vset, &bytes).ok()?;
-                return ((record.fence, record.seq, record.capture_seq)
-                    == (pointer.fence, pointer.seq, pointer.capture_seq))
-                    .then_some(record);
+                if checksum64(&bytes) != pointer.checksum {
+                    return None;
+                }
+                let manifest = Manifest::decode(vset, &bytes).ok()?;
+                if (
+                    manifest.writer_fence,
+                    manifest.journal_seq,
+                    manifest.archive_seq,
+                    manifest.capture_seq,
+                ) != (
+                    pointer.fence,
+                    pointer.journal_seq.0,
+                    pointer.seq.0,
+                    pointer.capture_seq,
+                ) {
+                    return None;
+                }
+                let list = match manifest.complete_list {
+                    None => None,
+                    Some(reference) => {
+                        let bytes = get_store_object(
+                            world,
+                            &layout::complete_file_list_key(
+                                vset,
+                                reference.writer_fence,
+                                reference.list_id,
+                            ),
+                            retry,
+                        )
+                        .await?;
+                        Some(CompleteFileList::decode(reference, vset, &bytes).ok()?)
+                    }
+                };
+                let own = manifest.current_files(list.as_ref()).ok()?;
+                let base = match manifest.base {
+                    None => Vec::new(),
+                    Some(reference) => {
+                        let root = BaseRoot {
+                            base_id: reference.base_id,
+                            manifest_id: reference.manifest_id,
+                            manifest_checksum: reference.manifest_checksum,
+                            post_state_checksum: reference.post_state_checksum,
+                        };
+                        let bytes = get_store_object(
+                            world,
+                            &layout::base_manifest_key(reference.base_id, reference.manifest_id),
+                            retry,
+                        )
+                        .await?;
+                        BaseManifest::decode(root, &bytes).ok()?.objects
+                    }
+                };
+                let mut objects = base;
+                objects.extend(own);
+                validate_object_refs(&objects).ok()?;
+                let vmstate = match manifest.recovery_kind {
+                    RecoveryKind::Whole => Some(
+                        load_vmstate(world, &objects, manifest.vmstate_logical_length, retry)
+                            .await?,
+                    ),
+                    _ => None,
+                };
+                let kind = match manifest.recovery_kind {
+                    RecoveryKind::Whole => {
+                        let bytes = &vmstate.as_ref()?.bytes;
+                        let raw: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+                        RecordKind::Checkpoint {
+                            epoch: manifest.checkpoint_epoch,
+                            vmstate: u64::from_le_bytes(raw),
+                            vmstate_logical_length: manifest.vmstate_logical_length,
+                        }
+                    }
+                    RecoveryKind::DiskOnly | RecoveryKind::Database => RecordKind::Commit,
+                };
+                let record = JournalRecord {
+                    config: manifest.config,
+                    seq: JournalSeq(manifest.journal_seq),
+                    fence: manifest.writer_fence,
+                    kind,
+                    capture_seq: manifest.capture_seq,
+                    sync_covered_through: manifest.sync_covered_through,
+                    post_state_checksum: manifest.post_state_checksum,
+                    database: manifest.database,
+                    files: Vec::new(),
+                    overlay: Default::default(),
+                    leaves: Default::default(),
+                    migrated_from: None,
+                };
+                return Some((
+                    record,
+                    objects,
+                    manifest.base,
+                    manifest.post_state_checksum,
+                    vmstate,
+                ));
             }
             Ok(None)
             | Err(StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge) => {
@@ -151,13 +273,128 @@ async fn get_manifest<W: Store>(
     }
 }
 
+async fn get_store_object<W: Store>(world: &W, key: &str, retry: u64) -> Option<Vec<u8>> {
+    loop {
+        match Store::get(world, key).await {
+            Ok(Some((_, bytes))) => return Some(bytes),
+            Ok(None)
+            | Err(StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge) => {
+                return None;
+            }
+            Err(StoreError::Fault(StoreFault::Unavailable)) => delay(retry).await,
+        }
+    }
+}
+
+struct LoadedVmstate {
+    bytes: Vec<u8>,
+    block_checksums: BTreeMap<BlockKey, (crate::types::Gen, u64)>,
+}
+
+async fn load_vmstate<W: Store>(
+    world: &W,
+    objects: &[ObjectRef],
+    logical_length: u64,
+    retry: u64,
+) -> Option<LoadedVmstate> {
+    let block_count = logical_length.div_ceil(crate::types::page_size() as u64);
+    let mut output = Vec::with_capacity(usize::try_from(logical_length).ok()?);
+    let mut block_checksums = BTreeMap::new();
+    for block in 0..block_count {
+        let key = BlockKey {
+            space: BlockSpace::Vmm,
+            volume: 0,
+            block: u32::try_from(block).ok()?,
+        };
+        let mut winner = None;
+        for reference in objects
+            .iter()
+            .filter(|reference| reference.first_key <= key && key <= reference.last_key)
+        {
+            let bytes = get_store_range(
+                world,
+                &reference.identity.store_key(),
+                u64::from(reference.footer_offset),
+                u64::from(reference.footer_length),
+                retry,
+            )
+            .await?;
+            let footer = open_footer(&bytes).ok()?;
+            let Some(entry) = footer.find(key) else {
+                continue;
+            };
+            if winner.as_ref().is_none_or(
+                |(old, old_ref): &(crate::blx::FooterEntry, ObjectRef)| {
+                    (entry.generation, reference.identity) > (old.generation, old_ref.identity)
+                },
+            ) {
+                winner = Some((entry, *reference));
+            }
+        }
+        let (indexed, reference) = winner?;
+        if indexed.kind != EntryKind::Data {
+            return None;
+        }
+        let bytes = get_store_range(
+            world,
+            &reference.identity.store_key(),
+            u64::from(indexed.offset),
+            u64::from(indexed.length),
+            retry,
+        )
+        .await?;
+        let BlxEntry::Data {
+            key: found,
+            generation,
+            bytes,
+        } = open_entry(&bytes).ok()?
+        else {
+            return None;
+        };
+        if found != key
+            || generation != indexed.generation
+            || crate::format::checksum64(&bytes) != indexed.value_checksum
+        {
+            return None;
+        }
+        block_checksums.insert(key, (generation, indexed.value_checksum));
+        output.extend_from_slice(&bytes);
+    }
+    output.truncate(usize::try_from(logical_length).ok()?);
+    Some(LoadedVmstate {
+        bytes: output,
+        block_checksums,
+    })
+}
+
+async fn get_store_range<W: Store>(
+    world: &W,
+    key: &str,
+    offset: u64,
+    length: u64,
+    retry: u64,
+) -> Option<Vec<u8>> {
+    loop {
+        match Store::get_range(world, key, offset, length).await {
+            Ok(Some((_, bytes))) if bytes.len() == usize::try_from(length).ok()? => {
+                return Some(bytes);
+            }
+            Ok(Some(_)) | Ok(None) => return None,
+            Err(StoreError::Fault(StoreFault::Unavailable)) => delay(retry).await,
+            Err(StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge) => {
+                return None;
+            }
+        }
+    }
+}
+
 fn recovery_verdict(record: &mut JournalRecord) -> Verdict {
     if record.config.kind == VsetKind::Database {
         return Verdict::DatabaseReady {
             synced_through: record.sync_covered_through,
         };
     }
-    if let RecordKind::Checkpoint { epoch, vmstate } = record.kind
+    if let RecordKind::Checkpoint { epoch, vmstate, .. } = record.kind
         && record.capture_seq >= record.sync_covered_through
     {
         return Verdict::Resume { epoch, vmstate };
@@ -165,6 +402,5 @@ fn recovery_verdict(record: &mut JournalRecord) -> Verdict {
     record
         .overlay
         .retain(|page, _| !record.config.is_memory(page.volume.idx));
-    record.leaves.retain(|span, _| !span_is_memory(*span));
     Verdict::ColdBoot
 }

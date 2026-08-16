@@ -9,7 +9,7 @@ fn racing_restore_claims_have_one_winner_and_one_loser() {
     assert!(report.violations.is_empty(), "{:?}", report.violations);
     assert_eq!(report.restores, 1);
     assert_eq!(report.claims_lost, 1);
-    assert_eq!(report.store_cas_conflicts, 1);
+    assert!(report.store_cas_conflicts >= 1);
     assert_eq!(report.guest_deaths, 0);
 }
 

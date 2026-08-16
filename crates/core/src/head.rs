@@ -6,7 +6,7 @@
 //! resolve to exactly one runner by CAS alone, and a fenced former holder's
 //! CAS failures make it structurally unable to publish (R6.4).
 //!
-//! The head is the one non-backup use of the object store (R4.2): small,
+//! The head is the one non-backup use of the object store (R6.3): small,
 //! rare, never on a guest-visible path.
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
@@ -19,9 +19,14 @@ pub const MAGIC_HEAD: u32 = u32::from_le_bytes(*b"BHD1");
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ManifestPtr {
     pub fence: u64,
+    /// The exact journal record represented by the manifest.
+    pub journal_seq: JournalSeq,
+    /// The independently advancing archive-publication sequence.
     pub seq: JournalSeq,
     /// The manifest's capture instant (restore planning, lag observability).
     pub capture_seq: u64,
+    /// Binds the pointer to the exact encoded manifest bytes.
+    pub checksum: u64,
 }
 
 /// Durable passive-stash placement. Health is deliberately absent: this is
@@ -43,8 +48,7 @@ pub const MAX_RETIRED_STASHES: usize = 8;
 /// The immediately former active peer. It is a redundant recovery source and
 /// cleanup target after a covering replacement commit; an older entry is
 /// superseded on the next activation so dead peers cannot form a finite
-/// failover budget. The decoder accepts the wider historical bound for rolling
-/// compatibility.
+/// failover budget.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RetiredStash {
     pub peer: HostId,
@@ -70,15 +74,7 @@ pub struct HeadRecord {
 impl HeadRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new();
-        let version = if self.retired_stashes.is_empty()
-            && self
-                .stash
-                .is_none_or(|stash| stash.active_assignment_epoch == stash.assignment_epoch)
-        {
-            2
-        } else {
-            3
-        };
+        let version = 4;
         assert!(self.retired_stashes.len() <= MAX_RETIRED_STASHES);
         e.u16(version);
         e.u64(self.vset.0);
@@ -89,8 +85,10 @@ impl HeadRecord {
             Some(ptr) => {
                 e.u8(1);
                 e.u64(ptr.fence);
+                e.u64(ptr.journal_seq.0);
                 e.u64(ptr.seq.0);
                 e.u64(ptr.capture_seq);
+                e.u64(ptr.checksum);
             }
         }
         match self.stash {
@@ -99,9 +97,7 @@ impl HeadRecord {
                 e.u8(1);
                 e.u64(stash.assignment_epoch);
                 e.u16(stash.active_peer.0);
-                if version >= 3 {
-                    e.u64(stash.active_assignment_epoch);
-                }
+                e.u64(stash.active_assignment_epoch);
                 match stash.transition_peer {
                     None => {
                         e.u8(0);
@@ -115,15 +111,13 @@ impl HeadRecord {
                 e.u64(stash.membership_epoch);
             }
         }
-        if version >= 3 {
-            e.u8(u8::try_from(self.retired_stashes.len()).expect("bounded history"));
-            for retired in &self.retired_stashes {
-                e.u16(retired.peer.0);
-                e.u64(retired.assignment_epoch);
-                e.u64(retired.through.writer_fence);
-                e.u64(retired.through.seq.0);
-                e.u64(retired.through.sync_covered_through);
-            }
+        e.u8(u8::try_from(self.retired_stashes.len()).expect("bounded history"));
+        for retired in &self.retired_stashes {
+            e.u16(retired.peer.0);
+            e.u64(retired.assignment_epoch);
+            e.u64(retired.through.writer_fence);
+            e.u64(retired.through.seq.0);
+            e.u64(retired.through.sync_covered_through);
         }
         seal_frame(MAGIC_HEAD, &e.finish())
     }
@@ -133,7 +127,7 @@ impl HeadRecord {
         let payload = open_frame(MAGIC_HEAD, bytes)?;
         let mut d = Dec::new(payload);
         let version = d.u16()?;
-        if !matches!(version, 1..=3) {
+        if version != 4 {
             return Err(DecodeError);
         }
         if d.u64()? != vset.0 {
@@ -145,68 +139,57 @@ impl HeadRecord {
             0 => None,
             1 => Some(ManifestPtr {
                 fence: d.u64()?,
+                journal_seq: JournalSeq(d.u64()?),
                 seq: JournalSeq(d.u64()?),
                 capture_seq: d.u64()?,
+                checksum: d.u64()?,
             }),
             _ => return Err(DecodeError),
         };
-        let stash = if version == 1 {
-            None
-        } else {
-            match d.u8()? {
-                0 => None,
-                1 => {
-                    let assignment_epoch = d.u64()?;
-                    let active_peer = HostId(d.u16()?);
-                    let active_assignment_epoch = if version >= 3 {
-                        d.u64()?
-                    } else {
-                        assignment_epoch
-                    };
-                    let transition_peer = match (d.u8()?, d.u16()?) {
-                        (0, 0) => None,
-                        (1, peer) => Some(HostId(peer)),
-                        _ => return Err(DecodeError),
-                    };
-                    let membership_epoch = d.u64()?;
-                    if transition_peer == Some(active_peer) {
-                        return Err(DecodeError);
-                    }
-                    if transition_peer.is_none() && active_assignment_epoch != assignment_epoch {
-                        return Err(DecodeError);
-                    }
-                    Some(StashAssignment {
-                        assignment_epoch,
-                        active_peer,
-                        active_assignment_epoch,
-                        transition_peer,
-                        membership_epoch,
-                    })
+        let stash = match d.u8()? {
+            0 => None,
+            1 => {
+                let assignment_epoch = d.u64()?;
+                let active_peer = HostId(d.u16()?);
+                let active_assignment_epoch = d.u64()?;
+                let transition_peer = match (d.u8()?, d.u16()?) {
+                    (0, 0) => None,
+                    (1, peer) => Some(HostId(peer)),
+                    _ => return Err(DecodeError),
+                };
+                let membership_epoch = d.u64()?;
+                if transition_peer == Some(active_peer) {
+                    return Err(DecodeError);
                 }
-                _ => return Err(DecodeError),
+                if transition_peer.is_none() && active_assignment_epoch != assignment_epoch {
+                    return Err(DecodeError);
+                }
+                Some(StashAssignment {
+                    assignment_epoch,
+                    active_peer,
+                    active_assignment_epoch,
+                    transition_peer,
+                    membership_epoch,
+                })
             }
+            _ => return Err(DecodeError),
         };
-        let retired_stashes = if version >= 3 {
-            let count = usize::from(d.u8()?);
-            if count > MAX_RETIRED_STASHES {
-                return Err(DecodeError);
-            }
-            let mut retired = Vec::with_capacity(count);
-            for _ in 0..count {
-                retired.push(RetiredStash {
-                    peer: HostId(d.u16()?),
-                    assignment_epoch: d.u64()?,
-                    through: ReplicaCommitInfo {
-                        writer_fence: d.u64()?,
-                        seq: JournalSeq(d.u64()?),
-                        sync_covered_through: d.u64()?,
-                    },
-                });
-            }
-            retired
-        } else {
-            Vec::new()
-        };
+        let count = usize::from(d.u8()?);
+        if count > MAX_RETIRED_STASHES {
+            return Err(DecodeError);
+        }
+        let mut retired_stashes = Vec::with_capacity(count);
+        for _ in 0..count {
+            retired_stashes.push(RetiredStash {
+                peer: HostId(d.u16()?),
+                assignment_epoch: d.u64()?,
+                through: ReplicaCommitInfo {
+                    writer_fence: d.u64()?,
+                    seq: JournalSeq(d.u64()?),
+                    sync_covered_through: d.u64()?,
+                },
+            });
+        }
         d.finish()?;
         Ok(HeadRecord {
             vset,
@@ -231,8 +214,10 @@ mod tests {
             fence: 4,
             manifest: Some(ManifestPtr {
                 fence: 2,
+                journal_seq: JournalSeq(11),
                 seq: JournalSeq(17),
                 capture_seq: 99,
+                checksum: 0x1234,
             }),
             stash: Some(StashAssignment {
                 assignment_epoch: 8,
@@ -250,8 +235,8 @@ mod tests {
         let bytes = sample().encode();
         assert_eq!(HeadRecord::decode(VsetId(0xA1), &bytes), Ok(sample()));
         // Byte pin (R10.2): any change here is a storage format change.
-        assert_eq!(bytes.len(), 79);
-        assert_eq!(crc32c(&bytes), 0xD362_8BF9);
+        assert_eq!(bytes.len(), 104);
+        assert_eq!(crc32c(&bytes), 0x7943_6F92);
     }
 
     #[test]
@@ -282,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_heads_decode_without_a_stash_assignment() {
+    fn old_head_versions_are_rejected() {
         let mut e = Enc::new();
         e.u16(1);
         e.u64(0xA1);
@@ -290,17 +275,7 @@ mod tests {
         e.u64(4);
         e.u8(0);
         let bytes = seal_frame(MAGIC_HEAD, &e.finish());
-        assert_eq!(
-            HeadRecord::decode(VsetId(0xA1), &bytes),
-            Ok(HeadRecord {
-                vset: VsetId(0xA1),
-                holder: HostId(3),
-                fence: 4,
-                manifest: None,
-                stash: None,
-                retired_stashes: Vec::new(),
-            })
-        );
+        assert!(HeadRecord::decode(VsetId(0xA1), &bytes).is_err());
     }
 
     #[test]

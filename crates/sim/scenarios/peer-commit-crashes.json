@@ -2,7 +2,7 @@
   "extends": ["peer-stash"],
   "schema": 1,
   "name": "peer-commit-crashes",
-  "description": "Crash each peer-stash commit, acknowledgement, publication, and release boundary.",
+  "description": "Crash peer-stash commit, acknowledgement, primary publication, and release boundaries.",
   "kind": "cluster",
   "topology": { "vset_count": 1 },
   "workload": { "horizon": "6s" },
@@ -13,7 +13,6 @@
       "crash-peer-after-commit-before-ack",
       "crash-primary-after-ack-before-sync-ok",
       "crash-primary-after-sync-ok",
-      "crash-peer-after-upload-before-head",
       "crash-primary-after-head-before-release"
     ]
   },
@@ -21,7 +20,6 @@
     { "metric": "peer-fault", "fault_point": "crash-peer-after-commit-before-ack", "label": "peer crash after commit" },
     { "metric": "peer-fault", "fault_point": "crash-primary-after-ack-before-sync-ok", "label": "primary crash after ack" },
     { "metric": "peer-fault", "fault_point": "crash-primary-after-sync-ok", "label": "primary crash after sync reply" },
-    { "metric": "peer-fault", "fault_point": "crash-peer-after-upload-before-head", "label": "peer crash after upload" },
     { "metric": "peer-fault", "fault_point": "crash-primary-after-head-before-release", "label": "primary crash before release" }
   ],
   "outcomes": [

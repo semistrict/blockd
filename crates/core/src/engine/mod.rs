@@ -41,15 +41,12 @@ pub use host::{host_actor, host_actor_with_state};
 pub(crate) use hydration::hydrate_mapping;
 pub use lineage::{create_fork, delete_base, keep_base};
 pub use migration::{
-    hydrate_tail, migrate_out, peer_fetch_leaf, peer_fetch_page, peer_source, reoffer_outbound,
+    hydrate_tail, migrate_out, peer_fetch_leaf, peer_fetch_page, peer_fetch_replica_page,
+    peer_source, reoffer_outbound,
 };
 pub use reclaim::{cleanup_local, reclaim_backed_segments};
 pub use recovery::recover_local;
-pub use replica::{
-    advance_archive_age, archive_latest, archives_ready, create_peer_stashed, publish_replica_head,
-    replica_message, replicate_latest, request_replica_archive, retry_archive_notices,
-    retry_replica_releases,
-};
+pub use replica::{create_peer_stashed, replica_message, replicate_latest, retry_replica_releases};
 pub use restore::restore_vset;
 pub use state::{HostState, SharedHost, VsetState};
 pub use vnode_member::{

@@ -1,17 +1,15 @@
-//! Journal records: one framed record per consistency point, write-once at
-//! `layout::journal_blob(vset, seq)`. A record is the atomic point of the
-//! vset's page→location map, carried as a bounded inline OVERLAY plus one
-//! pointer per map leaf ([`crate::mapleaf`]): the overlay holds entries
-//! newer than their span's leaf, lookups read overlay-then-leaf, and
-//! record size is O(overlay + spans) — never O(pages). Per-vset journal
-//! length stays O(1) records no matter how many checkpoints were ever
-//! taken (R3.4); recovery needs intact records and the leaves they name
-//! (R8.2). Archive manifests use this same encoding, with page locations
-//! optionally rewritten by passive packing.
+//! Journal records: one framed record per consistency point. The durable
+//! record names the complete BLX file set needed for recovery and carries the
+//! checksum of that exact logical state. Recovery rebuilds its block lookup
+//! from BLX footers; no durable page-to-file map is encoded. Migration may
+//! append a separate in-memory lookup index to its wire message, but that
+//! index is never written to either journal.
 
 use std::collections::BTreeMap;
 
+use crate::blx::{BlockKey, BlockSpace};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
+use crate::manifest::ObjectRef;
 use crate::mapleaf::LeafPtr;
 use crate::segment::PageLoc;
 use crate::types::{
@@ -19,6 +17,7 @@ use crate::types::{
 };
 
 pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
+const MAGIC_MIGRATION_INDEX: u32 = u32::from_le_bytes(*b"BMIX");
 
 /// The immutable consistency/lifecycle kind of a vset (R1.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,15 +120,17 @@ pub enum RecordKind {
     Commit,
     /// A whole-vset checkpoint (R1.2): memory, vmstate and disks of one
     /// instant; restore resumes.
-    Checkpoint { epoch: Epoch, vmstate: u64 },
+    Checkpoint {
+        epoch: Epoch,
+        vmstate: u64,
+        vmstate_logical_length: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MigrationSource {
     pub host: HostId,
     /// Exact source-writer fence whose offered cut this destination installed.
-    /// Legacy records lack the value and may only use the unfenced v1/v2
-    /// migration handshake.
     pub offer_fence: Option<u64>,
 }
 
@@ -149,13 +150,19 @@ pub struct JournalRecord {
     /// originally covered a sync. Recovery must never choose a resume point
     /// older than the highest watermark it can see.
     pub sync_covered_through: u64,
+    /// Checksum of the complete logical state represented by this record.
+    /// It is captured with the record so delayed publication cannot observe
+    /// a newer in-memory state.
+    pub post_state_checksum: u64,
     /// Present only for database vsets; compute records carry the canonical
     /// empty value.
     pub database: DatabaseMeta,
-    /// Map entries newer than their span's leaf (bounded by the writer's
-    /// overlay cap). Overlay wins over leaf on lookup.
+    /// The BLX files needed by this recovery point. This is the durable data
+    /// index; page locations below are runtime-only lookup state.
+    pub files: Vec<ObjectRef>,
+    /// Runtime-only lookup state used by migration messages.
     pub overlay: BTreeMap<PageId, (Gen, PageLoc)>,
-    /// The rest of the captured map: one leaf blob per span.
+    /// Runtime-only auxiliary lookup state used by migration messages.
     pub leaves: BTreeMap<u32, LeafPtr>,
     /// Migration provenance (R7.2): while an in-migrated vset still
     /// hydrates from its source, every record names that source. The
@@ -192,15 +199,22 @@ impl JournalRecord {
                 e.u8(0);
                 e.u64(0);
                 e.u64(0);
+                e.u64(0);
             }
-            RecordKind::Checkpoint { epoch, vmstate } => {
+            RecordKind::Checkpoint {
+                epoch,
+                vmstate,
+                vmstate_logical_length,
+            } => {
                 e.u8(1);
                 e.u64(epoch.0);
                 e.u64(vmstate);
+                e.u64(vmstate_logical_length);
             }
         }
         e.u64(self.capture_seq);
         e.u64(self.sync_covered_through);
+        e.u64(self.post_state_checksum);
         match self.migrated_from {
             None => {
                 e.u8(0);
@@ -224,9 +238,7 @@ impl JournalRecord {
         e.u8(self.config.kind as u8);
         e.u8(self.config.disk_volumes);
         e.u32(self.config.pages_per_volume);
-        // Version 6 previously encoded three per-vset policies here. The
-        // peer-first policy is now the sole accepted value; retaining its
-        // existing tag keeps already-created peer-first records readable.
+        // The sole current durability policy is primary plus one passive.
         e.u8(2);
         if self.config.kind == VsetKind::Database {
             for file in self.database.files() {
@@ -234,25 +246,64 @@ impl JournalRecord {
                 e.u64(file.size);
             }
         }
-        e.u32(u32::try_from(self.overlay.len()).expect("overlay count fits u32"));
-        for (page, (generation, loc)) in &self.overlay {
-            e.u8(page.volume.idx.0);
-            e.u32(page.page.0);
-            e.u64(generation.0);
-            e.u64(loc.base);
-            e.u64(loc.fence);
-            e.u64(loc.seg.0);
-            e.u32(loc.offset);
-            e.u32(loc.len);
-        }
-        e.u32(u32::try_from(self.leaves.len()).expect("leaf count fits u32"));
-        for (&span, ptr) in &self.leaves {
-            e.u32(span);
-            e.u64(ptr.base);
-            e.u64(ptr.fence);
-            e.u64(ptr.id);
+        e.u32(u32::try_from(self.files.len()).expect("file count fits u32"));
+        for file in &self.files {
+            file.encode_into(&mut e);
         }
         seal_frame(MAGIC_JOURNAL, &e.finish())
+    }
+
+    /// Migration carries the source's current lookup index after the durable
+    /// record. A destination persists this form only while it still depends
+    /// on the source, so local recovery can resume post-copy hydration after a
+    /// daemon crash. Ordinary journal records never carry the index.
+    pub fn encode_migration(&self, vset: VsetId) -> Vec<u8> {
+        self.encode_migration_with_checksums(vset, &BTreeMap::new())
+    }
+
+    pub fn encode_migration_with_checksums(
+        &self,
+        vset: VsetId,
+        block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
+    ) -> Vec<u8> {
+        let durable = self.encode(vset);
+        let mut index = Enc::new();
+        index.u32(u32::try_from(self.overlay.len()).expect("overlay count fits u32"));
+        for (page, (generation, loc)) in &self.overlay {
+            index.u8(page.volume.idx.0);
+            index.u32(page.page.0);
+            index.u64(generation.0);
+            index.u64(loc.base);
+            index.u64(loc.fence);
+            index.u64(loc.seg.0);
+            index.u32(loc.offset);
+            index.u32(loc.len);
+        }
+        index.u32(u32::try_from(self.leaves.len()).expect("leaf count fits u32"));
+        for (&span, ptr) in &self.leaves {
+            index.u32(span);
+            index.u64(ptr.base);
+            index.u64(ptr.fence);
+            index.u64(ptr.id);
+        }
+        index.u32(u32::try_from(block_checksums.len()).expect("block checksum count fits u32"));
+        for (key, (generation, checksum)) in block_checksums {
+            index.u8(key.space as u8);
+            index.u8(key.volume);
+            index.u32(key.block);
+            index.u64(generation.0);
+            index.u64(*checksum);
+        }
+        let index = seal_frame(MAGIC_MIGRATION_INDEX, &index.finish());
+        let mut bytes = Vec::with_capacity(8 + durable.len() + index.len());
+        bytes.extend_from_slice(
+            &u64::try_from(durable.len())
+                .expect("journal length fits u64")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&durable);
+        bytes.extend_from_slice(&index);
+        bytes
     }
 
     /// Verify and decode a record. Any damage is one answer: corrupt.
@@ -261,7 +312,7 @@ impl JournalRecord {
         let payload = open_frame(MAGIC_JOURNAL, bytes)?;
         let mut d = Dec::new(payload);
         let version = d.u16()?;
-        if !matches!(version, 4..=7) {
+        if version != 7 {
             return Err(DecodeError);
         }
         if d.u32()? != u32::try_from(page_size()).expect("page size fits u32") {
@@ -275,26 +326,28 @@ impl JournalRecord {
         let kind_tag = d.u8()?;
         let epoch = Epoch(d.u64()?);
         let vmstate = d.u64()?;
+        let vmstate_logical_length = d.u64()?;
         let kind = match kind_tag {
-            0 => RecordKind::Commit,
-            1 => RecordKind::Checkpoint { epoch, vmstate },
+            0 if epoch.0 == 0 && vmstate == 0 && vmstate_logical_length == 0 => RecordKind::Commit,
+            1 => RecordKind::Checkpoint {
+                epoch,
+                vmstate,
+                vmstate_logical_length,
+            },
             _ => return Err(DecodeError),
         };
         let capture_seq = d.u64()?;
         let sync_covered_through = d.u64()?;
+        let post_state_checksum = d.u64()?;
         let migrated_host = match (d.u8()?, d.u16()?) {
             (0, 0) => None,
             (1, source) => Some(HostId(source)),
             _ => return Err(DecodeError),
         };
-        let offered_fence = if version >= 7 {
-            match (d.u8()?, d.u64()?) {
-                (0, 0) => None,
-                (1, fence) => Some(fence),
-                _ => return Err(DecodeError),
-            }
-        } else {
-            None
+        let offered_fence = match (d.u8()?, d.u64()?) {
+            (0, 0) => None,
+            (1, fence) => Some(fence),
+            _ => return Err(DecodeError),
         };
         if migrated_host.is_none() && offered_fence.is_some() {
             return Err(DecodeError);
@@ -303,22 +356,18 @@ impl JournalRecord {
             host,
             offer_fence: offered_fence,
         });
-        let vset_kind = if version >= 6 {
-            match d.u8()? {
-                0 => VsetKind::Compute,
-                1 => VsetKind::Database,
-                _ => return Err(DecodeError),
-            }
-        } else {
-            VsetKind::Compute
+        let vset_kind = match d.u8()? {
+            0 => VsetKind::Compute,
+            1 => VsetKind::Database,
+            _ => return Err(DecodeError),
         };
         let config = VsetConfig {
             kind: vset_kind,
             disk_volumes: d.u8()?,
             pages_per_volume: d.u32()?,
         };
-        let legacy_durability = d.u8()?;
-        if !matches!((version, legacy_durability), (4..=7, 0 | 1) | (5..=7, 2)) {
+        let durability_tag = d.u8()?;
+        if durability_tag != 2 {
             return Err(DecodeError);
         }
         if !config.valid() {
@@ -349,6 +398,49 @@ impl JournalRecord {
         if config.kind == VsetKind::Database && !matches!(kind, RecordKind::Commit) {
             return Err(DecodeError);
         }
+        let file_count = d.u32()?;
+        let mut files = Vec::with_capacity(usize::try_from(file_count).expect("u32 fits usize"));
+        for _ in 0..file_count {
+            files.push(ObjectRef::decode_from(&mut d)?);
+        }
+        d.finish()?;
+        crate::manifest::validate_journal_object_refs(&files)?;
+        Ok(JournalRecord {
+            config,
+            seq,
+            fence,
+            kind,
+            capture_seq,
+            sync_covered_through,
+            post_state_checksum,
+            database,
+            files,
+            overlay: BTreeMap::new(),
+            leaves: BTreeMap::new(),
+            migrated_from,
+        })
+    }
+
+    pub fn decode_migration(vset: VsetId, bytes: &[u8]) -> Result<JournalRecord, DecodeError> {
+        Self::decode_migration_with_checksums(vset, bytes).map(|(record, _)| record)
+    }
+
+    pub fn decode_migration_with_checksums(
+        vset: VsetId,
+        bytes: &[u8],
+    ) -> Result<(JournalRecord, BTreeMap<BlockKey, (Gen, u64)>), DecodeError> {
+        let prefix = bytes.get(..8).ok_or(DecodeError)?;
+        let durable_len = usize::try_from(u64::from_le_bytes(
+            prefix.try_into().map_err(|_| DecodeError)?,
+        ))
+        .map_err(|_| DecodeError)?;
+        let durable_end = 8usize.checked_add(durable_len).ok_or(DecodeError)?;
+        let mut record = Self::decode(vset, bytes.get(8..durable_end).ok_or(DecodeError)?)?;
+        let payload = open_frame(
+            MAGIC_MIGRATION_INDEX,
+            bytes.get(durable_end..).ok_or(DecodeError)?,
+        )?;
+        let mut d = Dec::new(payload);
         let count = d.u32()?;
         let mut overlay = BTreeMap::new();
         for _ in 0..count {
@@ -366,7 +458,7 @@ impl JournalRecord {
                 volume: VolumeId { vset, idx: volume },
                 page: page_no,
             };
-            if !config.contains(page) {
+            if !record.config.contains(page) {
                 return Err(DecodeError);
             }
             if overlay.insert(page, (generation, loc)).is_some() {
@@ -386,19 +478,46 @@ impl JournalRecord {
                 return Err(DecodeError);
             }
         }
+        let checksum_count = d.u32()?;
+        let mut block_checksums = BTreeMap::new();
+        for _ in 0..checksum_count {
+            let space = match d.u8()? {
+                0 => BlockSpace::Memory,
+                1 => BlockSpace::Data,
+                2 => BlockSpace::Vmm,
+                _ => return Err(DecodeError),
+            };
+            let key = BlockKey {
+                space,
+                volume: d.u8()?,
+                block: d.u32()?,
+            };
+            let generation = Gen(d.u64()?);
+            let checksum = d.u64()?;
+            let valid = match key.space {
+                BlockSpace::Memory => {
+                    record.config.kind == VsetKind::Compute
+                        && key.volume == 0
+                        && key.block < record.config.pages_per_volume
+                }
+                BlockSpace::Vmm => record.config.kind == VsetKind::Compute && key.volume == 0,
+                BlockSpace::Data => {
+                    key.volume <= record.config.disk_volumes
+                        && key.block < record.config.pages_per_volume
+                }
+            };
+            if !valid
+                || block_checksums
+                    .insert(key, (generation, checksum))
+                    .is_some()
+            {
+                return Err(DecodeError);
+            }
+        }
         d.finish()?;
-        Ok(JournalRecord {
-            config,
-            seq,
-            fence,
-            kind,
-            capture_seq,
-            sync_covered_through,
-            database,
-            overlay,
-            leaves,
-            migrated_from,
-        })
+        record.overlay = overlay;
+        record.leaves = leaves;
+        Ok((record, block_checksums))
     }
 
     /// Every span this record's map depends on beyond its inline overlay.
@@ -410,7 +529,9 @@ impl JournalRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blx::{BlockKey, BlockSpace, NamespaceKind};
     use crate::format::{crc32c, open_frame, seal_frame};
+    use crate::manifest::ObjectIdentity;
     use crate::types::SegId;
 
     fn sample_page(volume: u8, page: u32) -> PageId {
@@ -462,10 +583,13 @@ mod tests {
             kind: RecordKind::Checkpoint {
                 epoch: Epoch(3),
                 vmstate: 41,
+                vmstate_logical_length: 8,
             },
             capture_seq: 99,
             sync_covered_through: 90,
+            post_state_checksum: 23,
             database: DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: pages,
             leaves: BTreeMap::from([(
                 0x100,
@@ -486,11 +610,14 @@ mod tests {
     fn records_round_trip_and_are_byte_pinned() {
         let record = sample_record();
         let bytes = record.encode(VsetId(0xA1));
-        assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
+        let mut durable = record.clone();
+        durable.overlay.clear();
+        durable.leaves.clear();
+        assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(durable));
         // Byte pin (R10.2): any change here is a storage format change.
         let expected = match page_size() {
-            4096 => (220, 0x52C3_9C5D),
-            16_384 => (220, 0x8DBC_0E33),
+            4096 => (114, 0xF261_B291),
+            16_384 => (114, 0x36DF_2844),
             size => panic!("byte pin missing for {size}-byte pages"),
         };
         assert_eq!((bytes.len(), crc32c(&bytes)), expected);
@@ -504,8 +631,11 @@ mod tests {
             .as_mut()
             .expect("migration provenance")
             .offer_fence = Some(0);
-        let bytes = record.encode(VsetId(0xA1));
-        assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(record));
+        let bytes = record.encode_migration(VsetId(0xA1));
+        assert_eq!(
+            JournalRecord::decode_migration(VsetId(0xA1), &bytes),
+            Ok(record)
+        );
     }
 
     #[test]
@@ -552,6 +682,7 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 18,
             sync_covered_through: 16,
+            post_state_checksum: 0,
             database: DatabaseMeta {
                 main: DatabaseFileMeta {
                     exists: true,
@@ -563,6 +694,7 @@ mod tests {
                 },
                 journal: DatabaseFileMeta::default(),
             },
+            files: Vec::new(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -581,10 +713,13 @@ mod tests {
             kind: RecordKind::Checkpoint {
                 epoch: Epoch(0),
                 vmstate: 0,
+                vmstate_logical_length: 0,
             },
             capture_seq: 0,
             sync_covered_through: 0,
+            post_state_checksum: 0,
             database: DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -592,98 +727,57 @@ mod tests {
         let _ = record.encode(VsetId(0xD1));
     }
 
-    /// The record for a LARGE vset must stay small: a million written
-    /// pages is unremarkable in production,
-    /// and the record is written per capture and uploaded per publish —
-    /// its size must be O(delta + leaves), never O(pages). Before the map
-    /// was sharded, this map's only representation was 45 MB of inline
-    /// entries — and the R4.6 64 MiB object cap made backed vsets beyond
-    /// ~1.5M pages impossible outright.
     #[test]
-    fn a_big_map_encodes_small() {
-        use crate::mapleaf::{LEAF_SPAN, MapLeaf};
+    fn runtime_page_index_is_not_persisted() {
         let vset = VsetId(0xA1);
-        let loc_of = |n: u32| PageLoc {
-            base: 0,
-            fence: 3,
-            seg: SegId(u64::from(n) / 4096),
-            offset: (n % 4096) * 8,
-            len: 8,
+        let record = sample_record();
+        let mut without_runtime_index = record.clone();
+        without_runtime_index.overlay.clear();
+        without_runtime_index.leaves.clear();
+
+        assert_eq!(record.encode(vset), without_runtime_index.encode(vset));
+        assert_eq!(
+            JournalRecord::decode(vset, &record.encode(vset)),
+            Ok(without_runtime_index)
+        );
+    }
+
+    #[test]
+    fn uncompacted_local_files_may_exceed_the_archive_overlap_limit() {
+        let vset = VsetId(0xA1);
+        let mut record = sample_record();
+        record.overlay.clear();
+        record.leaves.clear();
+        let key = BlockKey {
+            space: BlockSpace::Data,
+            volume: 1,
+            block: 7,
         };
-        // The map as the daemon durably represents it: full spans in leaf
-        // blobs, the freshest tail inline in the record's overlay.
-        let total: u32 = 1_000_000;
-        let overlay_from: u32 = total - 2048;
-        let mut leaves = BTreeMap::new();
-        let mut leaf_bytes_total = 0usize;
-        let span_count = u32::try_from(u64::from(overlay_from).div_ceil(LEAF_SPAN)).expect("fits");
-        for span in 0..span_count {
-            let lo = span * u32::try_from(LEAF_SPAN).expect("fits");
-            let hi = overlay_from.min(lo + u32::try_from(LEAF_SPAN).expect("fits"));
-            let leaf = MapLeaf {
-                span,
-                entries: (lo..hi)
-                    .map(|n| (VolumeIdx(0), PageNo(n), Gen(u64::from(n)), loc_of(n)))
-                    .collect(),
-            };
-            let bytes = leaf.encode(vset, 3, u64::from(span));
-            assert!(
-                bytes.len() < 256 * 1024,
-                "leaf {span} is {} bytes",
-                bytes.len()
-            );
-            leaf_bytes_total += bytes.len();
-            leaves.insert(
-                span,
-                LeafPtr {
-                    base: 0,
-                    fence: 3,
-                    id: u64::from(span),
+        record.files = (0..=crate::blx::MAX_OVERLAPPING_FILES)
+            .map(|index| ObjectRef {
+                identity: ObjectIdentity {
+                    namespace_kind: NamespaceKind::Vset,
+                    namespace_id: vset.0,
+                    writer_fence: record.fence,
+                    object_id: u64::try_from(index).expect("index fits u64"),
                 },
-            );
-        }
-        let overlay: BTreeMap<PageId, (Gen, PageLoc)> = (overlay_from..total)
-            .map(|n| {
-                (
-                    PageId {
-                        volume: VolumeId {
-                            vset,
-                            idx: VolumeIdx(0),
-                        },
-                        page: PageNo(n),
-                    },
-                    (Gen(u64::from(n)), loc_of(n)),
-                )
+                min_seq: u64::try_from(index).expect("index fits u64"),
+                max_seq: u64::try_from(index).expect("index fits u64"),
+                batch_id: u64::try_from(index).expect("index fits u64"),
+                chunk_index: 0,
+                chunk_count: 1,
+                first_key: key,
+                last_key: key,
+                pre_state_checksum: 0,
+                post_state_checksum: record.post_state_checksum,
+                size: 100,
+                footer_offset: 50,
+                footer_length: 25,
+                object_checksum: u64::try_from(index + 1).expect("index fits u64"),
             })
             .collect();
-        let record = JournalRecord {
-            config: VsetConfig {
-                kind: VsetKind::Compute,
-                disk_volumes: 0,
-                pages_per_volume: total,
-            },
-            seq: JournalSeq(9),
-            fence: 3,
-            kind: RecordKind::Checkpoint {
-                epoch: Epoch(1),
-                vmstate: 42,
-            },
-            capture_seq: u64::from(total),
-            sync_covered_through: 0,
-            database: DatabaseMeta::default(),
-            overlay,
-            leaves,
-            migrated_from: None,
-        };
+
         let bytes = record.encode(vset);
-        assert!(
-            bytes.len() < 1024 * 1024,
-            "a 1M-page map's record encoded to {} bytes — O(pages), not O(delta + leaves)",
-            bytes.len()
-        );
-        // The leaves carry the bulk exactly once (~45 B/page), and every
-        // object involved sits far under the R4.6 cap at any vset size.
-        assert!(leaf_bytes_total > 40 * 1024 * 1024);
         assert_eq!(JournalRecord::decode(vset, &bytes), Ok(record));
     }
 }

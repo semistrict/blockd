@@ -6,6 +6,7 @@ use blockd_exec::ReplyTarget;
 use blockd_exec::channel::{OneSender, UnboundedSender};
 
 use crate::authority::{AuthorityProof, PlacementRecord, VnodeId};
+use crate::blx::{BlxFooter, NamespaceKind};
 use crate::cache::Cache;
 use crate::database::{AttachmentId, DatabaseFile};
 use crate::head::ManifestPtr;
@@ -14,6 +15,7 @@ use crate::hostmeta::{
     VsetRole, VsetStats,
 };
 use crate::journal::{DatabaseMeta, JournalRecord, VsetConfig};
+use crate::manifest::{BaseRef, ObjectIdentity, ObjectRef};
 use crate::mapleaf::LeafPtr;
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
@@ -596,10 +598,8 @@ impl HostState {
                 committed_through: replica
                     .committed
                     .map_or(0, |commit| commit.sync_covered_through),
-                uploaded_through: replica
-                    .uploaded
-                    .map_or(0, |commit| commit.sync_covered_through),
-                unarchived_age_ns: replica.unarchived_age,
+                uploaded_through: 0,
+                unarchived_age_ns: 0,
             })
             .collect()
     }
@@ -612,24 +612,14 @@ pub struct ReplicaKey {
     pub assignment_epoch: u64,
 }
 
-#[derive(Clone)]
-pub struct ReplicaArchiveCut {
-    pub info: crate::protocol::ReplicaCommitInfo,
-    pub required: Vec<crate::protocol::ReplicaArtifact>,
-    pub record: Vec<u8>,
-}
-
 #[derive(Default)]
 pub struct ReplicaState {
     pub artifacts: BTreeMap<crate::protocol::ReplicaArtifact, (u32, Vec<u8>)>,
+    /// Artifacts appended after the last complete commit. A release for the
+    /// previous commit must not erase these bytes out from under a new put.
+    pub uncommitted_artifacts: BTreeSet<crate::protocol::ReplicaArtifact>,
     pub committed: Option<crate::protocol::ReplicaCommitInfo>,
     pub committed_record: Option<Vec<u8>>,
-    pub uploaded: Option<crate::protocol::ReplicaCommitInfo>,
-    pub uploaded_record: Option<Vec<u8>>,
-    pub archive_pending: Option<ReplicaArchiveCut>,
-    pub archive_inflight: bool,
-    pub archive_due: Option<u64>,
-    pub unarchived_age: u64,
     pub bytes: u64,
     pub current_generation: u64,
     pub current_file_bytes: u64,
@@ -714,7 +704,6 @@ struct MutationOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PublicationOwner {
     Direct,
-    Replica,
 }
 
 #[derive(Default)]
@@ -915,6 +904,13 @@ pub struct VsetState {
     pub ready: bool,
     pub epoch: Epoch,
     pub mutation_seq: u64,
+    /// Newest visible value checksum per block and their assembled checksum.
+    /// These describe logical state, not how values are split among files.
+    pub block_checksums: BTreeMap<crate::blx::BlockKey, (Gen, u64)>,
+    pub state_checksum: u64,
+    /// Deletion markers that must be written before a later journal can
+    /// retain a mixed batch containing values discarded by cold boot.
+    pub pending_tombstones: BTreeSet<crate::blx::BlockKey>,
     pub page_locs: BTreeMap<PageId, (Gen, PageLoc)>,
     pub overlay: BTreeMap<PageId, (Gen, PageLoc)>,
     pub leaf_table: BTreeMap<u32, LeafPtr>,
@@ -935,10 +931,37 @@ pub struct VsetState {
     pub checkpoint_results: BTreeMap<crate::protocol::ReqId, Epoch>,
     pub pinned: Option<JournalRecord>,
     pub record_writes: BTreeMap<JournalSeq, (u64, u64)>,
+    /// Every local BLX file written as part of a journal record. This keeps
+    /// files that contain only tombstones reachable even though they have no
+    /// live page location.
+    pub record_segments: BTreeMap<JournalSeq, BTreeSet<(u64, SegId)>>,
     pub segment_blobs: Vec<(u64, SegId, u64)>,
+    pub segment_refs: BTreeMap<(u64, SegId), ObjectRef>,
+    /// The complete local BLX batch that carries the newest resumable VMM
+    /// snapshot. It remains in every later recovery closure until replaced by
+    /// another checkpoint.
+    pub vmm_segments: BTreeSet<(u64, SegId)>,
     pub head_version: Option<u64>,
     pub backed: Option<ManifestPtr>,
+    pub archive_base: Option<BaseRef>,
+    /// Archive metadata is installed at attach time without reading data-file
+    /// footers. A footer is fetched and cached only when a block in that
+    /// file's key range is first requested.
+    pub archive_objects: Vec<ObjectRef>,
+    pub archive_footers: BTreeMap<ObjectIdentity, BlxFooter>,
+    pub archive_resolved_pages: BTreeSet<PageId>,
+    /// A running VM may refault archived memory, but a VM recovered by cold
+    /// boot must never see memory from before that boot.
+    pub archived_memory_usable: bool,
+    /// Local BLX files containing deletion markers remain part of the
+    /// unpublished change set until the archive has published them.
+    pub tombstone_segments: BTreeSet<(u64, SegId)>,
     pub backed_segments: BTreeSet<(u64, SegId)>,
+    /// Local files held stable while the primary is sending one exact cut to
+    /// its passive. Captures may continue concurrently, so the newest record
+    /// alone is not enough to protect this older closure from cleanup.
+    pub replicating_segments: BTreeSet<(u64, SegId)>,
+    pub publishing_segments: BTreeSet<(u64, SegId)>,
     pub backed_leaves: BTreeSet<(u64, u64)>,
     pub store_manifests: BTreeSet<(u64, JournalSeq)>,
     pub outbound: Option<HostId>,
@@ -948,10 +971,9 @@ pub struct VsetState {
     pub stash_assignment: Option<crate::head::StashAssignment>,
     pub retired_stashes: Vec<crate::head::RetiredStash>,
     pub peer_committed: Option<crate::protocol::ReplicaCommitInfo>,
+    pub peer_committed_record: Option<JournalRecord>,
     pub peer_published: Option<crate::protocol::ReplicaCommitInfo>,
     pub peer_committed_through: u64,
-    pub peer_upload_done: Option<crate::protocol::ReplicaCommitInfo>,
-    pub peer_upload_record: Option<JournalRecord>,
     pub wedge: WedgeState,
     pub database_runtime: DatabaseRuntime,
 }
@@ -966,6 +988,9 @@ impl VsetState {
             ready: false,
             epoch: Epoch(0),
             mutation_seq: 0,
+            block_checksums: BTreeMap::new(),
+            state_checksum: 0,
+            pending_tombstones: BTreeSet::new(),
             page_locs: BTreeMap::new(),
             overlay: BTreeMap::new(),
             leaf_table: BTreeMap::new(),
@@ -986,10 +1011,21 @@ impl VsetState {
             checkpoint_results: BTreeMap::new(),
             pinned: None,
             record_writes: BTreeMap::new(),
+            record_segments: BTreeMap::new(),
             segment_blobs: Vec::new(),
+            segment_refs: BTreeMap::new(),
+            vmm_segments: BTreeSet::new(),
             head_version: None,
             backed: None,
+            archive_base: None,
+            archive_objects: Vec::new(),
+            archive_footers: BTreeMap::new(),
+            archive_resolved_pages: BTreeSet::new(),
+            archived_memory_usable: true,
+            tombstone_segments: BTreeSet::new(),
             backed_segments: BTreeSet::new(),
+            replicating_segments: BTreeSet::new(),
+            publishing_segments: BTreeSet::new(),
             backed_leaves: BTreeSet::new(),
             store_manifests: BTreeSet::new(),
             outbound: None,
@@ -999,10 +1035,9 @@ impl VsetState {
             stash_assignment: None,
             retired_stashes: Vec::new(),
             peer_committed: None,
+            peer_committed_record: None,
             peer_published: None,
             peer_committed_through: 0,
-            peer_upload_done: None,
-            peer_upload_record: None,
             wedge: WedgeState::default(),
             database_runtime: DatabaseRuntime::default(),
         }
@@ -1021,16 +1056,10 @@ impl VsetState {
             return 0;
         };
         let pending = record
-            .overlay
-            .values()
-            .filter(|(_, location)| location.base == 0)
-            .map(|(_, location)| (location.fence, location.seg))
-            .chain(record.leaves.values().flat_map(|pointer| {
-                self.leaf_blobs
-                    .get(pointer)
-                    .into_iter()
-                    .flat_map(|(_, segments)| segments.iter().copied())
-            }))
+            .files
+            .iter()
+            .filter(|file| file.identity.namespace_kind == NamespaceKind::Vset)
+            .map(|file| (file.identity.writer_fence, SegId(file.identity.object_id)))
             .filter(|segment| !self.backed_segments.contains(segment))
             .collect::<BTreeSet<_>>();
         self.segment_blobs
@@ -1304,8 +1333,7 @@ mod tests {
         operations.finish_mutation(MutationOwner::Database);
 
         assert!(operations.try_start_publication(PublicationOwner::Direct));
-        assert!(!operations.try_start_publication(PublicationOwner::Replica));
-        operations.finish_publication(PublicationOwner::Replica);
+        assert!(!operations.try_start_publication(PublicationOwner::Direct));
         assert_eq!(
             operations.publication_owner(),
             Some(PublicationOwner::Direct)

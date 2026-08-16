@@ -52,10 +52,11 @@ async fn store_gc_pass<W: Store>(
             Some(
                 StoreKey::Head { .. }
                     | StoreKey::Manifest { .. }
+                    | StoreKey::ArchiveManifest { .. }
+                    | StoreKey::CompleteFileList { .. }
                     | StoreKey::PendingManifest { .. }
-                    | StoreKey::Leaf { .. }
-                    | StoreKey::BaseRecord { .. }
-                    | StoreKey::BaseLeaf { .. }
+                    | StoreKey::BaseRoot { .. }
+                    | StoreKey::BaseManifest { .. }
             )
         );
         let bytes = if needs_body {
@@ -86,9 +87,11 @@ mod tests {
     use blockd_exec::{Executor, delay};
 
     use super::*;
+    use crate::blx::{BlockKey, BlockSpace, NamespaceKind};
     use crate::head::{HeadRecord, ManifestPtr};
     use crate::journal::{DatabaseMeta, JournalRecord, RecordKind, VsetConfig};
     use crate::layout;
+    use crate::manifest::{CompleteFileList, Manifest, ObjectIdentity, ObjectRef, RecoveryKind};
     use crate::protocol::StoreFault;
     use crate::segment::PageLoc;
     use crate::types::{
@@ -233,15 +236,73 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 5,
             sync_covered_through: 5,
+            post_state_checksum: 0,
             database: DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: BTreeMap::from([(page, (Gen(1), location))]),
             leaves: BTreeMap::new(),
             migrated_from: None,
         };
+        let object = ObjectRef {
+            identity: ObjectIdentity {
+                namespace_kind: NamespaceKind::Vset,
+                namespace_id: vset.0,
+                writer_fence: fence,
+                object_id: location.seg.0,
+            },
+            min_seq: seq.0,
+            max_seq: seq.0,
+            batch_id: seq.0,
+            chunk_index: 0,
+            chunk_count: 1,
+            first_key: BlockKey {
+                space: BlockSpace::Data,
+                volume: 1,
+                block: 0,
+            },
+            last_key: BlockKey {
+                space: BlockSpace::Data,
+                volume: 1,
+                block: 0,
+            },
+            pre_state_checksum: 0,
+            post_state_checksum: 0,
+            size: 3,
+            footer_offset: 0,
+            footer_length: 1,
+            object_checksum: 0,
+        };
+        let list = CompleteFileList {
+            vset,
+            writer_fence: fence,
+            list_id: seq.0,
+            objects: vec![object],
+        };
+        let archive = Manifest {
+            vset,
+            writer_fence: fence,
+            journal_seq: record.seq.0,
+            archive_seq: seq.0,
+            capture_seq: record.capture_seq,
+            sync_covered_through: record.sync_covered_through,
+            recovery_kind: RecoveryKind::DiskOnly,
+            checkpoint_epoch: crate::types::Epoch(0),
+            config: record.config,
+            database: record.database,
+            vmstate_logical_length: 0,
+            base: None,
+            complete_list: Some(list.reference()),
+            post_state_checksum: 0,
+            metadata_checksum: 0,
+            added: Vec::new(),
+            removed: Vec::new(),
+        };
+        let archive_bytes = archive.encode().expect("bounded manifest");
         let head = layout::head_key(vset);
         let manifest = layout::manifest_key(vset, fence, seq);
         let pending = layout::pending_manifest_key(vset, fence, seq);
         let segment = layout::segment_key(vset, fence, location.seg);
+        let list_key = layout::complete_file_list_key(vset, fence, seq.0);
         store.objects.borrow_mut().extend([
             (
                 head.clone(),
@@ -258,7 +319,8 @@ mod tests {
                     .encode(),
                 ),
             ),
-            (pending.clone(), (1, record.encode(vset))),
+            (pending.clone(), (1, archive_bytes.clone())),
+            (list_key, (1, list.encode())),
             (segment.clone(), (1, vec![1, 2, 3])),
         ]);
         let task_store = Rc::clone(&store);
@@ -278,7 +340,7 @@ mod tests {
             task_store
                 .objects
                 .borrow_mut()
-                .insert(manifest, (1, record.encode(vset)));
+                .insert(manifest, (1, archive_bytes.clone()));
             task_store.objects.borrow_mut().insert(
                 head,
                 (
@@ -289,8 +351,10 @@ mod tests {
                         fence,
                         manifest: Some(ManifestPtr {
                             fence,
+                            journal_seq: record.seq,
                             seq,
                             capture_seq: record.capture_seq,
+                            checksum: crate::format::checksum64(&archive_bytes),
                         }),
                         stash: None,
                         retired_stashes: Vec::new(),

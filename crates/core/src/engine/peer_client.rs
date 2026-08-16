@@ -119,6 +119,7 @@ impl PeerClient {
         source: HostId,
         vset: VsetId,
         location: PageLoc,
+        replica_assignment_epoch: Option<u64>,
         retry: u64,
     ) -> Option<Vec<u8>> {
         loop {
@@ -129,6 +130,7 @@ impl PeerClient {
                 PeerMsg::FetchRange {
                     io,
                     vset,
+                    replica_assignment_epoch,
                     fence: location.fence,
                     seg: location.seg,
                     offset: location.offset,
@@ -170,6 +172,7 @@ impl PeerClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn offer_migration_once<W: Peers>(
         &self,
         world: &W,
@@ -177,6 +180,7 @@ impl PeerClient {
         vset: VsetId,
         offer_fence: u64,
         record: Vec<u8>,
+        vmstate: Option<Vec<u8>>,
         retry: u64,
     ) -> bool {
         let key = (vset, target, offer_fence);
@@ -189,7 +193,16 @@ impl PeerClient {
             return true;
         }
         let receive = self.migration(vset, target, offer_fence);
-        Peers::send(world, target, PeerMsg::MigrateOffer { vset, record }).await;
+        Peers::send(
+            world,
+            target,
+            PeerMsg::MigrateOffer {
+                vset,
+                record,
+                vmstate,
+            },
+        )
+        .await;
         matches!(timeout(retry, receive).await, Ok(Ok(())))
     }
 
@@ -880,6 +893,7 @@ mod tests {
                             VsetId(7),
                             CURRENT_MIGRATION_FENCE,
                             vec![1, 2, 3],
+                            None,
                             1,
                         )
                         .await
@@ -918,6 +932,7 @@ mod tests {
                         VsetId(7),
                         CURRENT_MIGRATION_FENCE,
                         vec![1, 2, 3],
+                        None,
                         1,
                     )
                     .await
@@ -951,6 +966,7 @@ mod tests {
                         VsetId(7),
                         CURRENT_MIGRATION_FENCE,
                         vec![4, 5, 6],
+                        None,
                         1,
                     )
                     .await

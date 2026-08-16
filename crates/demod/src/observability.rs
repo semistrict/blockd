@@ -977,8 +977,6 @@ fn append_runtime_counters(out: &mut String, counters: &Counters) {
         leaf_fills => "Map leaves hydrated lazily.",
         segs_compacted => "Mostly-dead segments compacted.",
         pages_compacted => "Live pages rewritten by compaction.",
-        archive_cycles => "Passive archive cycles started.",
-        archive_commits_coalesced => "Intermediate passive commits coalesced before archival.",
         replica_capacity_backpressure => "Passive writes held because host-wide spool hard capacity is exhausted.",
     }
 }
@@ -1095,7 +1093,7 @@ mod tests {
         let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        assert_eq!((custom.len(), custom_hash), (16_240, 0xafa5_6da1_1650_4889));
+        assert_eq!((custom.len(), custom_hash), (15_855, 0xf643_0b55_63e8_7571));
     }
 
     #[test]

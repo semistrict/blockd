@@ -16,7 +16,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   observable compute state may mix two epochs — not across volumes, not
   between memory and vmstate. A partial compute checkpoint (R3.7) declares
   memory invalid and is restorable only by cold boot. A database consistency
-  point instead atomically covers its durable file metadata and page map
+  point instead atomically covers its durable file metadata and visible blocks
   through one sync watermark; it carries no vmstate and recovers detached.
 - **R1.3** Plan for bare-metal hosts running up to **10,000 concurrently
   live guests each** — running Firecracker processes, not merely managed
@@ -108,7 +108,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   built-in cadence and never will be a requirement for one — and the
   dependency is forbidden in the other direction too: nothing in the
   system may **rely** on a checkpoint ever arriving. Writeback (R2.4),
-  archival (R4.2), eviction and pressure relief all run in the background
+  archival, eviction and pressure relief all run in the background
   whether a vset is checkpointed constantly or never; a never-checkpointed
   vset still recovers by cold boot at sync consistency (R3.8, R8.2). A
   checkpoint is an operation the system supports — a coherent
@@ -159,19 +159,6 @@ implementation decisions. Requirements take precedence when the two conflict.
   in the object store. The closure is the compressed immutable artifacts and
   record needed to cold-boot at the barrier; it is neither guest RAM nor every
   provisioned page. The peer is recovery storage, not an owner or runner.
-- **R4.2** The object store is an asynchronous archive of peer-committed state.
-  It advances on its own cadence, never gated on sync, capture, or checkpoints.
-  Archive cycles may coalesce any number of intermediate commits and optimize
-  the newest immutable cut before publishing it. Packing is derived wholly
-  inside the passive/archive subsystem from that durable cut: it does not ask
-  the primary to finalize a record, read guest memory, or mutate the live
-  serving timeline. Already archived and base-owned objects may remain
-  referenced; the passive rewrites the selected cut's staged live pages in
-  `(volume, page)` order into bounded archive-only segments and corresponding
-  leaves. Cycles are triggered by a
-  maximum interval, unpublished-byte threshold, passive-spool pressure, or an
-  explicit lifecycle event. Assignment records (R6.3) are its only non-archive
-  use. No guest-visible operation and no ordinary capture waits for the store.
 - **R4.3** Loss of either the primary or the active passive alone loses no
   acknowledged sync. The passive holds the newest protected closure; loss of
   that passive pauses new sync acknowledgments only while a replacement is
@@ -207,27 +194,15 @@ implementation decisions. Requirements take precedence when the two conflict.
   the archived frontier advances only after the manifest and all referenced
   objects are durable and a fenced head CAS publishes that cut. Neither may
   advance from an attempted, partial, or unverifiable write.
-- **R4.8** Data flows primary to one active passive and from that passive to
-  the object store. Candidate peers and virtual-node placement must never
-  cause steady-state fanout. When the active passive is unavailable, new sync
-  acknowledgments stop until one replacement has durably committed a covering
-  baseline. The current holder's existing writer fence authorizes that repair
-  even while the object store is wholly unavailable; head publication retries
-  independently and must not delay activation or later sync acknowledgments.
-  Failed replacements are skipped and replacement repeats automatically;
-  obsolete dead-peer cleanup can never block another failover.
-  Sequential machine failures before a covering replacement commit are outside
-  R4.1's single-failure guarantee, but once repair completes the new passive is
-  the ordinary protected copy and the guarantee is restored.
 - **R4.9** Passive retention is defined by recovery roots, not by archive age:
-  the newest complete protected cut, an immutable archive cut currently being
-  read, and any in-progress replacement cut. Once a newer complete cut is
+  the newest complete protected cut, any cut selected by the primary for
+  archival, and any in-progress replacement cut. Once a newer complete cut is
   durable, artifacts referenced only by superseded cuts may be compacted into
   fresh sealed spool generations even while the object store is unavailable.
-  The selected archive cut remains pinned until its attempt finishes or is
-  abandoned for a newer cut. Reclamation is explicit and crash-safe; capacity
-  exhaustion stalls new protected syncs and is observable rather than evicting
-  any recovery root.
+  A selected archive cut remains pinned locally and on the passive until its
+  attempt finishes or is abandoned for a newer cut.
+  Reclamation is explicit and crash-safe; capacity exhaustion stalls new
+  protected syncs and is observable rather than evicting any recovery root.
 
 ## R5 — Lineage: bases and forks
 
@@ -353,9 +328,9 @@ implementation decisions. Requirements take precedence when the two conflict.
   sync acknowledgments only until automatic replacement completes; it never
   permits an optimistic acknowledgment.
 - **R8.4** Bytes are stored compressed on local disk and in the object store.
-  Primary-to-passive transfer preserves the source segment bytes verbatim;
+  Primary-to-passive transfer preserves the source `.blx` bytes verbatim;
   an archive cycle may decode selected live entries and recompress them into
-  fewer bounded packs. The current archive format deliberately keeps the
+  fewer bounded `.blx` files. The current storage format deliberately keeps the
   existing LZ4 entry codec. Zstd, zero-page elision, or another format version
   requires a measured incremental win after temporal packing, plus updated
   byte-pin and bit-flip suites; it is not implied by this contract. The fault

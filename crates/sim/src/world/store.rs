@@ -13,12 +13,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use blockd_core::blx::scan_object;
 use blockd_core::head::HeadRecord;
-use blockd_core::journal::JournalRecord;
 use blockd_core::layout;
-use blockd_core::mapleaf::MapLeaf;
+use blockd_core::manifest::{CompleteFileList, Manifest};
 use blockd_core::types::SimTime;
-use blockd_core::types::{Gen, PageId, VolumeId, VsetId, page_size};
+use blockd_core::types::{Gen, PageId, VsetId, page_size};
 
 use crate::rng::Pcg64;
 
@@ -238,41 +238,32 @@ impl ObjectStore {
         else {
             return;
         };
-        let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
+        let Ok(manifest) = Manifest::decode(vset, record_bytes) else {
+            return;
+        };
+        let list = manifest.complete_list.and_then(|reference| {
+            let key =
+                layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id);
+            let (_, _, bytes) = self.objects.get(&key)?;
+            CompleteFileList::decode(reference, vset, bytes).ok()
+        });
+        let Ok(files) = manifest.current_files(list.as_ref()) else {
             return;
         };
         let mut current = BTreeMap::new();
-        for leaf_ptr in record.leaves.values() {
-            let (owner, leaf_key) = if leaf_ptr.base == 0 {
-                (vset, layout::leaf_key(vset, leaf_ptr.fence, leaf_ptr.id))
-            } else {
-                (
-                    VsetId(leaf_ptr.base),
-                    layout::base_leaf_key(leaf_ptr.base, leaf_ptr.fence, leaf_ptr.id),
-                )
-            };
-            let Some((_, _, leaf_bytes)) = self.objects.get(&leaf_key) else {
+        for file in files {
+            let Some((_, _, bytes)) = self.objects.get(&file.identity.store_key()) else {
                 continue;
             };
-            let Ok(leaf) = MapLeaf::decode(owner, leaf_ptr.fence, leaf_ptr.id, leaf_bytes) else {
+            let Ok((_, footer)) = scan_object(bytes) else {
                 continue;
             };
-            for (idx, page, generation, _) in leaf.entries {
-                current.insert(
-                    PageId {
-                        volume: VolumeId { vset, idx },
-                        page,
-                    },
-                    generation,
-                );
+            for entry in footer.entries {
+                if let Some(page) = entry.key.to_page(manifest.config.kind, vset) {
+                    current.insert(page, entry.generation);
+                }
             }
         }
-        current.extend(
-            record
-                .overlay
-                .iter()
-                .map(|(&page, &(generation, _))| (page, generation)),
-        );
         let previous = self.archived_generations.entry(vset).or_default();
         let changed = current
             .iter()

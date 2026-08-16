@@ -148,9 +148,11 @@ pub enum GuestMemoryError {
     Unservable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestPause {
     pub vmstate: u64,
+    /// Canonical VMM snapshot bytes captured at this pause.
+    pub vmstate_bytes: Vec<u8>,
     pub generation: u64,
 }
 
@@ -175,9 +177,14 @@ pub trait GuestMem {
     async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn install_database(&self, page: PageId, bytes: Vec<u8>) -> Result<(), GuestMemoryError>;
+    async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError>;
     async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError>;
     async fn resume(&self, vset: VsetId, pause: Option<GuestPause>)
     -> Result<(), GuestMemoryError>;
+    /// Commit a paused guest as stopped on this host without resuming it.
+    /// Migration uses this after its durable local cut and before any peer or
+    /// object-store work.
+    async fn commit_pause(&self, vset: VsetId, pause: GuestPause) -> Result<(), GuestMemoryError>;
     async fn harvest_accessed(&self) -> Vec<PageId>;
     async fn next_fault(&self) -> Option<GuestFault>;
     async fn next_sync(&self) -> Option<GuestSyncRequest>;

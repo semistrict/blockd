@@ -13,6 +13,16 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     .expect("CRC-32 result fits u32")
 }
 
+/// Deterministic 64-bit identity checksum used in references. Frame CRCs are
+/// still the byte-corruption check; this value binds a pointer to complete
+/// encoded object bytes.
+pub fn checksum64(bytes: &[u8]) -> u64 {
+    let low = u64::from(crc32c(bytes));
+    let mut reversed = bytes.to_vec();
+    reversed.reverse();
+    (u64::from(crc32c(&reversed)) << 32) | low
+}
+
 /// Append-only little-endian encoder. All widths explicit at call sites.
 #[derive(Default)]
 pub struct Enc {

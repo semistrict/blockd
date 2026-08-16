@@ -113,8 +113,10 @@ pub async fn install_replica_recovery(
     published_head.fence = writer_fence;
     published_head.manifest = Some(ManifestPtr {
         fence: writer_fence,
+        journal_seq: record.seq,
         seq: record.seq,
         capture_seq: record.capture_seq,
+        checksum: blockd_core::format::checksum64(record_bytes),
     });
     let head_version = store
         .put_cas(
@@ -279,7 +281,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 4,
             sync_covered_through: 5,
+            post_state_checksum: 0,
             database: blockd_core::journal::DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -363,7 +367,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 4,
             sync_covered_through: 5,
+            post_state_checksum: 0,
             database: blockd_core::journal::DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -387,8 +393,10 @@ mod tests {
         let advanced_head = HeadRecord {
             manifest: Some(ManifestPtr {
                 fence: 1,
+                journal_seq: JournalSeq(3),
                 seq: JournalSeq(4),
                 capture_seq: 6,
+                checksum: 9,
             }),
             ..verified_head
         };

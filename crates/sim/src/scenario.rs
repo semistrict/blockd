@@ -966,7 +966,6 @@ pub enum FaultPointSpec {
     CrashPeerAfterCommitBeforeAck,
     CrashPrimaryAfterAckBeforeSyncOk,
     CrashPrimaryAfterSyncOk,
-    CrashPeerAfterUploadBeforeHead,
     CrashPrimaryAfterHeadBeforeRelease,
     CrashPrimaryBeforeTransitionCas,
     CrashPrimaryAfterSeedBeforeActiveCas,
@@ -975,7 +974,6 @@ pub enum FaultPointSpec {
     CrashPrimaryAfterClosureCapture,
     CrashPrimaryDuringArtifactTransfer,
     CrashPeerAfterDataFlushBeforeCommit,
-    CrashPeerDuringUpload,
 }
 
 impl FaultPointSpec {
@@ -991,7 +989,6 @@ impl FaultPointSpec {
             Self::CrashPeerAfterCommitBeforeAck => FaultPoint::CrashPeerAfterCommitBeforeAck,
             Self::CrashPrimaryAfterAckBeforeSyncOk => FaultPoint::CrashPrimaryAfterAckBeforeSyncOk,
             Self::CrashPrimaryAfterSyncOk => FaultPoint::CrashPrimaryAfterSyncOk,
-            Self::CrashPeerAfterUploadBeforeHead => FaultPoint::CrashPeerAfterUploadBeforeHead,
             Self::CrashPrimaryAfterHeadBeforeRelease => {
                 FaultPoint::CrashPrimaryAfterHeadBeforeRelease
             }
@@ -1010,7 +1007,6 @@ impl FaultPointSpec {
             Self::CrashPeerAfterDataFlushBeforeCommit => {
                 FaultPoint::CrashPeerAfterDataFlushBeforeCommit
             }
-            Self::CrashPeerDuringUpload => FaultPoint::CrashPeerDuringUpload,
         }
     }
 }
@@ -1046,7 +1042,6 @@ enum PeerKindSpec {
     ReplicaCommitAck,
     ReplicaStatus,
     ReplicaStatusReply,
-    ReplicaUploadDone,
     ReplicaRelease,
     ReplicaReleaseAck,
 }
@@ -1068,7 +1063,6 @@ impl From<PeerKindSpec> for PeerKind {
             PeerKindSpec::ReplicaCommitAck => Self::ReplicaCommitAck,
             PeerKindSpec::ReplicaStatus => Self::ReplicaStatus,
             PeerKindSpec::ReplicaStatusReply => Self::ReplicaStatusReply,
-            PeerKindSpec::ReplicaUploadDone => Self::ReplicaUploadDone,
             PeerKindSpec::ReplicaRelease => Self::ReplicaRelease,
             PeerKindSpec::ReplicaReleaseAck => Self::ReplicaReleaseAck,
         }

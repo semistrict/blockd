@@ -4,17 +4,19 @@ use std::rc::Rc;
 use blockd_exec::channel::{Receiver, unbounded};
 use blockd_exec::{Either, OneOf3, TaskSet, delay, select2, select3, yield_now};
 
-use super::capture::{shard_map, write_record_copies};
+use super::capture::{write_migration_record_copies, write_record_copies};
 use super::fault::load_page_for_database;
 use super::hydration::HydrationError;
 use super::keyed_queue::KeyedQueue;
 use super::reclaim::cleanup_local;
 use super::replica::replicate_latest;
 use super::state::{AttachmentPhase, CommitFlagLease, MutationOwner, SharedHost};
+use crate::blx::{BlockKey, EntryKind, open_object, replace_state_block, scan_object};
 use crate::database::{
     AttachmentId, DatabaseCall, DatabaseError, DatabaseFile, DatabaseOp, DatabaseResult,
     DatabaseSuccess, MAX_DATABASE_IO,
 };
+use crate::format::checksum64;
 use crate::journal::{DatabaseFileMeta, JournalRecord, MigrationSource, RecordKind, VsetKind};
 use crate::layout;
 use crate::mapleaf::{LEAF_SPAN, span_of};
@@ -683,7 +685,8 @@ where
     }
     let mut database = database;
     file_meta_mut(&mut database, file).size = size;
-    let prune = (size < old_size).then_some((file, first_removed));
+    let prune =
+        (size < old_size).then_some((file, first_removed, old_size.div_ceil(page_size() as u64)));
     match persist_database(state, world, vset, updates, prune, database, true, None).await {
         Ok(sequence) => Ok(DatabaseSuccess::Truncated { sequence }),
         Err(_) => Err(DatabaseError::Io),
@@ -699,10 +702,14 @@ async fn delete<W>(
 where
     W: Blobs + Store + Peers + AdminIo,
 {
-    let (incarnation, mut database) = {
+    let (incarnation, mut database, old_size) = {
         let host = state.borrow();
         let vset_state = &host.vsets[&vset];
-        (vset_state.incarnation, vset_state.database)
+        (
+            vset_state.incarnation,
+            vset_state.database,
+            file_meta(vset_state.database, file).size,
+        )
     };
     if hydrate_prune_spans(state, world, vset, file, 0, incarnation)
         .await
@@ -716,7 +723,7 @@ where
         world,
         vset,
         Vec::new(),
-        Some((file, 0)),
+        Some((file, 0, old_size.div_ceil(page_size() as u64))),
         database,
         true,
         None,
@@ -792,7 +799,7 @@ async fn persist_database<W>(
     world: &W,
     vset: VsetId,
     updates: Vec<(PageId, Vec<u8>)>,
-    prune: Option<(DatabaseFile, u64)>,
+    prune: Option<(DatabaseFile, u64, u64)>,
     database: crate::journal::DatabaseMeta,
     mutation: bool,
     sync_barrier: Option<u64>,
@@ -837,14 +844,17 @@ where
             .checked_add(1)
             .ok_or(DatabasePersistError::Overflow)?;
         let first_segment = SegId(vset_state.next_seg);
-        let generation_count = u64::try_from(updates.len()).expect("update count fits u64");
+        let tombstone_count = prune.map_or(0, |(_, first, end)| end.saturating_sub(first));
+        let generation_count = u64::try_from(updates.len())
+            .expect("update count fits u64")
+            .checked_add(tombstone_count)
+            .ok_or(DatabasePersistError::Overflow)?;
         let generation_after = vset_state
             .next_gen
             .checked_add(generation_count)
             .ok_or(DatabasePersistError::Overflow)?;
-        let generations = (0..updates.len())
+        let generations = (0..generation_count)
             .map(|offset| {
-                let offset = u64::try_from(offset).expect("update count fits u64");
                 vset_state
                     .next_gen
                     .checked_add(offset)
@@ -856,6 +866,8 @@ where
         staged.fence = vset_state.fence;
         staged.page_locs = vset_state.page_locs.clone();
         staged.overlay = vset_state.overlay.clone();
+        staged.block_checksums = vset_state.block_checksums.clone();
+        staged.state_checksum = vset_state.state_checksum;
         staged.leaf_table = vset_state.leaf_table.clone();
         staged.next_leaf = vset_state.next_leaf;
         let covered = sync_barrier.map_or(vset_state.local_covered_through, |barrier| {
@@ -877,10 +889,53 @@ where
             generation_after,
         )
     };
-    let mut builder = SegmentBatchBuilder::new(vset, fence, first_segment);
+    let mut tombstone_pages = Vec::new();
+    if let Some((file, first_removed, end_removed)) = prune {
+        for (offset, page_number) in (first_removed..end_removed).enumerate() {
+            let page_number =
+                u32::try_from(page_number).map_err(|_| DatabasePersistError::Overflow)?;
+            let generation = generations
+                .get(updates.len() + offset)
+                .copied()
+                .ok_or(DatabasePersistError::Overflow)?;
+            let page = file.page(vset, page_number);
+            tombstone_pages.push((page, generation));
+        }
+    }
+    let pre_state_checksum = staged.state_checksum;
+    for ((page, bytes), generation) in updates.iter().zip(&generations) {
+        replace_state_block(
+            &mut staged.state_checksum,
+            &mut staged.block_checksums,
+            BlockKey::from_page(VsetKind::Database, *page),
+            Some((*generation, checksum64(bytes))),
+        );
+    }
+    for &(page, _) in &tombstone_pages {
+        replace_state_block(
+            &mut staged.state_checksum,
+            &mut staged.block_checksums,
+            BlockKey::from_page(VsetKind::Database, page),
+            None,
+        );
+    }
+    let mut builder = SegmentBatchBuilder::new_for_record_with_checksums(
+        VsetKind::Database,
+        vset,
+        fence,
+        first_segment,
+        seq.0,
+        pre_state_checksum,
+        staged.state_checksum,
+    );
     for ((page, bytes), generation) in updates.iter().zip(&generations) {
         builder
             .try_add(*page, *generation, bytes)
+            .map_err(|_| DatabasePersistError::Overflow)?;
+    }
+    for &(page, generation) in &tombstone_pages {
+        builder
+            .try_add_tombstone(page, generation)
             .map_err(|_| DatabasePersistError::Overflow)?;
     }
     let segments = builder.finish();
@@ -894,10 +949,26 @@ where
             staged.overlay.insert(page, (generation, location));
         }
     }
-    if let Some((file, first_removed)) = prune {
+    if let Some((file, first_removed, _)) = prune {
         prune_file(&mut staged, file, first_removed);
     }
-    let (record_overlay, record_leaves, leaf_writes) = shard_map(&mut staged, vset);
+    let record_overlay = staged.page_locs.clone();
+    let record_leaves: std::collections::BTreeMap<u32, crate::mapleaf::LeafPtr> =
+        Default::default();
+    let mut files = state
+        .borrow()
+        .vsets
+        .get(&vset)
+        .ok_or(DatabasePersistError::Stale)?
+        .segment_refs
+        .clone();
+    for (segment, bytes, _) in &segments {
+        let object = open_object(bytes).map_err(|_| DatabasePersistError::Fatal)?;
+        files.insert(
+            (fence, *segment),
+            crate::manifest::ObjectRef::from_blx(&object),
+        );
+    }
     let record = JournalRecord {
         config,
         seq,
@@ -905,7 +976,9 @@ where
         kind: RecordKind::Commit,
         capture_seq,
         sync_covered_through: covered,
+        post_state_checksum: staged.state_checksum,
         database,
+        files: files.values().copied().collect(),
         overlay: record_overlay.clone(),
         leaves: record_leaves.clone(),
         migrated_from: peer_source.map(|host| MigrationSource {
@@ -921,12 +994,6 @@ where
                 bytes.len() as u64,
             )
         })
-        .chain(leaf_writes.iter().map(|(pointer, bytes, _)| {
-            (
-                layout::leaf_blob(vset, pointer.fence, pointer.id),
-                bytes.len() as u64,
-            )
-        }))
         .collect::<Vec<_>>();
     {
         let mut host = state.borrow_mut();
@@ -959,20 +1026,12 @@ where
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
     }
-    let mut new_leaf_blobs = Vec::new();
-    for (pointer, bytes, segments) in &leaf_writes {
-        let name = layout::leaf_blob(vset, pointer.fence, pointer.id);
-        if super::blob::write(state, world, name.clone(), bytes.clone())
-            .await
-            .is_err()
-        {
-            state.borrow_mut().fail("database map-leaf write failed");
-            return Err(DatabasePersistError::Fatal);
-        }
-        state.borrow_mut().record_blob(name, bytes.len() as u64);
-        new_leaf_blobs.push((*pointer, (bytes.len() as u64, segments.clone())));
-    }
-    if !write_record_copies(state, world, vset, &record).await {
+    let wrote_record = if record.migrated_from.is_some() {
+        write_migration_record_copies(state, world, vset, &record, &staged.block_checksums).await
+    } else {
+        write_record_copies(state, world, vset, &record).await
+    };
+    if !wrote_record {
         state.borrow_mut().fail("database journal write failed");
         return Err(DatabasePersistError::Fatal);
     }
@@ -989,13 +1048,31 @@ where
         vset_state.next_gen = generation_after;
         vset_state.next_leaf = staged.next_leaf;
         vset_state.page_locs = staged.page_locs;
+        vset_state.block_checksums = staged.block_checksums;
+        vset_state.state_checksum = staged.state_checksum;
+        vset_state
+            .archive_resolved_pages
+            .extend(tombstone_pages.iter().map(|(page, _)| *page));
         vset_state.database = database;
         vset_state.segment_blobs.extend(
             segments
                 .iter()
                 .map(|(segment, bytes, _)| (fence, *segment, bytes.len() as u64)),
         );
-        vset_state.leaf_blobs.extend(new_leaf_blobs);
+        vset_state.segment_refs = files;
+        vset_state.tombstone_segments.extend(
+            segments
+                .iter()
+                .filter(|(_, bytes, _)| {
+                    scan_object(bytes).is_ok_and(|(_, footer)| {
+                        footer
+                            .entries
+                            .iter()
+                            .any(|entry| entry.kind == EntryKind::Tombstone)
+                    })
+                })
+                .map(|(segment, _, _)| (fence, *segment)),
+        );
         vset_state.overlay = record_overlay;
         vset_state.leaf_table = record_leaves;
         vset_state.best_record = Some(record.clone());
@@ -1003,13 +1080,19 @@ where
         vset_state
             .record_writes
             .insert(seq, (fence, record.sync_covered_through));
+        vset_state.record_segments.insert(
+            seq,
+            segments
+                .iter()
+                .map(|(segment, _, _)| (fence, *segment))
+                .collect(),
+        );
         vset_state
             .operations
             .finish_mutation(MutationOwner::Database);
         let mutation_waiters = std::mem::take(&mut vset_state.mutation_waiters);
         host.counters.pages_flushed += updates.len() as u64;
         host.counters.records_written += 1;
-        host.counters.leaf_rolls += leaf_writes.len() as u64;
         mutation_waiters
     };
     lease.commit();
@@ -1159,6 +1242,7 @@ mod tests {
     use blockd_exec::{Executor, bridge_request, spawn};
 
     use super::*;
+    use crate::blx::{BlockKey, EntryKind, scan_object};
     use crate::hostmeta::HostConfig;
     use crate::journal::{DatabaseMeta, VsetConfig};
     use crate::protocol::{AdminCall, AdminEvent, AdminResult};
@@ -1302,6 +1386,105 @@ mod tests {
                 .mutation_owner()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn database_prune_writes_a_tombstone_file() {
+        let vset = VsetId(1);
+        let page = DatabaseFile::Main.page(vset, 1);
+        let mut host = super::super::state::HostState::new(HostConfig {
+            archive: Default::default(),
+            host: HostId(1),
+            cache_pages: 1,
+            writeback_interval: 1,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: None,
+        });
+        host.insert_fresh(vset, VsetConfig::database(4));
+        host.vsets.get_mut(&vset).expect("vset").ready = true;
+        let state = Rc::new(RefCell::new(host));
+        let world = Rc::new(TestWorld::default());
+        let mut executor = Executor::simulation(3);
+        let database = DatabaseMeta {
+            main: DatabaseFileMeta {
+                exists: true,
+                size: 2 * page_size() as u64,
+            },
+            ..DatabaseMeta::default()
+        };
+        let first = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    vec![(page, vec![7; page_size()])],
+                    None,
+                    database,
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(first, Ok(1));
+        let truncated = DatabaseMeta {
+            main: DatabaseFileMeta {
+                exists: true,
+                size: page_size() as u64,
+            },
+            ..DatabaseMeta::default()
+        };
+        let second = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    Vec::new(),
+                    Some((DatabaseFile::Main, 1, 2)),
+                    truncated,
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(second, Ok(2));
+        let third = executor.block_on({
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move {
+                persist_database(
+                    &state,
+                    world.as_ref(),
+                    vset,
+                    Vec::new(),
+                    None,
+                    truncated,
+                    true,
+                    None,
+                )
+                .await
+            }
+        });
+        assert_eq!(third, Ok(3));
+        let key = BlockKey::from_page(VsetKind::Database, page);
+        assert!(world.blobs.borrow().values().any(|bytes| {
+            scan_object(bytes).is_ok_and(|(header, footer)| {
+                header.max_seq == 1
+                    && footer
+                        .find(key)
+                        .is_some_and(|entry| entry.kind == EntryKind::Tombstone)
+            })
+        }));
     }
 
     #[test]

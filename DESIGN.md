@@ -23,26 +23,21 @@ isolation; if the fault server dies, its VMs stop.
 
 ## Standing decisions
 
-### Records, not layer chains
+### One read-only data-file format
 
-Every capture writes one journal record carrying the vset's
-page→location map as a **bounded inline overlay plus one pointer per
-4096-page span**, whose contents live in write-once leaf blobs — record
-size is O(delta), never O(vset), and forks reference base leaves in
-place. One write-once segment holds the flushed pages. Reads never walk
-a chain; recovery reads the newest record whose leaves are intact — it
-never replays a log. Superseded blobs are reclaimed once a newer
-committed record replaces them (R4.5), and **minimal compaction** keeps
-that honest for long-lived vsets: a segment at least half dead has its
-live pages rewritten forward on the writeback cadence, so disk stays
-within ~2× live data and each rewritten byte reclaims at least one. The
-record is the atomic consistency point (R3.5), and its monotone
-`sync_covered_through` watermark is what makes sync ordering survive record
-reclamation (R3.8) — a bare covers-sync flag provably loses it; the
-simulation found this. Each record is written twice (`.rec` + `.recm`):
-the newest record is the sole carrier of its newly-acked syncs, and the
-simulation showed one rotten bit rolling acked syncs back silently —
-recovery accepts whichever copy decodes.
+[STORAGE_DESIGN.md](STORAGE_DESIGN.md) defines the storage format. Changed
+blocks are written into sorted, bounded `.blx` files on the primary. The same
+bytes are copied to the passive and may later be uploaded by the primary.
+There is no second archive page-data format.
+
+A local journal record commits the files that make up one recovery point and
+its monotone `sync_covered_through` watermark. The primary and passive flush
+the named files before committing the record. Periodic complete local file
+lists bound restart work. Object storage uses one current manifest, one
+reusable complete file list, and bounded additions and removals; restore never
+walks manifest history. Compaction replaces file references without changing
+the saved guest state. Each local commit record is written twice (`.rec` and
+`.recm`) so recovery can use either verified copy.
 
 ### Fenced namespaces
 
@@ -63,7 +58,7 @@ SQLite's userspace page cache and unavoidable guest virtio-fs metadata/page
 state are bounded parts of the data path; correctness never relies on either
 surviving cold recovery. Eviction of a clean compute page uses
 `MADV_DONTNEED` plus a hole punch; database pages are reclaimed from the DAX
-window/backend cache. Refault or a FUSE read reloads from the local segment.
+window/backend cache. Refault or a FUSE read reloads from a local `.blx` file.
 The eviction structure mirrors the multi-generational LRU, with compute memory
 receiving the higher residency affinity of R2.4 and every storage page sharing
 the lower class.
@@ -134,20 +129,22 @@ page-cache pages and divergence is kernel copy-on-write.
 ### Local capture, peer-protected sync, asynchronous archival
 
 Captures complete on local NVMe (R3.6), while guest sync acknowledgement also
-requires a durable passive copy (R4.1). The passive archives committed state
-asynchronously, independent of checkpoints (R4.2). Restore fetches only the
-head, manifest, and resume set before the guest's first instruction; pages
-follow on demand (R6.2). Fault sources prefer local NVMe, then a peer, then the
-store (R2.3).
+requires a durable passive copy (R4.1). The primary archives protected state
+asynchronously, independent of checkpoints. Restore fetches only the head,
+manifest, and resume set before the guest's first instruction; pages follow on
+demand (R6.2). Fault sources prefer local NVMe, then a peer, then the store
+(R2.3).
 
 Peer-stashed durability changes only the acknowledgment point of guest disk
 sync. The primary appends the exact compressed recovery closure to one passive
 peer and waits for that peer's durable commit footer. It does not wait for the
 object store, copy guest RAM, or fan out to the peer's placement candidates.
-The passive peer subsequently uploads those same stored bytes;
-the primary performs only the small fenced manifest/head publication. Once the
-head covers the peer commit, cleanup unlinks wholly covered sealed spool files
-without compaction or data rewrite.
+After protection, the primary independently merges unpublished local records
+through a selected protected cut, uploads the resulting archive objects and
+full manifest, and publishes the manifest through the fenced head CAS. The
+passive never uploads to the object store; it remains the durable recovery copy
+until the primary's published archive covers its commit. Cleanup then releases
+wholly covered sealed spool files without entering the guest sync path.
 
 The per-vset head remains the global authority. Besides holder and writer
 fence, a peer-stashed head records one active stash, an assignment epoch, and
@@ -175,7 +172,9 @@ Post-copy: a compute source pauses and captures a final whole record; a
 database source first retires its attachment and captures a final commit
 record. Either source makes an outbound handoff marker durable before offering,
 and the destination makes the record durable as its own first journal entry
-before resuming a compute guest or declaring a database ready and detached.
+before resuming a compute guest or declaring a database ready and detached. A
+compute offer normally carries the captured VMM bytes directly; if it cannot,
+the destination verifies and reads those bytes from the source before resume.
 Whichever side crashes, at most one host can own the vset (R6.3/R7.2); a source
 recovering with an intact marker serves fetches and never runs or attaches it.
 

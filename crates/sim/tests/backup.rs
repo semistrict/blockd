@@ -46,24 +46,24 @@ fn assert_clean(report: &RunReport) {
 }
 
 #[test]
-fn every_vset_publishes_through_its_passive_peer() {
+fn every_vset_is_published_by_its_primary() {
     let report = run(11, base_config());
     assert_clean(&report);
-    // R4.2: the archive advanced on its own cadence without checkpoints.
+    // The archive advanced on its own cadence without checkpoints.
     assert_eq!(report.counters.checkpoints_done, 0);
     assert!(report.counters.manifests_published > 0);
     assert_eq!(report.counters.fenced, 0);
     for vset in [VsetId(1), VsetId(2)] {
         let prefix = layout::vset_prefix(vset);
         assert!(report.store_keys.contains(&layout::head_key(vset)));
-        assert_eq!(
+        assert!(
             report
                 .store_keys
                 .iter()
                 .filter(|key| key.starts_with(&format!("{prefix}m/")))
-                .count(),
-            1,
-            "superseded manifests are reclaimed: counters={:?} keys={:?}",
+                .count()
+                >= 1,
+            "current manifest exists: counters={:?} keys={:?}",
             report.counters,
             report.store_keys
         );

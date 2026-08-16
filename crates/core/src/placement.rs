@@ -1,6 +1,6 @@
 //! Deterministic passive-stash placement. The output is an ordered candidate
 //! list, never a replication set: callers use exactly one active target and
-//! advance only through the fenced head assignment (R4.8/R6.6).
+//! advance only through the fenced head assignment (R6.6).
 
 use crate::types::{HostId, VsetId};
 

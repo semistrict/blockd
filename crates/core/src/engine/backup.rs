@@ -1,19 +1,27 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use blockd_exec::delay;
 
 use super::SharedHost;
 use super::capture::finish_creation;
+use super::replica::retry_replica_releases;
 use super::state::PublicationOwner;
+use crate::blx::{
+    BatchMeta, BlxCompactor, MAX_OVERLAPPING_FILES, NamespaceKind, compaction_object_id_start,
+    open_object,
+};
+use crate::format::checksum64;
 use crate::head::{HeadRecord, ManifestPtr, StashAssignment};
-use crate::journal::{JournalRecord, VsetConfig};
+use crate::journal::{JournalRecord, RecordKind, VsetConfig, VsetKind};
 use crate::layout;
-use crate::mapleaf::MapLeaf;
+use crate::manifest::{
+    BaseManifest, BaseRef, BaseRoot, CompleteFileList, Manifest, ObjectRef, RecoveryKind,
+    bound_manifest, max_object_overlap, validate_file_state_chain, validate_object_refs,
+};
 use crate::protocol::{AdminError, AdminEvent, AdminResult, AdminSuccess, StoreFault};
-use crate::segment::scan_segment;
 use crate::types::{JournalSeq, SegId, VsetId};
-use crate::world::{AdminIo, Blobs, GuestMem, Store, StoreError};
+use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
 
 pub async fn create_backed<W>(
     state: SharedHost,
@@ -22,7 +30,7 @@ pub async fn create_backed<W>(
     config: VsetConfig,
 ) -> Option<AdminResult>
 where
-    W: Blobs + Store + GuestMem + AdminIo + 'static,
+    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
     let duplicate = state.borrow().vsets.contains_key(&vset);
     if duplicate {
@@ -53,7 +61,7 @@ where
             return false;
         };
         vset_state.backed.is_some_and(|pointer| {
-            (pointer.capture_seq, pointer.seq) == (record.capture_seq, record.seq)
+            (pointer.capture_seq, pointer.journal_seq) >= (record.capture_seq, record.seq)
         })
     });
     if published {
@@ -151,7 +159,7 @@ pub(super) async fn claim_new_head_with_stash<W: Store>(
 #[allow(clippy::too_many_lines)]
 pub async fn publish_latest<W>(state: SharedHost, world: Rc<W>, vset: VsetId)
 where
-    W: Blobs + Store + GuestMem + AdminIo + 'static,
+    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
 {
     let Some((incarnation, retry)) = ({
         let mut host = state.borrow_mut();
@@ -167,101 +175,65 @@ where
     };
     let lease = PublishLease::new(&state, vset, incarnation);
     'publish: while let Some(snapshot) = publish_snapshot(&state, vset, incarnation) {
-        if snapshot.backed.is_some_and(|backed| {
-            (backed.capture_seq, backed.seq) >= (snapshot.pointer.capture_seq, snapshot.pointer.seq)
-        }) {
+        if publication_interrupted(&state, vset, incarnation) {
             break;
         }
-        let pending_key =
-            layout::pending_manifest_key(vset, snapshot.pointer.fence, snapshot.pointer.seq);
-        if put_retry(
+        {
+            let mut host = state.borrow_mut();
+            let Some(vset_state) = host
+                .vsets
+                .get_mut(&vset)
+                .filter(|vset| vset.incarnation == incarnation)
+            else {
+                return;
+            };
+            vset_state
+                .publishing_segments
+                .clone_from(&snapshot.segments);
+        }
+        let already_published = snapshot.published_commit.is_some_and(|published| {
+            (published.writer_fence, published.seq)
+                >= (snapshot.commit.writer_fence, snapshot.commit.seq)
+                && published.sync_covered_through >= snapshot.commit.sync_covered_through
+        }) || (snapshot.published_commit.is_none()
+            && snapshot
+                .backed
+                .is_some_and(|backed| backed.capture_seq >= snapshot.record.capture_seq));
+        let compact_only = already_published
+            && archive_needs_compaction(&state, world.as_ref(), vset, snapshot.backed, retry).await;
+        if publication_interrupted(&state, vset, incarnation) {
+            break;
+        }
+        if already_published && !compact_only {
+            break;
+        }
+        let Some(prepared) = prepare_archive(
             &state,
             world.as_ref(),
-            pending_key.clone(),
-            snapshot.record.clone(),
+            vset,
+            incarnation,
+            &snapshot,
             retry,
+            compact_only,
         )
         .await
-        .is_none()
-        {
-            state.borrow_mut().fail("pending manifest write failed");
-            return;
-        }
-        for (fence, segment) in snapshot.segments {
-            let name = layout::segment_blob(vset, fence, segment);
-            let Some(bytes) = read_blob_retry(world.as_ref(), &name, retry).await else {
-                delay(retry).await;
-                continue 'publish;
-            };
-            if !scan_segment(&bytes).is_ok_and(|(found_vset, found_fence, found_segment, _)| {
-                (found_vset, found_fence, found_segment) == (vset, fence, segment)
-            }) {
-                delay(retry).await;
-                continue 'publish;
+        else {
+            if publication_interrupted(&state, vset, incarnation) {
+                break;
             }
-            if put_retry(
-                &state,
-                world.as_ref(),
-                layout::segment_key(vset, fence, segment),
-                bytes,
-                retry,
-            )
-            .await
-            .is_none()
-            {
-                state.borrow_mut().fail("segment backup failed");
-                return;
-            }
-            if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                vset_state.backed_segments.insert((fence, segment));
-            }
-        }
-        for (fence, id) in snapshot.leaves {
-            let name = layout::leaf_blob(vset, fence, id);
-            let Some(bytes) = read_blob_retry(world.as_ref(), &name, retry).await else {
-                delay(retry).await;
-                continue 'publish;
-            };
-            if MapLeaf::decode(vset, fence, id, &bytes).is_err() {
-                delay(retry).await;
-                continue 'publish;
-            }
-            if put_retry(
-                &state,
-                world.as_ref(),
-                layout::leaf_key(vset, fence, id),
-                bytes,
-                retry,
-            )
-            .await
-            .is_none()
-            {
-                state.borrow_mut().fail("map-leaf backup failed");
-                return;
-            }
-            if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
-                vset_state.backed_leaves.insert((fence, id));
-            }
-        }
-        if put_retry(
-            &state,
-            world.as_ref(),
-            layout::manifest_key(vset, snapshot.pointer.fence, snapshot.pointer.seq),
-            snapshot.record,
-            retry,
-        )
-        .await
-        .is_none()
-        {
-            state.borrow_mut().fail("manifest backup failed");
-            return;
+            delay(retry).await;
+            continue 'publish;
+        };
+        if publication_interrupted(&state, vset, incarnation) {
+            let _ = Store::delete(world.as_ref(), &prepared.pending_key).await;
+            break;
         }
         match publish_head(
             &state,
             world.as_ref(),
             vset,
             incarnation,
-            snapshot.pointer,
+            prepared.pointer,
             retry,
         )
         .await
@@ -277,10 +249,17 @@ where
                         return;
                     };
                     vset_state.head_version = Some(version);
-                    vset_state.backed = Some(snapshot.pointer);
+                    vset_state.backed = Some(prepared.pointer);
+                    vset_state
+                        .backed_segments
+                        .extend(snapshot.segments.iter().copied());
+                    if vset_state.stash_assignment.is_some() {
+                        vset_state.peer_published = Some(snapshot.commit);
+                    }
                     host.counters.manifests_published += 1;
                 }
-                let _ = Store::delete(world.as_ref(), &pending_key).await;
+                let _ = Store::delete(world.as_ref(), &prepared.pending_key).await;
+                retry_replica_releases(Rc::clone(&state), Rc::clone(&world), vset).await;
             }
             PublishHead::Fenced => {
                 fence_vset(&state, world.as_ref(), vset, Some(incarnation)).await;
@@ -293,6 +272,17 @@ where
         }
     }
     lease.commit();
+}
+
+fn publication_interrupted(state: &SharedHost, vset: VsetId, incarnation: u64) -> bool {
+    state
+        .borrow()
+        .vsets
+        .get(&vset)
+        .filter(|vset_state| vset_state.incarnation == incarnation)
+        .is_none_or(|vset_state| {
+            vset_state.operations.migration_running() || vset_state.outbound.is_some()
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -325,6 +315,12 @@ where
         match Store::get(world.as_ref(), &layout::head_key(vset)).await {
             Ok(Some((version, bytes))) => {
                 let Ok(head) = HeadRecord::decode(vset, &bytes) else {
+                    fence_vset(&state, world.as_ref(), vset, None).await;
+                    return None;
+                };
+                let Some((archive_objects, archive_base)) =
+                    load_archive_closure(&state, world.as_ref(), vset, head.manifest, retry).await
+                else {
                     fence_vset(&state, world.as_ref(), vset, None).await;
                     return None;
                 };
@@ -376,6 +372,12 @@ where
                                     .filter(|vset_state| vset_state.incarnation == incarnation)?;
                                 vset_state.head_version = Some(upgraded_version);
                                 vset_state.backed = upgraded.manifest;
+                                install_archive_closure(
+                                    vset_state,
+                                    vset,
+                                    &archive_objects,
+                                    archive_base,
+                                );
                                 vset_state.peer_published = peer_published;
                                 if let Some(manifest) = upgraded.manifest {
                                     vset_state
@@ -427,9 +429,9 @@ where
                             .map_or((0, JournalSeq(0)), |record| {
                                 (record.capture_seq, record.seq)
                             });
-                        let behind = head
-                            .manifest
-                            .is_some_and(|manifest| (manifest.capture_seq, manifest.seq) > local);
+                        let behind = head.manifest.is_some_and(|manifest| {
+                            (manifest.capture_seq, manifest.journal_seq) > local
+                        });
                         head.holder == local_host
                             && (head.fence == 0 || head.fence == vset_state.fence)
                             && !behind
@@ -450,9 +452,9 @@ where
                         .map_or((0, JournalSeq(0)), |record| {
                             (record.capture_seq, record.seq)
                         });
-                    let behind = head
-                        .manifest
-                        .is_some_and(|manifest| (manifest.capture_seq, manifest.seq) > local);
+                    let behind = head.manifest.is_some_and(|manifest| {
+                        (manifest.capture_seq, manifest.journal_seq) > local
+                    });
                     if head.holder != local_host
                         || (head.fence != 0 && head.fence != vset_state.fence)
                         || behind
@@ -461,6 +463,7 @@ where
                     } else {
                         vset_state.head_version = Some(version);
                         vset_state.backed = head.manifest;
+                        install_archive_closure(vset_state, vset, &archive_objects, archive_base);
                         vset_state.peer_published = peer_published;
                         if let Some(manifest) = head.manifest {
                             vset_state
@@ -559,6 +562,70 @@ where
     }
 }
 
+fn install_archive_closure(
+    vset_state: &mut super::state::VsetState,
+    vset: VsetId,
+    objects: &[ObjectRef],
+    base: Option<BaseRef>,
+) {
+    vset_state.archive_objects = objects.to_vec();
+    vset_state.archive_base = base;
+    vset_state.archive_footers.clear();
+    vset_state.archive_resolved_pages.clear();
+    vset_state.backed_segments = objects
+        .iter()
+        .filter(|object| {
+            object.identity.namespace_kind == NamespaceKind::Vset
+                && object.identity.namespace_id == vset.0
+        })
+        .map(|object| {
+            (
+                object.identity.writer_fence,
+                SegId(object.identity.object_id),
+            )
+        })
+        .collect();
+}
+
+async fn load_archive_closure<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+    pointer: Option<ManifestPtr>,
+    retry: u64,
+) -> Option<(Vec<ObjectRef>, Option<BaseRef>)> {
+    let Some(pointer) = pointer else {
+        return Some((Vec::new(), None));
+    };
+    let Some((manifest, list)) =
+        load_archive_metadata(state, world, vset, Some(pointer), retry).await?
+    else {
+        return None;
+    };
+    let mut objects = match manifest.base {
+        None => Vec::new(),
+        Some(reference) => {
+            let root = BaseRoot {
+                base_id: reference.base_id,
+                manifest_id: reference.manifest_id,
+                manifest_checksum: reference.manifest_checksum,
+                post_state_checksum: reference.post_state_checksum,
+            };
+            let bytes = get_retry(
+                state,
+                world,
+                &layout::base_manifest_key(reference.base_id, reference.manifest_id),
+                retry,
+            )
+            .await?;
+            BaseManifest::decode(root, &bytes).ok()?.objects
+        }
+    };
+    objects.extend(manifest.current_files(list.as_ref()).ok()?);
+    validate_object_refs(&objects).ok()?;
+    Some((objects, manifest.base))
+}
+
 async fn recover_peer_published<W: Store>(
     state: &SharedHost,
     world: &W,
@@ -567,18 +634,6 @@ async fn recover_peer_published<W: Store>(
     retry: u64,
 ) -> Option<crate::protocol::ReplicaCommitInfo> {
     let pointer = pointer?;
-    if let Some(info) = state.borrow().vsets.get(&vset).and_then(|vset_state| {
-        let record = vset_state.best_record.as_ref()?;
-        ((pointer.fence, pointer.seq) == (record.fence, record.seq)).then_some(
-            crate::protocol::ReplicaCommitInfo {
-                writer_fence: record.fence,
-                seq: record.seq,
-                sync_covered_through: record.sync_covered_through,
-            },
-        )
-    }) {
-        return Some(info);
-    }
     loop {
         match Store::get(
             world,
@@ -587,14 +642,28 @@ async fn recover_peer_published<W: Store>(
         .await
         {
             Ok(Some((_, bytes))) => {
-                let record = JournalRecord::decode(vset, &bytes).ok()?;
-                if (record.fence, record.seq) != (pointer.fence, pointer.seq) {
+                if checksum64(&bytes) != pointer.checksum {
                     return None;
                 }
-                return Some(crate::protocol::ReplicaCommitInfo {
-                    writer_fence: record.fence,
-                    seq: record.seq,
-                    sync_covered_through: record.sync_covered_through,
+                let manifest = Manifest::decode(vset, &bytes).ok()?;
+                if (
+                    manifest.writer_fence,
+                    manifest.journal_seq,
+                    manifest.archive_seq,
+                ) != (pointer.fence, pointer.journal_seq.0, pointer.seq.0)
+                {
+                    return None;
+                }
+                return state.borrow().vsets.get(&vset).and_then(|vset_state| {
+                    let record = vset_state.best_record.as_ref()?;
+                    (manifest.journal_seq == record.seq.0
+                        && manifest.capture_seq == record.capture_seq
+                        && manifest.metadata_checksum == checksum64(&record.encode(vset)))
+                    .then_some(crate::protocol::ReplicaCommitInfo {
+                        writer_fence: record.fence,
+                        seq: record.seq,
+                        sync_covered_through: record.sync_covered_through,
+                    })
                 });
             }
             Err(StoreError::Fault(StoreFault::Unavailable)) => {
@@ -610,11 +679,15 @@ async fn recover_peer_published<W: Store>(
 }
 
 struct PublishSnapshot {
-    pointer: ManifestPtr,
-    record: Vec<u8>,
-    segments: Vec<(u64, SegId)>,
-    leaves: Vec<(u64, u64)>,
+    record: JournalRecord,
+    base: Option<BaseRef>,
+    base_objects: Vec<ObjectRef>,
+    segments: BTreeSet<(u64, SegId)>,
+    segment_refs: Vec<ObjectRef>,
     backed: Option<ManifestPtr>,
+    published_commit: Option<crate::protocol::ReplicaCommitInfo>,
+    commit: crate::protocol::ReplicaCommitInfo,
+    state_checksum: u64,
 }
 
 fn publish_snapshot(state: &SharedHost, vset: VsetId, incarnation: u64) -> Option<PublishSnapshot> {
@@ -623,34 +696,427 @@ fn publish_snapshot(state: &SharedHost, vset: VsetId, incarnation: u64) -> Optio
         .vsets
         .get(&vset)
         .filter(|vset| vset.incarnation == incarnation)?;
-    let record = vset_state.best_record.as_ref()?;
-    let pointer = ManifestPtr {
-        fence: record.fence,
-        seq: record.seq,
-        capture_seq: record.capture_seq,
+    let record = if vset_state.stash_assignment.is_some() {
+        vset_state.peer_committed_record.as_ref()?
+    } else {
+        vset_state.best_record.as_ref()?
     };
-    let mut segments = record
-        .overlay
-        .values()
-        .filter(|(_, location)| location.base == 0)
-        .map(|(_, location)| (location.fence, location.seg))
+    let segment_refs = record
+        .files
+        .iter()
+        .filter(|file| {
+            file.identity.namespace_kind == NamespaceKind::Vset
+                && file.identity.namespace_id == vset.0
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let segments = segment_refs
+        .iter()
+        .map(|file| (file.identity.writer_fence, SegId(file.identity.object_id)))
         .collect::<BTreeSet<_>>();
-    let mut leaves = BTreeSet::new();
-    for pointer in record.leaves.values().filter(|pointer| pointer.base == 0) {
-        leaves.insert((pointer.fence, pointer.id));
-        if let Some((_, leaf_segments)) = vset_state.leaf_blobs.get(pointer) {
-            segments.extend(leaf_segments);
+    Some(PublishSnapshot {
+        record: record.clone(),
+        base: vset_state.archive_base,
+        base_objects: vset_state
+            .archive_objects
+            .iter()
+            .filter(|object| {
+                object.identity.namespace_kind != NamespaceKind::Vset
+                    || object.identity.namespace_id != vset.0
+            })
+            .copied()
+            .collect(),
+        segments,
+        segment_refs,
+        backed: vset_state.backed,
+        published_commit: vset_state.peer_published,
+        commit: crate::protocol::ReplicaCommitInfo {
+            writer_fence: record.fence,
+            seq: record.seq,
+            sync_covered_through: record.sync_covered_through,
+        },
+        state_checksum: record.post_state_checksum,
+    })
+}
+
+struct PreparedArchive {
+    pointer: ManifestPtr,
+    pending_key: String,
+}
+
+async fn archive_needs_compaction<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+    pointer: Option<ManifestPtr>,
+    retry: u64,
+) -> bool {
+    let Some(Some((manifest, list))) =
+        load_archive_metadata(state, world, vset, pointer, retry).await
+    else {
+        return false;
+    };
+    manifest
+        .current_files(list.as_ref())
+        .is_ok_and(|files| max_object_overlap(&files) >= MAX_OVERLAPPING_FILES)
+}
+
+fn source_object_is_covered(frontier: Option<(u64, u64)>, writer_fence: u64, max_seq: u64) -> bool {
+    frontier.is_some_and(|(fence, seq)| writer_fence == fence && max_seq <= seq)
+}
+
+async fn prepare_archive<W: Blobs + Store>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+    incarnation: u64,
+    snapshot: &PublishSnapshot,
+    retry: u64,
+    force_compaction: bool,
+) -> Option<PreparedArchive> {
+    let Some(previous) = load_archive_metadata(state, world, vset, snapshot.backed, retry).await
+    else {
+        return None;
+    };
+    if publication_interrupted(state, vset, incarnation) {
+        return None;
+    }
+    let previous_files = match &previous {
+        None => Vec::new(),
+        Some((manifest, list)) => manifest.current_files(list.as_ref()).ok()?,
+    };
+    let previous_source_frontier = previous
+        .as_ref()
+        .map(|(manifest, _)| (manifest.writer_fence, manifest.journal_seq));
+    let mut current = previous_files
+        .into_iter()
+        .map(|object| (object.identity, object))
+        .collect::<BTreeMap<_, _>>();
+    for reference in &snapshot.segment_refs {
+        if publication_interrupted(state, vset, incarnation) {
+            return None;
+        }
+        let identity = reference.identity;
+        let fence = identity.writer_fence;
+        let segment = SegId(identity.object_id);
+        if current.contains_key(&identity) {
+            continue;
+        }
+        if source_object_is_covered(
+            previous_source_frontier,
+            identity.writer_fence,
+            reference.max_seq,
+        ) {
+            continue;
+        }
+        let bytes =
+            read_blob_retry(world, &layout::segment_blob(vset, fence, segment), retry).await?;
+        let object = open_object(&bytes).ok()?;
+        if ObjectRef::from_blx(&object) != *reference {
+            return None;
+        }
+        put_immutable_retry(state, world, identity.store_key(), bytes, retry).await?;
+        if publication_interrupted(state, vset, incarnation) {
+            return None;
+        }
+        current.insert(identity, *reference);
+    }
+
+    let mut current_files = current.into_values().collect::<Vec<_>>();
+    let combined_valid = |own: &[ObjectRef]| {
+        let mut combined = snapshot.base_objects.clone();
+        combined.extend_from_slice(own);
+        validate_object_refs(&combined).is_ok()
+    };
+    let base_checksum = snapshot.base.map_or(0, |base| base.post_state_checksum);
+    if !combined_valid(&current_files)
+        || validate_file_state_chain(base_checksum, snapshot.state_checksum, &current_files)
+            .is_err()
+        || (force_compaction && max_object_overlap(&current_files) >= MAX_OVERLAPPING_FILES)
+    {
+        // Compacted bytes are immutable and materialize one exact journal
+        // state. A failed head publication may retry the same archive number
+        // with a newer journal state, so the archive number cannot safely
+        // identify these objects.
+        let mut groups = BTreeMap::new();
+        for reference in &current_files {
+            let partition = reference.first_key.file_partition();
+            if reference.last_key.file_partition() != partition {
+                return None;
+            }
+            groups
+                .entry(partition)
+                .or_insert_with(Vec::new)
+                .push(*reference);
+        }
+        let mut next_object_id = compaction_object_id_start(snapshot.record.seq.0)?;
+        current_files.clear();
+        for references in groups.into_values() {
+            if publication_interrupted(state, vset, incarnation) {
+                return None;
+            }
+            let mut compactor = BlxCompactor::default();
+            for reference in references {
+                let bytes = get_retry(state, world, &reference.identity.store_key(), retry).await?;
+                if checksum64(&bytes) != reference.object_checksum {
+                    return None;
+                }
+                compactor.add_object(&bytes).ok()?;
+            }
+            let compacted = compactor.finish(
+                BatchMeta {
+                    namespace_kind: NamespaceKind::Vset,
+                    namespace_id: vset.0,
+                    writer_fence: snapshot.record.fence,
+                    first_object_id: next_object_id,
+                    min_seq: snapshot.record.seq.0,
+                    max_seq: snapshot.record.seq.0,
+                    batch_id: next_object_id,
+                    pre_state_checksum: snapshot.state_checksum,
+                    post_state_checksum: snapshot.state_checksum,
+                },
+                true,
+            );
+            next_object_id = next_object_id.checked_add(u64::try_from(compacted.len()).ok()?)?;
+            for object in compacted {
+                let reference = ObjectRef::from_blx(&object);
+                put_immutable_retry(
+                    state,
+                    world,
+                    reference.identity.store_key(),
+                    object.bytes,
+                    retry,
+                )
+                .await?;
+                if publication_interrupted(state, vset, incarnation) {
+                    return None;
+                }
+                current_files.push(reference);
+            }
+        }
+        if !combined_valid(&current_files)
+            || validate_file_state_chain(base_checksum, snapshot.state_checksum, &current_files)
+                .is_err()
+        {
+            return None;
         }
     }
-    segments.retain(|segment| !vset_state.backed_segments.contains(segment));
-    leaves.retain(|leaf| !vset_state.backed_leaves.contains(leaf));
-    Some(PublishSnapshot {
+    let (complete_list, added, removed, mut new_list) = match &previous {
+        None => {
+            let list = CompleteFileList {
+                vset,
+                writer_fence: snapshot.record.fence,
+                list_id: snapshot.record.seq.0,
+                objects: current_files.clone(),
+            };
+            (Some(list.reference()), Vec::new(), Vec::new(), Some(list))
+        }
+        Some((previous_manifest, previous_list)) => {
+            let baseline = previous_list.as_ref().map_or_else(BTreeMap::new, |list| {
+                list.objects
+                    .iter()
+                    .copied()
+                    .map(|object| (object.identity, object))
+                    .collect()
+            });
+            let current = current_files
+                .iter()
+                .copied()
+                .map(|object| (object.identity, object))
+                .collect::<BTreeMap<_, _>>();
+            let added = current
+                .iter()
+                .filter(|(identity, _)| !baseline.contains_key(identity))
+                .map(|(_, object)| *object)
+                .collect();
+            let removed = baseline
+                .keys()
+                .filter(|identity| !current.contains_key(identity))
+                .copied()
+                .collect();
+            (previous_manifest.complete_list, added, removed, None)
+        }
+    };
+    let (recovery_kind, checkpoint_epoch, vmstate_logical_length) = match snapshot.record.kind {
+        RecordKind::Checkpoint {
+            epoch,
+            vmstate_logical_length,
+            ..
+        } if snapshot.record.capture_seq >= snapshot.record.sync_covered_through => {
+            (RecoveryKind::Whole, epoch, vmstate_logical_length)
+        }
+        _ if snapshot.record.config.kind == VsetKind::Database => {
+            (RecoveryKind::Database, crate::types::Epoch(0), 0)
+        }
+        _ => (RecoveryKind::DiskOnly, crate::types::Epoch(0), 0),
+    };
+    let archive_seq = previous
+        .as_ref()
+        .map_or(0, |(manifest, _)| manifest.archive_seq.saturating_add(1));
+    let manifest = Manifest {
+        vset,
+        writer_fence: snapshot.record.fence,
+        journal_seq: snapshot.record.seq.0,
+        archive_seq,
+        capture_seq: snapshot.record.capture_seq,
+        sync_covered_through: snapshot.record.sync_covered_through,
+        recovery_kind,
+        checkpoint_epoch,
+        config: snapshot.record.config,
+        database: snapshot.record.database,
+        vmstate_logical_length,
+        base: snapshot.base,
+        complete_list,
+        post_state_checksum: snapshot.state_checksum,
+        metadata_checksum: checksum64(&snapshot.record.encode(vset)),
+        added,
+        removed,
+    };
+    let prior_list = previous.as_ref().and_then(|(_, list)| list.as_ref());
+    let bounded = bound_manifest(manifest, prior_list, archive_seq).ok()?;
+    if bounded.new_complete_list.is_some() {
+        new_list = bounded.new_complete_list;
+    }
+    if let Some(list) = new_list {
+        let bytes = list.encode();
+        put_immutable_retry(
+            state,
+            world,
+            layout::complete_file_list_key(vset, list.writer_fence, list.list_id),
+            bytes,
+            retry,
+        )
+        .await?;
+        if publication_interrupted(state, vset, incarnation) {
+            return None;
+        }
+    }
+    let manifest_bytes = bounded.manifest.encode().ok()?;
+    let pointer = ManifestPtr {
+        fence: bounded.manifest.writer_fence,
+        journal_seq: JournalSeq(bounded.manifest.journal_seq),
+        seq: JournalSeq(bounded.manifest.archive_seq),
+        capture_seq: bounded.manifest.capture_seq,
+        checksum: checksum64(&manifest_bytes),
+    };
+    let pending_key = layout::pending_manifest_key(vset, pointer.fence, pointer.seq);
+    put_retry(
+        state,
+        world,
+        pending_key.clone(),
+        manifest_bytes.clone(),
+        retry,
+    )
+    .await?;
+    if publication_interrupted(state, vset, incarnation) {
+        return None;
+    }
+    put_immutable_retry(
+        state,
+        world,
+        layout::manifest_key(vset, pointer.fence, pointer.seq),
+        manifest_bytes,
+        retry,
+    )
+    .await?;
+    Some(PreparedArchive {
         pointer,
-        record: record.encode(vset),
-        segments: segments.into_iter().collect(),
-        leaves: leaves.into_iter().collect(),
-        backed: vset_state.backed,
+        pending_key,
     })
+}
+
+async fn load_archive_metadata<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+    pointer: Option<ManifestPtr>,
+    retry: u64,
+) -> Option<Option<(Manifest, Option<CompleteFileList>)>> {
+    let Some(pointer) = pointer else {
+        return Some(None);
+    };
+    let bytes = get_retry(
+        state,
+        world,
+        &layout::manifest_key(vset, pointer.fence, pointer.seq),
+        retry,
+    )
+    .await?;
+    if checksum64(&bytes) != pointer.checksum {
+        return None;
+    }
+    let manifest = Manifest::decode(vset, &bytes).ok()?;
+    if (
+        manifest.writer_fence,
+        manifest.journal_seq,
+        manifest.archive_seq,
+        manifest.capture_seq,
+    ) != (
+        pointer.fence,
+        pointer.journal_seq.0,
+        pointer.seq.0,
+        pointer.capture_seq,
+    ) {
+        return None;
+    }
+    let list = if let Some(reference) = manifest.complete_list {
+        let bytes = get_retry(
+            state,
+            world,
+            &layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id),
+            retry,
+        )
+        .await?;
+        Some(CompleteFileList::decode(reference, vset, &bytes).ok()?)
+    } else {
+        None
+    };
+    Some(Some((manifest, list)))
+}
+
+async fn get_retry<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    key: &str,
+    retry: u64,
+) -> Option<Vec<u8>> {
+    loop {
+        match Store::get(world, key).await {
+            Ok(Some((_, bytes))) => return Some(bytes),
+            Ok(None) | Err(StoreError::TooLarge) => return None,
+            Err(StoreError::Fault(StoreFault::Unavailable)) => {
+                state.borrow_mut().counters.store_retries += 1;
+                delay(retry).await;
+            }
+            Err(StoreError::Fault(StoreFault::CasConflict { .. })) => return None,
+        }
+    }
+}
+
+async fn put_immutable_retry<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    key: String,
+    bytes: Vec<u8>,
+    retry: u64,
+) -> Option<u64> {
+    loop {
+        match Store::put_cas(world, key.clone(), None, bytes.clone()).await {
+            Ok(version) => return Some(version),
+            Err(StoreError::Fault(StoreFault::CasConflict { .. })) => {
+                let Some((version, found)) = Store::get(world, &key).await.ok().flatten() else {
+                    delay(retry).await;
+                    continue;
+                };
+                return (found == bytes).then_some(version);
+            }
+            Err(StoreError::Fault(StoreFault::Unavailable)) => {
+                state.borrow_mut().counters.store_retries += 1;
+                delay(retry).await;
+            }
+            Err(StoreError::TooLarge) => return None,
+        }
+    }
 }
 
 async fn read_blob_retry<W: Blobs>(world: &W, name: &str, retry: u64) -> Option<Vec<u8>> {
@@ -712,8 +1178,8 @@ async fn publish_head<W: Store>(
                             holder: host.config.host,
                             fence: vset_state.fence,
                             manifest: Some(pointer),
-                            stash: None,
-                            retired_stashes: Vec::new(),
+                            stash: vset_state.stash_assignment,
+                            retired_stashes: vset_state.retired_stashes.clone(),
                         },
                     ))
                 })
@@ -723,7 +1189,30 @@ async fn publish_head<W: Store>(
         match Store::put_cas(world, layout::head_key(vset), Some(expected), head.encode()).await {
             Ok(version) => return PublishHead::Published(version),
             Err(StoreError::Fault(StoreFault::CasConflict { .. })) => {
-                return PublishHead::Fenced;
+                match Store::get(world, &layout::head_key(vset)).await {
+                    Ok(Some((version, bytes))) => {
+                        let Ok(found) = HeadRecord::decode(vset, &bytes) else {
+                            return PublishHead::Fatal;
+                        };
+                        if found.holder != head.holder || found.fence != head.fence {
+                            return PublishHead::Fenced;
+                        }
+                        if found.manifest.is_some_and(|manifest| {
+                            (manifest.capture_seq, manifest.seq)
+                                >= (pointer.capture_seq, pointer.seq)
+                        }) {
+                            return PublishHead::Published(version);
+                        }
+                        if let Some(vset_state) = state.borrow_mut().vsets.get_mut(&vset) {
+                            vset_state.head_version = Some(version);
+                        }
+                    }
+                    Ok(None) => return PublishHead::Fenced,
+                    Err(StoreError::Fault(StoreFault::Unavailable)) => delay(retry).await,
+                    Err(
+                        StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge,
+                    ) => return PublishHead::Fatal,
+                }
             }
             Err(StoreError::TooLarge) => return PublishHead::Fatal,
             Err(StoreError::Fault(StoreFault::Unavailable)) => {
@@ -813,6 +1302,7 @@ impl PublishLease {
             .get_mut(&self.vset)
             .filter(|vset| vset.incarnation == self.incarnation)
         {
+            vset.publishing_segments.clear();
             vset.operations.finish_publication(PublicationOwner::Direct);
         }
         self.state.borrow_mut().schedule_vset(self.vset);
@@ -830,8 +1320,23 @@ impl Drop for PublishLease {
                 .get_mut(&self.vset)
                 .filter(|vset| vset.incarnation == self.incarnation)
         {
+            vset.publishing_segments.clear();
             vset.operations.finish_publication(PublicationOwner::Direct);
         }
         self.state.borrow_mut().schedule_vset(self.vset);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_object_is_covered;
+
+    #[test]
+    fn archive_source_frontier_is_scoped_to_one_writer_fence() {
+        let frontier = Some((9, 40));
+        assert!(source_object_is_covered(frontier, 9, 40));
+        assert!(source_object_is_covered(frontier, 9, 12));
+        assert!(!source_object_is_covered(frontier, 9, 41));
+        assert!(!source_object_is_covered(frontier, 10, 1));
     }
 }

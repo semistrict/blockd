@@ -121,14 +121,18 @@ fn write_blobs(root: &Path, blobs: &[(String, Vec<u8>)]) {
 fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
     let mut nontrivial = 0u64;
     for seed in [3, 5, 7, 11, 29, 104] {
-        let config = presets::single_host_chaos();
+        let mut config = presets::single_host_base();
+        // This test exercises local directory recovery. Keep the local
+        // recovery points present instead of letting archival publication
+        // reclaim every one before the snapshot is taken.
+        config.daemon.archive.interval = blockd_core::types::secs(60);
+        config.daemon.archive.max_unpublished_bytes = u64::MAX;
         let host_config = config.daemon.clone();
         let (report, blobs) = run_final_blobs(seed, config);
         assert_eq!(report.violations, Vec::<String>::new(), "seed {seed}");
         if blobs.is_empty() {
             continue;
         }
-
         let memory_side = recover(host_config.clone(), Rc::new(MemoryBlobs::new(&blobs)));
 
         let root = tempfile::tempdir().expect("recovery fixture");

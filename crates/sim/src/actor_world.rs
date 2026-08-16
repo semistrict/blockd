@@ -4,14 +4,14 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use blockd_core::blx::scan_object;
 use blockd_core::database::{DatabaseReply, DatabaseRequest};
 use blockd_core::engine::HostFatal;
 use blockd_core::head::HeadRecord;
-use blockd_core::journal::JournalRecord;
 use blockd_core::layout;
-use blockd_core::mapleaf::MapLeaf;
+use blockd_core::manifest::{CompleteFileList, Manifest};
 use blockd_core::protocol::{AdminCall, AdminEvent, AdminResult, PeerMsg, StoreFault};
-use blockd_core::types::{Gen, HostId, PageId, VolumeId, VsetId, page_size};
+use blockd_core::types::{Gen, HostId, PageId, VsetId, page_size};
 use blockd_core::world::{
     AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, DatabaseActorRequest, FillSource,
     GuestFault, GuestMem, GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store,
@@ -272,45 +272,32 @@ impl StoreState {
         else {
             return;
         };
-        let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
+        let Ok(manifest) = Manifest::decode(vset, record_bytes) else {
+            return;
+        };
+        let list = manifest.complete_list.and_then(|reference| {
+            let key =
+                layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id);
+            let (_, bytes) = self.objects.get(&key)?;
+            CompleteFileList::decode(reference, vset, bytes).ok()
+        });
+        let Ok(files) = manifest.current_files(list.as_ref()) else {
             return;
         };
         let mut current = BTreeMap::new();
-        for leaf_pointer in record.leaves.values() {
-            let (owner, leaf_key) = if leaf_pointer.base == 0 {
-                (
-                    vset,
-                    layout::leaf_key(vset, leaf_pointer.fence, leaf_pointer.id),
-                )
-            } else {
-                (
-                    VsetId(leaf_pointer.base),
-                    layout::base_leaf_key(leaf_pointer.base, leaf_pointer.fence, leaf_pointer.id),
-                )
-            };
-            let Some((_, leaf_bytes)) = self.objects.get(&leaf_key) else {
+        for file in files {
+            let Some((_, bytes)) = self.objects.get(&file.identity.store_key()) else {
                 continue;
             };
-            let Ok(leaf) = MapLeaf::decode(owner, leaf_pointer.fence, leaf_pointer.id, leaf_bytes)
-            else {
+            let Ok((_, footer)) = scan_object(bytes) else {
                 continue;
             };
-            for (idx, page, generation, _) in leaf.entries {
-                current.insert(
-                    PageId {
-                        volume: VolumeId { vset, idx },
-                        page,
-                    },
-                    generation,
-                );
+            for entry in footer.entries {
+                if let Some(page) = entry.key.to_page(manifest.config.kind, vset) {
+                    current.insert(page, entry.generation);
+                }
             }
         }
-        current.extend(
-            record
-                .overlay
-                .iter()
-                .map(|(&page, &(generation, _))| (page, generation)),
-        );
         let previous = self.archived_generations.entry(vset).or_default();
         let changed = current
             .iter()
@@ -707,8 +694,7 @@ impl SimWorld {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn published_archive_metrics(&self) -> (u64, u64, u64, u64) {
         let store = self.store.borrow();
-        let mut segments = BTreeSet::new();
-        let mut live_locations = BTreeSet::new();
+        let mut files = BTreeMap::new();
         for (key, (_, head_bytes)) in &store.objects {
             let Some(encoded_vset) = key
                 .strip_prefix("v/")
@@ -725,95 +711,61 @@ impl SimWorld {
             let Some(pointer) = head.manifest else {
                 continue;
             };
-            let Some((_, record_bytes)) =
+            let Some((_, manifest_bytes)) =
                 store
                     .objects
                     .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
             else {
                 continue;
             };
-            let Ok(record) = JournalRecord::decode(vset, record_bytes) else {
+            let Ok(manifest) = Manifest::decode(vset, manifest_bytes) else {
                 continue;
             };
-            for (_, location) in record.overlay.values() {
-                segments.insert((vset, location.base, location.fence, location.seg));
-                live_locations.insert((
-                    vset,
-                    location.base,
-                    location.fence,
-                    location.seg,
-                    location.offset,
-                    location.len,
-                ));
-            }
-            for leaf_pointer in record.leaves.values() {
-                let (owner, leaf_key) = if leaf_pointer.base == 0 {
-                    (
-                        vset,
-                        layout::leaf_key(vset, leaf_pointer.fence, leaf_pointer.id),
-                    )
-                } else {
-                    (
-                        VsetId(leaf_pointer.base),
-                        layout::base_leaf_key(
-                            leaf_pointer.base,
-                            leaf_pointer.fence,
-                            leaf_pointer.id,
-                        ),
-                    )
-                };
-                let Some((_, leaf_bytes)) = store.objects.get(&leaf_key) else {
-                    continue;
-                };
-                let Ok(leaf) =
-                    MapLeaf::decode(owner, leaf_pointer.fence, leaf_pointer.id, leaf_bytes)
-                else {
-                    continue;
-                };
-                for (_, _, _, location) in leaf.entries {
-                    segments.insert((vset, location.base, location.fence, location.seg));
-                    live_locations.insert((
-                        vset,
-                        location.base,
-                        location.fence,
-                        location.seg,
-                        location.offset,
-                        location.len,
-                    ));
-                }
-            }
+            let list = manifest.complete_list.and_then(|reference| {
+                let key =
+                    layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id);
+                let (_, bytes) = store.objects.get(&key)?;
+                CompleteFileList::decode(reference, vset, bytes).ok()
+            });
+            let Ok(current) = manifest.current_files(list.as_ref()) else {
+                continue;
+            };
+            files.extend(current.into_iter().map(|file| (file.identity, file)));
         }
 
         let mut total = 0_u64;
-        let mut live = 0_u64;
-        let mut dead = 0_u64;
-        for (vset, base, fence, segment) in segments {
-            let key = if base == 0 {
-                layout::segment_key(vset, fence, segment)
-            } else {
-                layout::base_segment_key(base, fence, segment)
-            };
-            let Some((_, bytes)) = store.objects.get(&key) else {
+        let mut newest = BTreeMap::new();
+        let mut indexed = Vec::new();
+        for file in files.values() {
+            let Some((_, bytes)) = store.objects.get(&file.identity.store_key()) else {
                 continue;
             };
-            let Ok((_, _, _, entries)) = blockd_core::segment::scan_segment(bytes) else {
+            let Ok((_, footer)) = scan_object(bytes) else {
                 continue;
             };
             total = total.saturating_add(bytes.len() as u64);
-            for (_, _, location) in entries {
-                let size = u64::from(location.len);
-                if live_locations.contains(&(
-                    vset,
-                    base,
-                    fence,
-                    segment,
-                    location.offset,
-                    location.len,
-                )) {
-                    live = live.saturating_add(size);
-                } else {
-                    dead = dead.saturating_add(size);
+            for entry in footer.entries {
+                let location = (file.identity, entry.offset, entry.length);
+                if newest
+                    .get(&entry.key)
+                    .is_none_or(|(generation, _)| *generation <= entry.generation)
+                {
+                    newest.insert(entry.key, (entry.generation, location));
                 }
+                indexed.push((location, u64::from(entry.length)));
+            }
+        }
+        let live_locations = newest
+            .into_values()
+            .map(|(_, location)| location)
+            .collect::<BTreeSet<_>>();
+        let mut live = 0_u64;
+        let mut dead = 0_u64;
+        for (location, size) in indexed {
+            if live_locations.contains(&location) {
+                live += size;
+            } else {
+                dead += size;
             }
         }
         (total, live, dead, total.saturating_sub(live + dead))
@@ -838,6 +790,20 @@ impl SimWorld {
 
     pub(crate) fn blob_count(&self) -> usize {
         self.blobs.borrow().durable.len()
+    }
+
+    pub(crate) fn primary_blob_count(&self) -> usize {
+        self.blobs
+            .borrow()
+            .durable
+            .keys()
+            .filter(|name| {
+                !matches!(
+                    blockd_core::layout::parse_blob(name),
+                    Some(blockd_core::layout::BlobName::ReplicaSpool { .. })
+                )
+            })
+            .count()
     }
 
     pub(crate) fn rot_store_suffix(&self, suffix: &str) -> u64 {
@@ -944,7 +910,7 @@ impl SimWorld {
         self.bitflip_local(|name| {
             std::path::Path::new(name)
                 .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("seg"))
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("blx"))
         })
     }
 
@@ -1607,10 +1573,8 @@ fn peer_tag(message: &PeerMsg) -> u8 {
         PeerMsg::ReplicaPutAck { .. } => 9,
         PeerMsg::ReplicaCommit { .. } => 10,
         PeerMsg::ReplicaCommitAck { .. } => 11,
-        PeerMsg::ReplicaStatus { .. } => 12,
-        PeerMsg::ReplicaStatusReply { .. } => 13,
-        PeerMsg::ReplicaUploadDone { .. } => 14,
-        PeerMsg::ReplicaArchive { .. } => 15,
+        PeerMsg::ReplicaStatus { .. } => 13,
+        PeerMsg::ReplicaStatusReply { .. } => 14,
         PeerMsg::ReplicaRelease { .. } => 16,
         PeerMsg::ReplicaReleaseAck { .. } => 17,
         PeerMsg::VnodeAdopt { .. } => 18,
@@ -1714,6 +1678,19 @@ impl GuestMem for SimWorld {
         Ok(())
     }
 
+    async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
+        let raw: [u8; 8] = bytes
+            .get(..8)
+            .ok_or(GuestMemoryError::Unservable)?
+            .try_into()
+            .map_err(|_| GuestMemoryError::Unservable)?;
+        self.memory
+            .borrow_mut()
+            .vmstate
+            .insert(vset, u64::from_le_bytes(raw));
+        Ok(())
+    }
+
     async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError> {
         let generation = {
             let mut generations = self.pause_generations.borrow_mut();
@@ -1777,6 +1754,7 @@ impl GuestMem for SimWorld {
                     pending.finish();
                     return Ok(GuestPause {
                         vmstate,
+                        vmstate_bytes: vmstate.to_le_bytes().to_vec(),
                         generation,
                     });
                 }
@@ -1821,6 +1799,17 @@ impl GuestMem for SimWorld {
             if !self.faults_inflight.borrow().contains(&page) {
                 self.wake_fault(page, true);
             }
+        }
+        Ok(())
+    }
+
+    async fn commit_pause(&self, vset: VsetId, pause: GuestPause) -> Result<(), GuestMemoryError> {
+        if self.pause_generations.borrow().get(&vset).copied() != Some(pause.generation) {
+            return Ok(());
+        }
+        if let Some(started) = self.pause_started.borrow_mut().remove(&vset) {
+            self.max_pause_ns
+                .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
         }
         Ok(())
     }
@@ -2641,7 +2630,7 @@ mod tests {
             let world = Rc::clone(&world);
             async move { GuestMem::pause(world.as_ref(), VsetId(1)).await }
         });
-        assert_eq!(pause.map(|pause| pause.vmstate), Ok(0));
+        assert_eq!(pause.as_ref().map(|pause| pause.vmstate), Ok(0));
         executor
             .spawn({
                 let world = Rc::clone(&world);

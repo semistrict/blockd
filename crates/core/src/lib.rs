@@ -5,6 +5,7 @@
 //! external I/O is reachable from this crate.
 
 pub mod authority;
+pub mod blx;
 pub mod cache;
 pub mod database;
 pub mod dbproto;
@@ -15,6 +16,7 @@ pub mod head;
 pub mod hostmeta;
 pub mod journal;
 pub mod layout;
+pub mod manifest;
 pub mod mapleaf;
 pub mod peer;
 pub mod placement;

@@ -8,8 +8,9 @@
 //! u8 | fields`, fields in [`PeerMsg`] declaration order.
 //! `Vec<u8>` encodes as `len u32 | bytes`; `Option<Vec<u8>>` prefixes a
 //! presence byte. Embedded blobs (records, segment entries, leaves) are
-//! already framed and verified by their consumers — they pass through
-//! verbatim, damage included (R8.1: the reader decides).
+//! already framed and verified by their consumers. Inline VMM bytes are
+//! protected by the peer frame and checked against the offered record before
+//! use (R8.1: the reader decides).
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::protocol::{MAX_OBJECT_BYTES, PeerMsg, PeerRequestId};
@@ -52,11 +53,16 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
     let mut e = Enc::new();
     e.u16(from.0);
     match msg {
-        PeerMsg::MigrateOffer { vset, record } => {
+        PeerMsg::MigrateOffer {
+            vset,
+            record,
+            vmstate,
+        } => {
             e.u8(0);
             e.u64(vset.0);
             e.u32(u32::try_from(record.len()).expect("record fits u32"));
             e.bytes(record);
+            opt_bytes(&mut e, vmstate.as_deref());
         }
         PeerMsg::MigrateAccept { vset, offer_fence } => {
             e.u8(1);
@@ -66,6 +72,7 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
         PeerMsg::FetchRange {
             io,
             vset,
+            replica_assignment_epoch,
             fence,
             seg,
             offset,
@@ -74,6 +81,16 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
             e.u8(2);
             e.u64(io.0);
             e.u64(vset.0);
+            match replica_assignment_epoch {
+                Some(epoch) => {
+                    e.u8(1);
+                    e.u64(*epoch);
+                }
+                None => {
+                    e.u8(0);
+                    e.u64(0);
+                }
+            }
             e.u64(*fence);
             e.u64(seg.0);
             e.u32(*offset);
@@ -198,29 +215,6 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
                 }
             }
         }
-        PeerMsg::ReplicaUploadDone {
-            vset,
-            assignment_epoch,
-            info,
-            record,
-        } => {
-            e.u8(14);
-            e.u64(vset.0);
-            e.u64(*assignment_epoch);
-            encode_commit_info(&mut e, *info);
-            e.u32(u32::try_from(record.len()).expect("replica record fits u32"));
-            e.bytes(record);
-        }
-        PeerMsg::ReplicaArchive {
-            vset,
-            assignment_epoch,
-            through,
-        } => {
-            e.u8(17);
-            e.u64(vset.0);
-            e.u64(*assignment_epoch);
-            encode_commit_info(&mut e, *through);
-        }
         PeerMsg::ReplicaRelease {
             vset,
             assignment_epoch,
@@ -313,7 +307,12 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             let vset = VsetId(d.u64()?);
             let len = usize::try_from(d.u32()?).expect("u32 fits usize");
             let record = d.bytes(len)?.to_vec();
-            PeerMsg::MigrateOffer { vset, record }
+            let vmstate = decode_opt_bytes(&mut d)?;
+            PeerMsg::MigrateOffer {
+                vset,
+                record,
+                vmstate,
+            }
         }
         1 => PeerMsg::MigrateAccept {
             vset: VsetId(d.u64()?),
@@ -322,6 +321,11 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
         2 => PeerMsg::FetchRange {
             io: PeerRequestId(d.u64()?),
             vset: VsetId(d.u64()?),
+            replica_assignment_epoch: match d.u8()? {
+                0 if d.u64()? == 0 => None,
+                1 => Some(d.u64()?),
+                _ => return Err(DecodeError),
+            },
             fence: d.u64()?,
             seg: SegId(d.u64()?),
             offset: d.u32()?,
@@ -409,26 +413,12 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
                 _ => return Err(DecodeError),
             },
         },
-        14 => PeerMsg::ReplicaUploadDone {
-            vset: VsetId(d.u64()?),
-            assignment_epoch: d.u64()?,
-            info: decode_commit_info(&mut d)?,
-            record: {
-                let len = usize::try_from(d.u32()?).expect("u32 fits usize");
-                d.bytes(len)?.to_vec()
-            },
-        },
         15 => PeerMsg::ReplicaRelease {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
         },
         16 => PeerMsg::ReplicaReleaseAck {
-            vset: VsetId(d.u64()?),
-            assignment_epoch: d.u64()?,
-            through: decode_commit_info(&mut d)?,
-        },
-        17 => PeerMsg::ReplicaArchive {
             vset: VsetId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
@@ -564,6 +554,7 @@ mod tests {
             PeerMsg::MigrateOffer {
                 vset: VsetId(7),
                 record: vec![0xAB; 17],
+                vmstate: Some(vec![0xCD; 9]),
             },
             PeerMsg::MigrateAccept {
                 vset: VsetId(7),
@@ -572,6 +563,7 @@ mod tests {
             PeerMsg::FetchRange {
                 io: PeerRequestId(99),
                 vset: VsetId(7),
+                replica_assignment_epoch: Some(8),
                 fence: 3,
                 seg: SegId(12),
                 offset: 4096,
@@ -647,17 +639,6 @@ mod tests {
                 assignment_epoch: 3,
                 committed: Some(info),
             },
-            PeerMsg::ReplicaUploadDone {
-                vset: VsetId(7),
-                assignment_epoch: 3,
-                info,
-                record: vec![0xD4; 19],
-            },
-            PeerMsg::ReplicaArchive {
-                vset: VsetId(7),
-                assignment_epoch: 3,
-                through: info,
-            },
             PeerMsg::ReplicaRelease {
                 vset: VsetId(7),
                 assignment_epoch: 3,
@@ -731,8 +712,8 @@ mod tests {
             .iter()
             .flat_map(|msg| encode_peer(HostId(2), msg))
             .collect();
-        assert_eq!(bytes.len(), 2466);
-        assert_eq!(crc32c(&bytes), 0x7EE1_4580);
+        assert_eq!(bytes.len(), 2356);
+        assert_eq!(crc32c(&bytes), 0x212E_7AB0);
     }
 
     #[test]

@@ -368,7 +368,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 12,
             sync_covered_through: info.sync_covered_through,
+            post_state_checksum: 0,
             database: crate::journal::DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -417,7 +419,9 @@ mod tests {
             kind: RecordKind::Commit,
             capture_seq: 12,
             sync_covered_through: info.sync_covered_through,
+            post_state_checksum: 0,
             database: crate::journal::DatabaseMeta::default(),
+            files: Vec::new(),
             overlay: BTreeMap::new(),
             leaves: BTreeMap::new(),
             migrated_from: None,
@@ -426,8 +430,8 @@ mod tests {
         let frame = seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record)
             .expect("commit valid");
         let expected_pin = match page_size() {
-            4096 => (183, 0x4510_CF30),
-            16_384 => (183, 0x82B6_7903),
+            4096 => (195, 0x0FC3_0B7B),
+            16_384 => (195, 0x44FB_D9B3),
             size => panic!("spool frame pin missing for {size}-byte pages"),
         };
         assert_eq!((frame.len(), crc32c(&frame)), expected_pin);

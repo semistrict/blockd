@@ -7,28 +7,52 @@ use blockd_exec::inject::{Injector, Lane, injector};
 use blockd_exec::{join2, spawn, yield_now};
 
 use super::cleanup_local;
-use super::state::{CaptureKind, CaptureLease, DrainState, MutationOwner, SharedHost};
-use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetConfig};
+use super::state::{CaptureKind, CaptureLease, DrainState, MutationOwner, SharedHost, VsetState};
+use crate::blx::{BlockKey, open_object, replace_state_block};
+use crate::format::checksum64;
+use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetConfig, VsetKind};
 use crate::layout;
-use crate::mapleaf::{LEAF_SPAN, LeafPtr, MapLeaf, span_of};
+use crate::manifest::ObjectRef;
+use crate::mapleaf::LeafPtr;
 use crate::protocol::{AdminError, AdminResult, AdminSuccess, ReqId};
 use crate::segment::{PageLoc, SegmentBatchBuilder, open_entry, scan_segment};
-use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
+use crate::types::{Gen, JournalSeq, PageId, SegId, VsetId};
 use crate::world::{AdminIo, Blobs, GuestMem, GuestPause, Store};
 
 const DRAIN_PAGES_PER_POLL: usize = 64;
-const OVERLAY_MAX: usize = 2048;
 const ROLL_THRESHOLD: usize = 256;
 const COMPACT_BATCH: usize = 8;
 
-type LeafWrite = (LeafPtr, Vec<u8>, BTreeSet<(u64, SegId)>);
 type PageMap = BTreeMap<PageId, (Gen, crate::segment::PageLoc)>;
 
-#[derive(Clone, Copy)]
+pub(super) fn recovery_files(vset: &VsetState) -> Vec<ObjectRef> {
+    let mut needed_segments = vset
+        .page_locs
+        .values()
+        .filter_map(|(_, location)| (location.base == 0).then_some((location.fence, location.seg)))
+        .collect::<BTreeSet<_>>();
+    needed_segments.extend(vset.tombstone_segments.iter().copied());
+    needed_segments.extend(vset.vmm_segments.iter().copied());
+
+    let needed_batches = vset
+        .segment_refs
+        .iter()
+        .filter(|(segment, _)| needed_segments.contains(segment))
+        .map(|(_, file)| (file.identity.writer_fence, file.batch_id))
+        .collect::<BTreeSet<_>>();
+    vset.segment_refs
+        .values()
+        .filter(|file| needed_batches.contains(&(file.identity.writer_fence, file.batch_id)))
+        .copied()
+        .collect()
+}
+
+#[derive(Clone)]
 struct Checkpoint {
     req: Option<ReqId>,
     epoch: crate::types::Epoch,
     vmstate: u64,
+    vmstate_bytes: Vec<u8>,
 }
 
 enum CheckpointDecision {
@@ -101,7 +125,7 @@ impl<W: GuestMem + AdminIo + 'static> Clone for PauseTracker<W> {
             world: Rc::clone(&self.world),
             vset: self.vset,
             incarnation: self.incarnation,
-            pause: self.pause,
+            pause: self.pause.clone(),
             active: Rc::clone(&self.active),
         }
     }
@@ -124,7 +148,7 @@ impl<W: GuestMem + AdminIo + 'static> PauseTracker<W> {
             self.active.set(false);
             return true;
         }
-        let resumed = GuestMem::resume(self.world.as_ref(), self.vset, Some(self.pause))
+        let resumed = GuestMem::resume(self.world.as_ref(), self.vset, Some(self.pause.clone()))
             .await
             .is_ok();
         if self.active.replace(false) {
@@ -235,6 +259,23 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
             Some(done) => done.await == Ok(true),
             None => false,
         }
+    }
+
+    pub(super) async fn commit(&mut self) -> bool {
+        let committed = GuestMem::commit_pause(
+            self.tracker.world.as_ref(),
+            self.tracker.vset,
+            self.tracker.pause.clone(),
+        )
+        .await
+        .is_ok();
+        if !committed {
+            self.tracker
+                .state
+                .borrow_mut()
+                .fail("guest stop after migration cut failed");
+        }
+        committed
     }
 
     pub(super) fn disarm(self) {
@@ -392,7 +433,9 @@ fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
         kind: RecordKind::Commit,
         capture_seq: 0,
         sync_covered_through: 0,
+        post_state_checksum: 0,
         database: crate::journal::DatabaseMeta::default(),
+        files: Vec::new(),
         overlay: BTreeMap::new(),
         leaves: BTreeMap::new(),
         migrated_from: None,
@@ -493,8 +536,14 @@ where
         state.borrow_mut().fail("guest pause failed");
         return None;
     };
-    let Some(paused) = PausedGuest::new(&state, &world, vset, incarnation, pause, protections)
-    else {
+    let Some(paused) = PausedGuest::new(
+        &state,
+        &world,
+        vset,
+        incarnation,
+        pause.clone(),
+        protections,
+    ) else {
         if GuestMem::resume(world.as_ref(), vset, Some(pause))
             .await
             .is_err()
@@ -509,6 +558,7 @@ where
         req: Some(req),
         epoch,
         vmstate: pause.vmstate,
+        vmstate_bytes: pause.vmstate_bytes.clone(),
     };
     let captured = capture_record(
         Rc::clone(&state),
@@ -539,16 +589,28 @@ where
 {
     let pre_reserved = reservation.is_some();
     let reserved_incarnation = reservation.as_ref().map(|(incarnation, _)| *incarnation);
-    let capture_kind = checkpoint.map_or(CaptureKind::Writeback, |checkpoint| {
-        if checkpoint.req.is_some() {
-            CaptureKind::Checkpoint
-        } else {
-            CaptureKind::Migration
-        }
-    });
+    let capture_kind = checkpoint
+        .as_ref()
+        .map_or(CaptureKind::Writeback, |checkpoint| {
+            if checkpoint.req.is_some() {
+                CaptureKind::Checkpoint
+            } else {
+                CaptureKind::Migration
+            }
+        });
     let capture_owner = MutationOwner::Capture(capture_kind);
     let prepared_compaction = prepare_compaction(&state, world.as_ref(), vset).await;
-    let (incarnation, seq, capture_seq, fence, pages, protect, first_seg, compact_victims) = {
+    let (
+        incarnation,
+        seq,
+        capture_seq,
+        fence,
+        pages,
+        protect,
+        first_seg,
+        compact_victims,
+        pending_tombstones,
+    ) = {
         let mut host = state.borrow_mut();
         let vset_state = host.vsets.get(&vset)?;
         let flush_set = host
@@ -584,6 +646,7 @@ where
         }
         let needs_commit = host.cache.has_dirty_of(vset)
             || !compact_victims.is_empty()
+            || !vset_state.pending_tombstones.is_empty()
             || vset_state
                 .pending_syncs
                 .iter()
@@ -603,7 +666,7 @@ where
         let incarnation = vset_state.incarnation;
         let pages = host.cache.unstable_pages_of(vset);
         let protect = host.cache.dirty_pages_of(vset);
-        let (seq, capture_seq, first_seg, fence) = {
+        let (seq, capture_seq, first_seg, fence, pending_tombstones) = {
             let vset_state = host.vsets.get_mut(&vset).expect("just observed");
             let seq = JournalSeq(vset_state.next_seq);
             vset_state.next_seq += 1;
@@ -612,7 +675,10 @@ where
             vset_state.next_seg = vset_state
                 .next_seg
                 .checked_add(
-                    u64::try_from(pages.len() + rescues.len()).expect("page count fits u64"),
+                    u64::try_from(
+                        pages.len() + rescues.len() + vset_state.pending_tombstones.len(),
+                    )
+                    .expect("entry count fits u64"),
                 )
                 .expect("segment id overflow");
             let mut unread = BTreeMap::new();
@@ -636,7 +702,29 @@ where
                     })
                     .collect(),
             });
-            (seq, capture_seq, first_seg, vset_state.fence)
+            let pending_keys = vset_state
+                .pending_tombstones
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            let mut pending_tombstones = Vec::with_capacity(pending_keys.len());
+            for &key in &pending_keys {
+                let generation = if key.space == crate::blx::BlockSpace::Vmm {
+                    Gen(seq.0)
+                } else {
+                    let generation = Gen(vset_state.next_gen);
+                    vset_state.next_gen += 1;
+                    generation
+                };
+                pending_tombstones.push((key, generation));
+            }
+            (
+                seq,
+                capture_seq,
+                first_seg,
+                vset_state.fence,
+                pending_tombstones,
+            )
         };
         for &page in &pages {
             host.cache.begin_flush(page);
@@ -650,6 +738,7 @@ where
             protect,
             first_seg,
             compact_victims,
+            pending_tombstones,
         )
     };
     let lease = reservation.map_or_else(
@@ -711,7 +800,9 @@ where
         return None;
     }
 
-    let resume_after_capture = checkpoint.is_some_and(|checkpoint| checkpoint.req.is_some());
+    let resume_after_capture = checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.req.is_some());
     let mut captured_pages = Vec::with_capacity(pages.len());
     let mut capture_valid = true;
     for (index, page) in pages.iter().copied().enumerate() {
@@ -746,10 +837,7 @@ where
         return None;
     }
 
-    let mut builder = SegmentBatchBuilder::new(vset, fence, first_seg);
-    for (page, generation, bytes) in captured_pages {
-        builder.add(page, generation, &bytes);
-    }
+    let mut batch_pages = captured_pages;
     let rescues = {
         let mut host = state.borrow_mut();
         let vset_state = host
@@ -758,11 +846,97 @@ where
             .filter(|state| state.incarnation == incarnation)?;
         std::mem::take(&mut vset_state.operations.drain_mut()?.rescues)
     };
-    for (index, (page, generation, bytes)) in rescues.into_iter().enumerate() {
-        builder.add(page, generation, &bytes);
+    for (index, rescued) in rescues.into_iter().enumerate() {
+        batch_pages.push(rescued);
         if (index + 1) % DRAIN_PAGES_PER_POLL == 0 {
             yield_now().await;
         }
+    }
+
+    let (pre_state_checksum, post_state_checksum, block_checksums) = {
+        let host = state.borrow();
+        let vset_state = host.vsets.get(&vset)?;
+        let mut checksum = vset_state.state_checksum;
+        let mut blocks = vset_state.block_checksums.clone();
+        for (page, generation, bytes) in &batch_pages {
+            replace_state_block(
+                &mut checksum,
+                &mut blocks,
+                BlockKey::from_page(VsetKind::Compute, *page),
+                Some((*generation, checksum64(bytes))),
+            );
+        }
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            let old_vmm = blocks
+                .keys()
+                .filter(|key| key.space == crate::blx::BlockSpace::Vmm)
+                .copied()
+                .collect::<Vec<_>>();
+            for key in old_vmm {
+                replace_state_block(&mut checksum, &mut blocks, key, None);
+            }
+            for (block, chunk) in checkpoint
+                .vmstate_bytes
+                .chunks(crate::types::page_size())
+                .enumerate()
+            {
+                let mut padded = vec![0; crate::types::page_size()];
+                padded[..chunk.len()].copy_from_slice(chunk);
+                replace_state_block(
+                    &mut checksum,
+                    &mut blocks,
+                    BlockKey {
+                        space: crate::blx::BlockSpace::Vmm,
+                        volume: 0,
+                        block: u32::try_from(block).expect("VMM block fits u32"),
+                    },
+                    Some((Gen(seq.0), checksum64(&padded))),
+                );
+            }
+        }
+        (vset_state.state_checksum, checksum, blocks)
+    };
+    let mut builder = SegmentBatchBuilder::new_for_record_with_checksums(
+        VsetKind::Compute,
+        vset,
+        fence,
+        first_seg,
+        seq.0,
+        pre_state_checksum,
+        post_state_checksum,
+    );
+    for (page, generation, bytes) in &batch_pages {
+        builder.add(*page, *generation, bytes);
+    }
+    for &(key, generation) in &pending_tombstones {
+        if key.space == crate::blx::BlockSpace::Vmm {
+            builder.add_vmm_tombstone(key.block, generation);
+        } else if let Some(page) = key.to_page(VsetKind::Compute, vset) {
+            builder
+                .try_add_tombstone(page, generation)
+                .expect("reserved segment IDs cover pending tombstones");
+        }
+    }
+    if let Some(checkpoint) = checkpoint.as_ref() {
+        let old_vmm_blocks = state
+            .borrow()
+            .vsets
+            .get(&vset)?
+            .block_checksums
+            .keys()
+            .filter(|key| key.space == crate::blx::BlockSpace::Vmm)
+            .map(|key| key.block)
+            .collect::<BTreeSet<_>>();
+        let new_count = checkpoint
+            .vmstate_bytes
+            .len()
+            .div_ceil(crate::types::page_size());
+        for block in old_vmm_blocks {
+            if block as usize >= new_count {
+                builder.add_vmm_tombstone(block, Gen(seq.0));
+            }
+        }
+        builder.add_vmm_snapshot(Gen(seq.0), &checkpoint.vmstate_bytes);
     }
 
     let segment_blobs = builder.finish();
@@ -799,6 +973,20 @@ where
             vset_state
                 .segment_blobs
                 .push((fence, *segment, bytes.len() as u64));
+            let object = open_object(bytes).ok()?;
+            vset_state
+                .segment_refs
+                .insert((fence, *segment), ObjectRef::from_blx(&object));
+            if object
+                .footer
+                .entries
+                .iter()
+                .any(|entry| entry.kind == crate::blx::EntryKind::Tombstone)
+            {
+                vset_state.tombstone_segments.insert((fence, *segment));
+            }
+            vset_state.state_checksum = post_state_checksum;
+            vset_state.block_checksums.clone_from(&block_checksums);
         }
         for &(page, _, _) in entries {
             if flushed_pages.contains(&page) {
@@ -807,42 +995,26 @@ where
         }
         host.wake_pressure_waiter();
     }
-
-    let (record_overlay, record_leaves, leaf_writes) = {
+    if checkpoint.is_some() {
         let mut host = state.borrow_mut();
         let vset_state = host
             .vsets
             .get_mut(&vset)
             .filter(|state| state.incarnation == incarnation)?;
-        force_victim_spans(vset_state, &compact_victims);
-        shard_map(vset_state, vset)
-    };
-    for (pointer, bytes, segments) in &leaf_writes {
-        let name = layout::leaf_blob(vset, pointer.fence, pointer.id);
-        if !state
-            .borrow_mut()
-            .try_reserve_blob(name.clone(), bytes.len() as u64)
-        {
-            return None;
-        }
-        if super::blob::write(&state, world.as_ref(), name.clone(), bytes.clone())
-            .await
-            .is_err()
-        {
-            state.borrow_mut().fail("local map-leaf write failed");
-            return None;
-        }
-        let mut host = state.borrow_mut();
-        host.record_blob(name, bytes.len() as u64);
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
-            .filter(|state| state.incarnation == incarnation)?;
-        vset_state
-            .leaf_blobs
-            .insert(*pointer, (bytes.len() as u64, segments.clone()));
-        host.counters.leaf_rolls += 1;
+        vset_state.vmm_segments = segment_blobs
+            .iter()
+            .map(|(segment, _, _)| (fence, *segment))
+            .collect();
     }
+
+    let (record_overlay, record_leaves): (PageMap, BTreeMap<u32, LeafPtr>) = {
+        let host = state.borrow();
+        let vset_state = host
+            .vsets
+            .get(&vset)
+            .filter(|state| state.incarnation == incarnation)?;
+        (vset_state.page_locs.clone(), BTreeMap::new())
+    };
     {
         let mut host = state.borrow_mut();
         let vset_state = host
@@ -869,13 +1041,18 @@ where
             config: vset_state.config,
             seq,
             fence,
-            kind: checkpoint.map_or(RecordKind::Commit, |checkpoint| RecordKind::Checkpoint {
-                epoch: checkpoint.epoch,
-                vmstate: checkpoint.vmstate,
-            }),
+            kind: checkpoint
+                .as_ref()
+                .map_or(RecordKind::Commit, |checkpoint| RecordKind::Checkpoint {
+                    epoch: checkpoint.epoch,
+                    vmstate: checkpoint.vmstate,
+                    vmstate_logical_length: checkpoint.vmstate_bytes.len() as u64,
+                }),
             capture_seq,
             sync_covered_through: covered,
+            post_state_checksum,
             database: vset_state.database,
+            files: recovery_files(vset_state),
             overlay: record_overlay,
             leaves: record_leaves,
             migrated_from: vset_state.peer_source.map(|host| MigrationSource {
@@ -884,7 +1061,12 @@ where
             }),
         }
     };
-    if !write_record_copies(&state, world.as_ref(), vset, &record).await {
+    let wrote_record = if record.migrated_from.is_some() {
+        write_migration_record_copies(&state, world.as_ref(), vset, &record, &block_checksums).await
+    } else {
+        write_record_copies(&state, world.as_ref(), vset, &record).await
+    };
+    if !wrote_record {
         state.borrow_mut().fail("local journal write failed");
         return None;
     }
@@ -896,6 +1078,12 @@ where
             .get_mut(&vset)
             .filter(|state| state.incarnation == incarnation)?;
         vset_state.best_record = Some(record.clone());
+        for (key, _) in &pending_tombstones {
+            vset_state.pending_tombstones.remove(key);
+        }
+        if let Some((segment, _, _)) = segment_blobs.last() {
+            vset_state.next_seg = vset_state.next_seg.max(segment.0.saturating_add(1));
+        }
         vset_state.local_covered_through = record.sync_covered_through;
         let mut completed = Vec::new();
         let pending = std::mem::take(&mut vset_state.pending_syncs);
@@ -909,9 +1097,16 @@ where
         vset_state
             .record_writes
             .insert(record.seq, (fence, record.sync_covered_through));
+        vset_state.record_segments.insert(
+            record.seq,
+            segment_blobs
+                .iter()
+                .map(|(segment, _, _)| (fence, *segment))
+                .collect(),
+        );
         vset_state.operations.finish_mutation(capture_owner);
         let waiters = std::mem::take(&mut vset_state.mutation_waiters);
-        if let Some(checkpoint) = checkpoint {
+        if let Some(checkpoint) = checkpoint.as_ref() {
             vset_state.epoch = checkpoint.epoch;
             vset_state.pinned = Some(record.clone());
             if let Some(req) = checkpoint.req {
@@ -954,7 +1149,7 @@ pub(super) async fn capture_migration<W>(
     state: SharedHost,
     world: Rc<W>,
     vset: VsetId,
-) -> Option<(JournalRecord, PausedGuest<W>)>
+) -> Option<(JournalRecord, PausedGuest<W>, Vec<u8>)>
 where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
@@ -1014,8 +1209,14 @@ where
         state.borrow_mut().fail("guest pause failed");
         return None;
     };
-    let Some(paused) = PausedGuest::new(&state, &world, vset, incarnation, pause, protections)
-    else {
+    let Some(paused) = PausedGuest::new(
+        &state,
+        &world,
+        vset,
+        incarnation,
+        pause.clone(),
+        protections,
+    ) else {
         if GuestMem::resume(world.as_ref(), vset, Some(pause))
             .await
             .is_err()
@@ -1034,118 +1235,18 @@ where
             req: None,
             epoch,
             vmstate: pause.vmstate,
+            vmstate_bytes: pause.vmstate_bytes.clone(),
         }),
         Some((incarnation, lease)),
         None,
     )
     .await;
     if let Some(record) = record {
-        Some((record, paused))
+        Some((record, paused, pause.vmstate_bytes))
     } else {
         let _ = paused.resume().await;
         None
     }
-}
-
-fn force_victim_spans(state: &mut super::VsetState, victims: &BTreeSet<(u64, SegId)>) {
-    if victims.is_empty() {
-        return;
-    }
-    let spans = state
-        .leaf_table
-        .iter()
-        .filter_map(|(&span, pointer)| {
-            state
-                .leaf_blobs
-                .get(pointer)
-                .is_some_and(|(_, segments)| {
-                    segments.iter().any(|segment| victims.contains(segment))
-                })
-                .then_some(span)
-        })
-        .collect::<Vec<_>>();
-    for span in spans {
-        state.leaf_table.remove(&span);
-        state.overlay.extend(
-            state
-                .page_locs
-                .iter()
-                .filter(|(page, _)| span_of(**page) == span)
-                .map(|(&page, &entry)| (page, entry)),
-        );
-    }
-}
-
-pub(super) fn shard_map(
-    state: &mut super::VsetState,
-    vset: VsetId,
-) -> (PageMap, BTreeMap<u32, LeafPtr>, Vec<LeafWrite>) {
-    let mut overlay = state.overlay.clone();
-    let mut leaf_table = state.leaf_table.clone();
-    let mut span_counts = BTreeMap::<u32, usize>::new();
-    for &page in overlay.keys() {
-        *span_counts.entry(span_of(page)).or_default() += 1;
-    }
-    let mut to_roll = span_counts
-        .iter()
-        .filter_map(|(&span, &count)| (count >= ROLL_THRESHOLD).then_some(span))
-        .collect::<BTreeSet<_>>();
-    let mut remaining = overlay.len()
-        - to_roll
-            .iter()
-            .map(|span| span_counts.get(span).copied().unwrap_or(0))
-            .sum::<usize>();
-    while remaining > OVERLAY_MAX {
-        let Some((&span, &count)) = span_counts
-            .iter()
-            .filter(|(span, _)| !to_roll.contains(span))
-            .max_by_key(|&(span, count)| (*count, *span))
-        else {
-            break;
-        };
-        to_roll.insert(span);
-        remaining -= count;
-    }
-
-    let mut writes = Vec::new();
-    for span in to_roll {
-        let lo_key = u64::from(span) * LEAF_SPAN;
-        let idx = VolumeIdx(u8::try_from(lo_key >> 32).expect("volume index"));
-        let page_at = |key: u64| PageId {
-            volume: VolumeId { vset, idx },
-            page: PageNo(u32::try_from(key & 0xffff_ffff).expect("page number")),
-        };
-        let lo = page_at(lo_key);
-        let hi = page_at(lo_key + LEAF_SPAN - 1);
-        let content = state
-            .page_locs
-            .range(lo..=hi)
-            .map(|(&page, &entry)| (page, entry))
-            .collect::<BTreeMap<_, _>>();
-        let id = state.next_leaf;
-        state.next_leaf += 1;
-        let pointer = LeafPtr {
-            base: 0,
-            fence: state.fence,
-            id,
-        };
-        let entries = content
-            .iter()
-            .map(|(page, &(generation, location))| {
-                (page.volume.idx, page.page, generation, location)
-            })
-            .collect();
-        let segments = content
-            .values()
-            .filter(|(_, location)| location.base == 0)
-            .map(|(_, location)| (location.fence, location.seg))
-            .collect();
-        overlay.retain(|page, _| span_of(*page) != span);
-        leaf_table.insert(span, pointer);
-        let bytes = MapLeaf { span, entries }.encode(vset, state.fence, id);
-        writes.push((pointer, bytes, segments));
-    }
-    (overlay, leaf_table, writes)
 }
 
 pub(super) async fn write_record_copies<W: Blobs>(
@@ -1154,7 +1255,42 @@ pub(super) async fn write_record_copies<W: Blobs>(
     vset: VsetId,
     record: &JournalRecord,
 ) -> bool {
-    let bytes = record.encode(vset);
+    // A destination that still depends on its migration source must survive a
+    // daemon crash without forgetting the remote page locations. Keep that
+    // temporary lookup index in both local journal copies until hydration has
+    // made the cut wholly local.
+    let bytes = if record.migrated_from.is_some() {
+        let checksums = state
+            .borrow()
+            .vsets
+            .get(&vset)
+            .map(|vset| vset.block_checksums.clone())
+            .unwrap_or_default();
+        record.encode_migration_with_checksums(vset, &checksums)
+    } else {
+        record.encode(vset)
+    };
+    write_encoded_record_copies(state, world, vset, record, bytes).await
+}
+
+pub(super) async fn write_migration_record_copies<W: Blobs>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+    record: &JournalRecord,
+    block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
+) -> bool {
+    let bytes = record.encode_migration_with_checksums(vset, block_checksums);
+    write_encoded_record_copies(state, world, vset, record, bytes).await
+}
+
+async fn write_encoded_record_copies<W: Blobs>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+    record: &JournalRecord,
+    bytes: Vec<u8>,
+) -> bool {
     let primary_name = layout::journal_blob(vset, record.fence, record.seq);
     let mirror_name = layout::journal_mirror_blob(vset, record.fence, record.seq);
     let len = bytes.len() as u64;

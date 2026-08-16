@@ -152,7 +152,6 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
         replica_bytes,
         replica_rejected,
         replica_commits,
-        replica_store_bytes,
         replica_unlinks,
         replica_network_bytes,
         replica_logical_bytes,
@@ -162,8 +161,6 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
         replica_artifact_flushes,
         replica_commit_flushes,
         replica_rotations,
-        archive_cycles,
-        archive_commits_coalesced,
         replica_capacity_backpressure,
     );
 }
@@ -1129,11 +1126,6 @@ async fn handle_recovery_event(
                 *guest_states[&vset].durable_expected.borrow_mut() = cold;
             }
             blockd_core::protocol::Verdict::Unrestorable => {
-                if count_unrestorable {
-                    events
-                        .unrestorable
-                        .set(events.unrestorable.get().saturating_add(1));
-                }
                 if local_recovery {
                     let restored_reply = match select2(
                         world.request_admin(AdminCall::RestoreVset { vset }),
@@ -1154,6 +1146,11 @@ async fn handle_recovery_event(
                             ..
                         })) => {
                             assert_eq!(restored_vset, vset);
+                            if count_unrestorable {
+                                events
+                                    .unrestorable
+                                    .set(events.unrestorable.get().saturating_add(1));
+                            }
                             verdict = restored_verdict;
                             local_recovery = false;
                             restored = true;
@@ -1166,14 +1163,24 @@ async fn handle_recovery_event(
                                     vset,
                                     verdict: blockd_core::protocol::Verdict::Unrestorable,
                                 },
-                                count_unrestorable: false,
+                                count_unrestorable,
                                 generation,
                             });
                         }
                         Ok(Err(AdminError::Rejected | AdminError::NotFound) | Ok(_)) => {
+                            if count_unrestorable {
+                                events
+                                    .unrestorable
+                                    .set(events.unrestorable.get().saturating_add(1));
+                            }
                             return None;
                         }
                     }
+                }
+                if count_unrestorable {
+                    events
+                        .unrestorable
+                        .set(events.unrestorable.get().saturating_add(1));
                 }
                 return None;
             }
