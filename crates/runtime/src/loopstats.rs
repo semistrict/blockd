@@ -1,4 +1,4 @@
-//! Where the actor executor's thread and production-world operations spend
+//! Where the actor Tokio thread and production-world operations spend
 //! wall time. Actor polls are the straight-line protocol work; world calls
 //! are the async I/O boundary. Guest faults wait behind runnable actors, but
 //! never behind the blocking I/O itself.
@@ -9,10 +9,11 @@
 //! cheap enough to leave on always.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 pub(crate) const POLL_KINDS: [&str; 1] = ["ActorPoll"];
 
-pub(crate) const WORLD_KINDS: [&str; 25] = [
+pub(crate) const WORLD_KINDS: [&str; 24] = [
     "Fill",
     "FillShared",
     "FillFailed",
@@ -37,7 +38,6 @@ pub(crate) const WORLD_KINDS: [&str; 25] = [
     "Admin",
     "PeerSend",
     "Abort",
-    "DatabaseInstall",
 ];
 
 pub(crate) mod world_kind {
@@ -65,7 +65,6 @@ pub(crate) mod world_kind {
     pub const ADMIN: usize = 21;
     pub const PEER_SEND: usize = 22;
     pub const ABORT: usize = 23;
-    pub const DATABASE_INSTALL: usize = 24;
 }
 
 #[derive(Default)]
@@ -88,11 +87,20 @@ impl Cell {
     }
 }
 
-#[derive(Default)]
 pub struct LoopStats {
     poll: [Cell; POLL_KINDS.len()],
     world: [Cell; WORLD_KINDS.len()],
-    idle_ns: AtomicU64,
+    started: Instant,
+}
+
+impl Default for LoopStats {
+    fn default() -> Self {
+        Self {
+            poll: std::array::from_fn(|_| Cell::default()),
+            world: std::array::from_fn(|_| Cell::default()),
+            started: Instant::now(),
+        }
+    }
 }
 
 impl LoopStats {
@@ -102,10 +110,6 @@ impl LoopStats {
 
     pub(crate) fn record_world(&self, kind: usize, ns: u64) {
         self.world[kind].add(ns);
-    }
-
-    pub(crate) fn record_idle(&self, ns: u64) {
-        self.idle_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
     /// (name, count, total ns) per actor-poll kind.
@@ -140,7 +144,9 @@ impl LoopStats {
 
     /// Loop time spent blocked waiting for an event.
     pub fn idle_ns(&self) -> u64 {
-        self.idle_ns.load(Ordering::Relaxed)
+        u64::try_from(self.started.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(self.busy_ns())
     }
 
     /// Busy fraction of the loop's observed lifetime, in [0, 1].

@@ -40,8 +40,7 @@ pub const MAX_NR_GENS: u64 = 4;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
-    /// 0 = storage, 1 = compute memory. Stored at admission because volume
-    /// index zero is a database file for database vsets (R2.4/R12.1).
+    /// 0 = storage, 1 = compute memory.
     class: u8,
     /// Write-unprotected: the guest is mutating it invisibly.
     dirty: bool,
@@ -149,9 +148,7 @@ impl Cache {
         self.entries.get(&page).is_some_and(|e| e.dirty)
     }
 
-    /// Remove one resident page regardless of dirty state. Database
-    /// truncate/delete uses this only after the logical mapping has been
-    /// pruned, so the old bytes cannot be observed by a later extension.
+    /// Remove one resident page regardless of dirty state.
     pub fn remove_page(&mut self, page: PageId) -> bool {
         let Some(entry) = self.entries.remove(&page) else {
             return false;

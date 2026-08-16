@@ -141,10 +141,6 @@ FC_DIR=/var/opt/blockd/fc
 mkdir -p "$FC_DIR"
 
 echo "$(date -u) building the guest initramfs (static musl PID 1)"
-CC=musl-gcc AR=ar ./infra/build-sqlite.sh "$FC_DIR/sqlite"
-SQLITE3_STATIC=1 \
-SQLITE3_LIB_DIR="$FC_DIR/sqlite/lib" \
-SQLITE3_INCLUDE_DIR="$FC_DIR/sqlite/include" \
 cargo build --release -p blockd-fc-guest --target x86_64-unknown-linux-musl
 rm -rf "$FC_DIR/initramfs"
 mkdir -p "$FC_DIR/initramfs/dev"
@@ -162,14 +158,16 @@ if [ ! -f /opt/firecracker/Cargo.toml ]; then
   git fetch --depth 1 origin "$FC_COMMIT"
   git checkout -q FETCH_HEAD
   git apply /opt/blockd/patches/firecracker-uffd-shmem.patch
-  git apply /opt/blockd/patches/firecracker-vhost-user-fs.patch
 fi
 cd /opt/firecracker
 cargo build --release -p firecracker
 cp build/cargo_target/release/firecracker "$FC_DIR/firecracker"
 
-echo "$(date -u) building the pinned virtio-fs DAX guest kernel"
-./infra/build-fc-kernel.sh "$FC_DIR" x86_64
+echo "$(date -u) fetching the Firecracker CI guest kernel"
+ARCH=x86_64
+LATEST=$(curl -sf "http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/v1.13/$ARCH/vmlinux-6.1&list-type=2" \
+  | grep -oP "(?<=<Key>)(firecracker-ci/v1.13/$ARCH/vmlinux-6\.1\.\d+)(?=</Key>)" | sort -V | tail -1)
+curl -sf "https://s3.amazonaws.com/spec.ccfc.min/$LATEST" -o "$FC_DIR/vmlinux"
 
 # The daemon opens /dev/kvm and /dev/userfaultfd; make both world-usable
 # (the demo VM is single-purpose).

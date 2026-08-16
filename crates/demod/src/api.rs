@@ -2,6 +2,7 @@
 //! bind it only to the cluster's internal management network.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -215,48 +216,40 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-async fn run_blocking<T, F>(state: &ApiState, operation: F) -> ApiResult<T>
+async fn run_operation<T, F, Fut>(state: &ApiState, operation: F) -> ApiResult<T>
 where
-    T: Send + 'static,
-    F: FnOnce(Arc<Demod>) -> T + Send + 'static,
+    F: FnOnce(Arc<Demod>) -> Fut,
+    Fut: Future<Output = T>,
 {
     let permit = state
         .operation_slots
         .clone()
         .acquire_owned()
         .await
-        .map_err(|_| ApiError::internal("operation executor closed"))?;
+        .map_err(|_| ApiError::internal("operation scheduler closed"))?;
     let daemon = state.daemon.clone();
     let parent = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        parent.in_scope(|| operation(daemon))
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("operation failed: {error}")))
+    let _permit = permit;
+    Ok(operation(daemon).instrument(parent).await)
 }
 
-async fn start_background<F>(state: &ApiState, operation: F) -> ApiResult<()>
+async fn start_background<F, Fut>(state: &ApiState, operation: F) -> ApiResult<()>
 where
-    F: FnOnce(Arc<Demod>, tokio::sync::oneshot::Sender<()>) + Send + 'static,
+    F: FnOnce(Arc<Demod>, tokio::sync::oneshot::Sender<()>) -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
 {
     let permit = state
         .background_slots
         .clone()
         .acquire_owned()
         .await
-        .map_err(|_| ApiError::internal("background executor closed"))?;
+        .map_err(|_| ApiError::internal("background scheduler closed"))?;
     let daemon = state.daemon.clone();
     let parent = tracing::Span::current();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_local(async move {
         let _permit = permit;
-        parent.in_scope(|| operation(daemon, ready_tx));
-    });
-    tokio::spawn(async move {
-        if let Err(error) = handle.await {
-            tracing::error!(%error, "background operation failed");
-        }
+        operation(daemon, ready_tx).instrument(parent).await;
     });
     ready_rx
         .await
@@ -273,15 +266,10 @@ where
         .clone()
         .acquire_owned()
         .await
-        .map_err(|_| ApiError::internal("observation executor closed"))?;
+        .map_err(|_| ApiError::internal("observation scheduler closed"))?;
     let daemon = state.daemon.clone();
-    let parent = tracing::Span::current();
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        parent.in_scope(|| observation(daemon))
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("observation failed: {error}")))
+    let _permit = permit;
+    Ok(observation(daemon))
 }
 
 fn arg(query: &BTreeMap<String, String>, key: &str, default: u64) -> u64 {
@@ -309,12 +297,12 @@ async fn metrics(State(state): State<ApiState>) -> ApiResult<Response> {
 }
 
 async fn base(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
-    let sum = run_blocking(&state, |daemon| daemon.bake_base()).await?;
+    let sum = run_operation(&state, |daemon| async move { daemon.bake_base().await }).await?;
     Ok(Json(json!({ "baked": true, "sum": sum })))
 }
 
 async fn start_vm(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
-    let id = run_blocking(&state, move |daemon| daemon.start_vm()).await?;
+    let id = run_operation(&state, move |daemon| async move { daemon.start_vm().await }).await?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -325,13 +313,17 @@ async fn work(
 ) -> ApiResult<Json<Value>> {
     let id = parse_id(&id)?;
     let bursts = arg(&query, "bursts", 1);
-    let (burst, sum) = run_blocking(&state, move |daemon| daemon.work(id, bursts)).await?;
+    let (burst, sum) = run_operation(&state, move |daemon| async move {
+        daemon.work(id, bursts).await
+    })
+    .await?;
     Ok(Json(json!({ "id": id, "burst": burst, "guest_sum": sum })))
 }
 
 async fn verify(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let id = parse_id(&id)?;
-    let (burst, mismatches) = run_blocking(&state, move |daemon| daemon.verify(id)).await?;
+    let (burst, mismatches) =
+        run_operation(&state, move |daemon| async move { daemon.verify(id).await }).await?;
     Ok(Json(json!({
         "id": id,
         "burst": burst,
@@ -347,7 +339,12 @@ async fn fork(
 ) -> ApiResult<Json<Value>> {
     let id = parse_id(&id)?;
     let n = u32::try_from(arg(&query, "n", 3)).map_err(|_| ApiError::bad_request("bad n"))?;
-    let (ids, rss, pss, resident) = run_blocking(&state, move |daemon| daemon.fork(id, n)).await?;
+    let (ids, rss, pss, resident) =
+        run_operation(
+            &state,
+            move |daemon| async move { daemon.fork(id, n).await },
+        )
+        .await?;
     Ok(Json(json!({
         "forks": ids,
         "rss_sum": rss,
@@ -358,10 +355,12 @@ async fn fork(
 
 async fn expect(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let id = parse_id(&id)?;
-    start_background(&state, move |daemon, ready| {
-        daemon.expect(id, || {
-            let _ = ready.send(());
-        });
+    start_background(&state, move |daemon, ready| async move {
+        daemon
+            .expect(id, || {
+                let _ = ready.send(());
+            })
+            .await;
     })
     .await?;
     Ok(Json(json!({ "id": id, "expecting": true })))
@@ -374,7 +373,11 @@ async fn migrate(
 ) -> ApiResult<Json<Value>> {
     let id = parse_id(&id)?;
     let to = u16::try_from(arg(&query, "to", 1)).map_err(|_| ApiError::bad_request("bad to"))?;
-    let timings = run_blocking(&state, move |daemon| daemon.migrate(id, to)).await?;
+    let timings = run_operation(
+        &state,
+        move |daemon| async move { daemon.migrate(id, to).await },
+    )
+    .await?;
     Ok(Json(json!({
         "id": id,
         "to": to,
@@ -389,7 +392,11 @@ async fn migrate(
 
 async fn restore(State(state): State<ApiState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let id = parse_id(&id)?;
-    let verdict = run_blocking(&state, move |daemon| daemon.restore(id)).await?;
+    let verdict = run_operation(
+        &state,
+        move |daemon| async move { daemon.restore(id).await },
+    )
+    .await?;
     Ok(Json(json!({ "id": id, "verdict": verdict })))
 }
 

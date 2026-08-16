@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use crate::blx::{BlockKey, BlockSpace};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::manifest::ObjectRef;
-use crate::mapleaf::LeafPtr;
 use crate::segment::PageLoc;
 use crate::types::{
     Epoch, Gen, HostId, JournalSeq, PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size,
@@ -19,53 +18,21 @@ use crate::types::{
 pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
 const MAGIC_MIGRATION_INDEX: u32 = u32::from_le_bytes(*b"BMIX");
 
+pub type MigrationBlockChecksums = BTreeMap<BlockKey, (Gen, u64)>;
+
 /// The immutable consistency/lifecycle kind of a vset (R1.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum VsetKind {
     /// Guest memory at volume zero followed by guest disk volumes.
     Compute = 0,
-    /// `SQLite` main, WAL and rollback-journal files; no memory or vmstate.
-    Database = 1,
-}
-
-/// One durable `SQLite` file's namespace metadata (R12.4).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct DatabaseFileMeta {
-    pub exists: bool,
-    pub size: u64,
-}
-
-/// File metadata committed atomically with a database vset's page map.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct DatabaseMeta {
-    pub main: DatabaseFileMeta,
-    pub wal: DatabaseFileMeta,
-    pub journal: DatabaseFileMeta,
-}
-
-impl DatabaseMeta {
-    fn files(self) -> [DatabaseFileMeta; 3] {
-        [self.main, self.wal, self.journal]
-    }
-
-    fn is_empty(self) -> bool {
-        self == Self::default()
-    }
-
-    fn valid(self, max_size: u64) -> bool {
-        self.files()
-            .iter()
-            .all(|file| file.size <= max_size && (file.exists || file.size == 0))
-    }
 }
 
 /// Immutable configuration of a vset, carried in every record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VsetConfig {
     pub kind: VsetKind,
-    /// Highest valid volume index. Compute volume zero is memory; database
-    /// indices 0, 1 and 2 are main, WAL and rollback journal respectively.
+    /// Highest valid volume index. Compute volume zero is memory.
     pub disk_volumes: u8,
     pub pages_per_volume: u32,
 }
@@ -79,15 +46,7 @@ impl VsetConfig {
         }
     }
 
-    pub const fn database(pages_per_file: u32) -> Self {
-        Self {
-            kind: VsetKind::Database,
-            disk_volumes: 2,
-            pages_per_volume: pages_per_file,
-        }
-    }
-
-    /// All logical volumes/files of the vset.
+    /// All logical volumes of the vset.
     pub fn volumes(&self, vset: VsetId) -> impl Iterator<Item = VolumeId> + use<> {
         (0..=self.disk_volumes).map(move |idx| VolumeId {
             vset,
@@ -100,15 +59,11 @@ impl VsetConfig {
     }
 
     pub fn is_memory(&self, idx: VolumeIdx) -> bool {
-        self.kind == VsetKind::Compute && idx.is_memory()
+        idx.is_memory()
     }
 
     fn valid(self) -> bool {
-        self.pages_per_volume > 0
-            && match self.kind {
-                VsetKind::Compute => true,
-                VsetKind::Database => self.disk_volumes == 2,
-            }
+        self.pages_per_volume > 0 && self.kind == VsetKind::Compute
     }
 }
 
@@ -154,16 +109,11 @@ pub struct JournalRecord {
     /// It is captured with the record so delayed publication cannot observe
     /// a newer in-memory state.
     pub post_state_checksum: u64,
-    /// Present only for database vsets; compute records carry the canonical
-    /// empty value.
-    pub database: DatabaseMeta,
     /// The BLX files needed by this recovery point. This is the durable data
     /// index; page locations below are runtime-only lookup state.
     pub files: Vec<ObjectRef>,
     /// Runtime-only lookup state used by migration messages.
     pub overlay: BTreeMap<PageId, (Gen, PageLoc)>,
-    /// Runtime-only auxiliary lookup state used by migration messages.
-    pub leaves: BTreeMap<u32, LeafPtr>,
     /// Migration provenance (R7.2): while an in-migrated vset still
     /// hydrates from its source, every record names that source. The
     /// destination's first record — the durable ACCEPT of the handoff —
@@ -176,18 +126,6 @@ pub struct JournalRecord {
 impl JournalRecord {
     pub fn encode(&self, vset: VsetId) -> Vec<u8> {
         assert!(self.config.valid(), "invalid vset config");
-        assert!(
-            match self.config.kind {
-                VsetKind::Compute => self.database.is_empty(),
-                VsetKind::Database => {
-                    matches!(self.kind, RecordKind::Commit)
-                        && self
-                            .database
-                            .valid(u64::from(self.config.pages_per_volume) * page_size() as u64)
-                }
-            },
-            "record kind/metadata disagrees with vset kind"
-        );
         let mut e = Enc::new();
         e.u16(7); // version: accepted migration source fence
         e.u32(u32::try_from(page_size()).expect("page size fits u32"));
@@ -240,12 +178,6 @@ impl JournalRecord {
         e.u32(self.config.pages_per_volume);
         // The sole current durability policy is primary plus one passive.
         e.u8(2);
-        if self.config.kind == VsetKind::Database {
-            for file in self.database.files() {
-                e.u8(u8::from(file.exists));
-                e.u64(file.size);
-            }
-        }
         e.u32(u32::try_from(self.files.len()).expect("file count fits u32"));
         for file in &self.files {
             file.encode_into(&mut e);
@@ -278,13 +210,6 @@ impl JournalRecord {
             index.u64(loc.seg.0);
             index.u32(loc.offset);
             index.u32(loc.len);
-        }
-        index.u32(u32::try_from(self.leaves.len()).expect("leaf count fits u32"));
-        for (&span, ptr) in &self.leaves {
-            index.u32(span);
-            index.u64(ptr.base);
-            index.u64(ptr.fence);
-            index.u64(ptr.id);
         }
         index.u32(u32::try_from(block_checksums.len()).expect("block checksum count fits u32"));
         for (key, (generation, checksum)) in block_checksums {
@@ -358,7 +283,6 @@ impl JournalRecord {
         });
         let vset_kind = match d.u8()? {
             0 => VsetKind::Compute,
-            1 => VsetKind::Database,
             _ => return Err(DecodeError),
         };
         let config = VsetConfig {
@@ -371,31 +295,6 @@ impl JournalRecord {
             return Err(DecodeError);
         }
         if !config.valid() {
-            return Err(DecodeError);
-        }
-        let database = if config.kind == VsetKind::Database {
-            let mut file = || -> Result<DatabaseFileMeta, DecodeError> {
-                let exists = match d.u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(DecodeError),
-                };
-                let size = d.u64()?;
-                let max_size = u64::from(config.pages_per_volume) * page_size() as u64;
-                if (!exists && size != 0) || size > max_size {
-                    return Err(DecodeError);
-                }
-                Ok(DatabaseFileMeta { exists, size })
-            };
-            DatabaseMeta {
-                main: file()?,
-                wal: file()?,
-                journal: file()?,
-            }
-        } else {
-            DatabaseMeta::default()
-        };
-        if config.kind == VsetKind::Database && !matches!(kind, RecordKind::Commit) {
             return Err(DecodeError);
         }
         let file_count = d.u32()?;
@@ -413,10 +312,8 @@ impl JournalRecord {
             capture_seq,
             sync_covered_through,
             post_state_checksum,
-            database,
             files,
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from,
         })
     }
@@ -428,7 +325,7 @@ impl JournalRecord {
     pub fn decode_migration_with_checksums(
         vset: VsetId,
         bytes: &[u8],
-    ) -> Result<(JournalRecord, BTreeMap<BlockKey, (Gen, u64)>), DecodeError> {
+    ) -> Result<(JournalRecord, MigrationBlockChecksums), DecodeError> {
         let prefix = bytes.get(..8).ok_or(DecodeError)?;
         let durable_len = usize::try_from(u64::from_le_bytes(
             prefix.try_into().map_err(|_| DecodeError)?,
@@ -462,19 +359,6 @@ impl JournalRecord {
                 return Err(DecodeError);
             }
             if overlay.insert(page, (generation, loc)).is_some() {
-                return Err(DecodeError);
-            }
-        }
-        let leaf_count = d.u32()?;
-        let mut leaves = BTreeMap::new();
-        for _ in 0..leaf_count {
-            let span = d.u32()?;
-            let ptr = LeafPtr {
-                base: d.u64()?,
-                fence: d.u64()?,
-                id: d.u64()?,
-            };
-            if leaves.insert(span, ptr).is_some() {
                 return Err(DecodeError);
             }
         }
@@ -516,13 +400,7 @@ impl JournalRecord {
         }
         d.finish()?;
         record.overlay = overlay;
-        record.leaves = leaves;
         Ok((record, block_checksums))
-    }
-
-    /// Every span this record's map depends on beyond its inline overlay.
-    pub fn leaf_ptrs(&self) -> impl Iterator<Item = (u32, LeafPtr)> + '_ {
-        self.leaves.iter().map(|(&span, &ptr)| (span, ptr))
     }
 }
 
@@ -588,17 +466,8 @@ mod tests {
             capture_seq: 99,
             sync_covered_through: 90,
             post_state_checksum: 23,
-            database: DatabaseMeta::default(),
             files: Vec::new(),
             overlay: pages,
-            leaves: BTreeMap::from([(
-                0x100,
-                LeafPtr {
-                    base: 0,
-                    fence: 4,
-                    id: 11,
-                },
-            )]),
             migrated_from: Some(MigrationSource {
                 host: HostId(2),
                 offer_fence: Some(5),
@@ -612,7 +481,6 @@ mod tests {
         let bytes = record.encode(VsetId(0xA1));
         let mut durable = record.clone();
         durable.overlay.clear();
-        durable.leaves.clear();
         assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(durable));
         // Byte pin (R10.2): any change here is a storage format change.
         let expected = match page_size() {
@@ -674,66 +542,11 @@ mod tests {
     }
 
     #[test]
-    fn database_records_round_trip_with_file_metadata() {
-        let record = JournalRecord {
-            config: VsetConfig::database(1024),
-            seq: JournalSeq(7),
-            fence: 3,
-            kind: RecordKind::Commit,
-            capture_seq: 18,
-            sync_covered_through: 16,
-            post_state_checksum: 0,
-            database: DatabaseMeta {
-                main: DatabaseFileMeta {
-                    exists: true,
-                    size: 8192,
-                },
-                wal: DatabaseFileMeta {
-                    exists: true,
-                    size: 512,
-                },
-                journal: DatabaseFileMeta::default(),
-            },
-            files: Vec::new(),
-            overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
-            migrated_from: None,
-        };
-        let bytes = record.encode(VsetId(0xD1));
-        assert_eq!(JournalRecord::decode(VsetId(0xD1), &bytes), Ok(record));
-    }
-
-    #[test]
-    #[should_panic(expected = "record kind/metadata disagrees with vset kind")]
-    fn database_records_cannot_carry_vmstate() {
-        let record = JournalRecord {
-            config: VsetConfig::database(1),
-            seq: JournalSeq(0),
-            fence: 1,
-            kind: RecordKind::Checkpoint {
-                epoch: Epoch(0),
-                vmstate: 0,
-                vmstate_logical_length: 0,
-            },
-            capture_seq: 0,
-            sync_covered_through: 0,
-            post_state_checksum: 0,
-            database: DatabaseMeta::default(),
-            files: Vec::new(),
-            overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
-            migrated_from: None,
-        };
-        let _ = record.encode(VsetId(0xD1));
-    }
-
-    #[test]
     fn runtime_page_index_is_not_persisted() {
         let vset = VsetId(0xA1);
         let record = sample_record();
         let mut without_runtime_index = record.clone();
         without_runtime_index.overlay.clear();
-        without_runtime_index.leaves.clear();
 
         assert_eq!(record.encode(vset), without_runtime_index.encode(vset));
         assert_eq!(
@@ -747,7 +560,6 @@ mod tests {
         let vset = VsetId(0xA1);
         let mut record = sample_record();
         record.overlay.clear();
-        record.leaves.clear();
         let key = BlockKey {
             space: BlockSpace::Data,
             volume: 1,

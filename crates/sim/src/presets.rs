@@ -1,8 +1,7 @@
-//! Compatibility names for the committed simulation seed corpora.
+//! Named entry points for the committed simulation seed corpora.
 //!
-//! The checked-in scenario documents are the single source of truth. These
-//! wrappers preserve the existing Rust API used by regression tests while the
-//! sweep runner can realize the same specifications directly by name and seed.
+//! The checked-in scenario documents are the single source of truth for both
+//! regression tests and sweep runs.
 
 use crate::cluster::ClusterConfig;
 use crate::harness::HarnessConfig;

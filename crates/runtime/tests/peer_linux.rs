@@ -26,7 +26,7 @@ fn free_addr() -> SocketAddr {
         .expect("addr")
 }
 
-fn net(
+async fn net(
     self_id: HostId,
     listen: SocketAddr,
     peers: BTreeMap<HostId, SocketAddr>,
@@ -42,7 +42,9 @@ fn net(
     // those — a bogus self id would leak the host itself into the list.
     let host = PeerNet::start(&config, self_id, move |from, msg| {
         let _ = tx.send((from, msg));
-    });
+    })
+    .await
+    .expect("peer listen");
     (host, rx)
 }
 
@@ -78,17 +80,6 @@ fn sample_msgs() -> Vec<PeerMsg> {
         PeerMsg::Page {
             io: PeerRequestId(1),
             bytes: Some(vec![9; 640]),
-        },
-        PeerMsg::FetchLeaf {
-            io: PeerRequestId(2),
-            vset: VsetId(7),
-            base: 0,
-            fence: 2,
-            id: 1,
-        },
-        PeerMsg::Leaf {
-            io: PeerRequestId(2),
-            bytes: None,
         },
         PeerMsg::Released {
             vset: VsetId(7),
@@ -145,15 +136,15 @@ fn sample_msgs() -> Vec<PeerMsg> {
     ]
 }
 
-#[test]
-fn every_variant_crosses_the_wire_with_its_sender() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_variant_crosses_the_wire_with_its_sender() {
     let addr_a = free_addr();
     let addr_b = free_addr();
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone());
-    let (_b, rx_b) = net(HostId(1), addr_b, roster);
+    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone()).await;
+    let (_b, rx_b) = net(HostId(1), addr_b, roster).await;
 
     for msg in sample_msgs() {
         a.send(HostId(0), HostId(1), &msg);
@@ -168,14 +159,14 @@ fn every_variant_crosses_the_wire_with_its_sender() {
 /// Sends into the void drop silently; once the listener exists, later
 /// sends connect fresh and arrive. (The daemon's retry timers are what
 /// re-drive the dropped ones in real use.)
-#[test]
-fn sends_before_the_listener_drop_and_reconnect_works_after() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sends_before_the_listener_drop_and_reconnect_works_after() {
     let addr_a = free_addr();
     let addr_b = free_addr();
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone());
+    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone()).await;
 
     // No listener at addr_b yet: this frame is dropped on the floor.
     a.send(
@@ -190,7 +181,7 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
     assert!(a.dropped_sends.load(Ordering::SeqCst) >= 1);
     assert_eq!(a.connections(), vec![(HostId(1), false)]);
 
-    let (_b, rx_b) = net(HostId(1), addr_b, roster);
+    let (_b, rx_b) = net(HostId(1), addr_b, roster).await;
     // The sender's dead connection is discovered on the next write; the
     // retry after that reconnects. Send a few — at least one must land.
     for _ in 0..5 {
@@ -220,11 +211,11 @@ fn sends_before_the_listener_drop_and_reconnect_works_after() {
 
 /// A stream that turns to garbage is closed at the first bad frame and
 /// never wedges the receiver: fresh connections keep delivering.
-#[test]
-fn a_corrupt_frame_closes_its_connection_without_wedging() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_frame_closes_its_connection_without_wedging() {
     let addr_b = free_addr();
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(1), addr_b)].into_iter().collect();
-    let (_b, rx_b) = net(HostId(1), addr_b, roster.clone());
+    let (_b, rx_b) = net(HostId(1), addr_b, roster.clone()).await;
 
     // A raw connection writing garbage: dropped without a delivery.
     let mut raw = TcpStream::connect(addr_b).expect("connect");
@@ -239,7 +230,7 @@ fn a_corrupt_frame_closes_its_connection_without_wedging() {
     let addr_a = free_addr();
     let mut full = roster;
     full.insert(HostId(0), addr_a);
-    let (a, _rx_a) = net(HostId(0), addr_a, full);
+    let (a, _rx_a) = net(HostId(0), addr_a, full).await;
     a.send(
         HostId(0),
         HostId(1),
@@ -261,15 +252,15 @@ fn a_corrupt_frame_closes_its_connection_without_wedging() {
 }
 
 /// A segment-sized page payload (8 MiB) crosses intact.
-#[test]
-fn a_segment_sized_payload_round_trips() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_segment_sized_payload_round_trips() {
     let addr_a = free_addr();
     let addr_b = free_addr();
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone());
-    let (_b, rx_b) = net(HostId(1), addr_b, roster);
+    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone()).await;
+    let (_b, rx_b) = net(HostId(1), addr_b, roster).await;
 
     let payload: Vec<u8> = (0..8 * 1024 * 1024u32)
         .map(|i| u8::try_from((i * 31) % 256).expect("fits"))

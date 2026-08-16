@@ -1,16 +1,41 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
 use blockd_core::types::millis;
-use blockd_runtime::{PeerConfig, PeerTlsConfig, RuntimeConfig};
+use blockd_runtime::fakegcs::{FakeGcs, FakeGcsServer};
+use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, PeerTlsConfig, RuntimeConfig};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
+
+#[allow(dead_code)]
+pub(crate) async fn local<F: Future>(future: F) -> F::Output {
+    tokio::task::LocalSet::new().run_until(future).await
+}
+
+#[allow(dead_code)]
+pub(crate) struct TestGcs {
+    pub fake: FakeGcsServer,
+    pub store: Arc<GcsStore>,
+}
+
+#[allow(dead_code)]
+pub(crate) async fn test_gcs(tag: &str) -> TestGcs {
+    let (fake, endpoint) = FakeGcs::start().await;
+    let store = Arc::new(GcsStore::new(GcsConfig {
+        bucket: "test".to_owned(),
+        prefix: format!("{tag}/"),
+        endpoint: endpoint.clone(),
+        metadata_endpoint: endpoint,
+    }));
+    TestGcs { fake, store }
+}
 
 const MAX_TEST_HOSTS: usize = 3;
 

@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use axum::Router;
@@ -55,19 +55,53 @@ pub struct FakeGcs {
     pub data_outage: std::sync::atomic::AtomicBool,
 }
 
+/// Owned lifetime of one fake object-store HTTP service.
+pub struct FakeGcsServer {
+    state: Arc<FakeGcs>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Deref for FakeGcsServer {
+    type Target = FakeGcs;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl Drop for FakeGcsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl FakeGcs {
-    /// Bind an ephemeral port and serve forever; returns the endpoint URL
-    /// (usable as both `endpoint` and `metadata_endpoint`).
-    pub fn start() -> (Arc<FakeGcs>, String) {
-        FakeGcs::start_on("127.0.0.1:0".parse().expect("addr"))
+    pub fn request_count(&self) -> usize {
+        self.seen
+            .lock()
+            .expect("fake GCS seen mutex poisoned")
+            .len()
+    }
+
+    pub fn method_count(&self, method: &str) -> usize {
+        self.seen
+            .lock()
+            .expect("fake GCS seen mutex poisoned")
+            .iter()
+            .filter(|request| request.method == method)
+            .count()
+    }
+
+    /// Bind an ephemeral port on the current Tokio runtime.
+    pub async fn start() -> (FakeGcsServer, String) {
+        FakeGcs::start_on("127.0.0.1:0".parse().expect("addr")).await
     }
 
     /// Serve on a specific address (the demo's shared local store).
-    pub fn start_on(addr: SocketAddr) -> (Arc<FakeGcs>, String) {
-        let listener = std::net::TcpListener::bind(addr).expect("bind fake gcs");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking listener");
+    pub async fn start_on(addr: SocketAddr) -> (FakeGcsServer, String) {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("bind fake gcs");
         let addr = listener.local_addr().expect("addr");
         let fake = Arc::new(FakeGcs {
             objects: Mutex::new(BTreeMap::new()),
@@ -83,34 +117,25 @@ impl FakeGcs {
             outage: std::sync::atomic::AtomicBool::new(false),
             data_outage: std::sync::atomic::AtomicBool::new(false),
         });
-        let server = fake.clone();
-        thread::Builder::new()
-            .name("blockd-fake-gcs".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .expect("fake GCS runtime");
-                runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(listener)
-                        .expect("async fake GCS listener");
-                    let app = Router::new()
-                        .fallback(handle)
-                        .layer(DefaultBodyLimit::max(
-                            usize::try_from(MAX_OBJECT_BYTES).expect("object cap fits usize"),
-                        ))
-                        .with_state(server);
-                    axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .await
-                    .expect("serve fake GCS");
-                });
-            })
-            .expect("spawn fake GCS");
-        (fake, format!("http://{addr}"))
+        let state = Arc::clone(&fake);
+        let app = Router::new()
+            .fallback(handle)
+            .layer(DefaultBodyLimit::max(
+                usize::try_from(MAX_OBJECT_BYTES).expect("object cap fits usize"),
+            ))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("serve fake GCS");
+        });
+        (
+            FakeGcsServer { state: fake, task },
+            format!("http://{addr}"),
+        )
     }
 
     fn object_response(&self, seen: &Seen, body: Vec<u8>) -> Response {

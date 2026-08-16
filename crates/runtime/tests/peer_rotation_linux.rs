@@ -36,7 +36,7 @@ fn free_addr() -> SocketAddr {
         .expect("address")
 }
 
-fn start(
+async fn start(
     host: u16,
     addresses: [SocketAddr; 2],
     tls: PeerTlsConfig,
@@ -52,7 +52,9 @@ fn start(
         move |from, msg| {
             let _ = tx.send((from, msg));
         },
-    );
+    )
+    .await
+    .expect("peer listen");
     (net, rx)
 }
 
@@ -80,24 +82,24 @@ fn settle_rebind() {
     std::thread::sleep(Duration::from_millis(50));
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
-fn rolling_certificate_rotation_requires_overlap_then_removes_old_identity() {
+async fn rolling_certificate_rotation_requires_overlap_then_removes_old_identity() {
     let addresses = [free_addr(), free_addr()];
-    let (mut a, mut a_rx) = start(0, addresses, tls(0, IdentitySet::Old, true, false));
-    let (mut b, mut b_rx) = start(1, addresses, tls(1, IdentitySet::Old, true, false));
+    let (mut a, mut a_rx) = start(0, addresses, tls(0, IdentitySet::Old, true, false)).await;
+    let (mut b, mut b_rx) = start(1, addresses, tls(1, IdentitySet::Old, true, false)).await;
     delivered("old A to old B", &a, HostId(0), HostId(1), &b_rx);
     delivered("old B to old A", &b, HostId(1), HostId(0), &a_rx);
 
     drop(a);
     settle_rebind();
-    (a, a_rx) = start(0, addresses, tls(0, IdentitySet::Old, true, true));
+    (a, a_rx) = start(0, addresses, tls(0, IdentitySet::Old, true, true)).await;
     delivered("overlap A to old B", &a, HostId(0), HostId(1), &b_rx);
     delivered("old B to overlap A", &b, HostId(1), HostId(0), &a_rx);
 
     drop(b);
     settle_rebind();
-    (b, b_rx) = start(1, addresses, tls(1, IdentitySet::New, true, true));
+    (b, b_rx) = start(1, addresses, tls(1, IdentitySet::New, true, true)).await;
     delivered(
         "old A to new B during overlap",
         &a,
@@ -115,25 +117,25 @@ fn rolling_certificate_rotation_requires_overlap_then_removes_old_identity() {
 
     drop(a);
     settle_rebind();
-    (a, a_rx) = start(0, addresses, tls(0, IdentitySet::New, true, true));
+    (a, a_rx) = start(0, addresses, tls(0, IdentitySet::New, true, true)).await;
     delivered("new A to overlap B", &a, HostId(0), HostId(1), &b_rx);
     delivered("overlap B to new A", &b, HostId(1), HostId(0), &a_rx);
 
     drop(b);
     settle_rebind();
-    (b, b_rx) = start(1, addresses, tls(1, IdentitySet::New, false, true));
+    (b, b_rx) = start(1, addresses, tls(1, IdentitySet::New, false, true)).await;
     delivered("new A to new-only B", &a, HostId(0), HostId(1), &b_rx);
     delivered("new-only B to new A", &b, HostId(1), HostId(0), &a_rx);
 
     drop(a);
     settle_rebind();
-    let (a, a_rx) = start(0, addresses, tls(0, IdentitySet::New, false, true));
+    let (a, a_rx) = start(0, addresses, tls(0, IdentitySet::New, false, true)).await;
     delivered("new-only A to B", &a, HostId(0), HostId(1), &b_rx);
     delivered("new-only B to A", &b, HostId(1), HostId(0), &a_rx);
 
     drop(a);
     settle_rebind();
-    let (old_a, _) = start(0, addresses, tls(0, IdentitySet::Old, false, true));
+    let (old_a, _) = start(0, addresses, tls(0, IdentitySet::Old, false, true)).await;
     // `delivered` fires up to 30 copies and returns on the first arrival;
     // under load the stragglers land late. Only the DISTINCT payload below
     // can prove the old identity authenticated — drain the stale

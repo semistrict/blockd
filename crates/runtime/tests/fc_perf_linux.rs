@@ -12,12 +12,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use blockd_core::protocol::StoreFault;
-use blockd_runtime::fc::{FcVm, ShmemServer, upload_mem_parts, upload_mem_parts_async};
-use blockd_runtime::{GetResult, ObjectStore, S3LatencyModel, S3Store};
+use blockd_runtime::fc::{FcVm, ShmemServer, upload_mem_parts_async};
+use blockd_runtime::{GetResult, ObjectStore};
+
+mod support;
 
 const MEM_MIB: u32 = 128;
 const ARENA_PAGES: u32 = 4096; // 16 MiB guest working set
-const PART_BYTES: u64 = 8 * 1024 * 1024; // segment-object size for S3 parts
+const PART_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Default)]
 struct UploadProbe {
@@ -62,9 +64,9 @@ impl ObjectStore for UploadProbe {
     }
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "performance profile; run explicitly in release mode"]
-fn profile_streaming_snapshot_upload() {
+async fn profile_streaming_snapshot_upload() {
     let scratch = tempfile::tempdir().expect("scratch");
     let memory = scratch.path().join("memory");
     std::fs::File::create(&memory)
@@ -72,17 +74,9 @@ fn profile_streaming_snapshot_upload() {
         .set_len(u64::from(MEM_MIB) * 1024 * 1024)
         .expect("size memory file");
     let store = Arc::new(UploadProbe::default());
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
     let started = Instant::now();
-    let parts = runtime.block_on(upload_mem_parts_async(
-        store.clone(),
-        memory,
-        "snapshot/mem".to_owned(),
-        PART_BYTES,
-    ));
+    let parts =
+        upload_mem_parts_async(store.clone(), memory, "snapshot/mem".to_owned(), PART_BYTES).await;
     let elapsed = started.elapsed();
     let max_in_flight = store.max_in_flight.load(Ordering::SeqCst);
     assert_eq!(parts, 16);
@@ -135,17 +129,17 @@ fn shmem_path(tag: &str) -> PathBuf {
 
 /// Boot a VM, run the seeded workload, snapshot it, kill it. Returns the
 /// guest's own checksum of its worked state.
-fn worked_snapshot(art: &Artifacts) -> (PathBuf, PathBuf, String) {
-    let mut vm = FcVm::spawn(&art.fc, &art.scratch.join("base.sock"));
-    vm.boot(&art.kernel, &art.initrd, MEM_MIB);
-    vm.wait_line("READY");
-    vm.cmd(&format!("fill 7 {ARENA_PAGES}"), "FILLED ");
-    let sum = vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM ");
+async fn worked_snapshot(art: &Artifacts) -> (PathBuf, PathBuf, String) {
+    let mut vm = FcVm::spawn(&art.fc, &art.scratch.join("base.sock")).await;
+    vm.boot(&art.kernel, &art.initrd, MEM_MIB).await;
+    vm.wait_line("READY").await;
+    vm.cmd(&format!("fill 7 {ARENA_PAGES}"), "FILLED ").await;
+    let sum = vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM ").await;
     let snap = art.scratch.join("base.vmstate");
     let mem = art.scratch.join("base.mem");
-    vm.pause();
-    vm.snapshot(&snap, &mem);
-    vm.kill();
+    vm.pause().await;
+    vm.snapshot(&snap, &mem).await;
+    vm.kill().await;
     (snap, mem, sum)
 }
 
@@ -174,49 +168,56 @@ fn fault_profile(histogram: &blockd_runtime::HistogramSnapshot) -> String {
 
 /// PROFILE 1 & 2: restore + full working-set drain, upstream `File`
 /// backend vs the patched `UffdShmem` backend, same worked snapshot.
-#[test]
-fn profile_restore_file_vs_uffdshmem() {
+#[tokio::test]
+async fn profile_restore_file_vs_uffdshmem() {
     let art = artifacts("backends");
-    let (snap, mem, base_sum) = worked_snapshot(&art);
+    let (snap, mem, base_sum) = worked_snapshot(&art).await;
 
     // ── File backend (upstream): kernel MAP_PRIVATE of the mem file ─────
     let started = Instant::now();
-    let mut file_vm = FcVm::spawn(&art.fc, &art.scratch.join("file.sock"));
-    file_vm.load_snapshot(&snap, &mem, None);
+    let mut file_vm = FcVm::spawn(&art.fc, &art.scratch.join("file.sock")).await;
+    file_vm.load_snapshot(&snap, &mem, None).await;
     let file_first_response = {
         let t = Instant::now();
-        file_vm.cmd("ping", "PONG");
+        file_vm.cmd("ping", "PONG").await;
         t.elapsed()
     };
     let file_restore_total = started.elapsed();
     let t = Instant::now();
-    assert_eq!(file_vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM "), base_sum);
+    assert_eq!(
+        file_vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM ").await,
+        base_sum
+    );
     let file_drain = t.elapsed();
-    file_vm.kill();
+    file_vm.kill().await;
 
     // ── UffdShmem backend (our patch): handler-served, warm local tier ──
     let uffd_sock = art.scratch.join("shm.sock");
     let shmem = shmem_path("perf-backends");
-    let listener = std::os::unix::net::UnixListener::bind(&uffd_sock).expect("bind");
+    let listener = tokio::net::UnixListener::bind(&uffd_sock).expect("bind");
     let server = ShmemServer::start(
         listener,
         mem.clone(),
         &shmem,
         u64::from(MEM_MIB) * 1024 * 1024,
-    );
+    )
+    .await;
     let started = Instant::now();
-    let mut shm_vm = FcVm::spawn(&art.fc, &art.scratch.join("shmvm.sock"));
-    shm_vm.load_snapshot_shmem(&snap, &uffd_sock, &shmem);
+    let mut shm_vm = FcVm::spawn(&art.fc, &art.scratch.join("shmvm.sock")).await;
+    shm_vm.load_snapshot_shmem(&snap, &uffd_sock, &shmem).await;
     let shm_first_response = {
         let t = Instant::now();
-        shm_vm.cmd("ping", "PONG");
+        shm_vm.cmd("ping", "PONG").await;
         t.elapsed()
     };
     let shm_restore_total = started.elapsed();
     let t = Instant::now();
-    assert_eq!(shm_vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM "), base_sum);
+    assert_eq!(
+        shm_vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM ").await,
+        base_sum
+    );
     let shm_drain = t.elapsed();
-    shm_vm.kill();
+    shm_vm.kill().await;
 
     eprintln!("── PROFILE: restore + 16 MiB working-set drain ──");
     eprintln!(
@@ -240,35 +241,47 @@ fn profile_restore_file_vs_uffdshmem() {
 }
 
 /// PROFILE 3: cold restore of a real microVM served ENTIRELY from the
-/// S3-shaped store under realistic same-region latency, with the exact
-/// S3 request bill recorded — how many calls, of which types, how many
-/// bytes.
-#[test]
-fn profile_cold_restore_from_simulated_s3() {
-    let art = artifacts("s3cold");
-    let (snap, mem, base_sum) = worked_snapshot(&art);
+/// GCS client under realistic same-region latency, with the exact HTTP
+/// request bill recorded.
+#[tokio::test]
+async fn profile_cold_restore_from_fake_gcs() {
+    let art = artifacts("gcs-cold");
+    let (snap, mem, base_sum) = worked_snapshot(&art).await;
 
     // The bucket, with same-region latency on every request.
-    let mut store = S3Store::new();
-    store.s3.set_latency(S3LatencyModel::same_region());
-    let store = Arc::new(store);
+    let gcs = support::test_gcs("fc-cold").await;
+    gcs.fake.latency_ms.store(56, Ordering::SeqCst);
+    let store = gcs.store.clone();
 
     // Backup: the snapshot memory as segment objects (R4.6-sized parts).
     let t = Instant::now();
-    let parts = upload_mem_parts(&store, &mem, "v/0000000000000001/mem", PART_BYTES);
+    let parts = upload_mem_parts_async(
+        store.clone(),
+        mem.clone(),
+        "v/0000000000000001/mem".to_owned(),
+        PART_BYTES,
+    )
+    .await;
     let upload_time = t.elapsed();
     assert_eq!(parts, u64::from(MEM_MIB) * 1024 * 1024 / PART_BYTES);
-    let puts_after_upload = store.s3.stats.put_object.load(Ordering::SeqCst);
+    let puts_after_upload = gcs
+        .fake
+        .seen
+        .lock()
+        .expect("seen lock")
+        .iter()
+        .filter(|request| request.method == "PUT")
+        .count() as u64;
     assert_eq!(puts_after_upload, parts, "one PutObject per part");
 
-    // Cold restore: every byte the guest touches is fetched from "S3" by
+    // Cold restore: every byte the guest touches is fetched through GCS by
     // the handler, one GetObject per touched part. Readahead is OFF so the
     // bill below stays exactly demand-shaped (the readahead machinery is
     // pinned by tests/part_fetch_linux.rs).
-    let uffd_sock = art.scratch.join("s3.sock");
-    let shmem = shmem_path("perf-s3cold");
-    let listener = std::os::unix::net::UnixListener::bind(&uffd_sock).expect("bind");
-    let server = ShmemServer::start_s3(
+    let uffd_sock = art.scratch.join("gcs.sock");
+    let shmem = shmem_path("perf-gcs-cold");
+    let listener = tokio::net::UnixListener::bind(&uffd_sock).expect("bind");
+    let server = ShmemServer::start_store(
         listener,
         store.clone(),
         "v/0000000000000001/mem".to_owned(),
@@ -276,28 +289,47 @@ fn profile_cold_restore_from_simulated_s3() {
         &shmem,
         u64::from(MEM_MIB) * 1024 * 1024,
         0,
-    );
+    )
+    .await;
     let started = Instant::now();
-    let mut vm = FcVm::spawn(&art.fc, &art.scratch.join("s3vm.sock"));
-    vm.load_snapshot_shmem(&snap, &uffd_sock, &shmem);
+    let mut vm = FcVm::spawn(&art.fc, &art.scratch.join("s3vm.sock")).await;
+    vm.load_snapshot_shmem(&snap, &uffd_sock, &shmem).await;
     let first_response = {
         let t = Instant::now();
-        vm.cmd("ping", "PONG");
+        vm.cmd("ping", "PONG").await;
         t.elapsed()
     };
     let restore_total = started.elapsed();
-    let gets_at_first_response = store.s3.stats.get_object.load(Ordering::SeqCst);
+    let gets_at_first_response = gcs
+        .fake
+        .seen
+        .lock()
+        .expect("seen lock")
+        .iter()
+        .filter(|request| request.method == "GET")
+        .count() as u64;
 
     let t = Instant::now();
-    assert_eq!(vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM "), base_sum);
+    assert_eq!(
+        vm.cmd(&format!("sum {ARENA_PAGES}"), "SUM ").await,
+        base_sum
+    );
     let drain = t.elapsed();
     // Liveness after the cold path: keep working.
-    let refilled = vm.cmd("fill 11 1024", "FILLED ");
-    assert_eq!(vm.cmd("sum 1024", "SUM "), refilled);
-    vm.kill();
+    let refilled = vm.cmd("fill 11 1024", "FILLED ").await;
+    assert_eq!(vm.cmd("sum 1024", "SUM ").await, refilled);
+    vm.kill().await;
 
-    let gets_total = store.s3.stats.get_object.load(Ordering::SeqCst);
-    eprintln!("── PROFILE: cold restore from simulated same-region S3 ──");
+    let seen = gcs.fake.seen.lock().expect("seen lock");
+    let gets_total = seen
+        .iter()
+        .filter(|request| request.method == "GET")
+        .count() as u64;
+    let range_requests = seen
+        .iter()
+        .filter(|request| request.headers.contains_key("range"))
+        .count();
+    eprintln!("── PROFILE: cold restore through GcsStore + FakeGcs ──");
     eprintln!(
         "  upload: {parts} parts of {} MiB in {upload_time:.1?}",
         PART_BYTES / 1024 / 1024
@@ -308,7 +340,7 @@ fn profile_cold_restore_from_simulated_s3() {
     );
     eprintln!("  16 MiB working-set drain {drain:.1?} ({gets_total} GetObject calls total)");
     eprintln!("  faults: {}", fault_profile(&server.fault_latency()));
-    eprintln!("  S3 bill: {}", store.s3.stats.report());
+    eprintln!("  HTTP bill: {puts_after_upload} PUT, {gets_total} GET");
 
     // The request bill's SHAPE is deterministic: one PutObject per part on
     // backup; on restore, one GetObject per distinct part the guest's
@@ -319,15 +351,8 @@ fn profile_cold_restore_from_simulated_s3() {
         "more GetObjects than parts: per-page fetching crept in"
     );
     assert_eq!(
-        store.s3.stats.get_object_range.load(Ordering::SeqCst)
-            + store.s3.stats.put_object_conditional.load(Ordering::SeqCst),
-        0,
-        "unexpected request types in this scenario"
-    );
-    assert_eq!(
-        store.s3.stats.bytes_downloaded.load(Ordering::SeqCst),
-        gets_total * PART_BYTES,
-        "download bytes must equal fetched parts exactly"
+        range_requests, 0,
+        "unexpected range request in this scenario"
     );
     // Demand paging under same-region latency still resumes promptly: the
     // guest answered within a handful of part fetches (~0.6s in

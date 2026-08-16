@@ -788,7 +788,6 @@ where
                     ReplicaArtifact::Segment { fence, seg } => {
                         layout::segment_blob(vset, fence, seg)
                     }
-                    ReplicaArtifact::Leaf { fence, id } => layout::leaf_blob(vset, fence, id),
                 };
                 let Ok(Some(bytes)) = Blobs::read(world.as_ref(), &name).await else {
                     return None;

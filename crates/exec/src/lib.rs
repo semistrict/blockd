@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! Deterministic current-thread async actors.
+//! Tokio-backed current-thread async actor support.
 //!
-//! The executor owns task ordering, virtual time, randomness, and fault
-//! injection. Simulation has no external injector; production admits events
-//! through the explicit two-lane injector while running the same futures.
+//! Tokio owns task scheduling, timers, waking, and cancellation. This crate
+//! keeps the small domain-specific pieces shared by production and simulation:
+//! typed request/reply channels, priority injection, seeded randomness, fault points,
+//! and stable observations.
 
-pub mod bridge;
 pub mod channel;
 pub mod fault;
 pub mod inject;
@@ -18,17 +18,13 @@ pub mod trace;
 
 mod runtime;
 
-pub use bridge::{
-    BridgeReceiver, BridgeRecvError, BridgeReply, BridgeRequest, BridgeSender, ReplyTarget, bridge,
-    bridge_request,
-};
 pub use fault::{FaultConfig, FaultPoint};
-pub use request::{Reply, Request, request};
+pub use request::{Reply, Request, Response, TryRecvError, request};
 pub use runtime::{
-    Cancelled, Delay, Executor, Mode, MonotonicClock, TaskHandle, TaskId, WakeSource, current_poll,
-    delay, fault_point, now, observe, random_u64, spawn, yield_now,
+    Cancelled, Delay, ProductionContext, SimulationContext, TaskHandle, TaskId, advance_to,
+    current_poll, delay, fault_point, now, observe, random_u64, run_ready,
+    set_simulation_fault_config, simulation_fault_hits, simulation_polls, simulation_scope,
+    simulation_trace_hash, spawn, yield_now,
 };
-pub use select::{
-    Either, Join2, OneOf3, Select2, Select3, Timeout, join2, select2, select3, timeout,
-};
+pub use select::{Either, OneOf3, Timeout, join2, select2, select3, timeout};
 pub use task_set::{ActorCollection, TaskSet};

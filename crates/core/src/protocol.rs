@@ -4,9 +4,8 @@
 
 use std::fmt;
 
-use crate::database::AttachmentId;
 use crate::journal::VsetConfig;
-use crate::types::{Epoch, HostId, SegId, VmId, VsetId};
+use crate::types::{Epoch, HostId, SegId, VsetId};
 
 /// Largest object accepted by the durable-store seam, including framing
 /// overhead for payloads whose unframed contract is 64 MiB.
@@ -45,7 +44,6 @@ pub enum StoreFault {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ReplicaArtifact {
     Segment { fence: u64, seg: SegId },
-    Leaf { fence: u64, id: u64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,21 +91,6 @@ pub enum PeerMsg {
     /// Peer fetch response: raw stored bytes, damage included (the reader
     /// verifies, R8.1). `None` = the peer no longer has it.
     Page {
-        io: PeerRequestId,
-        bytes: Option<Vec<u8>>,
-    },
-    /// Fetch one map leaf blob from a peer (post-copy hydration of a
-    /// migrated vset's map, R7.1). `base` is 0 for the vset's own
-    /// namespace, else the base whose leaf this is.
-    FetchLeaf {
-        io: PeerRequestId,
-        vset: VsetId,
-        base: u64,
-        fence: u64,
-        id: u64,
-    },
-    /// Leaf fetch response: the blob's raw bytes, damage included.
-    Leaf {
         io: PeerRequestId,
         bytes: Option<Vec<u8>>,
     },
@@ -232,67 +215,18 @@ pub enum AdminCall {
         vset: VsetId,
         to: HostId,
     },
-    AttachDatabase {
-        vset: VsetId,
-        vm: VmId,
-    },
-    BeginDetachDatabase {
-        vset: VsetId,
-        attachment: AttachmentId,
-        mode: DetachMode,
-    },
-    FinishDetachDatabase {
-        vset: VsetId,
-        attachment: AttachmentId,
-    },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DetachMode {
-    Graceful,
-    Forced,
 }
 
 /// Successful completion of an in-process administrative operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdminSuccess {
-    VsetCreated {
-        vset: VsetId,
-    },
-    CheckpointDone {
-        vset: VsetId,
-        epoch: Epoch,
-    },
-    VsetRestored {
-        vset: VsetId,
-        verdict: Verdict,
-    },
-    BaseKept {
-        base: u64,
-    },
-    BaseDeleted {
-        base: u64,
-    },
-    VsetForked {
-        vset: VsetId,
-        verdict: Verdict,
-    },
-    MigratedOut {
-        vset: VsetId,
-    },
-    DatabaseAttached {
-        vset: VsetId,
-        attachment: AttachmentId,
-    },
-    DatabaseDetachStarted {
-        vset: VsetId,
-        attachment: AttachmentId,
-        forced: bool,
-    },
-    DatabaseDetached {
-        vset: VsetId,
-        attachment: AttachmentId,
-    },
+    VsetCreated { vset: VsetId },
+    CheckpointDone { vset: VsetId, epoch: Epoch },
+    VsetRestored { vset: VsetId, verdict: Verdict },
+    BaseKept { base: u64 },
+    BaseDeleted { base: u64 },
+    VsetForked { vset: VsetId, verdict: Verdict },
+    MigratedOut { vset: VsetId },
 }
 
 pub type AdminResult = Result<AdminSuccess, AdminError>;
@@ -324,9 +258,6 @@ pub enum Verdict {
     /// Newest usable recovery point is disk-only: boot fresh from disks at
     /// sync consistency; memory is invalid (R3.7).
     ColdBoot,
-    /// A storage-only `SQLite` vset recovered at a durable file/page point.
-    /// It is ready for a separate attachment and carries no VM state.
-    DatabaseReady { synced_through: u64 },
     /// Durable state exists but no intact record: nothing restorable.
     Unrestorable,
 }

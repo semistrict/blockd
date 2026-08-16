@@ -7,7 +7,7 @@
 //! Payload layout after the standard frame header: `from u16 | discriminant
 //! u8 | fields`, fields in [`PeerMsg`] declaration order.
 //! `Vec<u8>` encodes as `len u32 | bytes`; `Option<Vec<u8>>` prefixes a
-//! presence byte. Embedded blobs (records, segment entries, leaves) are
+//! presence byte. Embedded blobs (records and segment entries) are
 //! already framed and verified by their consumers. Inline VMM bytes are
 //! protected by the peer frame and checked against the offered record before
 //! use (R8.1: the reader decides).
@@ -81,15 +81,12 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
             e.u8(2);
             e.u64(io.0);
             e.u64(vset.0);
-            match replica_assignment_epoch {
-                Some(epoch) => {
-                    e.u8(1);
-                    e.u64(*epoch);
-                }
-                None => {
-                    e.u8(0);
-                    e.u64(0);
-                }
+            if let Some(epoch) = replica_assignment_epoch {
+                e.u8(1);
+                e.u64(*epoch);
+            } else {
+                e.u8(0);
+                e.u64(0);
             }
             e.u64(*fence);
             e.u64(seg.0);
@@ -98,25 +95,6 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
         }
         PeerMsg::Page { io, bytes } => {
             e.u8(3);
-            e.u64(io.0);
-            opt_bytes(&mut e, bytes.as_deref());
-        }
-        PeerMsg::FetchLeaf {
-            io,
-            vset,
-            base,
-            fence,
-            id,
-        } => {
-            e.u8(4);
-            e.u64(io.0);
-            e.u64(vset.0);
-            e.u64(*base);
-            e.u64(*fence);
-            e.u64(*id);
-        }
-        PeerMsg::Leaf { io, bytes } => {
-            e.u8(5);
             e.u64(io.0);
             opt_bytes(&mut e, bytes.as_deref());
         }
@@ -335,17 +313,6 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             io: PeerRequestId(d.u64()?),
             bytes: decode_opt_bytes(&mut d)?,
         },
-        4 => PeerMsg::FetchLeaf {
-            io: PeerRequestId(d.u64()?),
-            vset: VsetId(d.u64()?),
-            base: d.u64()?,
-            fence: d.u64()?,
-            id: d.u64()?,
-        },
-        5 => PeerMsg::Leaf {
-            io: PeerRequestId(d.u64()?),
-            bytes: decode_opt_bytes(&mut d)?,
-        },
         6 => PeerMsg::Released {
             vset: VsetId(d.u64()?),
             release_fence: d.u64()?,
@@ -532,7 +499,6 @@ mod tests {
             fence: 4,
             seg: SegId(12),
         };
-        let leaf = ReplicaArtifact::Leaf { fence: 4, id: 8 };
         let info = ReplicaCommitInfo {
             writer_fence: 4,
             seq: JournalSeq(13),
@@ -577,21 +543,6 @@ mod tests {
                 io: PeerRequestId(100),
                 bytes: None,
             },
-            PeerMsg::FetchLeaf {
-                io: PeerRequestId(101),
-                vset: VsetId(7),
-                base: 0,
-                fence: 3,
-                id: 2,
-            },
-            PeerMsg::Leaf {
-                io: PeerRequestId(101),
-                bytes: Some(vec![0xC3; 136]),
-            },
-            PeerMsg::Leaf {
-                io: PeerRequestId(102),
-                bytes: None,
-            },
             PeerMsg::Released {
                 vset: VsetId(7),
                 release_fence: 3,
@@ -617,7 +568,7 @@ mod tests {
                 vset: VsetId(7),
                 assignment_epoch: 3,
                 info,
-                required: vec![segment, leaf],
+                required: vec![segment],
                 record: vec![0xC3; 27],
             },
             PeerMsg::ReplicaCommitAck {
@@ -712,8 +663,8 @@ mod tests {
             .iter()
             .flat_map(|msg| encode_peer(HostId(2), msg))
             .collect();
-        assert_eq!(bytes.len(), 2356);
-        assert_eq!(crc32c(&bytes), 0x212E_7AB0);
+        assert_eq!(bytes.len(), 2096);
+        assert_eq!(crc32c(&bytes), 0xF56F_4AA0);
     }
 
     #[test]

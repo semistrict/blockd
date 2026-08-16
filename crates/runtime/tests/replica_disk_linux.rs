@@ -8,7 +8,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,12 +19,13 @@ use blockd_core::layout;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
 use blockd_core::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use blockd_core::replica_spool::{seal_replica_artifact, seal_replica_commit};
-use blockd_core::segment::SegmentBuilder;
+use blockd_core::segment::SegmentBatchBuilder;
 use blockd_core::types::{
     Gen, HostId, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,
 };
-use blockd_exec::Executor;
+use blockd_exec::ProductionContext;
 use blockd_runtime::world::FileBlobs;
+use tokio::process::Command;
 
 const VSET: VsetId = VsetId(7);
 
@@ -37,9 +37,9 @@ fn fixture() -> (Vec<u8>, Vec<u8>) {
         },
         page: PageNo(2),
     };
-    let mut builder = SegmentBuilder::new(VSET, 4, SegId(9));
+    let mut builder = SegmentBatchBuilder::new(VSET, 4, SegId(9));
     builder.add(page, Gen(3), &vec![0xA5; page_size()]);
-    let (segment, locs) = builder.finish();
+    let (_, segment, locs) = builder.finish().pop().expect("fixture object");
     let artifact = ReplicaArtifact::Segment {
         fence: 4,
         seg: SegId(9),
@@ -60,9 +60,9 @@ fn fixture() -> (Vec<u8>, Vec<u8>) {
         kind: RecordKind::Commit,
         capture_seq: 12,
         sync_covered_through: info.sync_covered_through,
-        database: blockd_core::journal::DatabaseMeta::default(),
+        post_state_checksum: 0,
+        files: Vec::new(),
         overlay: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
-        leaves: BTreeMap::new(),
         migrated_from: None,
     }
     .encode(VSET);
@@ -115,102 +115,109 @@ fn replica_kill_child() {
     thread::sleep(Duration::from_mins(1));
 }
 
-#[test]
-fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
-    let root = std::env::temp_dir().join(format!("blockd-replica-kill-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("root");
-    let mut child = Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", "replica_kill_child", "--nocapture"])
-        .env("BLOCKD_REPLICA_KILL_CHILD", &root)
-        .spawn()
-        .expect("spawn append helper");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !root.join("ready").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "append helper did not become ready"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    child.kill().expect("kill append helper");
-    let status = child.wait().expect("reap append helper");
-    assert!(!status.success(), "helper must die abruptly");
+#[tokio::test(flavor = "current_thread")]
+async fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root =
+                std::env::temp_dir().join(format!("blockd-replica-kill-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("root");
+            let mut child = Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", "replica_kill_child", "--nocapture"])
+                .env("BLOCKD_REPLICA_KILL_CHILD", &root)
+                .spawn()
+                .expect("spawn append helper");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("ready").exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "append helper did not become ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            child.kill().await.expect("kill append helper");
+            let status = child.wait().await.expect("reap append helper");
+            assert!(!status.success(), "helper must die abruptly");
 
-    let name = layout::replica_spool_blob(HostId(0), VSET, 1);
-    let path = root.join(&name);
-    let bytes = std::fs::read(&path).expect("surviving spool");
-    let (artifact, _) = fixture();
-    assert!(bytes.len() > artifact.len());
-    let roster = vec![
-        PeerCandidate {
-            host: HostId(0),
-            weight: 1,
-            failure_domain: 1,
-            drained: false,
-        },
-        PeerCandidate {
-            host: HostId(1),
-            weight: 1,
-            failure_domain: 2,
-            drained: false,
-        },
-        PeerCandidate {
-            host: HostId(2),
-            weight: 1,
-            failure_domain: 3,
-            drained: false,
-        },
-    ];
-    let target = rank_stash_candidates(6, HostId(0), 1, VSET, &roster)[0];
-    let target_domain = roster
-        .iter()
-        .find(|candidate| candidate.host == target)
-        .expect("target")
-        .failure_domain;
-    let host_config = HostConfig {
-        archive: blockd_core::hostmeta::ArchivePolicy::default(),
-        host: target,
-        cache_pages: 8,
-        writeback_interval: 1_000_000,
-        backup_retry: 200_000_000,
-        disk_capacity: None,
-        disk_headroom: 0,
-        wedge_ticks: 500,
-        replica_placement: Some(ReplicaPlacementConfig {
-            membership_epoch: 6,
-            local_failure_domain: target_domain,
-            roster,
-            authority: None,
-        }),
-    };
-    let blobs = Rc::new(FileBlobs::new(&root).expect("file actor world"));
-    let state = Rc::new(RefCell::new(HostState::new(host_config.clone())));
-    let mut executor = Executor::production();
-    let verdicts = executor
-        .block_on({
-            let state = Rc::clone(&state);
-            let blobs = Rc::clone(&blobs);
-            async move { recover_local(state, blobs.as_ref()).await }
+            let name = layout::replica_spool_blob(HostId(0), VSET, 1);
+            let path = root.join(&name);
+            let bytes = std::fs::read(&path).expect("surviving spool");
+            let (artifact, _) = fixture();
+            assert!(bytes.len() > artifact.len());
+            let roster = vec![
+                PeerCandidate {
+                    host: HostId(0),
+                    weight: 1,
+                    failure_domain: 1,
+                    drained: false,
+                },
+                PeerCandidate {
+                    host: HostId(1),
+                    weight: 1,
+                    failure_domain: 2,
+                    drained: false,
+                },
+                PeerCandidate {
+                    host: HostId(2),
+                    weight: 1,
+                    failure_domain: 3,
+                    drained: false,
+                },
+            ];
+            let target = rank_stash_candidates(6, HostId(0), 1, VSET, &roster)[0];
+            let target_domain = roster
+                .iter()
+                .find(|candidate| candidate.host == target)
+                .expect("target")
+                .failure_domain;
+            let host_config = HostConfig {
+                archive: blockd_core::hostmeta::ArchivePolicy::default(),
+                host: target,
+                cache_pages: 8,
+                writeback_interval: 1_000_000,
+                backup_retry: 200_000_000,
+                disk_capacity: None,
+                disk_headroom: 0,
+                wedge_ticks: 500,
+                replica_placement: Some(ReplicaPlacementConfig {
+                    membership_epoch: 6,
+                    local_failure_domain: target_domain,
+                    roster,
+                    authority: None,
+                }),
+            };
+            let blobs = Rc::new(FileBlobs::new(&root));
+            let state = Rc::new(RefCell::new(HostState::new(host_config.clone())));
+            let context = ProductionContext::new(|_| {});
+            let verdicts = context
+                .scope({
+                    let state = Rc::clone(&state);
+                    let blobs = Rc::clone(&blobs);
+                    async move { recover_local(state, blobs.as_ref()).await }
+                })
+                .await
+                .expect("actor recovery succeeds");
+            assert!(verdicts.is_empty());
+            let repaired = std::fs::read(&path).expect("repaired spool");
+            assert_eq!(repaired, artifact, "actor recovery did not trim torn tail");
+
+            let second_state = Rc::new(RefCell::new(HostState::new(host_config)));
+            context
+                .scope({
+                    let state = Rc::clone(&second_state);
+                    let blobs = Rc::clone(&blobs);
+                    async move { recover_local(state, blobs.as_ref()).await }
+                })
+                .await
+                .expect("second actor recovery succeeds");
+            assert_eq!(
+                std::fs::read(&path).expect("stable spool"),
+                artifact,
+                "a valid recovered spool was truncated again"
+            );
+
+            std::fs::remove_dir_all(root).expect("cleanup root");
         })
-        .expect("actor recovery succeeds");
-    assert!(verdicts.is_empty());
-    let repaired = std::fs::read(&path).expect("repaired spool");
-    assert_eq!(repaired, artifact, "actor recovery did not trim torn tail");
-
-    let second_state = Rc::new(RefCell::new(HostState::new(host_config)));
-    executor
-        .block_on({
-            let state = Rc::clone(&second_state);
-            let blobs = Rc::clone(&blobs);
-            async move { recover_local(state, blobs.as_ref()).await }
-        })
-        .expect("second actor recovery succeeds");
-    assert_eq!(
-        std::fs::read(&path).expect("stable spool"),
-        artifact,
-        "a valid recovered spool was truncated again"
-    );
-
-    std::fs::remove_dir_all(root).expect("cleanup root");
+        .await;
 }

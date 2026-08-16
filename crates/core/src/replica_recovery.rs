@@ -4,14 +4,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::head::HeadRecord;
+use crate::blx::{BatchMeta, NamespaceKind, compact_objects, open_object};
+use crate::head::{HeadRecord, ManifestPtr};
 use crate::journal::JournalRecord;
 use crate::layout;
-use crate::manifest::Manifest;
+use crate::manifest::{CompleteFileList, Manifest, ObjectRef};
 use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::replica_spool::{ReplicaCommitFrame, ReplicaSpoolScan, scan_replica_spool};
 use crate::segment::scan_segment;
 use crate::types::{HostId, VsetId};
+
+pub type ReplicaStoreObjects = Vec<(String, Vec<u8>)>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReplicaResidue<'a> {
@@ -88,6 +91,16 @@ impl ReplicaRecoveryReport {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReplicaRecoveryClaim {
     pub expected_version: u64,
+    pub head: HeadRecord,
+}
+
+/// The single fenced publication produced from a verified passive export.
+/// Store objects are ordered data first, then the complete list, then the
+/// manifest; the head CAS is the sole visibility transition.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ReplicaPublication {
+    pub export: ReplicaExport,
+    pub store_objects: ReplicaStoreObjects,
     pub head: HeadRecord,
 }
 
@@ -178,6 +191,154 @@ pub fn refence_replica_export(
     result.info.writer_fence = new_fence;
     result.blobs = blobs;
     Ok(result)
+}
+
+pub fn prepare_replica_publication(
+    vset: VsetId,
+    claimant: HostId,
+    writer_fence: u64,
+    claimed_head: &HeadRecord,
+    export: &ReplicaExport,
+) -> Result<ReplicaPublication, ReplicaRecoveryError> {
+    let export = refence_replica_export(vset, export, writer_fence)?;
+    let (record, record_bytes) = publication_record(vset, writer_fence, &export)?;
+    let (store_objects, manifest) =
+        build_replica_archive(vset, writer_fence, &record, record_bytes, &export)?;
+    let mut head = claimed_head.clone();
+    head.vset = vset;
+    head.holder = claimant;
+    head.fence = writer_fence;
+    head.manifest = Some(manifest);
+    head.stash = None;
+    head.retired_stashes.clear();
+    Ok(ReplicaPublication {
+        export,
+        store_objects,
+        head,
+    })
+}
+
+fn publication_record(
+    vset: VsetId,
+    writer_fence: u64,
+    export: &ReplicaExport,
+) -> Result<(JournalRecord, &[u8]), ReplicaRecoveryError> {
+    let bytes = export
+        .blobs
+        .iter()
+        .find_map(|(name, bytes)| {
+            matches!(
+                layout::parse_blob(name),
+                Some(layout::BlobName::Journal { fence, .. }) if fence == writer_fence
+            )
+            .then_some(bytes)
+        })
+        .ok_or(ReplicaRecoveryError::NoCommit)?;
+    let record =
+        JournalRecord::decode(vset, bytes).map_err(|_| ReplicaRecoveryError::CorruptObject {
+            key: "recovery journal".to_owned(),
+        })?;
+    Ok((record, bytes))
+}
+
+fn build_replica_archive(
+    vset: VsetId,
+    writer_fence: u64,
+    record: &JournalRecord,
+    record_bytes: &[u8],
+    export: &ReplicaExport,
+) -> Result<(ReplicaStoreObjects, ManifestPtr), ReplicaRecoveryError> {
+    if record.sync_covered_through > record.capture_seq {
+        return Err(ReplicaRecoveryError::CorruptObject {
+            key: "recovery journal".to_owned(),
+        });
+    }
+    let mut inputs = Vec::new();
+    for (name, bytes) in &export.blobs {
+        if matches!(
+            layout::parse_blob(name),
+            Some(layout::BlobName::Segment { .. })
+        ) {
+            inputs.push(
+                open_object(bytes)
+                    .map_err(|_| ReplicaRecoveryError::CorruptObject { key: name.clone() })?,
+            );
+        }
+    }
+    let compacted = compact_objects(
+        BatchMeta {
+            namespace_kind: NamespaceKind::Vset,
+            namespace_id: vset.0,
+            writer_fence,
+            first_object_id: u64::MAX - 1024,
+            min_seq: record.seq.0,
+            max_seq: record.seq.0,
+            batch_id: u64::MAX - 1024,
+            pre_state_checksum: record.post_state_checksum,
+            post_state_checksum: record.post_state_checksum,
+        },
+        &inputs,
+        true,
+    )
+    .map_err(|_| ReplicaRecoveryError::CorruptObject {
+        key: "recovery segment".to_owned(),
+    })?;
+    let mut store_objects = Vec::new();
+    let objects = compacted
+        .into_iter()
+        .map(|object| {
+            let reference = ObjectRef::from_blx(&object);
+            store_objects.push((reference.identity.store_key(), object.bytes));
+            reference
+        })
+        .collect::<Vec<_>>();
+    let list = CompleteFileList {
+        vset,
+        writer_fence,
+        list_id: record.seq.0,
+        objects,
+    };
+    store_objects.push((
+        layout::complete_file_list_key(vset, writer_fence, record.seq.0),
+        list.encode(),
+    ));
+    let (recovery_kind, checkpoint_epoch, vmstate_logical_length) =
+        crate::engine::recovery_policy::recovery_metadata(record);
+    let archive = Manifest {
+        vset,
+        writer_fence,
+        journal_seq: record.seq.0,
+        archive_seq: record.seq.0,
+        capture_seq: record.capture_seq,
+        sync_covered_through: record.sync_covered_through,
+        recovery_kind,
+        checkpoint_epoch,
+        config: record.config,
+        vmstate_logical_length,
+        base: None,
+        complete_list: Some(list.reference()),
+        post_state_checksum: record.post_state_checksum,
+        metadata_checksum: crate::format::checksum64(record_bytes),
+        added: Vec::new(),
+        removed: Vec::new(),
+    };
+    let archive_bytes = archive
+        .encode()
+        .map_err(|_| ReplicaRecoveryError::CorruptObject {
+            key: "recovery manifest".to_owned(),
+        })?;
+    let manifest = ManifestPtr {
+        fence: writer_fence,
+        journal_seq: record.seq,
+        seq: record.seq,
+        capture_seq: record.capture_seq,
+        checksum: crate::format::checksum64(&archive_bytes),
+    };
+    store_objects.push((
+        layout::manifest_key(vset, manifest.fence, manifest.seq),
+        archive_bytes,
+    ));
+    Ok((store_objects, manifest))
 }
 
 pub fn report_replica_recovery(
@@ -483,9 +644,9 @@ fn artifact_bytes(
 mod tests {
     use super::*;
     use crate::head::StashAssignment;
-    use crate::journal::{DatabaseFileMeta, DatabaseMeta, RecordKind, VsetConfig, VsetKind};
+    use crate::journal::{RecordKind, VsetConfig};
     use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
-    use crate::segment::SegmentBuilder;
+    use crate::segment::SegmentBatchBuilder;
     use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, page_size};
 
     fn file_ref(bytes: &[u8]) -> crate::manifest::ObjectRef {
@@ -508,9 +669,9 @@ mod tests {
             page: PageNo(2),
         };
         let seg = SegId(seq);
-        let mut builder = SegmentBuilder::new(vset, 4, seg);
+        let mut builder = SegmentBatchBuilder::new(vset, 4, seg);
         builder.add(page, Gen(seq), &vec![fill; page_size()]);
-        let (segment, locs) = builder.finish();
+        let (_, segment, locs) = builder.finish().pop().expect("fixture object");
         let artifact = ReplicaArtifact::Segment { fence: 4, seg };
         let info = ReplicaCommitInfo {
             writer_fence: 4,
@@ -525,13 +686,11 @@ mod tests {
             capture_seq: seq,
             sync_covered_through: covered,
             post_state_checksum: 0,
-            database: crate::journal::DatabaseMeta::default(),
             files: vec![file_ref(&segment)],
             overlay: locs
                 .into_iter()
                 .map(|(page, generation, loc)| (page, (generation, loc)))
                 .collect(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let encoded = record.encode(vset);
@@ -557,9 +716,9 @@ mod tests {
             },
             page: PageNo(2),
         };
-        let mut builder = SegmentBuilder::new(vset, 4, SegId(9));
+        let mut builder = SegmentBatchBuilder::new(vset, 4, SegId(9));
         builder.add(page, Gen(3), &vec![0xA5; page_size()]);
-        let (segment, locs) = builder.finish();
+        let (_, segment, locs) = builder.finish().pop().expect("fixture object");
         let artifact = ReplicaArtifact::Segment {
             fence: 4,
             seg: SegId(9),
@@ -581,13 +740,11 @@ mod tests {
             capture_seq: 11,
             sync_covered_through: info.sync_covered_through,
             post_state_checksum: 0,
-            database: crate::journal::DatabaseMeta::default(),
             files: vec![file_ref(&segment)],
             overlay: locs
                 .into_iter()
                 .map(|(page, generation, loc)| (page, (generation, loc)))
                 .collect(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         }
         .encode(vset);
@@ -622,7 +779,7 @@ mod tests {
             }],
             &BTreeMap::new(),
         )
-        .expect("complete peer residue recovers without S3 data");
+        .expect("complete peer residue recovers without object-store data");
         assert_eq!(export.source_peer, peer);
         assert_eq!(export.sync_covered_through, 12);
         let report = report_replica_recovery(
@@ -804,10 +961,8 @@ mod tests {
             capture_seq: 11,
             sync_covered_through: peer_info.sync_covered_through,
             post_state_checksum: 0,
-            database: crate::journal::DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         }
         .encode(vset);
@@ -822,10 +977,8 @@ mod tests {
             capture_seq: 13,
             sync_covered_through: 13,
             post_state_checksum: 0,
-            database: crate::journal::DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let head = HeadRecord {
@@ -929,7 +1082,6 @@ mod tests {
             .expect("active journal exported");
         let mut expected = active_record;
         expected.overlay.clear();
-        expected.leaves.clear();
         assert_eq!(
             JournalRecord::decode(vset, bytes).expect("exported journal"),
             expected
@@ -980,7 +1132,6 @@ mod tests {
             .expect("old active journal");
         let mut expected = active_record;
         expected.overlay.clear();
-        expected.leaves.clear();
         assert_eq!(JournalRecord::decode(vset, journal).unwrap(), expected);
 
         let transition_complete = export_replica_recovery(
@@ -1015,137 +1166,6 @@ mod tests {
             .expect("transition journal");
         let mut expected = transition_record;
         expected.overlay.clear();
-        expected.leaves.clear();
         assert_eq!(JournalRecord::decode(vset, journal).unwrap(), expected);
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn database_recovery_after_passive_replacement_preserves_metadata_and_bytes() {
-        let source = HostId(0);
-        let peer = HostId(4);
-        let vset = VsetId(21);
-        let main_page = PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(0),
-            },
-            page: PageNo(0),
-        };
-        let wal_page = PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(1),
-            },
-            page: PageNo(1),
-        };
-        let mut builder = SegmentBuilder::new_for_kind(VsetKind::Database, vset, 7, SegId(70));
-        builder.add(main_page, Gen(7), &vec![0xDB; page_size()]);
-        builder.add(wal_page, Gen(8), &vec![0xA1; page_size()]);
-        let (segment, locs) = builder.finish();
-        let artifact = ReplicaArtifact::Segment {
-            fence: 7,
-            seg: SegId(70),
-        };
-        let info = ReplicaCommitInfo {
-            writer_fence: 7,
-            seq: JournalSeq(70),
-            sync_covered_through: 700,
-        };
-        let database = DatabaseMeta {
-            main: DatabaseFileMeta {
-                exists: true,
-                size: page_size() as u64 - 17,
-            },
-            wal: DatabaseFileMeta {
-                exists: true,
-                size: page_size() as u64 + 31,
-            },
-            journal: DatabaseFileMeta::default(),
-        };
-        let record = JournalRecord {
-            config: VsetConfig::database(8),
-            seq: info.seq,
-            fence: info.writer_fence,
-            kind: RecordKind::Commit,
-            capture_seq: 70,
-            sync_covered_through: info.sync_covered_through,
-            post_state_checksum: 0,
-            database,
-            files: vec![file_ref(&segment)],
-            overlay: locs
-                .into_iter()
-                .map(|(page, generation, loc)| (page, (generation, loc)))
-                .collect(),
-            leaves: BTreeMap::new(),
-            migrated_from: None,
-        };
-        let encoded = record.encode(vset);
-        let mut spool = seal_replica_artifact(source, vset, 20, artifact, &segment).unwrap();
-        spool.extend(seal_replica_commit(source, vset, 20, info, &[artifact], &encoded).unwrap());
-        let head = HeadRecord {
-            vset,
-            holder: source,
-            fence: 7,
-            manifest: None,
-            stash: Some(StashAssignment {
-                assignment_epoch: 20,
-                active_peer: peer,
-                active_assignment_epoch: 20,
-                transition_peer: None,
-                membership_epoch: 6,
-            }),
-            retired_stashes: Vec::new(),
-        };
-        let export = export_replica_recovery(
-            source,
-            vset,
-            head.fence,
-            &head,
-            &[ReplicaResidue {
-                peer,
-                assignment_epoch: 20,
-                bytes: &spool,
-            }],
-            &BTreeMap::new(),
-        )
-        .expect("replacement database closure");
-        assert_eq!(export.source_peer, peer);
-        assert_eq!(export.sync_covered_through, 700);
-        assert!(export.blobs.iter().any(|(name, bytes)| {
-            name == &layout::segment_blob(vset, 7, SegId(70)) && bytes == &segment
-        }));
-        let (_, recovered_record) = export
-            .blobs
-            .iter()
-            .find(|(name, _)| name == &layout::journal_blob(vset, 7, JournalSeq(70)))
-            .expect("database journal");
-        let recovered_record = JournalRecord::decode(vset, recovered_record).unwrap();
-        let mut expected = record;
-        expected.overlay.clear();
-        expected.leaves.clear();
-        assert_eq!(recovered_record, expected);
-        assert_eq!(recovered_record.database, database);
-        let (_, footer) = crate::blx::scan_object(&segment).expect("database BLX");
-        assert_eq!(
-            footer
-                .find(crate::blx::BlockKey::from_page(
-                    VsetKind::Database,
-                    main_page
-                ))
-                .unwrap()
-                .generation,
-            Gen(7)
-        );
-        assert_eq!(
-            footer
-                .find(crate::blx::BlockKey::from_page(
-                    VsetKind::Database,
-                    wal_page
-                ))
-                .unwrap()
-                .generation,
-            Gen(8)
-        );
     }
 }

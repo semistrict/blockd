@@ -1,14 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use blockd_exec::channel::{OneReceiver, Sender, TrySendError, bounded, oneshot, unbounded};
 use blockd_exec::{Either, TaskSet, delay, select2, timeout, yield_now};
 
-use super::capture::{
-    capture_migration, recovery_files, write_migration_record_copies, write_record_copies,
-};
+use super::capture::{capture_migration, recovery_files, write_record_copies};
 use super::keyed_queue::KeyedQueue;
+use super::recovery_policy::record_verdict;
 use super::state::MutationOwner;
+use super::store_retry;
 use super::{SharedHost, VsetState, replica_message, replicate_latest};
 use super::{adopt_vnode_generation, commit_vnode_closure, read_vnode_closure};
 use crate::blx::{
@@ -20,10 +20,9 @@ use crate::head::HeadRecord;
 use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetKind};
 use crate::layout;
 use crate::manifest::ObjectRef;
-use crate::mapleaf::{LeafPtr, MapLeaf};
 use crate::protocol::{AdminError, AdminEvent, AdminResult, AdminSuccess, PeerMsg, Verdict};
 use crate::segment::{PageLoc, SegmentBatchBuilder, open_entry};
-use crate::types::{Gen, HostId, PageId, SegId, VsetId};
+use crate::types::{Gen, HostId, SegId, VsetId};
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
 
 const MAGIC_HANDOFF: u32 = u32::from_le_bytes(*b"BHF1");
@@ -49,14 +48,6 @@ enum PeerStorageRequest {
         seg: crate::types::SegId,
         offset: u32,
         len: u32,
-    },
-    Leaf {
-        from: HostId,
-        io: crate::protocol::PeerRequestId,
-        vset: VsetId,
-        base: u64,
-        fence: u64,
-        id: u64,
     },
 }
 
@@ -208,43 +199,35 @@ where
             Hydrating(OneReceiver<bool>),
             Reserved { incarnation: u64, publishing: bool },
         }
-        let decision =
-            {
-                let mut host = state.borrow_mut();
-                let Some(vset_state) = host.vsets.get_mut(&vset) else {
-                    return Some(Err(AdminError::Rejected));
-                };
-                let allowed = vset_state.ready
-                    && vset_state.outbound.is_none()
-                    && !vset_state.operations.migration_running()
-                    && !vset_state.operations.guest_resume_pending()
-                    && (vset_state.config.kind != VsetKind::Database
-                        || (vset_state.database_runtime.phase
-                            == super::state::AttachmentPhase::Detached
-                            && vset_state.database_runtime.active.is_none()
-                            && vset_state.database_runtime.handles.is_empty()));
-                if !allowed {
-                    Decision::Invalid
-                } else if vset_state.peer_source.is_some()
-                    && (vset_state.page_locs.values().any(|(_, location)| {
-                        location.base == 0 && location.fence < vset_state.fence
-                    }) || vset_state
-                        .leaf_table
-                        .keys()
-                        .any(|span| !vset_state.hydrated_spans.contains(span)))
-                {
-                    let (wake, wait) = oneshot();
-                    vset_state.hydration_waiters.push(wake);
-                    host.schedule_vset(vset);
-                    Decision::Hydrating(wait)
-                } else {
-                    assert!(vset_state.operations.start_migration());
-                    Decision::Reserved {
-                        incarnation: vset_state.incarnation,
-                        publishing: vset_state.operations.publication_owner().is_some(),
-                    }
-                }
+        let decision = {
+            let mut host = state.borrow_mut();
+            let Some(vset_state) = host.vsets.get_mut(&vset) else {
+                return Some(Err(AdminError::Rejected));
             };
+            let allowed = vset_state.ready
+                && vset_state.outbound.is_none()
+                && !vset_state.operations.migration_running()
+                && !vset_state.operations.guest_resume_pending();
+            if !allowed {
+                Decision::Invalid
+            } else if vset_state.peer_source.is_some()
+                && vset_state
+                    .page_locs
+                    .values()
+                    .any(|(_, location)| location.base == 0 && location.fence < vset_state.fence)
+            {
+                let (wake, wait) = oneshot();
+                vset_state.hydration_waiters.push(wake);
+                host.schedule_vset(vset);
+                Decision::Hydrating(wait)
+            } else {
+                assert!(vset_state.operations.start_migration());
+                Decision::Reserved {
+                    incarnation: vset_state.incarnation,
+                    publishing: vset_state.operations.publication_owner().is_some(),
+                }
+            }
+        };
         match decision {
             Decision::Invalid => return Some(Err(AdminError::Rejected)),
             Decision::Hydrating(wait) => {
@@ -263,13 +246,10 @@ where
         loop {
             let publication_finished = {
                 let host = state.borrow();
-                let Some(vset_state) = host
+                let vset_state = host
                     .vsets
                     .get(&vset)
-                    .filter(|vset_state| vset_state.incarnation == incarnation)
-                else {
-                    return None;
-                };
+                    .filter(|vset_state| vset_state.incarnation == incarnation)?;
                 vset_state.operations.publication_owner().is_none()
             };
             if publication_finished {
@@ -650,27 +630,6 @@ where
             PeerMsg::Page { io, bytes } => {
                 state.borrow_mut().peer_client.resolve_page(io, from, bytes);
             }
-            PeerMsg::FetchLeaf {
-                io,
-                vset,
-                base,
-                fence,
-                id,
-            } => {
-                let request = PeerStorageRequest::Leaf {
-                    from,
-                    io,
-                    vset,
-                    base,
-                    fence,
-                    id,
-                };
-                let route = peer_storage_route(from, vset);
-                let _ = storage_routes[route].try_send(request);
-            }
-            PeerMsg::Leaf { io, bytes } => {
-                state.borrow_mut().peer_client.resolve_leaf(io, from, bytes);
-            }
             PeerMsg::Released {
                 vset,
                 release_fence,
@@ -781,8 +740,7 @@ async fn handle_peer_storage<W: Blobs + Peers>(
     request: PeerStorageRequest,
 ) {
     let (from, vset) = match &request {
-        PeerStorageRequest::Range { from, vset, .. }
-        | PeerStorageRequest::Leaf { from, vset, .. } => (*from, *vset),
+        PeerStorageRequest::Range { from, vset, .. } => (*from, *vset),
     };
     let authorized = state
         .borrow()
@@ -843,25 +801,6 @@ async fn handle_peer_storage<W: Blobs + Peers>(
                 None
             };
             Peers::send(world, from, PeerMsg::Page { io, bytes }).await;
-        }
-        PeerStorageRequest::Leaf {
-            io,
-            base,
-            fence,
-            id,
-            ..
-        } => {
-            let name = if base == 0 {
-                layout::leaf_blob(vset, fence, id)
-            } else {
-                layout::base_leaf_blob(vset, base, fence, id)
-            };
-            let bytes = if authorized {
-                Blobs::read(world, &name).await.ok().flatten()
-            } else {
-                None
-            };
-            Peers::send(world, from, PeerMsg::Leaf { io, bytes }).await;
         }
     }
 }
@@ -963,15 +902,13 @@ pub(super) async fn migrate_in<W>(
         state: Rc::clone(&state),
         vset,
     };
-    let verdict = match (offered.config.kind, offered.kind) {
-        (VsetKind::Compute, RecordKind::Checkpoint { epoch, vmstate, .. }) => {
-            Verdict::Resume { epoch, vmstate }
-        }
-        (VsetKind::Database, RecordKind::Commit) => Verdict::DatabaseReady {
-            synced_through: offered.sync_covered_through,
-        },
-        _ => return,
+    if offered.config.kind != VsetKind::Compute {
+        return;
+    }
+    let Verdict::Resume { epoch, vmstate } = record_verdict(&offered) else {
+        return;
     };
+    let verdict = Verdict::Resume { epoch, vmstate };
     let vmstate = match offered.kind {
         RecordKind::Checkpoint {
             vmstate_logical_length,
@@ -1017,42 +954,6 @@ pub(super) async fn migrate_in<W>(
             return;
         }
     }
-    let mut leaves = BTreeMap::new();
-    for (&span, &pointer) in &offered.leaves {
-        let Some(bytes) = peer_fetch_leaf(&state, world.as_ref(), from, vset, pointer).await else {
-            return;
-        };
-        let owner = if pointer.base == 0 {
-            vset
-        } else {
-            VsetId(pointer.base)
-        };
-        let Ok(leaf) = MapLeaf::decode(owner, pointer.fence, pointer.id, &bytes) else {
-            return;
-        };
-        if leaf.span != span {
-            return;
-        }
-        let name = if pointer.base == 0 {
-            layout::leaf_blob(vset, pointer.fence, pointer.id)
-        } else {
-            layout::base_leaf_blob(vset, pointer.base, pointer.fence, pointer.id)
-        };
-        if !state
-            .borrow_mut()
-            .try_reserve_blob(name.clone(), bytes.len() as u64)
-        {
-            return;
-        }
-        if super::blob::write(&state, world.as_ref(), name.clone(), bytes.clone())
-            .await
-            .is_err()
-        {
-            return;
-        }
-        state.borrow_mut().record_blob(name, bytes.len() as u64);
-        leaves.insert(pointer, (bytes.len() as u64, leaf));
-    }
     let Some(fence) = available_inbound_fence(&state, vset, offered.fence) else {
         return;
     };
@@ -1067,19 +968,11 @@ pub(super) async fn migrate_in<W>(
             offered.post_state_checksum,
             offered.post_state_checksum,
         );
-        for (block, chunk) in loaded.bytes.chunks(crate::types::page_size()).enumerate() {
-            let block = u32::try_from(block).expect("validated VMM block count fits u32");
-            let key = BlockKey {
-                space: BlockSpace::Vmm,
-                volume: 0,
-                block,
-            };
+        for (key, padded) in crate::blx::vmm_snapshot_blocks(&loaded.bytes) {
             let Some(&(generation, _)) = loaded.block_checksums.get(&key) else {
                 return;
             };
-            let mut padded = vec![0; crate::types::page_size()];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            builder.add_vmm_block(block, generation, &padded);
+            builder.add_vmm_block(key.block, generation, &padded);
         }
         builder.finish()
     } else {
@@ -1128,9 +1021,7 @@ pub(super) async fn migrate_in<W>(
         host: from,
         offer_fence: Some(offered.fence),
     });
-    if !write_migration_record_copies(&state, world.as_ref(), vset, &record, &offered_checksums)
-        .await
-    {
+    if !write_record_copies(&state, world.as_ref(), vset, &record, &offered_checksums).await {
         state
             .borrow_mut()
             .fail("inbound migration journal write failed");
@@ -1156,7 +1047,6 @@ pub(super) async fn migrate_in<W>(
         if let Verdict::Resume { epoch, .. } = verdict {
             incoming.epoch = epoch;
         }
-        incoming.database = record.database;
         incoming.mutation_seq = record.capture_seq;
         incoming.state_checksum = record.post_state_checksum;
         incoming.block_checksums = offered_checksums;
@@ -1168,28 +1058,13 @@ pub(super) async fn migrate_in<W>(
         incoming.peer_committed_through = record.sync_covered_through;
         incoming.next_seq = 1;
         incoming.next_seg = u64::try_from(local_vmm.len()).expect("VMM object count fits u64");
-        incoming.overlay = record.overlay.clone();
-        incoming.leaf_table = record.leaves.clone();
-        incoming.hydrated_spans = record.leaves.keys().copied().collect();
-        incoming.page_locs = materialize(vset, &record, &leaves);
+        incoming.page_locs = record.overlay.clone();
         incoming.next_gen = incoming
             .block_checksums
             .values()
             .map(|(generation, _)| generation.0.saturating_add(1))
             .max()
             .unwrap_or(0);
-        incoming.leaf_blobs = leaves
-            .iter()
-            .map(|(&pointer, (size, leaf))| {
-                let segments = leaf
-                    .entries
-                    .iter()
-                    .filter(|(_, _, _, location)| location.base == 0)
-                    .map(|(_, _, _, location)| (location.fence, location.seg))
-                    .collect::<BTreeSet<_>>();
-                (pointer, (*size, segments))
-            })
-            .collect();
         incoming.segment_blobs.extend(
             local_vmm
                 .iter()
@@ -1228,9 +1103,7 @@ pub(super) async fn migrate_in<W>(
         host.vsets.insert(vset, incoming);
         host.counters.records_written += 1;
     }
-    if !claim_migrated_database_head(&state, world.as_ref(), from, vset, incarnation, &offered)
-        .await
-    {
+    if !claim_migrated_head(&state, world.as_ref(), from, vset, incarnation, &offered).await {
         state.borrow_mut().vsets.remove(&vset);
         return;
     }
@@ -1264,7 +1137,7 @@ pub(super) fn available_inbound_fence(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn claim_migrated_database_head<W>(
+async fn claim_migrated_head<W>(
     state: &SharedHost,
     world: &W,
     source: HostId,
@@ -1281,18 +1154,9 @@ where
         return false;
     };
     let (claim_fence, manifest, stash, retired_stashes) = loop {
-        let current = match Store::get(world, &layout::head_key(vset)).await {
+        let current = match store_retry::get(state, world, &layout::head_key(vset), retry).await {
             Ok(Some(current)) => current,
-            Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
-                state.borrow_mut().counters.store_retries += 1;
-                delay(retry).await;
-                continue;
-            }
-            Ok(None)
-            | Err(
-                StoreError::TooLarge
-                | StoreError::Fault(crate::protocol::StoreFault::CasConflict { .. }),
-            ) => return false,
+            Ok(None) | Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
         };
         let Ok(head) = HeadRecord::decode(vset, &current.1) else {
             return false;
@@ -1336,11 +1200,11 @@ where
                     .fail("head CAS did not advance the ownership fence");
                 return false;
             }
-            Err(StoreError::Fault(
-                crate::protocol::StoreFault::Unavailable
-                | crate::protocol::StoreFault::CasConflict { .. },
-            )) => {
+            Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
                 state.borrow_mut().counters.store_retries += 1;
+                delay(retry).await;
+            }
+            Err(StoreError::Fault(crate::protocol::StoreFault::CasConflict { .. })) => {
                 delay(retry).await;
             }
             Err(StoreError::TooLarge) => return false,
@@ -1360,7 +1224,14 @@ where
         host: source,
         offer_fence: Some(offered.fence),
     });
-    if !write_record_copies(state, world, vset, &claimed).await {
+    let checksums = state
+        .borrow()
+        .vsets
+        .get(&vset)
+        .filter(|vset_state| vset_state.incarnation == incarnation)
+        .map(|vset_state| vset_state.block_checksums.clone())
+        .unwrap_or_default();
+    if !write_record_copies(state, world, vset, &claimed, &checksums).await {
         state
             .borrow_mut()
             .fail("claimed migration journal write failed");
@@ -1397,18 +1268,9 @@ where
         retired_stashes,
     };
     let head_version = loop {
-        let current = match Store::get(world, &layout::head_key(vset)).await {
+        let current = match store_retry::get(state, world, &layout::head_key(vset), retry).await {
             Ok(Some(current)) => current,
-            Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
-                state.borrow_mut().counters.store_retries += 1;
-                delay(retry).await;
-                continue;
-            }
-            Ok(None)
-            | Err(
-                StoreError::TooLarge
-                | StoreError::Fault(crate::protocol::StoreFault::CasConflict { .. }),
-            ) => return false,
+            Ok(None) | Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
         };
         let Ok(head) = HeadRecord::decode(vset, &current.1) else {
             return false;
@@ -1432,11 +1294,11 @@ where
         .await
         {
             Ok(version) => break version,
-            Err(StoreError::Fault(
-                crate::protocol::StoreFault::Unavailable
-                | crate::protocol::StoreFault::CasConflict { .. },
-            )) => {
+            Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
                 state.borrow_mut().counters.store_retries += 1;
+                delay(retry).await;
+            }
+            Err(StoreError::Fault(crate::protocol::StoreFault::CasConflict { .. })) => {
                 delay(retry).await;
             }
             Err(StoreError::TooLarge) => return false,
@@ -1509,17 +1371,8 @@ fn decode_inline_vmstate(
         return None;
     }
     let mut block_checksums = BTreeMap::new();
-    for (block, chunk) in bytes.chunks(crate::types::page_size()).enumerate() {
-        let mut padded = vec![0; crate::types::page_size()];
-        padded[..chunk.len()].copy_from_slice(chunk);
-        block_checksums.insert(
-            BlockKey {
-                space: BlockSpace::Vmm,
-                volume: 0,
-                block: u32::try_from(block).ok()?,
-            },
-            (generation, checksum64(&padded)),
-        );
+    for (key, padded) in crate::blx::vmm_snapshot_blocks(&bytes) {
+        block_checksums.insert(key, (generation, checksum64(&padded)));
     }
     Some(MigratedVmstate {
         bytes,
@@ -1743,7 +1596,6 @@ where
         capture_seq,
         covered,
         config,
-        database,
         source_offer_fence,
     )) = ({
         let host = state.borrow();
@@ -1767,16 +1619,17 @@ where
                 let mut staged = VsetState::fresh(vset_state.config, incarnation);
                 staged.fence = vset_state.fence;
                 staged.page_locs = vset_state.page_locs.clone();
-                staged.overlay = vset_state.overlay.clone();
                 staged.block_checksums = vset_state.block_checksums.clone();
                 staged.state_checksum = vset_state.state_checksum;
-                staged.pending_tombstones = vset_state.pending_tombstones.clone();
+                staged
+                    .pending_tombstones
+                    .clone_from(&vset_state.pending_tombstones);
                 staged.archived_memory_usable = vset_state.archived_memory_usable;
-                staged.leaf_table = vset_state.leaf_table.clone();
-                staged.next_leaf = vset_state.next_leaf;
                 staged.segment_refs = vset_state.segment_refs.clone();
-                staged.vmm_segments = vset_state.vmm_segments.clone();
-                staged.tombstone_segments = vset_state.tombstone_segments.clone();
+                staged.vmm_segments.clone_from(&vset_state.vmm_segments);
+                staged
+                    .tombstone_segments
+                    .clone_from(&vset_state.tombstone_segments);
                 (
                     generations,
                     staged,
@@ -1788,7 +1641,6 @@ where
                     vset_state.mutation_seq,
                     vset_state.local_covered_through,
                     vset_state.config,
-                    vset_state.database,
                     vset_state.peer_source_offer_fence,
                 )
             })
@@ -1821,11 +1673,9 @@ where
     for (_, _, entries) in &segments {
         for &(page, generation, location) in entries {
             staged.page_locs.insert(page, (generation, location));
-            staged.overlay.insert(page, (generation, location));
         }
     }
     let overlay = staged.page_locs.clone();
-    let leaves = BTreeMap::new();
     let mut files = state
         .borrow()
         .vsets
@@ -1851,10 +1701,8 @@ where
         capture_seq,
         sync_covered_through: covered,
         post_state_checksum: staged.state_checksum,
-        database,
         files: recovery_files(&staged),
         overlay: overlay.clone(),
-        leaves: leaves.clone(),
         migrated_from: Some(MigrationSource {
             host: source,
             offer_fence: source_offer_fence,
@@ -1883,7 +1731,7 @@ where
         }
         state.borrow_mut().record_blob(name, bytes.len() as u64);
     }
-    if !write_migration_record_copies(
+    if !write_record_copies(
         &state,
         world.as_ref(),
         vset,
@@ -1914,13 +1762,10 @@ where
             .max()
             .unwrap_or(vset_state.next_seg)
             .max(vset_state.next_seg);
-        vset_state.next_leaf = staged.next_leaf;
         vset_state.page_locs = staged.page_locs;
         vset_state.block_checksums = staged.block_checksums;
         vset_state.state_checksum = staged.state_checksum;
         vset_state.pending_tombstones = staged.pending_tombstones;
-        vset_state.overlay = overlay;
-        vset_state.leaf_table = leaves;
         vset_state.segment_blobs.extend(
             segments
                 .iter()
@@ -1995,19 +1840,6 @@ pub(super) fn finish_hydration(state: &SharedHost, vset: VsetId, incarnation: u6
     }
 }
 
-pub async fn peer_fetch_leaf<W: Peers>(
-    state: &SharedHost,
-    world: &W,
-    source: HostId,
-    vset: VsetId,
-    pointer: LeafPtr,
-) -> Option<Vec<u8>> {
-    let client = state.borrow().peer_client.clone();
-    client
-        .fetch_leaf(world, source, vset, pointer, PEER_RETRY)
-        .await
-}
-
 async fn release_source<W: Blobs + Peers + GuestMem>(
     state: &SharedHost,
     world: &W,
@@ -2042,13 +1874,6 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
                 names.push(layout::journal_blob(vset, fence, seq));
                 names.push(layout::journal_mirror_blob(vset, fence, seq));
             }
-            names.extend(vset_state.leaf_blobs.keys().map(|pointer| {
-                if pointer.base == 0 {
-                    layout::leaf_blob(vset, pointer.fence, pointer.id)
-                } else {
-                    layout::base_leaf_blob(vset, pointer.base, pointer.fence, pointer.id)
-                }
-            }));
         }
         if let Ok(blobs) = Blobs::scan(world).await {
             names.extend(blobs.into_iter().filter_map(|blob| {
@@ -2059,12 +1884,8 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
                         }
                         | layout::BlobName::Segment {
                             vset: owner, fence, ..
-                        }
-                        | layout::BlobName::Leaf {
-                            vset: owner, fence, ..
                         },
                     ) => owner == vset && fence < release_fence,
-                    Some(layout::BlobName::BaseLeaf { vset: owner, .. }) => owner == vset,
                     Some(layout::BlobName::Handoff { vset: owner }) => owner == vset,
                     Some(layout::BlobName::ReplicaSpool { .. }) | None => false,
                 };
@@ -2098,27 +1919,6 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
         )
         .await;
     }
-}
-
-fn materialize(
-    vset: VsetId,
-    record: &JournalRecord,
-    leaves: &BTreeMap<LeafPtr, (u64, MapLeaf)>,
-) -> BTreeMap<PageId, (crate::types::Gen, crate::segment::PageLoc)> {
-    let mut locations = BTreeMap::new();
-    for pointer in record.leaves.values() {
-        for &(idx, page, generation, location) in &leaves[pointer].1.entries {
-            let page = PageId {
-                volume: crate::types::VolumeId { vset, idx },
-                page,
-            };
-            if record.config.contains(page) {
-                locations.insert(page, (generation, location));
-            }
-        }
-    }
-    locations.extend(record.overlay.iter().map(|(&page, &entry)| (page, entry)));
-    locations
 }
 
 #[cfg(test)]

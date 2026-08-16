@@ -1,9 +1,11 @@
 //! Single-host deterministic runs over the async actor core.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
@@ -14,8 +16,8 @@ use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, pa
 use blockd_exec::channel::unbounded;
 use blockd_exec::rng::Ppm;
 use blockd_exec::{
-    Either, Executor, OneOf3, TaskHandle, TaskId, TaskSet, delay, now, random_u64, select2,
-    select3, spawn, yield_now,
+    Either, FaultConfig, OneOf3, SimulationContext, TaskHandle, TaskId, TaskSet, delay, now,
+    random_u64, select2, select3, simulation_polls, simulation_trace_hash, spawn, yield_now,
 };
 use blockd_workload::{
     LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
@@ -23,8 +25,8 @@ use blockd_workload::{
 
 use crate::actor_world::{OracleSnapshot, SimWorld};
 use crate::guest::page_pattern;
-use crate::world::blobdev::BlobDevConfig;
-use crate::world::store::{StoreConfig, StoreCounters};
+use crate::model::{BlobDevConfig, StoreConfig, StoreCounters};
+use crate::peer_transport::{PeerTransport, PeerTransportFaults, PeerTransportStats};
 
 #[derive(Clone, Debug)]
 pub struct ActorHarnessConfig {
@@ -54,10 +56,22 @@ pub struct ActorFaultPlan {
     pub rot_records_at: Vec<(u64, bool)>,
 }
 
+impl ActorFaultPlan {
+    pub fn none() -> Self {
+        Self {
+            restart_delay: (
+                blockd_core::types::millis(10),
+                blockd_core::types::millis(500),
+            ),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActorRunReport {
     pub trace_hash: u64,
-    pub executor_polls: u64,
+    pub actor_polls: u64,
     pub violations: Vec<String>,
     pub counters: Counters,
     pub completed_ops: u64,
@@ -83,6 +97,16 @@ pub struct ActorRunReport {
     pub restores: u64,
     pub guest_deaths: u64,
     pub bitflips: u64,
+}
+
+pub use ActorFaultPlan as FaultPlan;
+pub use ActorHarnessConfig as HarnessConfig;
+pub use ActorRunReport as RunReport;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WorkloadRunReport {
+    pub simulation: RunReport,
+    pub workload: WorkloadOutcome,
 }
 
 #[derive(Default)]
@@ -145,8 +169,6 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
         wedged_guests,
         wedged_hydration,
         wedged_outbound,
-        leaf_rolls,
-        leaf_fills,
         segs_compacted,
         pages_compacted,
         replica_bytes,
@@ -171,7 +193,37 @@ type StateSlot = Rc<RefCell<SharedHostState>>;
 type GuestSlots = Rc<RefCell<BTreeMap<VsetId, Option<TaskHandle<()>>>>>;
 const RECOVERY_CONCURRENCY: usize = 32;
 const RECOVERY_QUEUE_CAPACITY: usize = 1_024;
-const CHECKPOINT_CONCURRENCY: usize = 32;
+#[cfg(test)]
+const CHECKPOINT_CONCURRENCY: usize = crate::checkpoint_schedule::CONCURRENCY;
+
+struct HarnessPair {
+    primary: HostId,
+    passive: HostId,
+    primary_world: Rc<SimWorld>,
+    passive_world: Rc<SimWorld>,
+    passive_state: SharedHostState,
+}
+
+impl HarnessPair {
+    fn new(config: &mut ActorHarnessConfig) -> Self {
+        let primary = config.host.host;
+        let passive = HostId(primary.0 ^ u16::MAX);
+        config.host.replica_placement = harness_placement(primary, passive);
+        let [primary_world, passive_world] =
+            SimWorld::pair([primary, passive], config.blobs, config.store);
+        let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
+            &config.host,
+            passive,
+        ))));
+        Self {
+            primary,
+            passive,
+            primary_world,
+            passive_world,
+            passive_state,
+        }
+    }
+}
 
 struct RecoveryWork {
     event: AdminEvent,
@@ -198,10 +250,119 @@ pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
     run_final_blobs(seed, config).0
 }
 
+fn run_pair_in_turmoil<T: 'static>(
+    seed: u64,
+    horizon: u64,
+    pair: HarnessPair,
+    future: impl Future<Output = T> + 'static,
+) -> T {
+    let HarnessPair {
+        primary,
+        passive,
+        primary_world,
+        passive_world,
+        passive_state,
+    } = pair;
+    let tick = Duration::from_millis(blockd_core::types::millis(1));
+    let duration = Duration::from_millis(horizon.saturating_add(5_000_000_000));
+    let output = Rc::new(RefCell::new(None));
+    let host_output = Rc::clone(&output);
+    let host_future = Rc::new(RefCell::new(Some(future)));
+    let host_done = Rc::new(tokio::sync::Notify::new());
+    let client_done = Rc::clone(&host_done);
+    let roster = BTreeMap::from([
+        (primary, "primary".to_owned()),
+        (passive, "passive".to_owned()),
+    ]);
+    let peer_metrics = Rc::new(PeerTransportStats::default());
+    let primary_context =
+        SimulationContext::new(seed, FaultConfig::disabled()).semantic_trace_only();
+    let passive_context =
+        SimulationContext::new(seed.wrapping_add(1), FaultConfig::disabled()).semantic_trace_only();
+    let mut builder = turmoil::Builder::new();
+    builder
+        .rng_seed(seed)
+        .simulation_duration(duration)
+        .tick_duration(tick)
+        .min_message_latency(Duration::from_millis(100))
+        .max_message_latency(Duration::from_secs(1));
+    let mut sim = builder.build();
+    let passive_roster = roster.clone();
+    let passive_peer_metrics = Rc::clone(&peer_metrics);
+    sim.host("passive", move || {
+        let world = Rc::clone(&passive_world);
+        let host_state = Rc::clone(&passive_state);
+        let roster = passive_roster.clone();
+        let peer_metrics = Rc::clone(&passive_peer_metrics);
+        let context = passive_context.clone();
+        async move {
+            let transport = PeerTransport::start(
+                passive,
+                roster,
+                PeerTransportFaults {
+                    max_frames_per_connection: 64,
+                    ..PeerTransportFaults::default()
+                },
+                peer_metrics,
+            )
+            .await?;
+            let _attachment = world.attach_peer_transport(transport);
+            context
+                .scope(host_actor_with_state(host_state, world))
+                .await;
+            Ok(())
+        }
+    });
+    sim.host("primary", move || {
+        let future = host_future
+            .borrow_mut()
+            .take()
+            .expect("single-host software restarted unexpectedly");
+        let output = Rc::clone(&host_output);
+        let done = Rc::clone(&host_done);
+        let world = Rc::clone(&primary_world);
+        let roster = roster.clone();
+        let peer_metrics = Rc::clone(&peer_metrics);
+        let context = primary_context.clone();
+        async move {
+            let transport = PeerTransport::start(
+                primary,
+                roster,
+                PeerTransportFaults {
+                    max_frames_per_connection: 64,
+                    ..PeerTransportFaults::default()
+                },
+                peer_metrics,
+            )
+            .await?;
+            let _attachment = world.attach_peer_transport(transport);
+            let value = context.scope(future).await;
+            *output.borrow_mut() = Some(value);
+            done.notify_one();
+            Ok(())
+        }
+    });
+    sim.client("controller", async move {
+        client_done.notified().await;
+        Ok(())
+    });
+    sim.run().expect("Turmoil pair simulation");
+    output
+        .borrow_mut()
+        .take()
+        .expect("Turmoil single-host software completed")
+}
+
+async fn yield_ready() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Drive one deliberately large dirty set through the actor capture pipeline.
 ///
 /// This is the bare performance harness: all devices are the deterministic
-/// model implementations and the report exposes executor polls plus the
+/// model implementations and the report exposes actor polls plus the
 /// maximum number of guest-page reads performed by any single poll.
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_capture_profile(
@@ -212,17 +373,26 @@ pub fn run_capture_profile(
     assert!(dirty_pages != 0, "capture profile needs dirty pages");
     config.vset_count = 1;
     config.vset = VsetConfig::compute(1, dirty_pages);
+    let horizon = config.horizon;
+    let pair = HarnessPair::new(&mut config);
+    let future = run_capture_profile_inner(
+        config,
+        dirty_pages,
+        Rc::clone(&pair.primary_world),
+        Rc::clone(&pair.passive_world),
+        Rc::clone(&pair.passive_state),
+    );
+    run_pair_in_turmoil(seed, horizon, pair, future)
+}
 
-    let passive_host = HostId(config.host.host.0 ^ u16::MAX);
-    config.host.replica_placement = harness_placement(config.host.host, passive_host);
-    let (network, [world, passive_world]) =
-        SimWorld::pair([config.host.host, passive_host], config.blobs, config.store);
-    network.set_latency(1, 1);
+async fn run_capture_profile_inner(
+    config: ActorHarnessConfig,
+    dirty_pages: u32,
+    world: Rc<SimWorld>,
+    passive_world: Rc<SimWorld>,
+    passive_state: SharedHostState,
+) -> ActorRunReport {
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
-    let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
-        &config.host,
-        passive_host,
-    ))));
     let vset = VsetId(1);
     let create = world.request_admin(AdminCall::CreateVset {
         vset,
@@ -230,13 +400,8 @@ pub fn run_capture_profile(
         from_base: None,
     });
 
-    let mut executor = Executor::simulation(seed);
-    let mut host = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
-    let mut passive = executor.spawn(host_actor_with_state(
-        Rc::clone(&passive_state),
-        Rc::clone(&passive_world),
-    ));
-    let created = executor.block_on({
+    let mut host = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+    let created = {
         let world = Rc::clone(&world);
         let passive_world = Rc::clone(&passive_world);
         async move {
@@ -246,7 +411,8 @@ pub fn run_capture_profile(
                 OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
             }
         }
-    });
+    }
+    .await;
     assert!(
         matches!(
             created,
@@ -266,10 +432,11 @@ pub fn run_capture_profile(
             },
             page: PageNo(number),
         };
-        let served = executor.block_on({
+        let served = {
             let world = Rc::clone(&world);
             async move { world.fault(page, true).await }
-        });
+        }
+        .await;
         assert!(served, "capture-profile fault failed at {page:?}");
         assert!(
             world.write_resident(page, page_pattern(page, u64::from(number) + 1)),
@@ -277,17 +444,14 @@ pub fn run_capture_profile(
         );
     }
 
-    let drain_deadline = executor
-        .now()
-        .saturating_add(config.host.writeback_interval.saturating_mul(4));
-    executor.run_until(drain_deadline);
+    let drain_deadline = now().saturating_add(config.host.writeback_interval.saturating_mul(4));
+    delay(drain_deadline.saturating_sub(now())).await;
     let blobs = world.durable_blobs();
-    let mut report = report_from_state(&executor, &world, &state, &blobs);
+    let mut report = report_from_state(&world, &state, &blobs);
     merge_counters(&mut report.counters, &passive_state.borrow().counters);
     report.completed_ops = u64::from(dirty_pages);
     host.cancel();
-    passive.cancel();
-    executor.run_ready();
+    yield_ready().await;
     report
 }
 
@@ -296,27 +460,32 @@ pub fn run_final_blobs(
     seed: u64,
     mut config: ActorHarnessConfig,
 ) -> (ActorRunReport, Vec<(String, Vec<u8>)>) {
-    let passive_host = HostId(config.host.host.0 ^ u16::MAX);
-    config.host.replica_placement = harness_placement(config.host.host, passive_host);
-    let (network, [world, passive_world]) =
-        SimWorld::pair([config.host.host, passive_host], config.blobs, config.store);
-    network.set_latency(1_000, 10_000);
+    let horizon = config.horizon;
+    let pair = HarnessPair::new(&mut config);
+    let future = run_final_blobs_inner(
+        config,
+        Rc::clone(&pair.primary_world),
+        Rc::clone(&pair.passive_world),
+        Rc::clone(&pair.passive_state),
+    );
+    run_pair_in_turmoil(seed, horizon, pair, future)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_final_blobs_inner(
+    mut config: ActorHarnessConfig,
+    world: Rc<SimWorld>,
+    passive_world: Rc<SimWorld>,
+    passive_state: SharedHostState,
+) -> (ActorRunReport, Vec<(String, Vec<u8>)>) {
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
     let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
-    let mut executor = Executor::simulation(seed);
-    let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
-        &config.host,
-        passive_host,
-    ))));
-    let mut passive = executor.spawn(host_actor_with_state(
-        Rc::clone(&passive_state),
-        Rc::clone(&passive_world),
-    ));
-    let host_slot = Rc::new(RefCell::new(Some(
-        executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world))),
-    )));
+    let host_slot = Rc::new(RefCell::new(Some(spawn(host_actor_with_state(
+        Rc::clone(&state),
+        Rc::clone(&world),
+    )))));
     let creates = (1..=config.vset_count)
         .map(|number| {
             let vset = VsetId(u64::from(number));
@@ -328,7 +497,7 @@ pub fn run_final_blobs(
             (vset, reply)
         })
         .collect::<Vec<_>>();
-    executor.block_on({
+    {
         let world = Rc::clone(&world);
         let passive_world = Rc::clone(&passive_world);
         async move {
@@ -351,7 +520,23 @@ pub fn run_final_blobs(
                 }
             }
         }
-    });
+    }
+    .await;
+
+    let workload_start = now();
+    config.horizon = workload_start.saturating_add(config.horizon);
+    for at in &mut config.faults.crash_at {
+        *at = workload_start.saturating_add(*at);
+    }
+    if let Some((start, stop)) = config.faults.store_outage.as_mut() {
+        *start = workload_start.saturating_add(*start);
+        *stop = workload_start.saturating_add(*stop);
+    }
+    for (at, _) in &mut config.faults.rot_records_at {
+        *at = workload_start.saturating_add(*at);
+    }
+    world.set_blob_fault_epoch(workload_start);
+    passive_world.set_blob_fault_epoch(workload_start);
 
     let guest_states = Rc::new(
         (1..=config.vset_count)
@@ -371,7 +556,7 @@ pub fn run_final_blobs(
     for number in 1..=config.vset_count {
         let vset = VsetId(u64::from(number));
         let guest_config = config.clone();
-        let guest = executor.spawn(guest_actor(
+        let guest = spawn(guest_actor(
             Rc::clone(&world),
             Rc::clone(&guest_states[&vset]),
             Rc::clone(&events),
@@ -381,7 +566,7 @@ pub fn run_final_blobs(
         guest_slots.borrow_mut().insert(vset, Some(guest));
     }
 
-    let mut supervisor = executor.spawn(recovery_supervisor(
+    let mut supervisor = spawn(recovery_supervisor(
         Rc::clone(&world),
         Rc::clone(&guest_states),
         Rc::clone(&guest_slots),
@@ -389,7 +574,7 @@ pub fn run_final_blobs(
         config.clone(),
     ));
     let mut fault_actors = Vec::new();
-    fault_actors.push(executor.spawn(abort_schedule(
+    fault_actors.push(spawn(abort_schedule(
         Rc::clone(&world),
         Rc::clone(&host_slot),
         Rc::clone(&state_slot),
@@ -399,7 +584,7 @@ pub fn run_final_blobs(
         config.faults.restart_delay,
     )));
     if !config.faults.crash_at.is_empty() || config.faults.crash_mean_interval != 0 {
-        fault_actors.push(executor.spawn(crash_schedule(
+        fault_actors.push(spawn(crash_schedule(
             Rc::clone(&world),
             Rc::clone(&host_slot),
             Rc::clone(&state_slot),
@@ -411,27 +596,27 @@ pub fn run_final_blobs(
         )));
     }
     if let Some(window) = config.faults.store_outage {
-        fault_actors.push(executor.spawn(store_outage(Rc::clone(&world), window)));
+        fault_actors.push(spawn(store_outage(Rc::clone(&world), window)));
     }
     if config.faults.bitflip_mean_interval != 0 {
-        fault_actors.push(executor.spawn(bitflip_schedule(
+        fault_actors.push(spawn(bitflip_schedule(
             Rc::clone(&world),
             config.faults.bitflip_mean_interval,
             config.horizon,
         )));
     }
     if config.faults.journal_bitflip_mean_interval != 0 {
-        fault_actors.push(executor.spawn(record_bitflip_schedule(
+        fault_actors.push(spawn(record_bitflip_schedule(
             Rc::clone(&world),
             config.faults.journal_bitflip_mean_interval,
             config.horizon,
         )));
     }
     for &(at, mirror) in &config.faults.rot_records_at {
-        fault_actors.push(executor.spawn(record_bitflip_at(Rc::clone(&world), at, mirror)));
+        fault_actors.push(spawn(record_bitflip_at(Rc::clone(&world), at, mirror)));
     }
     if let Some(interval) = config.checkpoint_interval {
-        fault_actors.push(executor.spawn(checkpoint_schedule(
+        fault_actors.push(spawn(checkpoint_schedule(
             Rc::clone(&world),
             interval,
             config.horizon,
@@ -439,8 +624,8 @@ pub fn run_final_blobs(
         )));
     }
 
-    if executor.now() < config.horizon {
-        executor.run_until(config.horizon);
+    if now() < config.horizon {
+        delay(config.horizon.saturating_sub(now())).await;
     }
     for mut actor in fault_actors {
         actor.cancel();
@@ -449,21 +634,18 @@ pub fn run_final_blobs(
     if host_slot.borrow().is_none() {
         let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
         *state_slot.borrow_mut() = Rc::clone(&state);
-        *host_slot.borrow_mut() =
-            Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
+        *host_slot.borrow_mut() = Some(spawn(host_actor_with_state(state, Rc::clone(&world))));
     }
-    executor.run_ready();
-    let drain = executor
-        .now()
-        .saturating_add(config.host.writeback_interval.saturating_mul(4));
-    executor.run_until(drain);
+    yield_ready().await;
+    let drain = now().saturating_add(config.host.writeback_interval.saturating_mul(4));
+    delay(drain.saturating_sub(now())).await;
     for guest in guest_slots.borrow_mut().values_mut() {
         if let Some(mut guest) = guest.take() {
             guest.cancel();
         }
     }
     supervisor.cancel();
-    executor.run_ready();
+    yield_ready().await;
 
     let blobs = world.durable_blobs();
     let final_state = Rc::clone(&state_slot.borrow());
@@ -477,8 +659,8 @@ pub fn run_final_blobs(
         published_segment_overhead_bytes,
     ) = world.published_archive_metrics();
     let mut report = ActorRunReport {
-        trace_hash: executor.trace_hash(),
-        executor_polls: executor.polls(),
+        trace_hash: simulation_trace_hash(),
+        actor_polls: simulation_polls(),
         counters,
         completed_ops: guest_states
             .values()
@@ -496,7 +678,7 @@ pub fn run_final_blobs(
         published_dead_entry_bytes,
         published_segment_overhead_bytes,
         seg_live_bytes_end: final_state.borrow().seg_space().0,
-        parked_end: final_state.borrow().stats().parked_faults,
+        parked_end: final_state.borrow().stats().pressure_waiting_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
         max_pause_ns: world.max_pause_ns(),
         crashes: events.crashes.get(),
@@ -523,8 +705,7 @@ pub fn run_final_blobs(
     if let Some(mut host) = host_slot.borrow_mut().take() {
         host.cancel();
     }
-    passive.cancel();
-    executor.run_ready();
+    yield_ready().await;
     (report, blobs)
 }
 
@@ -559,20 +740,48 @@ fn harness_passive_config(primary: &HostConfig, passive: HostId) -> HostConfig {
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-pub fn run_workload(
+fn run_workload_parts(
     seed: u64,
     mut config: ActorHarnessConfig,
     spec: WorkloadSpec,
+) -> Result<(ActorRunReport, WorkloadOutcome), String> {
+    let horizon = config.horizon;
+    let pair = HarnessPair::new(&mut config);
+    let future = run_workload_inner(
+        config,
+        spec,
+        Rc::clone(&pair.primary_world),
+        Rc::clone(&pair.passive_world),
+        Rc::clone(&pair.passive_state),
+    );
+    run_pair_in_turmoil(seed, horizon, pair, future)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_workload(
+    seed: u64,
+    config: HarnessConfig,
+    spec: WorkloadSpec,
+) -> Result<WorkloadRunReport, String> {
+    let (simulation, workload) = run_workload_parts(seed, config, spec)?;
+    Ok(WorkloadRunReport {
+        simulation,
+        workload,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_workload_inner(
+    config: ActorHarnessConfig,
+    spec: WorkloadSpec,
+    world: Rc<SimWorld>,
+    passive_world: Rc<SimWorld>,
+    passive_state: SharedHostState,
 ) -> Result<(ActorRunReport, WorkloadOutcome), String> {
     spec.validate().map_err(|error| error.to_string())?;
     if config.vset_count != 1 {
         return Err("scripted workloads require exactly one vset".to_owned());
     }
-    let passive_host = HostId(config.host.host.0 ^ u16::MAX);
-    config.host.replica_placement = harness_placement(config.host.host, passive_host);
-    let (network, [world, passive_world]) =
-        SimWorld::pair([config.host.host, passive_host], config.blobs, config.store);
-    network.set_latency(1_000, 10_000);
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let vset = VsetId(1);
@@ -581,21 +790,13 @@ pub fn run_workload(
         config: config.vset,
         from_base: None,
     });
-    let mut executor = Executor::simulation(seed);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
     let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
-    let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
-        &config.host,
-        passive_host,
-    ))));
-    let mut passive = executor.spawn(host_actor_with_state(
-        Rc::clone(&passive_state),
-        Rc::clone(&passive_world),
-    ));
-    let host_slot = Rc::new(RefCell::new(Some(
-        executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world))),
-    )));
-    let created = executor.block_on({
+    let host_slot = Rc::new(RefCell::new(Some(spawn(host_actor_with_state(
+        Rc::clone(&state),
+        Rc::clone(&world),
+    )))));
+    let created = {
         let world = Rc::clone(&world);
         let passive_world = Rc::clone(&passive_world);
         async move {
@@ -605,7 +806,8 @@ pub fn run_workload(
                 OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
             }
         }
-    });
+    }
+    .await;
     if !matches!(
         created,
         Some(Ok(AdminSuccess::VsetCreated {
@@ -619,7 +821,7 @@ pub fn run_workload(
 
     let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
     let events = Rc::new(RunEvents::default());
-    let mut fault_actors = vec![executor.spawn(abort_schedule(
+    let mut fault_actors = vec![spawn(abort_schedule(
         Rc::clone(&world),
         Rc::clone(&host_slot),
         Rc::clone(&state_slot),
@@ -629,7 +831,7 @@ pub fn run_workload(
         config.faults.restart_delay,
     ))];
     if !config.faults.crash_at.is_empty() || config.faults.crash_mean_interval != 0 {
-        fault_actors.push(executor.spawn(crash_schedule(
+        fault_actors.push(spawn(crash_schedule(
             Rc::clone(&world),
             Rc::clone(&host_slot),
             Rc::clone(&state_slot),
@@ -641,27 +843,27 @@ pub fn run_workload(
         )));
     }
     if let Some(window) = config.faults.store_outage {
-        fault_actors.push(executor.spawn(store_outage(Rc::clone(&world), window)));
+        fault_actors.push(spawn(store_outage(Rc::clone(&world), window)));
     }
     if config.faults.bitflip_mean_interval != 0 {
-        fault_actors.push(executor.spawn(bitflip_schedule(
+        fault_actors.push(spawn(bitflip_schedule(
             Rc::clone(&world),
             config.faults.bitflip_mean_interval,
             config.horizon,
         )));
     }
     if config.faults.journal_bitflip_mean_interval != 0 {
-        fault_actors.push(executor.spawn(record_bitflip_schedule(
+        fault_actors.push(spawn(record_bitflip_schedule(
             Rc::clone(&world),
             config.faults.journal_bitflip_mean_interval,
             config.horizon,
         )));
     }
     for &(at, mirror) in &config.faults.rot_records_at {
-        fault_actors.push(executor.spawn(record_bitflip_at(Rc::clone(&world), at, mirror)));
+        fault_actors.push(spawn(record_bitflip_at(Rc::clone(&world), at, mirror)));
     }
     if let Some(interval) = config.checkpoint_interval {
-        fault_actors.push(executor.spawn(checkpoint_schedule(
+        fault_actors.push(spawn(checkpoint_schedule(
             Rc::clone(&world),
             interval,
             config.horizon,
@@ -678,10 +880,11 @@ pub fn run_workload(
     let unrestorable = 0_u64;
     for operation in program {
         let think = config.think;
-        executor.block_on(async move {
+        async move {
             delay(random_between(think.0, think.1)).await;
-        });
-        if executor.now() > config.horizon {
+        }
+        .await;
+        if now() > config.horizon {
             return Err(format!(
                 "workload {} did not finish before the simulation horizon (completed={})",
                 spec.name,
@@ -691,13 +894,13 @@ pub fn run_workload(
         match operation {
             Operation::Create => {}
             Operation::Read { page } => {
-                scripted_read(&mut executor, &world, page, model.expected(page))?;
+                scripted_read(&world, page, model.expected(page)).await?;
             }
             Operation::Write { page, value } => {
-                scripted_write(&mut executor, &world, page, value)?;
+                scripted_write(&world, page, value).await?;
             }
             Operation::Sync { volume } => {
-                let ok = executor.block_on({
+                let ok = {
                     let world = Rc::clone(&world);
                     async move {
                         world
@@ -710,7 +913,8 @@ pub fn run_workload(
                             })
                             .await
                     }
-                });
+                }
+                .await;
                 next_req = next_req.checked_add(1).expect("script request overflow");
                 if !ok {
                     return Err("scripted sync failed".to_owned());
@@ -720,7 +924,7 @@ pub fn run_workload(
                 let req = ReqId(next_req);
                 next_req = next_req.checked_add(1).expect("script request overflow");
                 let reply = world.request_admin(AdminCall::Checkpoint { retry: req, vset });
-                let reply = executor.block_on(reply);
+                let reply = reply.await;
                 if !matches!(reply, Ok(Ok(AdminSuccess::CheckpointDone { .. }))) {
                     return Err("scripted checkpoint failed".to_owned());
                 }
@@ -729,7 +933,7 @@ pub fn run_workload(
                 let running = host_slot.borrow_mut().take();
                 if let Some(mut host) = running {
                     host.cancel();
-                    executor.run_ready();
+                    yield_ready().await;
                     merge_counters(
                         &mut events.retired_counters.borrow_mut(),
                         &state_slot.borrow().borrow().counters,
@@ -738,18 +942,17 @@ pub fn run_workload(
                     world.crash_guest_io();
                     events.crashes.set(events.crashes.get().saturating_add(1));
                     let restart_delay = config.faults.restart_delay;
-                    let wait = executor
-                        .block_on(async move { random_between(restart_delay.0, restart_delay.1) });
-                    executor.run_until(executor.now().saturating_add(wait));
+                    let wait = random_between(restart_delay.0, restart_delay.1);
+                    delay(wait).await;
                     world.clear_abort();
                     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
                     *state_slot.borrow_mut() = Rc::clone(&state);
                     *host_slot.borrow_mut() =
-                        Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
+                        Some(spawn(host_actor_with_state(state, Rc::clone(&world))));
                 }
             }
             Operation::Restore => {
-                let deadline = executor.now().saturating_add(1_000_000_000);
+                let deadline = now().saturating_add(1_000_000_000);
                 let verdict = loop {
                     match world.try_next_admin_event() {
                         Some(AdminEvent::VsetRecovered {
@@ -757,9 +960,15 @@ pub fn run_workload(
                             verdict,
                         }) => break Some(verdict),
                         Some(_) => {}
-                        None if executor.now() >= deadline => break None,
-                        None => executor
-                            .run_until(deadline.min(executor.now().saturating_add(1_000_000))),
+                        None if now() >= deadline => break None,
+                        None => {
+                            delay(
+                                deadline
+                                    .min(now().saturating_add(1_000_000))
+                                    .saturating_sub(now()),
+                            )
+                            .await;
+                        }
                     }
                 };
                 match verdict {
@@ -778,7 +987,7 @@ pub fn run_workload(
                     Some(blockd_core::protocol::Verdict::Unrestorable) => {
                         return Err("scripted recovery was unrestorable".to_owned());
                     }
-                    Some(blockd_core::protocol::Verdict::DatabaseReady { .. }) | None => {
+                    None => {
                         return Err(format!(
                             "scripted recovery returned no compute verdict (abort={:?})",
                             world.abort_reason()
@@ -788,7 +997,7 @@ pub fn run_workload(
             }
             Operation::Verify { scope } => {
                 for (page, expected) in model.pages(scope) {
-                    scripted_read(&mut executor, &world, page, expected)?;
+                    scripted_read(&world, page, expected).await?;
                 }
             }
             Operation::Migrate { .. } | Operation::Fork { .. } => {
@@ -814,17 +1023,14 @@ pub fn run_workload(
     if host_slot.borrow().is_none() {
         let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
         *state_slot.borrow_mut() = Rc::clone(&state);
-        *host_slot.borrow_mut() =
-            Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
+        *host_slot.borrow_mut() = Some(spawn(host_actor_with_state(state, Rc::clone(&world))));
     }
-    executor.run_ready();
-    let drain = executor
-        .now()
-        .saturating_add(config.host.writeback_interval.saturating_mul(4));
-    executor.run_until(drain);
+    yield_ready().await;
+    let drain = now().saturating_add(config.host.writeback_interval.saturating_mul(4));
+    delay(drain.saturating_sub(now())).await;
     let blobs = world.durable_blobs();
     let final_state = Rc::clone(&state_slot.borrow());
-    let mut report = report_from_state(&executor, &world, &final_state, &blobs);
+    let mut report = report_from_state(&world, &final_state, &blobs);
     let mut counters = *events.retired_counters.borrow();
     merge_counters(&mut counters, &report.counters);
     merge_counters(&mut counters, &passive_state.borrow().counters);
@@ -839,22 +1045,21 @@ pub fn run_workload(
     if let Some(mut host) = host_slot.borrow_mut().take() {
         host.cancel();
     }
-    passive.cancel();
-    executor.run_ready();
+    yield_ready().await;
     Ok((report, outcome))
 }
 
-fn scripted_read(
-    executor: &mut Executor,
+async fn scripted_read(
     world: &Rc<SimWorld>,
     logical: LogicalPage,
     expected: u64,
 ) -> Result<(), String> {
     let page = scripted_page(logical);
-    let served = executor.block_on({
+    let served = {
         let world = Rc::clone(world);
         async move { world.fault(page, false).await }
-    });
+    }
+    .await;
     if !served {
         return Err(format!("scripted read fault failed at {logical:?}"));
     }
@@ -870,17 +1075,17 @@ fn scripted_read(
     Ok(())
 }
 
-fn scripted_write(
-    executor: &mut Executor,
+async fn scripted_write(
     world: &Rc<SimWorld>,
     logical: LogicalPage,
     value: u64,
 ) -> Result<(), String> {
     let page = scripted_page(logical);
-    let served = executor.block_on({
+    let served = {
         let world = Rc::clone(world);
         async move { world.fault(page, true).await }
-    });
+    }
+    .await;
     if !served || !world.write_resident(page, page_pattern(page, value.saturating_add(1))) {
         return Err(format!("scripted write fault failed at {logical:?}"));
     }
@@ -898,7 +1103,6 @@ fn scripted_page(logical: LogicalPage) -> PageId {
 }
 
 fn report_from_state(
-    executor: &Executor,
     world: &SimWorld,
     state: &SharedHostState,
     blobs: &[(String, Vec<u8>)],
@@ -910,8 +1114,8 @@ fn report_from_state(
         published_segment_overhead_bytes,
     ) = world.published_archive_metrics();
     let mut report = ActorRunReport {
-        trace_hash: executor.trace_hash(),
-        executor_polls: executor.polls(),
+        trace_hash: simulation_trace_hash(),
+        actor_polls: simulation_polls(),
         counters: state.borrow().counters,
         blob_count: blobs.len(),
         store_keys: world.store_keys(),
@@ -921,7 +1125,7 @@ fn report_from_state(
         published_dead_entry_bytes,
         published_segment_overhead_bytes,
         seg_live_bytes_end: state.borrow().seg_space().0,
-        parked_end: state.borrow().stats().parked_faults,
+        parked_end: state.borrow().stats().pressure_waiting_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
         max_pause_ns: world.max_pause_ns(),
         bitflips: world.bitflips(),
@@ -1184,7 +1388,6 @@ async fn handle_recovery_event(
                 }
                 return None;
             }
-            blockd_core::protocol::Verdict::DatabaseReady { .. } => return None,
         }
         *guest_states[&vset].recovering_pages.borrow_mut() = config
             .vset
@@ -1357,67 +1560,23 @@ async fn record_bitflip_at(world: Rc<SimWorld>, at: u64, mirror: bool) {
 }
 
 async fn checkpoint_schedule(world: Rc<SimWorld>, interval: u64, horizon: u64, vset_count: u16) {
-    let mut req = 1_u64 << 63;
-    let mut actors = TaskSet::new();
-    let (completed, mut completions) = unbounded();
-    let mut active = BTreeSet::new();
-    let mut queued = BTreeSet::new();
-    let mut pending = VecDeque::new();
-    let interval = interval.max(1);
-    let mut next_cadence = now().saturating_add(interval);
-    loop {
-        if now() >= next_cadence {
-            if now() > horizon {
-                pending.clear();
-                queued.clear();
-                while !active.is_empty() {
-                    let Some(vset) = completions.recv().await else {
-                        return;
-                    };
-                    active.remove(&vset);
-                }
-                return;
-            }
-            for number in 1..=vset_count {
-                let vset = VsetId(u64::from(number));
-                if world.vmstate_ready(vset) && !active.contains(&vset) && queued.insert(vset) {
-                    pending.push_back(vset);
-                }
-            }
-            next_cadence = now().saturating_add(interval);
-        }
-        while active.len() < CHECKPOINT_CONCURRENCY {
-            let Some(vset) = pending.pop_front() else {
-                break;
-            };
-            queued.remove(&vset);
-            if !world.vmstate_ready(vset) || !active.insert(vset) {
-                continue;
-            }
-            let reply = world.request_admin(AdminCall::Checkpoint {
-                retry: ReqId(req),
-                vset,
-            });
-            let completed = completed.clone();
-            actors.spawn(async move {
-                let _ = reply.await;
-                let _ = completed.send(vset);
-            });
-            req = req.checked_add(1).expect("checkpoint request overflow");
-        }
-        match select2(
-            completions.recv(),
-            delay(next_cadence.saturating_sub(now())),
-        )
-        .await
-        {
-            Either::First(Some(vset)) => {
-                active.remove(&vset);
-            }
-            Either::First(None) => return,
-            Either::Second(()) => {}
-        }
-    }
+    crate::checkpoint_schedule::run(
+        interval,
+        horizon,
+        1_u64 << 63,
+        || {
+            (1..=vset_count)
+                .map(|number| VsetId(u64::from(number)))
+                .filter(|&vset| world.vmstate_ready(vset))
+                .collect()
+        },
+        |vset, retry| {
+            world
+                .vmstate_ready(vset)
+                .then(|| world.request_admin(AdminCall::Checkpoint { retry, vset }))
+        },
+    )
+    .await;
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1647,7 +1806,18 @@ mod tests {
     use blockd_exec::timeout;
 
     use super::*;
-    use crate::actor_world::SimNetwork;
+
+    macro_rules! simulate {
+        ($seed:expr, $future:expr) => {{
+            tokio::task::LocalSet::new()
+                .run_until(blockd_exec::simulation_scope(
+                    $seed,
+                    FaultConfig::default(),
+                    $future,
+                ))
+                .await
+        }};
+    }
 
     fn config() -> ActorHarnessConfig {
         ActorHarnessConfig {
@@ -1704,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_drops_the_task_tree_and_recovers_on_the_same_executor() {
+    fn crash_drops_the_task_tree_and_recovers_in_the_same_simulation() {
         let mut crash = config();
         crash.vset_count = 1;
         crash.faults.crash_at = vec![millis(40)];
@@ -1718,17 +1888,15 @@ mod tests {
         assert!(first.violations.is_empty(), "{:?}", first.violations);
     }
 
-    #[test]
-    fn backed_local_unrestorable_verdict_requests_store_restore() {
+    #[tokio::test(start_paused = true)]
+    async fn backed_local_unrestorable_verdict_requests_store_restore() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(29);
-        let command = executor.block_on({
+        let command = simulate!(29, {
             let world = Rc::clone(&world);
             async move {
                 let supervisor = spawn(recovery_supervisor(
@@ -1759,12 +1927,11 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn recoverable_restore_failure_retries_without_blocking_another_vset() {
+    #[tokio::test(start_paused = true)]
+    async fn recoverable_restore_failure_retries_without_blocking_another_vset() {
         let mut config = config();
         config.host.backup_retry = 1;
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let first = VsetId(1);
         let second = VsetId(2);
         let guest_states = Rc::new(BTreeMap::from([
@@ -1773,8 +1940,7 @@ mod tests {
         ]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(30);
-        executor.block_on({
+        simulate!(30, {
             let world = Rc::clone(&world);
             let guest_slots = Rc::clone(&guest_slots);
             async move {
@@ -1826,18 +1992,16 @@ mod tests {
         });
     }
 
-    #[test]
-    fn older_restore_success_cannot_replace_newer_recovery_event() {
+    #[tokio::test(start_paused = true)]
+    async fn older_restore_success_cannot_replace_newer_recovery_event() {
         let mut config = config();
         config.host.backup_retry = 10;
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(32);
-        executor.block_on({
+        simulate!(32, {
             let world = Rc::clone(&world);
             let guest_slots = Rc::clone(&guest_slots);
             async move {
@@ -1892,17 +2056,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn newer_recovery_preempts_a_blocked_restore() {
+    #[tokio::test(start_paused = true)]
+    async fn newer_recovery_preempts_a_blocked_restore() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(37);
-        executor.block_on({
+        simulate!(37, {
             let world = Rc::clone(&world);
             let guest_slots = Rc::clone(&guest_slots);
             async move {
@@ -1949,17 +2111,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn generation_change_preempts_restore_before_newer_event_admission() {
+    #[tokio::test(start_paused = true)]
+    async fn generation_change_preempts_restore_before_newer_event_admission() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(38);
-        executor.block_on({
+        simulate!(38, {
             let world = Rc::clone(&world);
             async move {
                 AdminIo::emit_admin_event(
@@ -2015,18 +2175,16 @@ mod tests {
         });
     }
 
-    #[test]
-    fn superseded_recovery_work_issues_no_restore_request() {
+    #[tokio::test(start_paused = true)]
+    async fn superseded_recovery_work_issues_no_restore_request() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
         let stale_generation = world.admin_event_generation(vset);
-        let mut executor = Executor::simulation(34);
-        executor.block_on({
+        simulate!(34, {
             let world = Rc::clone(&world);
             async move {
                 AdminIo::emit_admin_event(
@@ -2066,17 +2224,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn stale_recovery_admission_does_not_block_its_newer_event() {
+    #[tokio::test(start_paused = true)]
+    async fn stale_recovery_admission_does_not_block_its_newer_event() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(35);
-        executor.block_on({
+        simulate!(35, {
             let world = Rc::clone(&world);
             let guest_slots = Rc::clone(&guest_slots);
             async move {
@@ -2113,12 +2269,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn queued_recovery_supersedes_an_active_restore_at_capacity() {
+    #[tokio::test(start_paused = true)]
+    async fn queued_recovery_supersedes_an_active_restore_at_capacity() {
         let mut config = config();
         config.host.backup_retry = 10;
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let first = VsetId(1);
         let guest_states = Rc::new(
             (1..=RECOVERY_QUEUE_CAPACITY)
@@ -2132,8 +2287,7 @@ mod tests {
         );
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(33);
-        executor.block_on({
+        simulate!(33, {
             let world = Rc::clone(&world);
             let guest_slots = Rc::clone(&guest_slots);
             async move {
@@ -2213,12 +2367,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn retrying_restores_release_every_recovery_slot_for_queued_vsets() {
+    #[tokio::test(start_paused = true)]
+    async fn retrying_restores_release_every_recovery_slot_for_queued_vsets() {
         let mut config = config();
         config.host.backup_retry = 10;
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let queued = VsetId(u64::try_from(RECOVERY_CONCURRENCY + 1).expect("vset fits"));
         let guest_states = Rc::new(
             (1..=queued.0)
@@ -2227,8 +2380,7 @@ mod tests {
         );
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(31);
-        executor.block_on({
+        simulate!(31, {
             let world = Rc::clone(&world);
             let guest_slots = Rc::clone(&guest_slots);
             async move {
@@ -2281,15 +2433,13 @@ mod tests {
         });
     }
 
-    #[test]
-    fn checkpoint_schedule_coalesces_one_outstanding_request_per_vset() {
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_schedule_coalesces_one_outstanding_request_per_vset() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         world.set_vmstate(vset, 1);
-        let mut executor = Executor::simulation(31);
-        executor.block_on({
+        simulate!(31, {
             let world = Rc::clone(&world);
             async move {
                 let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 100, 1));
@@ -2315,15 +2465,13 @@ mod tests {
         });
     }
 
-    #[test]
-    fn checkpoint_schedule_drains_an_admitted_request_past_the_horizon() {
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_schedule_drains_an_admitted_request_past_the_horizon() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset = VsetId(1);
         world.set_vmstate(vset, 1);
-        let mut executor = Executor::simulation(36);
-        executor.block_on({
+        simulate!(36, {
             let world = Rc::clone(&world);
             async move {
                 let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 2, 1));
@@ -2343,17 +2491,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn checkpoint_schedule_bounds_global_concurrency_and_refills_fairly() {
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_schedule_bounds_global_concurrency_and_refills_fairly() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let vset_count = u16::try_from(CHECKPOINT_CONCURRENCY + 8).expect("vset count fits");
         for number in 1..=vset_count {
             world.set_vmstate(VsetId(u64::from(number)), 1);
         }
-        let mut executor = Executor::simulation(32);
-        executor.block_on({
+        simulate!(32, {
             let world = Rc::clone(&world);
             async move {
                 let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 100, vset_count));
@@ -2405,28 +2551,25 @@ mod tests {
         assert!(report.violations.is_empty(), "{:?}", report.violations);
     }
 
-    #[test]
-    fn overlapping_restart_requests_create_only_one_replacement_host() {
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_restart_requests_create_only_one_replacement_host() {
         let config = config();
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(config.host.host, config.blobs, config.store, &network);
+        let world = SimWorld::new(config.host.host, config.blobs, config.store);
         let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
         let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
         let host_slot = Rc::new(RefCell::new(None));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let mut executor = Executor::simulation(35);
-        *host_slot.borrow_mut() =
-            Some(executor.spawn(host_actor_with_state(state, Rc::clone(&world))));
-        for _ in 0..2 {
-            let world = Rc::clone(&world);
-            let host_slot = Rc::clone(&host_slot);
-            let state_slot = Rc::clone(&state_slot);
-            let guest_slots = Rc::clone(&guest_slots);
-            let events = Rc::clone(&events);
-            let host_config = config.host.clone();
-            executor
-                .spawn(async move {
+        simulate!(35, async move {
+            *host_slot.borrow_mut() = Some(spawn(host_actor_with_state(state, Rc::clone(&world))));
+            for _ in 0..2 {
+                let world = Rc::clone(&world);
+                let host_slot = Rc::clone(&host_slot);
+                let state_slot = Rc::clone(&state_slot);
+                let guest_slots = Rc::clone(&guest_slots);
+                let events = Rc::clone(&events);
+                let host_config = config.host.clone();
+                spawn(async move {
                     crash_and_restart(
                         &world,
                         &host_slot,
@@ -2439,10 +2582,11 @@ mod tests {
                     .await;
                 })
                 .detach();
-        }
-        executor.run_until(10);
-        assert_eq!(events.crashes.get(), 1);
-        assert!(host_slot.borrow().is_some());
+            }
+            blockd_exec::advance_to(10).await;
+            assert_eq!(events.crashes.get(), 1);
+            assert!(host_slot.borrow().is_some());
+        });
     }
 
     #[test]

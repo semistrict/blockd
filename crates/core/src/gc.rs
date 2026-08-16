@@ -23,6 +23,7 @@ use crate::types::SimTime;
 /// `objects` is the full LIST (key, last-write time, bytes); reads of
 /// manifests and base roots happen from these bytes exactly
 /// as the real process would GET them.
+#[allow(clippy::too_many_lines)]
 pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) -> Vec<String> {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let find = |key: &str| objects.iter().find(|(k, _, _)| k == key);

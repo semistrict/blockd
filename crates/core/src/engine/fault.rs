@@ -1,10 +1,10 @@
 use std::rc::Rc;
 
 use blockd_exec::channel::oneshot;
-use blockd_exec::delay;
 
 use super::state::{CacheReservation, PageFillLease, SharedHost};
-use super::{hydrate_mapping, peer_fetch_page, peer_fetch_replica_page};
+use super::store_retry;
+use super::{peer_fetch_page, peer_fetch_replica_page};
 use crate::blx::{BlockKey, EntryKind, NamespaceKind, open_footer};
 use crate::format::checksum64;
 use crate::journal::VsetKind;
@@ -12,13 +12,12 @@ use crate::layout;
 use crate::manifest::ObjectRef;
 use crate::segment::{PageLoc, open_entry};
 use crate::types::{Gen, PageId, VsetId, page_size};
-use crate::world::{Blobs, FillSource, GuestMem, Peers, Store, StoreError};
+use crate::world::{Blobs, FillSource, GuestMem, Peers, Store};
 
 #[derive(Clone, Copy)]
 struct FetchPlan {
     generation: Gen,
     location: PageLoc,
-    backed: bool,
     source: Option<crate::types::HostId>,
     retry_delay: u64,
 }
@@ -134,7 +133,6 @@ async fn serve_missing_fault<W>(
         Ready {
             location: Option<(Gen, PageLoc)>,
             memory: bool,
-            backed: bool,
             source: Option<crate::types::HostId>,
             victim: Option<PageId>,
         },
@@ -148,12 +146,9 @@ async fn serve_missing_fault<W>(
         Gone,
     }
 
-    if hydrate_mapping(&state, world.as_ref(), page, incarnation)
+    if resolve_archive_mapping(&state, world.as_ref(), page, incarnation)
         .await
         .is_err()
-        || resolve_archive_mapping(&state, world.as_ref(), page, incarnation)
-            .await
-            .is_err()
     {
         state.borrow_mut().counters.faults_unservable += 1;
         let _ = GuestMem::fail(world.as_ref(), page).await;
@@ -171,7 +166,6 @@ async fn serve_missing_fault<W>(
             {
                 let location = vset.page_locs.get(&page).copied();
                 let memory = vset.config.is_memory(page.volume.idx);
-                let backed = true;
                 let source = vset.peer_source;
                 let shared = location
                     .map(|(_, location)| location)
@@ -203,7 +197,6 @@ async fn serve_missing_fault<W>(
                         Slot::Ready {
                             location,
                             memory,
-                            backed,
                             source,
                             victim,
                         }
@@ -218,14 +211,13 @@ async fn serve_missing_fault<W>(
                 Slot::Gone
             }
         };
-        let (location, memory, backed, source, victim) = match slot {
+        let (location, memory, source, victim) = match slot {
             Slot::Ready {
                 location,
                 memory,
-                backed,
                 source,
                 victim,
-            } => (location, memory, backed, source, victim),
+            } => (location, memory, source, victim),
             Slot::Shared {
                 share,
                 memory,
@@ -344,7 +336,6 @@ async fn serve_missing_fault<W>(
             FetchPlan {
                 generation,
                 location,
-                backed,
                 source,
                 retry_delay,
             },
@@ -446,6 +437,7 @@ fn same_incarnation(host: &super::state::HostState, page: PageId, incarnation: u
         .is_some_and(|vset| vset.incarnation == incarnation && vset.ready)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fetch_page<W: Blobs + Store + Peers>(
     state: &SharedHost,
     world: &W,
@@ -455,7 +447,6 @@ async fn fetch_page<W: Blobs + Store + Peers>(
     let FetchPlan {
         generation,
         location,
-        backed,
         source,
         retry_delay,
     } = plan;
@@ -513,9 +504,6 @@ async fn fetch_page<W: Blobs + Store + Peers>(
     {
         return Some((raw, FillSource::Peer));
     }
-    if !backed && location.base == 0 {
-        return None;
-    }
     let archive_key = state
         .borrow()
         .vsets
@@ -540,33 +528,24 @@ async fn fetch_page<W: Blobs + Store + Peers>(
             layout::blx_key(VsetId(location.base), location.fence, location.seg.0)
         }
     });
-    loop {
-        match Store::get_range(
-            world,
-            &key,
-            u64::from(location.offset),
-            u64::from(location.len),
-        )
-        .await
-        {
-            Ok(Some((_, bytes))) => {
-                return verify_entry(page, generation, Some(bytes))
-                    .map(|raw| (raw, FillSource::Store));
-            }
-            Ok(None) | Err(StoreError::TooLarge) => return None,
-            Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
-                delay(retry_delay).await;
-            }
-            Err(StoreError::Fault(crate::protocol::StoreFault::CasConflict { .. })) => {
-                return None;
-            }
-        }
-    }
+    let bytes = store_retry::get_range(
+        state,
+        world,
+        &key,
+        u64::from(location.offset),
+        u64::from(location.len),
+        retry_delay,
+    )
+    .await
+    .ok()??
+    .1;
+    verify_entry(page, generation, Some(bytes)).map(|raw| (raw, FillSource::Store))
 }
 
 /// Resolve one archived page without materializing a durable or in-memory map
 /// for the whole vset. Object key ranges select at most the configured overlap
 /// bound; only those footers are fetched, and each verified footer is cached.
+#[allow(clippy::too_many_lines)]
 async fn resolve_archive_mapping<W: Store>(
     state: &SharedHost,
     world: &W,
@@ -610,26 +589,18 @@ async fn resolve_archive_mapping<W: Store>(
         match action {
             Action::Ready => return Ok(()),
             Action::Fetch { object, retry } => {
-                let bytes = loop {
-                    match Store::get_range(
-                        world,
-                        &object.identity.store_key(),
-                        u64::from(object.footer_offset),
-                        u64::from(object.footer_length),
-                    )
-                    .await
-                    {
-                        Ok(Some((_, bytes))) => break bytes,
-                        Ok(None)
-                        | Err(StoreError::TooLarge)
-                        | Err(StoreError::Fault(crate::protocol::StoreFault::CasConflict {
-                            ..
-                        })) => return Err(()),
-                        Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
-                            delay(retry).await;
-                        }
-                    }
-                };
+                let bytes = store_retry::get_range(
+                    state,
+                    world,
+                    &object.identity.store_key(),
+                    u64::from(object.footer_offset),
+                    u64::from(object.footer_length),
+                    retry,
+                )
+                .await
+                .map_err(|_| ())?
+                .ok_or(())?
+                .1;
                 let footer = open_footer(&bytes).map_err(|_| ())?;
                 let valid = footer.entries.first().is_some_and(|entry| {
                     entry.key == object.first_key
@@ -727,7 +698,6 @@ async fn resolve_archive_mapping<W: Store>(
                     } else {
                         vset.block_checksums.remove(&key);
                         vset.page_locs.remove(&page);
-                        vset.overlay.remove(&page);
                     }
                 }
                 return Ok(());
@@ -745,63 +715,4 @@ fn verify_entry(page: PageId, generation: Gen, bytes: Option<Vec<u8>>) -> Option
                 && found_generation == generation)
                 .then_some(raw)
         })
-}
-
-pub(super) async fn load_page_for_database<W>(
-    state: &SharedHost,
-    world: &W,
-    page: PageId,
-    incarnation: u64,
-) -> Option<Vec<u8>>
-where
-    W: Blobs + Store + Peers,
-{
-    hydrate_mapping(state, world, page, incarnation)
-        .await
-        .ok()?;
-    resolve_archive_mapping(state, world, page, incarnation)
-        .await
-        .ok()?;
-    let (location, backed, source, retry) = {
-        let host = state.borrow();
-        let vset = host
-            .vsets
-            .get(&page.volume.vset)
-            .filter(|vset| vset.incarnation == incarnation && vset.ready)?;
-        (
-            vset.page_locs.get(&page).copied(),
-            true,
-            vset.peer_source,
-            host.config.backup_retry,
-        )
-    };
-    let Some((generation, location)) = location else {
-        return Some(vec![0; page_size()]);
-    };
-    let raw = fetch_page(
-        state,
-        world,
-        page,
-        FetchPlan {
-            generation,
-            location,
-            backed,
-            source,
-            retry_delay: retry,
-        },
-    )
-    .await?
-    .0;
-    if let Some(vset) = state
-        .borrow_mut()
-        .vsets
-        .get_mut(&page.volume.vset)
-        .filter(|vset| vset.incarnation == incarnation)
-    {
-        vset.block_checksums.insert(
-            BlockKey::from_page(vset.config.kind, page),
-            (generation, checksum64(&raw)),
-        );
-    }
-    Some(raw)
 }

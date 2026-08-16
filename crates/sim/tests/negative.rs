@@ -3,13 +3,13 @@
 use blockd_core::hostmeta::HostConfig;
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{HostId, millis, secs};
-use blockd_sim::harness::{FaultPlan, HarnessConfig, Sabotage, run};
-use blockd_sim::world::blobdev::BlobDevConfig;
-use blockd_sim::world::store::StoreConfig;
+use blockd_sim::cluster::Sabotage;
+use blockd_sim::harness::{FaultPlan, HarnessConfig, run};
+use blockd_sim::model::{BlobDevConfig, StoreConfig};
 
 fn base_config() -> HarnessConfig {
     HarnessConfig {
-        daemon: HostConfig {
+        host: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
             cache_pages: 256,
@@ -20,19 +20,18 @@ fn base_config() -> HarnessConfig {
             wedge_ticks: 25,
             replica_placement: None,
         },
-        bdev: BlobDevConfig::nvme(),
-        store: StoreConfig::s3(),
+        blobs: BlobDevConfig::nvme(),
+        store: StoreConfig::gcs(),
         vset_count: 2,
-        vset_config: VsetConfig::compute(2, 16),
+        vset: VsetConfig::compute(2, 16),
         horizon: secs(2),
         think: (millis(1), millis(5)),
         checkpoint_interval: None,
         faults: FaultPlan::none(),
-        sabotage: None,
-        guest_sync_share: None,
-        guest_hot_pages: None,
-        rot_records_at: vec![],
-        crash_at: vec![],
+        sync_share: None,
+        hot_pages: None,
+        corrupt_fills: false,
+        drop_write_protect: false,
     }
 }
 
@@ -42,7 +41,7 @@ fn oracle_catches_corrupted_fills() {
     // single bit, delivered through the only door into guest memory, are
     // flagged the moment any guest observes them.
     let mut config = base_config();
-    config.sabotage = Some(Sabotage::CorruptFill);
+    config.corrupt_fills = true;
     let report = run(3, config);
     assert!(
         report
@@ -62,18 +61,19 @@ fn oracle_catches_dropped_write_protection() {
     // exists to prevent.
     let mut config = base_config();
     config.vset_count = 1;
-    config.daemon.cache_pages = 8;
+    config.host.cache_pages = 8;
     config.horizon = millis(500);
     config.checkpoint_interval = Some(millis(100));
-    config.crash_at = vec![millis(250)];
+    config.faults.crash_at = vec![millis(250)];
     config.faults = FaultPlan {
         crash_mean_interval: 0,
         restart_delay: (millis(10), millis(10)),
         bitflip_mean_interval: 0,
         journal_bitflip_mean_interval: 0,
         store_outage: None,
+        ..FaultPlan::default()
     };
-    config.sabotage = Some(Sabotage::DropWriteProtect);
+    config.drop_write_protect = true;
     let caught = (0..16).any(|seed| !run(seed, config.clone()).violations.is_empty());
     assert!(
         caught,
@@ -102,7 +102,7 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
             replica_placement: None,
         },
         bdev: BlobDevConfig::nvme(),
-        store: StoreConfig::s3(),
+        store: StoreConfig::gcs(),
         horizon: secs(4),
         think: (millis(1), millis(5)),
         checkpoint_interval: Some(millis(300)),
@@ -117,7 +117,6 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         fault_points: vec![],
         store_outage: None,
         rot_resume_set_at: None,
-        rot_leaves_at: None,
         drop_peer: None,
         race_restore: false,
         migrate_at: vec![(millis(1_000), blockd_core::types::VsetId(1), 1)],

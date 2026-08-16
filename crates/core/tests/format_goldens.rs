@@ -3,10 +3,7 @@
 use std::collections::BTreeMap;
 
 use blockd_core::head::{HeadRecord, ManifestPtr};
-use blockd_core::journal::{
-    DatabaseMeta, JournalRecord, MigrationSource, RecordKind, VsetConfig, VsetKind,
-};
-use blockd_core::mapleaf::{LeafPtr, MapLeaf};
+use blockd_core::journal::{JournalRecord, MigrationSource, RecordKind, VsetConfig, VsetKind};
 use blockd_core::segment::PageLoc;
 use blockd_core::types::{
     Epoch, Gen, HostId, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,
@@ -52,7 +49,6 @@ fn golden_journal_record() -> (VsetId, JournalRecord) {
         capture_seq: 99,
         sync_covered_through: 90,
         post_state_checksum: 23,
-        database: DatabaseMeta::default(),
         files: Vec::new(),
         overlay: BTreeMap::from([(
             page(1, 7),
@@ -66,14 +62,6 @@ fn golden_journal_record() -> (VsetId, JournalRecord) {
                     len: 88,
                 },
             ),
-        )]),
-        leaves: BTreeMap::from([(
-            0x100,
-            LeafPtr {
-                base: 0,
-                fence: 4,
-                id: 11,
-            },
         )]),
         migrated_from: Some(MigrationSource {
             host: HostId(2),
@@ -100,40 +88,6 @@ fn golden_head() -> (VsetId, HeadRecord) {
         retired_stashes: Vec::new(),
     };
     (vset, head)
-}
-
-fn golden_leaf() -> (VsetId, u64, u64, MapLeaf) {
-    // VolumeIdx(1)'s pages 0..4095 linearize to span (1 << 32) / LEAF_SPAN.
-    let leaf = MapLeaf {
-        span: 0x10_0000,
-        entries: vec![
-            (
-                VolumeIdx(1),
-                PageNo(0),
-                Gen(4),
-                PageLoc {
-                    base: 0,
-                    fence: 3,
-                    seg: SegId(1),
-                    offset: 0,
-                    len: 64,
-                },
-            ),
-            (
-                VolumeIdx(1),
-                PageNo(3),
-                Gen(7),
-                PageLoc {
-                    base: 9,
-                    fence: 2,
-                    seg: SegId(5),
-                    offset: 128,
-                    len: 90,
-                },
-            ),
-        ],
-    };
-    (VsetId(0xC3), 4, 11, leaf)
 }
 
 // Journal v4 embeds the writer's page size, so each size this project
@@ -164,7 +118,6 @@ fn journal_v7_golden() -> &'static str {
 }
 const HEAD_V1: &str = "424844312d0000005e45983e0100b2000000000000000300110000000000000001100000000000000028000000000000000002000000000000";
 const HEAD_V2: &str = "424844313f000000953c48e50400b2000000000000000300110000000000000001100000000000000021000000000000002800000000000000000200000000000008070605040302010000";
-const LEAF_V1: &str = "424d4c317c000000936201c70100c30000000000000004000000000000000b00000000000000000010000200000001000000000400000000000000000000000000000003000000000000000100000000000000000000004000000001030000000700000000000000090000000000000002000000000000000500000000000000800000005a000000";
 
 #[test]
 fn peer_first_v7_is_pinned_and_old_records_are_rejected() {
@@ -189,7 +142,6 @@ fn peer_first_v7_is_pinned_and_old_records_are_rejected() {
     assert!(JournalRecord::decode(vset, &unhex(journal_v6_golden())).is_err());
     let mut durable = record;
     durable.overlay.clear();
-    durable.leaves.clear();
     assert_eq!(
         JournalRecord::decode(vset, &durable.encode(vset)),
         Ok(durable)
@@ -200,24 +152,8 @@ fn peer_first_v7_is_pinned_and_old_records_are_rejected() {
 fn current_head_bytes_are_pinned_and_old_bytes_are_rejected() {
     let (vset, head) = golden_head();
     assert_eq!(hex(&head.encode()), HEAD_V2, "v2 encoder drifted");
-    assert_eq!(
+    assert!(
         HeadRecord::decode(vset, &unhex(HEAD_V1)).is_err(),
-        true,
         "old head bytes must not be accepted"
-    );
-}
-
-#[test]
-fn leaf_v1_golden_bytes_decode() {
-    let (owner, fence, id, leaf) = golden_leaf();
-    assert_eq!(
-        hex(&leaf.encode(owner, fence, id)),
-        LEAF_V1,
-        "encoder drifted"
-    );
-    assert_eq!(
-        MapLeaf::decode(owner, fence, id, &unhex(LEAF_V1)),
-        Ok(leaf),
-        "decoder no longer reads the frozen v1 bytes"
     );
 }

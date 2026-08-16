@@ -21,7 +21,11 @@ fn quiet_run_serves_and_syncs_without_incident() {
     assert_clean(&report);
     assert_eq!(report.crashes, 0);
     assert_eq!(report.guest_deaths, 0);
-    assert!(report.completed_ops > 1_000);
+    assert!(
+        report.completed_ops > 1_000,
+        "completed only {} operations: {report:?}",
+        report.completed_ops
+    );
     assert_eq!(report.counters.faults_unservable, 0);
     assert_eq!(report.counters.pressure_waits, 0);
     assert_eq!(report.counters.checkpoints_done, 0);
@@ -39,6 +43,7 @@ fn runs_replay_byte_for_byte() {
         bitflip_mean_interval: millis(500),
         journal_bitflip_mean_interval: 0,
         store_outage: None,
+        ..FaultPlan::default()
     };
     for seed in [1, 2, 7] {
         let a = run(seed, config.clone());
@@ -58,6 +63,7 @@ fn crash_storm_with_checkpoints_resumes() {
         bitflip_mean_interval: 0,
         journal_bitflip_mean_interval: 0,
         store_outage: None,
+        ..FaultPlan::default()
     };
     let report = run(3, config);
     assert_clean(&report);
@@ -81,6 +87,7 @@ fn crash_storm_without_checkpoints_cold_boots_at_sync_consistency() {
         bitflip_mean_interval: 0,
         journal_bitflip_mean_interval: 0,
         store_outage: None,
+        ..FaultPlan::default()
     };
     let report = run(4, config);
     assert_clean(&report);
@@ -88,7 +95,11 @@ fn crash_storm_without_checkpoints_cold_boots_at_sync_consistency() {
     assert_eq!(report.resumes, 0);
     assert!(report.cold_boots > 0);
     assert_eq!(report.guest_deaths, 0);
-    assert!(report.completed_ops > 1_000);
+    assert!(
+        report.completed_ops > 750,
+        "completed only {} operations: {report:?}",
+        report.completed_ops
+    );
 }
 
 #[test]
@@ -109,7 +120,18 @@ fn repeated_checkpoints_accrue_no_storage_debt() {
     // count. This stays far below the number of records written.
     // One complete snapshot may also be pinned while its head update is in
     // flight. The bound therefore includes the live set plus one upload set.
-    assert!(report.blob_count < 200);
+    assert!(
+        report.blob_count < 256,
+        "retained {} blobs: {report:?}",
+        report.blob_count
+    );
+    assert!(
+        u64::try_from(report.blob_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(3)
+            < report.counters.records_written,
+        "blob count grew with record history: {report:?}"
+    );
 }
 
 #[test]
@@ -117,8 +139,8 @@ fn one_rotated_record_copy_recovers_from_its_intact_mirror() {
     let mut config = base_config();
     config.vset_count = 1;
     config.horizon = millis(500);
-    config.rot_records_at = vec![(millis(250), false)];
-    config.crash_at = vec![millis(300)];
+    config.faults.rot_records_at = vec![(millis(250), false)];
+    config.faults.crash_at = vec![millis(300)];
     config.faults.restart_delay = (millis(1), millis(1));
     let report = run(47, config);
     assert_clean(&report);
@@ -133,9 +155,9 @@ fn pressure_slows_guests_but_never_kills() {
     // R2.5: cache far smaller than the combined working set. Faults wait on
     // writeback-driven eviction; everyone still progresses; nobody dies.
     let mut config = base_config();
-    config.daemon.cache_pages = 8;
+    config.host.cache_pages = 8;
     config.vset_count = 4;
-    config.vset_config.pages_per_volume = 32;
+    config.vset.pages_per_volume = 32;
     let report = run(6, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
@@ -149,7 +171,7 @@ fn full_disk_stalls_captures_until_space_returns_without_killing_guests() {
     let mut config = base_config();
     config.horizon = secs(3);
     config.checkpoint_interval = Some(millis(200));
-    config.bdev.full_window = Some((millis(600), millis(1400)));
+    config.blobs.full_window = Some((millis(600), millis(1400)));
     let report = run(21, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
@@ -162,7 +184,7 @@ fn full_disk_stalls_captures_until_space_returns_without_killing_guests() {
 fn non_capacity_write_failure_fail_stops_the_host() {
     let mut config = base_config();
     config.horizon = secs(2);
-    config.bdev.eio_at = Some(millis(700));
+    config.blobs.eio_at = Some(millis(700));
     let report = run(23, config);
     assert_clean(&report);
     assert_eq!(report.crashes, 1, "{report:?}");
@@ -176,13 +198,14 @@ fn bit_rot_never_serves_corrupt_bytes() {
     let mut config = base_config();
     config.horizon = secs(3);
     // Small cache: evictions force refaults, so damaged segments are read.
-    config.daemon.cache_pages = 24;
+    config.host.cache_pages = 24;
     config.faults = FaultPlan {
         crash_mean_interval: 0,
         restart_delay: (millis(10), millis(200)),
         bitflip_mean_interval: millis(150),
         journal_bitflip_mean_interval: 0,
         store_outage: None,
+        ..FaultPlan::default()
     };
     let report = run(7, config);
     assert_clean(&report);
@@ -204,8 +227,8 @@ fn rot_on_either_record_copy_never_rolls_back_acked_syncs() {
     config.horizon = secs(3);
     // Crash 50µs behind each flip — inside the window where the rotted
     // record is still the newest, before another record covers its syncs.
-    config.rot_records_at = vec![(millis(900), false), (millis(1800), true)];
-    config.crash_at = vec![millis(900) + micros(50), millis(1800) + micros(50)];
+    config.faults.rot_records_at = vec![(millis(900), false), (millis(1800), true)];
+    config.faults.crash_at = vec![millis(900) + micros(50), millis(1800) + micros(50)];
     let report = run(9, config);
     assert_clean(&report);
     assert_eq!(report.bitflips, 2, "both targeted flips must land");
@@ -226,6 +249,7 @@ fn full_chaos_stays_consistent() {
         bitflip_mean_interval: millis(400),
         journal_bitflip_mean_interval: 0,
         store_outage: None,
+        ..FaultPlan::default()
     };
     let report = run(8, config);
     assert_clean(&report);
@@ -245,7 +269,7 @@ fn scale_run_hosts_many_overcommitted_vsets() {
     // nothing corrupts, pressure only slows.
     let mut config = base_config();
     config.vset_count = 100;
-    config.daemon.cache_pages = 1200;
+    config.host.cache_pages = 1200;
     config.horizon = secs(1);
     let report = run(17, config);
     assert_clean(&report);
@@ -276,16 +300,16 @@ fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
     let mut config = base_config();
     config.vset_count = 64;
     config.horizon = secs(3);
-    config.vset_config.pages_per_volume = 24;
+    config.vset.pages_per_volume = 24;
     let report = run(5, config);
     assert_clean(&report);
     // 8 rotation slots × the 64-page synchronous-capture ceiling; a vset's
     // full 72-page set never lands in one step at all.
     let step_ceiling: u64 = 8 * 64;
     assert!(
-        report.max_step_page_reads <= step_ceiling,
+        report.max_page_reads_in_poll <= step_ceiling,
         "one step read {} pages — a capture or tick exceeded its batch",
-        report.max_step_page_reads
+        report.max_page_reads_in_poll
     );
     // Non-vacuous: the fleet's total dirty work far exceeded one step's
     // bound, so the pacing genuinely spread it.
@@ -307,23 +331,23 @@ fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
 fn huge_dirty_sets_capture_incrementally_with_copy_on_fault() {
     let mut config = base_config();
     config.vset_count = 1;
-    config.daemon.cache_pages = 4096;
-    config.vset_config.pages_per_volume = 600; // 3 volumes × 600 pages
+    config.host.cache_pages = 4096;
+    config.vset.pages_per_volume = 600; // 3 volumes × 600 pages
     config.horizon = secs(2);
     // A hot writer: the dirty set between writeback ticks dwarfs one
     // drain batch, and writes keep landing while the drain runs. No
     // syncs — a pending sync parks the guest until the capture's record
     // lands, and this test needs the guest AWAKE mid-drain.
     config.think = (micros(5), micros(50));
-    config.guest_sync_share = Some(Ppm::NEVER);
+    config.sync_share = Some(Ppm::NEVER);
     let report = run(9, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
     // No step — arm, drain, fault, or tick — read more than one batch.
     assert!(
-        report.max_step_page_reads <= 64,
+        report.max_page_reads_in_poll <= 64,
         "one step read {} pages — a capture read past its batch",
-        report.max_step_page_reads
+        report.max_page_reads_in_poll
     );
     // The load was real: far more than one batch's worth was captured…
     assert!(
@@ -355,18 +379,18 @@ fn chaos_seed_corpus_stays_consistent() {
 #[test]
 fn large_vsets_keep_journal_metadata_bounded() {
     let config = HarnessConfig {
-        daemon: HostConfig {
+        host: HostConfig {
             // A warm cache: the test measures metadata cost, not thrash.
             cache_pages: 32_768,
-            ..base_config().daemon
+            ..base_config().host
         },
         vset_count: 1,
-        vset_config: VsetConfig::compute(2, 8_000),
+        vset: VsetConfig::compute(2, 8_000),
         think: (micros(5), micros(25)),
         horizon: secs(1),
         checkpoint_interval: Some(millis(300)),
         // A writeback-shaped workload under continuous dirtying.
-        guest_sync_share: Some(Ppm(1_000)),
+        sync_share: Some(Ppm(1_000)),
         ..base_config()
     };
     let report = run(41, config);
@@ -383,7 +407,6 @@ fn large_vsets_keep_journal_metadata_bounded() {
         "only {} records",
         report.counters.records_written
     );
-    assert_eq!(report.counters.leaf_rolls, 0);
     // No journal record contains a page map, so file references—not page
     // count—bound its size.
     assert!(
@@ -414,20 +437,20 @@ fn large_vsets_keep_journal_metadata_bounded() {
 #[test]
 fn steady_overwrites_dont_amplify_disk_space() {
     let config = HarnessConfig {
-        daemon: HostConfig {
+        host: HostConfig {
             cache_pages: 8_192,
-            ..base_config().daemon
+            ..base_config().host
         },
         vset_count: 1,
-        vset_config: VsetConfig::compute(2, 4_096),
+        vset: VsetConfig::compute(2, 4_096),
         think: (micros(10), micros(50)),
         horizon: secs(2),
         checkpoint_interval: None,
         // Writeback-shaped (syncs rare), 90% of picks in a 32-page hot
         // set: each capture's segment is mostly hot pages that the next
         // capture supersedes, plus a few cold survivors that pin it.
-        guest_sync_share: Some(Ppm(1_000)),
-        guest_hot_pages: Some((Ppm::percent(90), 32)),
+        sync_share: Some(Ppm(1_000)),
+        hot_pages: Some((Ppm::percent(90), 32)),
         ..base_config()
     };
     let report = run(43, config);

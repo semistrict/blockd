@@ -24,6 +24,11 @@ fn main() {
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() {
+    tokio::task::LocalSet::new().run_until(main_local()).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn main_local() {
     use std::sync::Arc;
 
     use blockd_runtime::fakegcs::FakeGcs;
@@ -36,7 +41,7 @@ async fn main() {
                 .expect("usage: demod fake-gcs <addr>")
                 .parse()
                 .expect("addr");
-            let (fake, endpoint) = FakeGcs::start_on(addr);
+            let (fake, endpoint) = FakeGcs::start_on(addr).await;
             let _telemetry = observability::init(None);
             if let Some(ms) = args.get(3) {
                 let ms: u64 = ms.parse().expect("latency ms");
@@ -48,9 +53,9 @@ async fn main() {
             std::future::pending::<()>().await;
         }
         Some(path) => {
-            let cfg = config::DemodConfig::load(path);
+            let cfg = config::DemodConfig::load(path).await;
             let _telemetry = observability::init(Some(cfg.host.0));
-            let state = Arc::new(vm::Demod::start(cfg));
+            let state = Arc::new(vm::Demod::start(cfg).await);
             api::serve(state).await;
         }
         None => {

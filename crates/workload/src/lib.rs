@@ -552,7 +552,12 @@ pub trait Backend {
         true
     }
 
-    fn execute(&mut self, operation: Operation, model: &WorkloadModel) -> Result<(), Self::Error>;
+    #[allow(async_fn_in_trait)]
+    async fn execute(
+        &mut self,
+        operation: Operation,
+        model: &WorkloadModel,
+    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -562,7 +567,7 @@ pub enum RunError<E> {
     Backend(E),
 }
 
-pub fn run<B: Backend>(
+pub async fn run<B: Backend>(
     spec: &WorkloadSpec,
     backend: &mut B,
 ) -> Result<WorkloadOutcome, RunError<B::Error>> {
@@ -576,6 +581,7 @@ pub fn run<B: Backend>(
         }
         backend
             .execute(operation, &model)
+            .await
             .map_err(RunError::Backend)?;
         model.complete(operation);
     }
@@ -594,7 +600,7 @@ mod tests {
     impl Backend for ReferenceBackend {
         type Error = String;
 
-        fn execute(
+        async fn execute(
             &mut self,
             operation: Operation,
             model: &WorkloadModel,
@@ -621,18 +627,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_checked_in_workload_validates_and_replays() {
+    #[tokio::test]
+    async fn every_checked_in_workload_validates_and_replays() {
         for name in names() {
             let spec = load(name).unwrap_or_else(|error| panic!("{name}: {error}"));
-            let first = run(&spec, &mut ReferenceBackend::default()).expect("first run");
-            let replay = run(&spec, &mut ReferenceBackend::default()).expect("replay");
+            let first = run(&spec, &mut ReferenceBackend::default())
+                .await
+                .expect("first run");
+            let replay = run(&spec, &mut ReferenceBackend::default())
+                .await
+                .expect("replay");
             assert_eq!(first, replay, "{name}");
         }
     }
 
-    #[test]
-    fn steady_io_operation_stream_and_outcome_are_pinned() {
+    #[tokio::test]
+    async fn steady_io_operation_stream_and_outcome_are_pinned() {
         let spec = load("steady-io").expect("steady workload");
         let operations: Vec<_> = Program::new(spec.clone())
             .expect("program")
@@ -687,14 +697,16 @@ mod tests {
                 },
             ]
         );
-        let outcome = run(&spec, &mut ReferenceBackend::default()).expect("run");
+        let outcome = run(&spec, &mut ReferenceBackend::default())
+            .await
+            .expect("run");
         assert_eq!(outcome.completed, 206);
         assert_eq!(outcome.syncs, 4);
         assert_eq!(outcome.verifications, 1);
     }
 
-    #[test]
-    fn unsupported_capability_stops_before_executing_it() {
+    #[tokio::test]
+    async fn unsupported_capability_stops_before_executing_it() {
         struct DataOnly;
         impl Backend for DataOnly {
             type Error = ();
@@ -706,7 +718,7 @@ mod tests {
                 )
             }
 
-            fn execute(
+            async fn execute(
                 &mut self,
                 _operation: Operation,
                 _model: &WorkloadModel,
@@ -714,7 +726,9 @@ mod tests {
                 Ok(())
             }
         }
-        let error = run(&load("steady-io").expect("spec"), &mut DataOnly).expect_err("verify");
+        let error = run(&load("steady-io").expect("spec"), &mut DataOnly)
+            .await
+            .expect_err("verify");
         assert_eq!(error, RunError::Unsupported(Capability::Verify));
     }
 }

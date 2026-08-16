@@ -8,7 +8,6 @@ use std::task::{Context, Poll};
 use blockd_exec::channel::{Closed, OneReceiver, OneSender, oneshot};
 use blockd_exec::{FaultPoint, fault_point, timeout};
 
-use crate::mapleaf::LeafPtr;
 use crate::protocol::{PeerMsg, PeerRequestId, ReplicaArtifact, ReplicaCommitInfo};
 use crate::segment::PageLoc;
 use crate::types::{HostId, JournalSeq, VsetId};
@@ -19,18 +18,47 @@ type ReplicaStatusKey = (HostId, VsetId, u64);
 type ReplicaPutKey = (HostId, VsetId, u64, ReplicaArtifact, u32);
 type ReplicaCommitKey = (HostId, VsetId, u64, u64, JournalSeq, u64);
 type MigrationKey = (VsetId, HostId, u64);
-type PendingGroup<T> = BTreeMap<u64, Pending<T>>;
-
-struct Pending<T> {
+struct Pending {
     expected: HostId,
-    generation: u64,
-    reply: OneSender<T>,
+    reply: PendingReply,
 }
 
-#[derive(Clone, Copy)]
+enum PendingReply {
+    Page(OneSender<Option<Vec<u8>>>),
+    Unit(OneSender<()>),
+    Status(OneSender<Option<ReplicaCommitInfo>>),
+    Adoption(OneSender<(AuthorityProof, Vec<ProtectedClosureRef>)>),
+    VnodeCommit(OneSender<ProtectedClosureRef>),
+}
+
+enum PendingValue {
+    Page(Option<Vec<u8>>),
+    Unit,
+    Status(Option<ReplicaCommitInfo>),
+    Adoption(AuthorityProof, Vec<ProtectedClosureRef>),
+    VnodeCommit(ProtectedClosureRef),
+}
+
+impl PendingReply {
+    fn send(self, value: PendingValue) -> bool {
+        match (self, value) {
+            (Self::Page(reply), PendingValue::Page(value)) => reply.send(value).is_ok(),
+            (Self::Unit(reply), PendingValue::Unit) => reply.send(()).is_ok(),
+            (Self::Status(reply), PendingValue::Status(value)) => reply.send(value).is_ok(),
+            (Self::Adoption(reply), PendingValue::Adoption(proof, closures)) => {
+                reply.send((proof, closures)).is_ok()
+            }
+            (Self::VnodeCommit(reply), PendingValue::VnodeCommit(value)) => {
+                reply.send(value).is_ok()
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PendingKey {
     Page(PeerRequestId),
-    Leaf(PeerRequestId),
     Migration(MigrationKey),
     Status(ReplicaStatusKey),
     Put(ReplicaPutKey),
@@ -44,17 +72,9 @@ enum PendingKey {
 struct Broker {
     next_request: u64,
     next_generation: u64,
-    pages: BTreeMap<PeerRequestId, Pending<Option<Vec<u8>>>>,
-    leaves: BTreeMap<PeerRequestId, Pending<Option<Vec<u8>>>>,
-    migrations: BTreeMap<MigrationKey, Pending<()>>,
+    pending: BTreeMap<PendingKey, BTreeMap<u64, Pending>>,
     active_migrations: BTreeSet<MigrationKey>,
     accepted_migrations: BTreeSet<MigrationKey>,
-    replica_status: BTreeMap<ReplicaStatusKey, PendingGroup<Option<ReplicaCommitInfo>>>,
-    replica_put: BTreeMap<ReplicaPutKey, PendingGroup<()>>,
-    replica_commit: BTreeMap<ReplicaCommitKey, PendingGroup<()>>,
-    adoptions: BTreeMap<PeerRequestId, Pending<(AuthorityProof, Vec<ProtectedClosureRef>)>>,
-    vnode_closures: BTreeMap<PeerRequestId, Pending<Option<Vec<u8>>>>,
-    vnode_commits: BTreeMap<PeerRequestId, Pending<ProtectedClosureRef>>,
 }
 
 /// One authenticated peer reply. Dropping the future unregisters it, so a
@@ -83,7 +103,7 @@ impl Drop for MigrationCall {
             let mut broker = broker.borrow_mut();
             broker.active_migrations.remove(&self.key);
             broker.accepted_migrations.remove(&self.key);
-            broker.migrations.remove(&self.key);
+            broker.pending.remove(&PendingKey::Migration(self.key));
         }
     }
 }
@@ -135,34 +155,6 @@ impl PeerClient {
                     seg: location.seg,
                     offset: location.offset,
                     len: location.len,
-                },
-            )
-            .await;
-            if let Ok(Ok(bytes)) = timeout(retry, receive).await {
-                return bytes;
-            }
-        }
-    }
-
-    pub async fn fetch_leaf<W: Peers>(
-        &self,
-        world: &W,
-        source: HostId,
-        vset: VsetId,
-        pointer: LeafPtr,
-        retry: u64,
-    ) -> Option<Vec<u8>> {
-        loop {
-            let (io, receive) = self.register_leaf(source);
-            Peers::send(
-                world,
-                source,
-                PeerMsg::FetchLeaf {
-                    io,
-                    vset,
-                    base: pointer.base,
-                    fence: pointer.fence,
-                    id: pointer.id,
                 },
             )
             .await;
@@ -341,8 +333,12 @@ impl PeerClient {
         PeerReply<(AuthorityProof, Vec<ProtectedClosureRef>)>,
     ) {
         let request = self.broker.borrow_mut().allocate_request();
-        let (pending, reply) = self.pending(target, PendingKey::Adoption(request));
-        self.broker.borrow_mut().adoptions.insert(request, pending);
+        let reply = self.pending(
+            target,
+            PendingKey::Adoption(request),
+            false,
+            PendingReply::Adoption,
+        );
         (request, reply)
     }
 
@@ -353,11 +349,10 @@ impl PeerClient {
         proof: AuthorityProof,
         closures: Vec<ProtectedClosureRef>,
     ) {
-        resolve(
-            &mut self.broker.borrow_mut().adoptions,
-            &request,
+        self.broker.borrow_mut().resolve(
+            PendingKey::Adoption(request),
             from,
-            (proof, closures),
+            PendingValue::Adoption(proof, closures),
         );
     }
 
@@ -371,11 +366,12 @@ impl PeerClient {
     ) -> Option<Vec<u8>> {
         for _ in 0..3 {
             let request = self.broker.borrow_mut().allocate_request();
-            let (pending, receive) = self.pending(target, PendingKey::VnodeClosure(request));
-            self.broker
-                .borrow_mut()
-                .vnode_closures
-                .insert(request, pending);
+            let receive = self.pending(
+                target,
+                PendingKey::VnodeClosure(request),
+                false,
+                PendingReply::Page,
+            );
             Peers::send(
                 world,
                 target,
@@ -399,11 +395,10 @@ impl PeerClient {
         from: HostId,
         bytes: Option<Vec<u8>>,
     ) {
-        resolve(
-            &mut self.broker.borrow_mut().vnode_closures,
-            &request,
+        self.broker.borrow_mut().resolve(
+            PendingKey::VnodeClosure(request),
             from,
-            bytes,
+            PendingValue::Page(bytes),
         );
     }
 
@@ -420,11 +415,12 @@ impl PeerClient {
     ) -> Option<ProtectedClosureRef> {
         for _ in 0..3 {
             let request = self.broker.borrow_mut().allocate_request();
-            let (pending, receive) = self.pending(target, PendingKey::VnodeCommit(request));
-            self.broker
-                .borrow_mut()
-                .vnode_commits
-                .insert(request, pending);
+            let receive = self.pending(
+                target,
+                PendingKey::VnodeCommit(request),
+                false,
+                PendingReply::VnodeCommit,
+            );
             Peers::send(
                 world,
                 target,
@@ -450,11 +446,10 @@ impl PeerClient {
         from: HostId,
         closure: ProtectedClosureRef,
     ) {
-        resolve(
-            &mut self.broker.borrow_mut().vnode_commits,
-            &request,
+        self.broker.borrow_mut().resolve(
+            PendingKey::VnodeCommit(request),
             from,
-            closure,
+            PendingValue::VnodeCommit(closure),
         );
     }
 
@@ -465,43 +460,33 @@ impl PeerClient {
 
     fn register_page(&self, source: HostId) -> (PeerRequestId, PeerReply<Option<Vec<u8>>>) {
         let request = self.broker.borrow_mut().allocate_request();
-        let (pending, reply) = self.pending(source, PendingKey::Page(request));
-        self.broker.borrow_mut().pages.insert(request, pending);
+        let reply = self.pending(source, PendingKey::Page(request), false, PendingReply::Page);
         (request, reply)
     }
 
     pub fn resolve_page(&self, request: PeerRequestId, from: HostId, bytes: Option<Vec<u8>>) {
-        resolve(&mut self.broker.borrow_mut().pages, &request, from, bytes);
-    }
-
-    #[cfg(test)]
-    pub(super) fn leaf(&self, source: HostId) -> (PeerRequestId, PeerReply<Option<Vec<u8>>>) {
-        self.register_leaf(source)
-    }
-
-    fn register_leaf(&self, source: HostId) -> (PeerRequestId, PeerReply<Option<Vec<u8>>>) {
-        let request = self.broker.borrow_mut().allocate_request();
-        let (pending, reply) = self.pending(source, PendingKey::Leaf(request));
-        self.broker.borrow_mut().leaves.insert(request, pending);
-        (request, reply)
-    }
-
-    pub fn resolve_leaf(&self, request: PeerRequestId, from: HostId, bytes: Option<Vec<u8>>) {
-        resolve(&mut self.broker.borrow_mut().leaves, &request, from, bytes);
+        self.broker.borrow_mut().resolve(
+            PendingKey::Page(request),
+            from,
+            PendingValue::Page(bytes),
+        );
     }
 
     fn migration(&self, vset: VsetId, target: HostId, offer_fence: u64) -> PeerReply<()> {
         let key = (vset, target, offer_fence);
-        let (pending, reply) = self.pending(target, PendingKey::Migration(key));
-        self.broker.borrow_mut().migrations.insert(key, pending);
-        reply
+        self.pending(
+            target,
+            PendingKey::Migration(key),
+            false,
+            PendingReply::Unit,
+        )
     }
 
     pub fn resolve_migration(&self, vset: VsetId, from: HostId, offer_fence: u64) {
         let key = (vset, from, offer_fence);
         let mut broker = self.broker.borrow_mut();
         if broker.active_migrations.contains(&key)
-            && !resolve(&mut broker.migrations, &key, from, ())
+            && !broker.resolve(PendingKey::Migration(key), from, PendingValue::Unit)
         {
             broker.accepted_migrations.insert(key);
         }
@@ -519,14 +504,7 @@ impl PeerClient {
         // or satisfy another assignment, so retries intentionally share this
         // semantic key.
         let key = (target, vset, assignment_epoch);
-        let (pending, reply) = self.pending(target, PendingKey::Status(key));
-        self.broker
-            .borrow_mut()
-            .replica_status
-            .entry(key)
-            .or_default()
-            .insert(pending.generation, pending);
-        reply
+        self.pending(target, PendingKey::Status(key), true, PendingReply::Status)
     }
 
     pub fn resolve_status(
@@ -536,45 +514,40 @@ impl PeerClient {
         assignment_epoch: u64,
         committed: Option<ReplicaCommitInfo>,
     ) {
-        resolve_group(
-            &mut self.broker.borrow_mut().replica_status,
-            &(from, vset, assignment_epoch),
+        self.broker.borrow_mut().resolve(
+            PendingKey::Status((from, vset, assignment_epoch)),
             from,
-            committed,
+            PendingValue::Status(committed),
         );
     }
 
     fn put(&self, target: HostId, key: ReplicaPutKey) -> PeerReply<()> {
-        let (pending, reply) = self.pending(target, PendingKey::Put(key));
-        self.broker
-            .borrow_mut()
-            .replica_put
-            .entry(key)
-            .or_default()
-            .insert(pending.generation, pending);
-        reply
+        self.pending(target, PendingKey::Put(key), true, PendingReply::Unit)
     }
 
     pub fn resolve_put(&self, from: HostId, key: ReplicaPutKey) {
-        resolve_group(&mut self.broker.borrow_mut().replica_put, &key, from, ());
+        self.broker
+            .borrow_mut()
+            .resolve(PendingKey::Put(key), from, PendingValue::Unit);
     }
 
     fn commit(&self, target: HostId, key: ReplicaCommitKey) -> PeerReply<()> {
-        let (pending, reply) = self.pending(target, PendingKey::Commit(key));
-        self.broker
-            .borrow_mut()
-            .replica_commit
-            .entry(key)
-            .or_default()
-            .insert(pending.generation, pending);
-        reply
+        self.pending(target, PendingKey::Commit(key), true, PendingReply::Unit)
     }
 
     pub fn resolve_commit(&self, from: HostId, key: ReplicaCommitKey) {
-        resolve_group(&mut self.broker.borrow_mut().replica_commit, &key, from, ());
+        self.broker
+            .borrow_mut()
+            .resolve(PendingKey::Commit(key), from, PendingValue::Unit);
     }
 
-    fn pending<T>(&self, expected: HostId, key: PendingKey) -> (Pending<T>, PeerReply<T>) {
+    fn pending<T>(
+        &self,
+        expected: HostId,
+        key: PendingKey,
+        grouped: bool,
+        wrap: fn(OneSender<T>) -> PendingReply,
+    ) -> PeerReply<T> {
         let generation = {
             let mut broker = self.broker.borrow_mut();
             let generation = broker.next_generation;
@@ -585,19 +558,24 @@ impl PeerClient {
             generation
         };
         let (send, receive) = oneshot();
-        (
+        let mut broker = self.broker.borrow_mut();
+        let entries = broker.pending.entry(key).or_default();
+        if !grouped {
+            entries.clear();
+        }
+        entries.insert(
+            generation,
             Pending {
                 expected,
-                generation,
-                reply: send,
+                reply: wrap(send),
             },
-            PeerReply {
-                receive,
-                broker: Rc::downgrade(&self.broker),
-                key,
-                generation,
-            },
-        )
+        );
+        PeerReply {
+            receive,
+            broker: Rc::downgrade(&self.broker),
+            key,
+            generation,
+        }
     }
 }
 
@@ -612,68 +590,44 @@ impl Broker {
     }
 
     fn remove_if_generation(&mut self, key: PendingKey, generation: u64) {
-        match key {
-            PendingKey::Page(key) => remove_generation(&mut self.pages, &key, generation),
-            PendingKey::Leaf(key) => remove_generation(&mut self.leaves, &key, generation),
-            PendingKey::Migration(key) => {
-                remove_generation(&mut self.migrations, &key, generation);
-            }
-            PendingKey::Status(key) => {
-                remove_group_generation(&mut self.replica_status, &key, generation);
-            }
-            PendingKey::Put(key) => {
-                remove_group_generation(&mut self.replica_put, &key, generation);
-            }
-            PendingKey::Commit(key) => {
-                remove_group_generation(&mut self.replica_commit, &key, generation);
-            }
-            PendingKey::Adoption(key) => {
-                remove_generation(&mut self.adoptions, &key, generation);
-            }
-            PendingKey::VnodeClosure(key) => {
-                remove_generation(&mut self.vnode_closures, &key, generation);
-            }
-            PendingKey::VnodeCommit(key) => {
-                remove_generation(&mut self.vnode_commits, &key, generation);
-            }
+        let Some(entries) = self.pending.get_mut(&key) else {
+            return;
+        };
+        entries.remove(&generation);
+        if entries.is_empty() {
+            self.pending.remove(&key);
         }
     }
-}
 
-fn resolve<K: Ord, T>(
-    pending: &mut BTreeMap<K, Pending<T>>,
-    key: &K,
-    from: HostId,
-    value: T,
-) -> bool {
-    if pending.get(key).is_some_and(|entry| entry.expected == from)
-        && let Some(entry) = pending.remove(key)
-    {
-        let _ = entry.reply.send(value);
-        return true;
+    fn resolve(&mut self, key: PendingKey, from: HostId, value: PendingValue) -> bool {
+        if !self
+            .pending
+            .get(&key)
+            .is_some_and(|entries| entries.values().all(|entry| entry.expected == from))
+        {
+            return false;
+        }
+        let Some(mut entries) = self.pending.remove(&key) else {
+            return false;
+        };
+        let Some((_, last)) = entries.pop_last() else {
+            return false;
+        };
+        for entry in entries.into_values() {
+            let cloned = match &value {
+                PendingValue::Page(value) => PendingValue::Page(value.clone()),
+                PendingValue::Unit => PendingValue::Unit,
+                PendingValue::Status(value) => PendingValue::Status(*value),
+                PendingValue::Adoption(proof, closures) => {
+                    PendingValue::Adoption(*proof, closures.clone())
+                }
+                PendingValue::VnodeCommit(value) => PendingValue::VnodeCommit(*value),
+            };
+            let _ = entry.reply.send(cloned);
+        }
+        let _ = last.reply.send(value);
+        true
     }
-    false
-}
-
-fn resolve_group<K: Ord, T: Clone>(
-    pending: &mut BTreeMap<K, PendingGroup<T>>,
-    key: &K,
-    from: HostId,
-    value: T,
-) -> bool {
-    if !pending
-        .get(key)
-        .is_some_and(|entries| entries.values().all(|entry| entry.expected == from))
-    {
-        return false;
-    }
-    let Some(entries) = pending.remove(key) else {
-        return false;
-    };
-    for entry in entries.into_values() {
-        let _ = entry.reply.send(value.clone());
-    }
-    true
 }
 
 fn commit_key(
@@ -692,36 +646,11 @@ fn commit_key(
     )
 }
 
-fn remove_generation<K: Ord, T>(pending: &mut BTreeMap<K, Pending<T>>, key: &K, generation: u64) {
-    if pending
-        .get(key)
-        .is_some_and(|entry| entry.generation == generation)
-    {
-        pending.remove(key);
-    }
-}
-
-fn remove_group_generation<K: Ord, T>(
-    pending: &mut BTreeMap<K, PendingGroup<T>>,
-    key: &K,
-    generation: u64,
-) {
-    let remove_group = if let Some(entries) = pending.get_mut(key) {
-        entries.remove(&generation);
-        entries.is_empty()
-    } else {
-        false
-    };
-    if remove_group {
-        pending.remove(key);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
-    use blockd_exec::{Executor, join2};
+    use blockd_exec::{FaultConfig, join2, simulation_scope};
 
     use super::*;
 
@@ -765,8 +694,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn page_reply_requires_the_authenticated_source_and_resolves_once() {
+    #[tokio::test(start_paused = true)]
+    async fn page_reply_requires_the_authenticated_source_and_resolves_once() {
         let client = PeerClient::default();
         let (request, receive) = client.page(HostId(2));
 
@@ -774,23 +703,14 @@ mod tests {
         client.resolve_page(request, HostId(2), Some(vec![2]));
         client.resolve_page(request, HostId(2), Some(vec![4]));
 
-        let mut executor = Executor::simulation(1);
-        assert_eq!(executor.block_on(receive), Ok(Some(vec![2])));
+        assert_eq!(
+            simulation_scope(1, FaultConfig::default(), receive).await,
+            Ok(Some(vec![2]))
+        );
     }
 
-    #[test]
-    fn cancellation_closes_the_reply_and_ignores_late_delivery() {
-        let client = PeerClient::default();
-        let (request, receive) = client.leaf(HostId(2));
-
-        drop(receive);
-        assert!(client.broker.borrow().leaves.is_empty());
-        client.resolve_leaf(request, HostId(2), Some(vec![2]));
-        assert!(client.broker.borrow().leaves.is_empty());
-    }
-
-    #[test]
-    fn stale_waiter_cleanup_cannot_remove_a_newer_retry() {
+    #[tokio::test(start_paused = true)]
+    async fn stale_waiter_cleanup_cannot_remove_a_newer_retry() {
         let client = PeerClient::default();
         let stale = client.status(HostId(2), VsetId(7), 11);
         let current = client.status(HostId(2), VsetId(7), 11);
@@ -801,87 +721,85 @@ mod tests {
             client
                 .broker
                 .borrow()
-                .replica_status
-                .contains_key(&(HostId(2), VsetId(7), 11))
+                .pending
+                .contains_key(&PendingKey::Status((HostId(2), VsetId(7), 11)))
         );
         client.resolve_status(HostId(2), VsetId(7), 11, None);
 
-        let mut executor = Executor::simulation(2);
-        assert_eq!(executor.block_on(current), Ok(None));
+        assert_eq!(
+            simulation_scope(2, FaultConfig::default(), current).await,
+            Ok(None)
+        );
     }
 
-    #[test]
-    fn equivalent_replica_rpcs_to_one_host_resolve_every_waiter() {
+    #[tokio::test(start_paused = true)]
+    async fn equivalent_replica_rpcs_to_one_host_resolve_every_waiter() {
         let client = PeerClient::default();
         let first = client.status(HostId(2), VsetId(7), 11);
         let second = client.status(HostId(2), VsetId(7), 11);
-        assert_eq!(client.broker.borrow().replica_status.len(), 1);
+        assert_eq!(client.broker.borrow().pending.len(), 1);
         assert_eq!(
-            client.broker.borrow().replica_status[&(HostId(2), VsetId(7), 11)].len(),
+            client.broker.borrow().pending[&PendingKey::Status((HostId(2), VsetId(7), 11))].len(),
             2
         );
 
         client.resolve_status(HostId(2), VsetId(7), 11, None);
-        let mut executor = Executor::simulation(6);
         assert_eq!(
-            executor.block_on(join2(first, second)),
+            simulation_scope(6, FaultConfig::default(), join2(first, second)).await,
             (Ok(None), Ok(None))
         );
-        assert!(client.broker.borrow().replica_status.is_empty());
+        assert!(client.broker.borrow().pending.is_empty());
     }
 
-    #[test]
-    fn equivalent_replica_rpcs_to_different_hosts_keep_independent_waiters() {
+    #[tokio::test(start_paused = true)]
+    async fn equivalent_replica_rpcs_to_different_hosts_keep_independent_waiters() {
         let client = PeerClient::default();
         let first = client.status(HostId(2), VsetId(7), 11);
         let second = client.status(HostId(3), VsetId(7), 11);
-        assert_eq!(client.broker.borrow().replica_status.len(), 2);
+        assert_eq!(client.broker.borrow().pending.len(), 2);
 
         client.resolve_status(HostId(3), VsetId(7), 11, None);
         client.resolve_status(HostId(2), VsetId(7), 11, None);
-        let mut executor = Executor::simulation(5);
         assert_eq!(
-            executor.block_on(join2(first, second)),
+            simulation_scope(5, FaultConfig::default(), join2(first, second)).await,
             (Ok(None), Ok(None))
         );
     }
 
-    #[test]
-    fn bounded_retry_cleans_each_timed_out_waiter() {
+    #[tokio::test(start_paused = true)]
+    async fn bounded_retry_cleans_each_timed_out_waiter() {
         let client = PeerClient::default();
         let peers = Rc::new(TestPeers {
             client: client.clone(),
             sends: Cell::new(0),
             mode: ReplyMode::Silent,
         });
-        let mut executor = Executor::simulation(3);
-        let error = executor
-            .block_on({
-                let client = client.clone();
-                let peers = Rc::clone(&peers);
-                async move {
-                    client
-                        .replica_status(peers.as_ref(), HostId(2), VsetId(7), 11, 1)
-                        .await
-                }
-            })
-            .expect_err("three unanswered attempts time out");
+        let error = simulation_scope(3, FaultConfig::default(), {
+            let client = client.clone();
+            let peers = Rc::clone(&peers);
+            async move {
+                client
+                    .replica_status(peers.as_ref(), HostId(2), VsetId(7), 11, 1)
+                    .await
+            }
+        })
+        .await
+        .expect_err("three unanswered attempts time out");
 
         assert_eq!(error, PeerRpcError { attempts: 3 });
         assert_eq!(peers.sends.get(), 3);
-        assert!(client.broker.borrow().replica_status.is_empty());
+        assert!(client.broker.borrow().pending.is_empty());
     }
 
-    #[test]
-    fn migration_retry_and_duplicate_accept_are_encapsulated() {
+    #[tokio::test(start_paused = true)]
+    async fn migration_retry_and_duplicate_accept_are_encapsulated() {
         let client = PeerClient::default();
         let peers = Rc::new(TestPeers {
             client: client.clone(),
             sends: Cell::new(0),
             mode: ReplyMode::AcceptMigrationOnSecondOffer,
         });
-        let mut executor = Executor::simulation(4);
-        let accepted = executor.block_on({
+        let accepted = simulation_scope(4, FaultConfig::default(), {
             let client = client.clone();
             let peers = Rc::clone(&peers);
             async move {
@@ -902,26 +820,26 @@ mod tests {
                     }
                 }
             }
-        });
+        })
+        .await;
 
         assert!(accepted);
         assert_eq!(peers.sends.get(), 2);
         let broker = client.broker.borrow();
-        assert!(broker.migrations.is_empty());
+        assert!(broker.pending.is_empty());
         assert!(broker.active_migrations.is_empty());
         assert!(broker.accepted_migrations.is_empty());
     }
 
-    #[test]
-    fn one_migration_offer_times_out_and_releases_its_waiter() {
+    #[tokio::test(start_paused = true)]
+    async fn one_migration_offer_times_out_and_releases_its_waiter() {
         let client = PeerClient::default();
         let peers = Rc::new(TestPeers {
             client: client.clone(),
             sends: Cell::new(0),
             mode: ReplyMode::Silent,
         });
-        let mut executor = Executor::simulation(7);
-        let accepted = executor.block_on({
+        let accepted = simulation_scope(7, FaultConfig::default(), {
             let client = client.clone();
             let peers = Rc::clone(&peers);
             async move {
@@ -937,25 +855,25 @@ mod tests {
                     )
                     .await
             }
-        });
+        })
+        .await;
 
         assert!(!accepted);
         assert_eq!(peers.sends.get(), 1);
         let broker = client.broker.borrow();
-        assert!(broker.migrations.is_empty());
+        assert!(broker.pending.is_empty());
         assert!(broker.active_migrations.is_empty());
     }
 
-    #[test]
-    fn delayed_prior_accept_cannot_complete_a_new_offer() {
+    #[tokio::test(start_paused = true)]
+    async fn delayed_prior_accept_cannot_complete_a_new_offer() {
         let client = PeerClient::default();
         let peers = Rc::new(TestPeers {
             client: client.clone(),
             sends: Cell::new(0),
             mode: ReplyMode::DeliverStaleMigrationAccept,
         });
-        let mut executor = Executor::simulation(8);
-        let accepted = executor.block_on({
+        let accepted = simulation_scope(8, FaultConfig::default(), {
             let client = client.clone();
             let peers = Rc::clone(&peers);
             async move {
@@ -971,7 +889,8 @@ mod tests {
                     )
                     .await
             }
-        });
+        })
+        .await;
 
         assert!(!accepted, "an accept from an older handoff must be ignored");
     }

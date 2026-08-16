@@ -3,11 +3,8 @@ use std::collections::BTreeSet;
 use super::SharedHost;
 use crate::journal::JournalRecord;
 use crate::layout;
-use crate::mapleaf::LeafPtr;
 use crate::types::{JournalSeq, SegId, VsetId};
 use crate::world::{BlobError, Blobs};
-
-type LeafBlobs = std::collections::BTreeMap<LeafPtr, (u64, BTreeSet<(u64, SegId)>)>;
 
 /// Drop local segment copies whose immutable bytes are already present in
 /// Store. Serving maps keep their locations and fault through to Store after
@@ -71,7 +68,7 @@ pub async fn cleanup_local<W: Blobs>(
     vset: VsetId,
     incarnation: u64,
 ) -> Result<(), BlobError> {
-    let (names, records_to_remove, segments_to_remove, leaves_to_remove, pressure_reclaims) = {
+    let (names, records_to_remove, segments_to_remove, pressure_reclaims) = {
         let host = state.borrow();
         let Some(vset_state) = host
             .vsets
@@ -82,35 +79,28 @@ pub async fn cleanup_local<W: Blobs>(
         };
         let mut keep_records = BTreeSet::new();
         let mut keep_segments = BTreeSet::new();
-        let mut keep_leaves = BTreeSet::new();
         if let Some(record) = &vset_state.best_record {
             add_closure(
                 record,
-                &vset_state.leaf_blobs,
                 &vset_state.record_segments,
                 &mut keep_records,
                 &mut keep_segments,
-                &mut keep_leaves,
             );
         }
         if let Some(record) = &vset_state.pinned {
             add_closure(
                 record,
-                &vset_state.leaf_blobs,
                 &vset_state.record_segments,
                 &mut keep_records,
                 &mut keep_segments,
-                &mut keep_leaves,
             );
         }
         if let Some(record) = &vset_state.peer_committed_record {
             add_closure(
                 record,
-                &vset_state.leaf_blobs,
                 &vset_state.record_segments,
                 &mut keep_records,
                 &mut keep_segments,
-                &mut keep_leaves,
             );
         }
         keep_segments.extend(
@@ -144,12 +134,6 @@ pub async fn cleanup_local<W: Blobs>(
         } else {
             0
         };
-        let leaves_to_remove = vset_state
-            .leaf_blobs
-            .keys()
-            .filter(|pointer| pointer.base == 0 && !keep_leaves.contains(pointer))
-            .copied()
-            .collect::<Vec<_>>();
         let names = records_to_remove
             .iter()
             .flat_map(|&(fence, seq)| {
@@ -163,17 +147,11 @@ pub async fn cleanup_local<W: Blobs>(
                     .iter()
                     .map(|&(fence, segment)| layout::segment_blob(vset, fence, segment)),
             )
-            .chain(
-                leaves_to_remove
-                    .iter()
-                    .map(|pointer| layout::leaf_blob(vset, pointer.fence, pointer.id)),
-            )
             .collect::<Vec<_>>();
         (
             names,
             records_to_remove,
             segments_to_remove,
-            leaves_to_remove,
             pressure_reclaims,
         )
     };
@@ -207,9 +185,6 @@ pub async fn cleanup_local<W: Blobs>(
     vset_state
         .segment_refs
         .retain(|segment, _| !segment_set.contains(segment));
-    for pointer in leaves_to_remove {
-        vset_state.leaf_blobs.remove(&pointer);
-    }
     host.counters.blobs_deleted += names.len() as u64;
     if pressure_reclaims > 0 {
         host.disk_reclaim_requested = !host.disk_reclaim_target_met();
@@ -223,11 +198,9 @@ pub async fn cleanup_local<W: Blobs>(
 
 fn add_closure(
     record: &JournalRecord,
-    leaf_blobs: &LeafBlobs,
     record_segments: &std::collections::BTreeMap<JournalSeq, BTreeSet<(u64, SegId)>>,
     records: &mut BTreeSet<(u64, JournalSeq)>,
     segments: &mut BTreeSet<(u64, SegId)>,
-    leaves: &mut BTreeSet<LeafPtr>,
 ) {
     records.insert((record.fence, record.seq));
     segments.extend(record.files.iter().filter_map(|file| {
@@ -244,10 +217,4 @@ fn add_closure(
             .filter(|(_, location)| location.base == 0)
             .map(|(_, location)| (location.fence, location.seg)),
     );
-    for pointer in record.leaves.values().filter(|pointer| pointer.base == 0) {
-        leaves.insert(*pointer);
-        if let Some((_, leaf_segments)) = leaf_blobs.get(pointer) {
-            segments.extend(leaf_segments);
-        }
-    }
 }

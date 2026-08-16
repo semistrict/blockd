@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::blx::{BlockKey, BlxObject, MAX_OVERLAPPING_FILES, NamespaceKind};
 use crate::format::{Dec, DecodeError, Enc, checksum64, open_frame, seal_frame};
-use crate::journal::{DatabaseFileMeta, DatabaseMeta, VsetConfig, VsetKind};
+use crate::head::ManifestPtr;
+use crate::journal::{VsetConfig, VsetKind};
 use crate::types::{Epoch, VsetId, page_size};
 
 pub const MAGIC_FILE_LIST: u32 = u32::from_le_bytes(*b"BLFL");
@@ -171,7 +172,6 @@ pub struct FileListRef {
 pub enum RecoveryKind {
     Whole = 0,
     DiskOnly = 1,
-    Database = 2,
 }
 
 impl RecoveryKind {
@@ -179,7 +179,6 @@ impl RecoveryKind {
         match value {
             0 => Ok(Self::Whole),
             1 => Ok(Self::DiskOnly),
-            2 => Ok(Self::Database),
             _ => Err(DecodeError),
         }
     }
@@ -287,7 +286,6 @@ pub struct Manifest {
     pub recovery_kind: RecoveryKind,
     pub checkpoint_epoch: Epoch,
     pub config: VsetConfig,
-    pub database: DatabaseMeta,
     pub vmstate_logical_length: u64,
     pub base: Option<BaseRef>,
     pub complete_list: Option<FileListRef>,
@@ -295,6 +293,49 @@ pub struct Manifest {
     pub metadata_checksum: u64,
     pub added: Vec<ObjectRef>,
     pub removed: Vec<ObjectIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestClosure {
+    pub manifest: Manifest,
+    pub complete_list: Option<CompleteFileList>,
+    pub files: Vec<ObjectRef>,
+}
+
+pub fn decode_manifest_closure(
+    vset: VsetId,
+    pointer: ManifestPtr,
+    manifest_bytes: &[u8],
+    complete_list_bytes: Option<&[u8]>,
+) -> Result<ManifestClosure, DecodeError> {
+    if checksum64(manifest_bytes) != pointer.checksum {
+        return Err(DecodeError);
+    }
+    let manifest = Manifest::decode(vset, manifest_bytes)?;
+    if (
+        manifest.writer_fence,
+        manifest.journal_seq,
+        manifest.archive_seq,
+        manifest.capture_seq,
+    ) != (
+        pointer.fence,
+        pointer.journal_seq.0,
+        pointer.seq.0,
+        pointer.capture_seq,
+    ) {
+        return Err(DecodeError);
+    }
+    let complete_list = match (manifest.complete_list, complete_list_bytes) {
+        (None, None) => None,
+        (Some(reference), Some(bytes)) => Some(CompleteFileList::decode(reference, vset, bytes)?),
+        _ => return Err(DecodeError),
+    };
+    let files = manifest.current_files(complete_list.as_ref())?;
+    Ok(ManifestClosure {
+        manifest,
+        complete_list,
+        files,
+    })
 }
 
 impl Manifest {
@@ -491,7 +532,6 @@ pub struct BaseManifest {
     pub recovery_kind: RecoveryKind,
     pub checkpoint_epoch: Epoch,
     pub config: VsetConfig,
-    pub database: DatabaseMeta,
     pub vmstate_logical_length: u64,
     pub post_state_checksum: u64,
     pub metadata_checksum: u64,
@@ -512,7 +552,6 @@ impl BaseManifest {
         e.u64(self.checkpoint_epoch.0);
         e.u32(u32::try_from(page_size()).expect("page size fits u32"));
         encode_config(self.config, &mut e);
-        encode_database(self.config.kind, self.database, &mut e);
         e.u64(self.vmstate_logical_length);
         e.u64(self.post_state_checksum);
         e.u64(self.metadata_checksum);
@@ -545,7 +584,6 @@ impl BaseManifest {
             return Err(DecodeError);
         }
         let config = decode_config(&mut d)?;
-        let database = decode_database(config.kind, config.pages_per_volume, &mut d)?;
         let vmstate_logical_length = d.u64()?;
         let post_state_checksum = d.u64()?;
         let metadata_checksum = d.u64()?;
@@ -567,7 +605,6 @@ impl BaseManifest {
             recovery_kind,
             checkpoint_epoch,
             config,
-            database,
             vmstate_logical_length,
             post_state_checksum,
             metadata_checksum,
@@ -629,7 +666,6 @@ fn encode_manifest_prefix(manifest: &Manifest, e: &mut Enc) {
     e.u64(manifest.checkpoint_epoch.0);
     e.u32(u32::try_from(page_size()).expect("page size fits u32"));
     encode_config(manifest.config, e);
-    encode_database(manifest.config.kind, manifest.database, e);
     e.u64(manifest.vmstate_logical_length);
     encode_base_ref(manifest.base, e);
     encode_list_ref(manifest.complete_list, e);
@@ -652,7 +688,6 @@ fn decode_manifest_prefix(vset: VsetId, d: &mut Dec<'_>) -> Result<Manifest, Dec
         return Err(DecodeError);
     }
     let config = decode_config(d)?;
-    let database = decode_database(config.kind, config.pages_per_volume, d)?;
     Ok(Manifest {
         vset,
         writer_fence,
@@ -663,7 +698,6 @@ fn decode_manifest_prefix(vset: VsetId, d: &mut Dec<'_>) -> Result<Manifest, Dec
         recovery_kind,
         checkpoint_epoch,
         config,
-        database,
         vmstate_logical_length: d.u64()?,
         base: decode_base_ref(d)?,
         complete_list: decode_list_ref(d)?,
@@ -683,7 +717,6 @@ fn encode_config(config: VsetConfig, e: &mut Enc) {
 fn decode_config(d: &mut Dec<'_>) -> Result<VsetConfig, DecodeError> {
     let kind = match d.u8()? {
         0 => VsetKind::Compute,
-        1 => VsetKind::Database,
         _ => return Err(DecodeError),
     };
     let config = VsetConfig {
@@ -691,54 +724,10 @@ fn decode_config(d: &mut Dec<'_>) -> Result<VsetConfig, DecodeError> {
         disk_volumes: d.u8()?,
         pages_per_volume: d.u32()?,
     };
-    if config.pages_per_volume == 0
-        || (config.kind == VsetKind::Database && config.disk_volumes != 2)
-    {
+    if config.pages_per_volume == 0 {
         return Err(DecodeError);
     }
     Ok(config)
-}
-
-fn encode_database(kind: VsetKind, database: DatabaseMeta, e: &mut Enc) {
-    let files = [database.main, database.wal, database.journal];
-    for file in files {
-        let file = if kind == VsetKind::Database {
-            file
-        } else {
-            DatabaseFileMeta::default()
-        };
-        e.u8(u8::from(file.exists));
-        e.u64(file.size);
-    }
-}
-
-fn decode_database(
-    kind: VsetKind,
-    pages_per_volume: u32,
-    d: &mut Dec<'_>,
-) -> Result<DatabaseMeta, DecodeError> {
-    let max_size = u64::from(pages_per_volume) * page_size() as u64;
-    let mut file = || {
-        let exists = match d.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(DecodeError),
-        };
-        let size = d.u64()?;
-        if (!exists && size != 0) || size > max_size {
-            return Err(DecodeError);
-        }
-        Ok(DatabaseFileMeta { exists, size })
-    };
-    let database = DatabaseMeta {
-        main: file()?,
-        wal: file()?,
-        journal: file()?,
-    };
-    if kind == VsetKind::Compute && database != DatabaseMeta::default() {
-        return Err(DecodeError);
-    }
-    Ok(database)
 }
 
 fn encode_base_ref(value: Option<BaseRef>, e: &mut Enc) {
@@ -864,8 +853,6 @@ fn assert_manifest_shape(manifest: &Manifest) {
 
 fn validate_manifest_shape(manifest: &Manifest) -> Result<(), DecodeError> {
     if manifest.sync_covered_through > manifest.capture_seq
-        || (manifest.recovery_kind == RecoveryKind::Database)
-            != (manifest.config.kind == VsetKind::Database)
         || (manifest.complete_list.is_none() && !manifest.removed.is_empty())
     {
         return Err(DecodeError);
@@ -1047,7 +1034,6 @@ mod tests {
             recovery_kind: RecoveryKind::DiskOnly,
             checkpoint_epoch: Epoch(0),
             config: VsetConfig::compute(1, 1024),
-            database: DatabaseMeta::default(),
             vmstate_logical_length: 0,
             base: None,
             complete_list: None,
@@ -1177,7 +1163,6 @@ mod tests {
             recovery_kind: RecoveryKind::DiskOnly,
             checkpoint_epoch: Epoch(0),
             config: VsetConfig::compute(1, 1024),
-            database: DatabaseMeta::default(),
             vmstate_logical_length: 0,
             post_state_checksum: 11,
             metadata_checksum: 12,

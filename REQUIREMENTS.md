@@ -6,18 +6,14 @@ implementation decisions. Requirements take precedence when the two conflict.
 ## R1 — The unit of everything is the volume set
 
 - **R1.1** The system manages *volume sets* (vsets), each with exactly one
-  immutable kind. A **compute vset** is one memory volume plus one or more
-  disk volumes and maps 1:1 onto a Firecracker sandbox. A **database vset**
-  is the durable files of one SQLite database and has no memory volume, VMM
-  state, or permanent parent sandbox. Either kind is captured, restored,
-  forked and migrated as its own consistent unit.
+  memory volume plus one or more disk volumes and maps 1:1 onto a Firecracker
+  sandbox. Each vset is captured, restored, forked and migrated as its own
+  consistent unit.
 - **R1.2** Every whole-compute-vset consistency point covers all of its
   volumes plus the VMM's device/vCPU state (vmstate) atomically. No
   observable compute state may mix two epochs — not across volumes, not
   between memory and vmstate. A partial compute checkpoint (R3.7) declares
-  memory invalid and is restorable only by cold boot. A database consistency
-  point instead atomically covers its durable file metadata and visible blocks
-  through one sync watermark; it carries no vmstate and recovers detached.
+  memory invalid and is restorable only by cold boot.
 - **R1.3** Plan for bare-metal hosts running up to **10,000 concurrently
   live guests each** — running Firecracker processes, not merely managed
   entries — with the population of non-resident vsets beyond them bounded
@@ -30,9 +26,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   must price 10,000 mostly-idle live guests into one host: no cost
   proportional to provisioned size, and fixed per-vset state (memory,
   descriptors, tasks) small enough that the fleet's overhead is a rounding
-  error next to one busy guest. A VM may have at least **500 database vsets**
-  attached through one transport without one device, mount, thread, or
-  provisioned-size allocation per database.
+  error next to one busy guest.
 - **R1.4** A vset has **exactly one writer** at any instant: the host that
   holds its assignment (R6.3). No volume is ever writable from two places;
   every other party that touches a vset's data — a peer serving a fetch, a
@@ -43,18 +37,7 @@ implementation decisions. Requirements take precedence when the two conflict.
 
 - **R2.1** Compute guests run against demand-paged RAM and virtio-pmem/DAX
   disks: a vset resumes before its bytes are local and every touched page is
-  faulted in on first access. Database vsets use the stock SQLite Unix VFS over
-  one VM-wide virtio-fs mount and an optional DAX shared-memory window. Their
-  page reads retain the same local, peer, then object-store source order and
-  may begin before the whole database is local. This database DAX window is
-  volatile shared memory, not pmem and not a durability domain.
-- **R2.2** Durable database page residency and eviction are controlled by the
-  host backend. SQLite's userspace page cache and bounded guest virtio-fs
-  metadata/page state are allowed, but correctness and durability may not rely
-  on either surviving cold recovery. Eligible mappings use virtio-fs DAX;
-  unsupported or reclaimed mappings fall back to FUSE reads and writes. A VM
-  has one device, mount, DAX window and backend connection regardless of its
-  database attachment count.
+  faulted in on first access.
 - **R2.3** Fault service targets by source: local NVMe in the ~100 µs class;
   a peer host under ~1 ms; the object store as fallback in the tens of
   milliseconds. The system must prefer sources in that order.
@@ -65,10 +48,9 @@ implementation decisions. Requirements take precedence when the two conflict.
   freely as one checkpointed constantly. A vset's working set must be
   able to refault after eviction. Eviction is kind-aware: **compute memory
   pages have strictly higher residency affinity than every storage page** —
-  compute disks and all database files go first, because a guest tolerates
-  storage latency where a RAM miss is a stalled vCPU. Volume index alone may
-  not determine the class because database file zero is not memory. Kernel
-  swap is forbidden on the host (it would bypass the accounting).
+  compute disks go first, because a guest tolerates storage latency where a
+  RAM miss is a stalled vCPU. Kernel swap is forbidden on the host (it would
+  bypass the accounting).
 - **R2.5** Memory pressure slows vsets down, gradually — pressure never
   kills a vset and never refuses admission (the only sanctioned guest
   deaths in the system are unservable data, R8.1, and daemon death, R8.2).
@@ -98,7 +80,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   vsets slow per R2.5 — slowness and loud pressure, never corruption,
   never a kill, and relief is the control plane's move exactly as in R2.5.
 
-## R3 — Capture: checkpoints and database commits
+## R3 — Capture: checkpoints
 
 - **R3.1** A compute checkpoint captures a coherent point-in-time of a whole vset
   while the guest keeps running, with a vCPU pause bounded by a caller-stated
@@ -113,8 +95,6 @@ implementation decisions. Requirements take precedence when the two conflict.
   vset still recovers by cold boot at sync consistency (R3.8, R8.2). A
   checkpoint is an operation the system supports — a coherent
   point-in-time capture of a compute vset — not a mechanism it leans on.
-  Database writeback and SQLite syncs produce database recovery points and
-  never wait for a VM checkpoint.
 - **R3.3** Checkpoint cost must scale with what changed since the last
   checkpoint, not with volume size — except the first capture of a
   never-checkpointed volume, which is inherently whole-written-set sized.
@@ -138,8 +118,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   it restores only by **cold boot** — the guest boots fresh from its disks,
   as after power loss — and the instant-resume target (R6.2) does not apply
   to it.
-- **R3.8** Sync ordering is inviolable. A compute pmem sync or database
-  `FUSE_FSYNC` (issued for SQLite `xSync`) is acknowledged to the guest
+- **R3.8** Sync ordering is inviolable. A compute pmem sync is acknowledged to the guest
   only once its ordering is locked in: from the ack onward, crash recovery
   can never observe that disk at a state older than the sync point, and
   every captured disk state is a crash-consistent point of that device's
@@ -147,9 +126,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   everything before it is. The durability domain is the primary host plus
   its assigned passive peer as specified by R4.1; object-store archival is
   asynchronous and is not on the acknowledgment path. This does not change
-  device ordering or checkpoint semantics. For a database vset, file existence,
-  logical sizes, truncation and deletion are ordered metadata mutations
-  covered atomically by the same watermark as page writes.
+  device ordering or checkpoint semantics.
 
 ## R4 — Durability: primary and passive first, object storage is the archive
 
@@ -171,7 +148,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   configures a time-bounded catastrophic RPO. Checkpoints govern the kind of
   recovery, never its existence: recovery uses the newest available point —
   resumed if it is a whole checkpoint, cold-booted at sync consistency
-  otherwise (R6.1). Database recovery opens detached.
+  otherwise (R6.1).
 - **R4.4** An object-store outage never limits sync admission by elapsed time
   or archive lag. A healthy active passive continues accepting protected writes
   indefinitely while its durable storage has capacity. Archive lag age and
@@ -188,7 +165,7 @@ implementation decisions. Requirements take precedence when the two conflict.
 - **R4.6** The object store is the only shared durable dependency, and the
   system requires of it only: strong read-after-write consistency,
   conditional writes (compare-and-swap by version), and objects up to
-  64 MiB. Anything speaking that contract (S3, GCS) must work.
+  64 MiB. The GCS client must enforce that contract.
 - **R4.7** Protected and archived durability are distinct monotone frontiers.
   The protected frontier advances on passive commit and authorizes sync ACKs;
   the archived frontier advances only after the manifest and all referenced
@@ -212,9 +189,8 @@ implementation decisions. Requirements take precedence when the two conflict.
   vset's checkpoint, or importing a raw disk image. It is **whole**
   (memory, vmstate and disks — forks of it resume) or **disk-only** (forks
   of it cold-boot, R3.7); an image import produces the disk-only kind.
-  A database base is a kept database recovery point and forks into a new
-  detached database vset. Every base is immutable, forkable from any host,
-  and alive until explicitly deleted.
+  Every base is immutable, forkable from any host, and alive until explicitly
+  deleted.
 - **R5.3** Sharing is proportional to divergence — in storage **and in
   memory**. Fork one base a thousand times and let every fork modify a
   little of every volume: the host stores the base once, keeps **one
@@ -236,17 +212,13 @@ implementation decisions. Requirements take precedence when the two conflict.
   requires a complete verified closure from its recorded stash assignment, or
   from a higher assignment epoch carrying a commit by the recorded holder's
   current writer fence (R6.6); it must never silently present the older
-  object-store point as satisfying the stronger guarantee. A database vset
-  instead becomes database-ready and detached at its newest archived recovery
-  point.
+  object-store point as satisfying the stronger guarantee.
 - **R6.2** A compute restore onto a host with none of the vset's bytes reaches the
   guest's first instruction in under 200 ms from a warm object store,
   independent of vset size — by fetching only what the resume touches (a
   recorded resume set prefetched, the rest on demand). ("Restore" always
   means resuming a whole-vset point; booting a disk-only point is a *cold
-  boot*, R3.7, and carries no latency target.) A restored database becomes
-  attachable after bounded metadata fetches independent of database size; file
-  pages follow on demand.
+  boot*, R3.7, and carries no latency target.)
 - **R6.3** The system itself is the authority for which host runs a vset —
   no consensus service, no trusted control plane. The instrument is the
   object store's conditional head: two hosts racing to restore one vset
@@ -258,10 +230,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   attempt at any moment — a wrong liveness guess costs a bounded double-run
   window, never divergent durable state. Every timing bound here rests
   only on local monotonic clocks with bounded drift; nothing anywhere
-  requires synchronized clocks across hosts. A database attachment is a
-  subordinate, daemon-incarnation-scoped lease to one VM on the owning host;
-  retiring its monotone generation makes every delayed request from the old VM
-  invalid before a new VM may attach.
+  requires synchronized clocks across hosts.
 - **R6.5** The control plane's only obligations are liveness policy (when to
   claim), placement preference, roster and certificates, and never reusing a
   vset id.
@@ -284,12 +253,9 @@ implementation decisions. Requirements take precedence when the two conflict.
 
 ## R7 — Migration
 
-- **R7.1** Migration is post-copy: cut over first, fetch the remainder. Compute
-  migration pauses the guest for under 500 ms; the destination resumes and
-  demand-faults the tail. Database migration first retires or gracefully
-  drains its attachment, makes the destination database-ready and detached,
-  then serves file reads while the tail drains. It never pauses an unrelated
-  VM and attaching at the destination is a separate operation.
+- **R7.1** Migration is post-copy: cut over first, fetch the remainder. It
+  pauses the guest for under 500 ms; the destination resumes and demand-faults
+  the tail.
 - **R7.2** Migration is served peer-to-peer while the source lives, with the
   same at-most-one-runner guarantee, transferred explicitly and durably on
   both sides. Its final handoff cut is an explicit archive event.
@@ -390,40 +356,3 @@ implementation decisions. Requirements take precedence when the two conflict.
   bucket-side encryption); the system must work unchanged on top of both
   and requires neither. Everything in flight is covered by R11.1 and by
   TLS to the object store.
-
-## R12 — SQLite database attachments
-
-- **R12.1** One SQLite database is one database vset. One VM-wide virtio
-  filesystem device and mount multiplexes all database attachments; hotplug is
-  a logical inode-namespace attachment, not Firecracker device hotplug. SQLite
-  uses its stock Unix VFS. The supported steady state is WAL mode.
-- **R12.2** A database vset has at most one writable VM attachment. The host
-  endpoint supplies the trusted VM identity; guest bytes cannot select it.
-  Every operation also carries the active attachment generation and stale
-  generations reveal no data and perform no mutation.
-- **R12.3** Graceful detach rejects new opens, drains handles and in-flight
-  operations, and completes a final local durability barrier before retiring
-  the attachment. Forced detach retires authority immediately and fails
-  outstanding I/O, synchronously revokes all DAX mappings, and terminates the
-  retiring VM if revocation cannot be proven. Reopening elsewhere uses normal
-  SQLite WAL or rollback-journal recovery. An open connection is never
-  transparently transferred to a different running VM.
-- **R12.4** The durable database namespace contains the main database, WAL and
-  rollback journal plus their existence and logical sizes. WAL is the supported
-  steady-state mode; rollback journal remains available for SQLite's safe
-  transition of a newly created database into WAL. WAL shared memory and
-  process locks are volatile during ordinary operation but belong to a warm VM
-  snapshot; temporary files remain guest-local. V1 does not claim atomic
-  transactions across database vsets or support super-journals.
-- **R12.5** A coordinated memory snapshot preserves open SQLite connections.
-  It pauses vCPUs, freezes and drains the filesystem backend, synchronizes
-  writable DAX state, pins an immutable version of every attached database,
-  and serializes VirtIO queues, stable handles, locks, SHM bytes, and DAX
-  mappings with RAM/VMM state. Restore must recreate the same PCI layout and
-  guest-physical mappings before any vCPU resumes; any partial failure fails
-  the entire snapshot or restore.
-- **R12.6** Restoring or forking a coordinated snapshot more than once creates
-  a distinct writable child of every attached database version for each VM.
-  Uncoordinated recovery and ordinary VM forks receive no writable attachment.
-  Snapshot restore is the only operation allowed to reconstruct attachment
-  leases, and only before restored vCPUs run.

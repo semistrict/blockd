@@ -5,13 +5,12 @@ use blockd_core::journal::VsetConfig;
 use blockd_core::layout;
 use blockd_core::types::{HostId, VsetId, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
+use blockd_sim::model::{BlobDevConfig, StoreConfig, StoreObjectKind};
 use blockd_sim::rng::Ppm;
-use blockd_sim::world::blobdev::BlobDevConfig;
-use blockd_sim::world::store::{StoreConfig, StoreObjectKind};
 
 fn base_config() -> HarnessConfig {
     HarnessConfig {
-        daemon: HostConfig {
+        host: HostConfig {
             archive: ArchivePolicy {
                 interval: secs(1),
                 ..Default::default()
@@ -25,19 +24,18 @@ fn base_config() -> HarnessConfig {
             wedge_ticks: 25,
             replica_placement: None,
         },
-        bdev: BlobDevConfig::nvme(),
-        store: StoreConfig::s3(),
+        blobs: BlobDevConfig::nvme(),
+        store: StoreConfig::gcs(),
         vset_count: 2,
-        vset_config: VsetConfig::compute(2, 16),
+        vset: VsetConfig::compute(2, 16),
         horizon: secs(2),
         think: (millis(1), millis(5)),
         checkpoint_interval: None,
         faults: FaultPlan::none(),
-        sabotage: None,
-        guest_sync_share: None,
-        guest_hot_pages: None,
-        rot_records_at: vec![],
-        crash_at: vec![],
+        sync_share: None,
+        hot_pages: None,
+        corrupt_fills: false,
+        drop_write_protect: false,
     }
 }
 
@@ -74,8 +72,8 @@ fn every_vset_is_published_by_its_primary() {
 fn hot_working_set_reports_archive_amplification_baseline() {
     let mut config = base_config();
     config.vset_count = 1;
-    config.vset_config = VsetConfig::compute(2, 256);
-    config.guest_hot_pages = Some((Ppm::percent(95), 8));
+    config.vset = VsetConfig::compute(2, 256);
+    config.hot_pages = Some((Ppm::percent(95), 8));
     config.horizon = secs(2);
     let report = run(0xA11C_0001, config);
     assert_clean(&report);
@@ -119,7 +117,7 @@ fn hot_working_set_reports_archive_amplification_baseline() {
     assert!(report.store.logical_changed_bytes > 0);
     assert!(report.published_segment_bytes > 0);
     eprintln!(
-        "archive-baseline horizon_ns={} put_attempts={} put_successes={} unique_bytes={} retry_bytes={} logical_changed_bytes={} final_segment_bytes={} final_live_entry_bytes={} final_dead_entry_bytes={} spool_bytes={} frontier_lag_bytes={}",
+        "archive-baseline horizon_ns={} put_attempts={} put_successes={} unique_bytes={} retry_bytes={} logical_changed_bytes={} final_segment_bytes={} final_live_entry_bytes={} final_dead_entry_bytes={}",
         secs(2),
         report.store.put_attempts,
         report.store.put_successes,
@@ -129,8 +127,6 @@ fn hot_working_set_reports_archive_amplification_baseline() {
         report.published_segment_bytes,
         report.published_live_entry_bytes,
         report.published_dead_entry_bytes,
-        report.replica_spool_bytes,
-        report.archive_lag_bytes,
     );
     assert_eq!(
         report.published_segment_bytes,
@@ -138,7 +134,6 @@ fn hot_working_set_reports_archive_amplification_baseline() {
             + report.published_dead_entry_bytes
             + report.published_segment_overhead_bytes
     );
-    assert!(report.peer_committed_through >= report.archived_through);
 }
 
 #[test]
@@ -169,6 +164,7 @@ fn journal_rot_is_survived_via_restore_from_backup() {
         bitflip_mean_interval: 0,
         journal_bitflip_mean_interval: millis(400),
         store_outage: None,
+        ..FaultPlan::default()
     };
     let report = run(13, config);
     assert_clean(&report);
@@ -189,6 +185,7 @@ fn backed_runs_replay_byte_for_byte() {
         bitflip_mean_interval: 0,
         journal_bitflip_mean_interval: millis(900),
         store_outage: Some((millis(400), millis(900))),
+        ..FaultPlan::default()
     };
     for seed in [11, 21] {
         let a = run(seed, config.clone());
@@ -204,9 +201,9 @@ fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
     // and loud pressure — never corruption, never a kill.
     let mut config = base_config();
     config.vset_count = 1;
-    config.daemon.cache_pages = 24;
-    config.daemon.disk_capacity = Some(16 * page_size() as u64);
-    config.daemon.disk_headroom = 4 * page_size() as u64;
+    config.host.cache_pages = 24;
+    config.host.disk_capacity = Some(16 * page_size() as u64);
+    config.host.disk_headroom = 4 * page_size() as u64;
     let report = run(14, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);

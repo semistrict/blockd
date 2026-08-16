@@ -84,12 +84,12 @@ async fn store_gc_pass<W: Store>(
 mod tests {
     use std::cell::RefCell;
 
-    use blockd_exec::{Executor, delay};
+    use blockd_exec::{FaultConfig, delay, simulation_scope};
 
     use super::*;
     use crate::blx::{BlockKey, BlockSpace, NamespaceKind};
     use crate::head::{HeadRecord, ManifestPtr};
-    use crate::journal::{DatabaseMeta, JournalRecord, RecordKind, VsetConfig};
+    use crate::journal::{JournalRecord, RecordKind, VsetConfig};
     use crate::layout;
     use crate::manifest::{CompleteFileList, Manifest, ObjectIdentity, ObjectRef, RecoveryKind};
     use crate::protocol::StoreFault;
@@ -156,8 +156,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn collector_renews_grace_then_deletes_only_unreachable_objects() {
+    #[tokio::test(start_paused = true)]
+    async fn collector_renews_grace_then_deletes_only_unreachable_objects() {
         let store = TestStore::default();
         let vset = VsetId(1);
         let head_key = layout::head_key(vset);
@@ -185,8 +185,7 @@ mod tests {
         let store = Rc::new(store);
         let task_store = Rc::clone(&store);
         let expected_orphan = orphan.clone();
-        let mut executor = Executor::simulation(1);
-        let result = executor.block_on(async move {
+        let result = simulation_scope(1, FaultConfig::default(), async move {
             let mut observed = BTreeMap::new();
             assert_eq!(
                 store_gc_pass(task_store.as_ref(), &mut observed, 10).await,
@@ -201,7 +200,8 @@ mod tests {
                 task_store.objects.borrow().contains_key(&head_key),
                 task_store.objects.borrow().contains_key(&orphan),
             )
-        });
+        })
+        .await;
         assert_eq!(result, (true, false));
         assert!(
             !store.fetched.borrow().contains(&expected_orphan),
@@ -209,8 +209,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collector_preserves_inflight_publication_roots() {
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)]
+    async fn collector_preserves_inflight_publication_roots() {
         let store = Rc::new(TestStore::default());
         let vset = VsetId(2);
         let fence = 3;
@@ -237,10 +238,8 @@ mod tests {
             capture_seq: 5,
             sync_covered_through: 5,
             post_state_checksum: 0,
-            database: DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::from([(page, (Gen(1), location))]),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let object = ObjectRef {
@@ -288,7 +287,6 @@ mod tests {
             recovery_kind: RecoveryKind::DiskOnly,
             checkpoint_epoch: crate::types::Epoch(0),
             config: record.config,
-            database: record.database,
             vmstate_logical_length: 0,
             base: None,
             complete_list: Some(list.reference()),
@@ -324,9 +322,7 @@ mod tests {
             (segment.clone(), (1, vec![1, 2, 3])),
         ]);
         let task_store = Rc::clone(&store);
-        let mut executor = Executor::simulation(2);
-
-        executor.block_on(async move {
+        simulation_scope(2, FaultConfig::default(), async move {
             let mut observed = BTreeMap::new();
             assert_eq!(
                 store_gc_pass(task_store.as_ref(), &mut observed, 10).await,
@@ -366,14 +362,15 @@ mod tests {
                 store_gc_pass(task_store.as_ref(), &mut observed, 10).await,
                 Ok(1)
             );
-        });
+        })
+        .await;
 
         assert!(store.objects.borrow().contains_key(&segment));
         assert!(!store.objects.borrow().contains_key(&pending));
     }
 
-    #[test]
-    fn unavailable_listing_fails_closed() {
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_listing_fails_closed() {
         struct Unavailable;
 
         impl Store for Unavailable {
@@ -407,10 +404,11 @@ mod tests {
             }
         }
 
-        let mut executor = Executor::simulation(1);
         assert_eq!(
-            executor
-                .block_on(async { store_gc_pass(&Unavailable, &mut BTreeMap::new(), 10).await }),
+            simulation_scope(1, FaultConfig::default(), async {
+                store_gc_pass(&Unavailable, &mut BTreeMap::new(), 10).await
+            })
+            .await,
             Err(StoreError::Fault(StoreFault::Unavailable))
         );
     }

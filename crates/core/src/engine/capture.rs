@@ -13,7 +13,6 @@ use crate::format::checksum64;
 use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetConfig, VsetKind};
 use crate::layout;
 use crate::manifest::ObjectRef;
-use crate::mapleaf::LeafPtr;
 use crate::protocol::{AdminError, AdminResult, AdminSuccess, ReqId};
 use crate::segment::{PageLoc, SegmentBatchBuilder, open_entry, scan_segment};
 use crate::types::{Gen, JournalSeq, PageId, SegId, VsetId};
@@ -400,31 +399,6 @@ async fn prepare_compaction<W: Blobs>(
     rescues
 }
 
-pub async fn create_fresh_local<W>(
-    state: SharedHost,
-    world: Rc<W>,
-    vset: VsetId,
-    config: VsetConfig,
-) -> Option<AdminResult>
-where
-    W: Blobs + AdminIo + 'static,
-{
-    let duplicate = state.borrow().vsets.contains_key(&vset);
-    if duplicate {
-        return Some(Err(AdminError::Busy));
-    }
-    let incarnation = {
-        let mut host = state.borrow_mut();
-        host.insert_fresh(vset, config)
-    };
-    if !finish_creation(Rc::clone(&state), world.as_ref(), vset, incarnation).await {
-        state.borrow_mut().vsets.remove(&vset);
-        state.borrow_mut().fail("local journal write failed");
-        return None;
-    }
-    Some(Ok(AdminSuccess::VsetCreated { vset }))
-}
-
 fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
     JournalRecord {
         config,
@@ -434,10 +408,8 @@ fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
         capture_seq: 0,
         sync_covered_through: 0,
         post_state_checksum: 0,
-        database: crate::journal::DatabaseMeta::default(),
         files: Vec::new(),
         overlay: BTreeMap::new(),
-        leaves: BTreeMap::new(),
         migrated_from: None,
     }
 }
@@ -458,7 +430,7 @@ pub(super) async fn finish_creation<W: Blobs>(
         return false;
     };
     let record = initial_record(config, fence);
-    if !write_record_copies(&state, world, vset, &record).await {
+    if !write_record_copies(&state, world, vset, &record, &BTreeMap::new()).await {
         return false;
     }
     {
@@ -875,21 +847,11 @@ where
             for key in old_vmm {
                 replace_state_block(&mut checksum, &mut blocks, key, None);
             }
-            for (block, chunk) in checkpoint
-                .vmstate_bytes
-                .chunks(crate::types::page_size())
-                .enumerate()
-            {
-                let mut padded = vec![0; crate::types::page_size()];
-                padded[..chunk.len()].copy_from_slice(chunk);
+            for (key, padded) in crate::blx::vmm_snapshot_blocks(&checkpoint.vmstate_bytes) {
                 replace_state_block(
                     &mut checksum,
                     &mut blocks,
-                    BlockKey {
-                        space: crate::blx::BlockSpace::Vmm,
-                        volume: 0,
-                        block: u32::try_from(block).expect("VMM block fits u32"),
-                    },
+                    key,
                     Some((Gen(seq.0), checksum64(&padded))),
                 );
             }
@@ -965,7 +927,6 @@ where
                 .filter(|state| state.incarnation == incarnation)?;
             for &(page, generation, location) in entries {
                 vset_state.page_locs.insert(page, (generation, location));
-                vset_state.overlay.insert(page, (generation, location));
                 if let Some(drain) = vset_state.operations.drain_mut() {
                     drain.armed.retain(|armed| *armed != page);
                 }
@@ -1007,23 +968,14 @@ where
             .collect();
     }
 
-    let (record_overlay, record_leaves): (PageMap, BTreeMap<u32, LeafPtr>) = {
+    let record_overlay: PageMap = {
         let host = state.borrow();
         let vset_state = host
             .vsets
             .get(&vset)
             .filter(|state| state.incarnation == incarnation)?;
-        (vset_state.page_locs.clone(), BTreeMap::new())
+        vset_state.page_locs.clone()
     };
-    {
-        let mut host = state.borrow_mut();
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
-            .filter(|state| state.incarnation == incarnation)?;
-        vset_state.overlay.clone_from(&record_overlay);
-        vset_state.leaf_table.clone_from(&record_leaves);
-    }
 
     let record = {
         let mut host = state.borrow_mut();
@@ -1051,21 +1003,16 @@ where
             capture_seq,
             sync_covered_through: covered,
             post_state_checksum,
-            database: vset_state.database,
             files: recovery_files(vset_state),
             overlay: record_overlay,
-            leaves: record_leaves,
             migrated_from: vset_state.peer_source.map(|host| MigrationSource {
                 host,
                 offer_fence: vset_state.peer_source_offer_fence,
             }),
         }
     };
-    let wrote_record = if record.migrated_from.is_some() {
-        write_migration_record_copies(&state, world.as_ref(), vset, &record, &block_checksums).await
-    } else {
-        write_record_copies(&state, world.as_ref(), vset, &record).await
-    };
+    let wrote_record =
+        write_record_copies(&state, world.as_ref(), vset, &record, &block_checksums).await;
     if !wrote_record {
         state.borrow_mut().fail("local journal write failed");
         return None;
@@ -1254,33 +1201,17 @@ pub(super) async fn write_record_copies<W: Blobs>(
     world: &W,
     vset: VsetId,
     record: &JournalRecord,
+    block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
 ) -> bool {
     // A destination that still depends on its migration source must survive a
     // daemon crash without forgetting the remote page locations. Keep that
     // temporary lookup index in both local journal copies until hydration has
     // made the cut wholly local.
     let bytes = if record.migrated_from.is_some() {
-        let checksums = state
-            .borrow()
-            .vsets
-            .get(&vset)
-            .map(|vset| vset.block_checksums.clone())
-            .unwrap_or_default();
-        record.encode_migration_with_checksums(vset, &checksums)
+        record.encode_migration_with_checksums(vset, block_checksums)
     } else {
         record.encode(vset)
     };
-    write_encoded_record_copies(state, world, vset, record, bytes).await
-}
-
-pub(super) async fn write_migration_record_copies<W: Blobs>(
-    state: &SharedHost,
-    world: &W,
-    vset: VsetId,
-    record: &JournalRecord,
-    block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
-) -> bool {
-    let bytes = record.encode_migration_with_checksums(vset, block_checksums);
     write_encoded_record_copies(state, world, vset, record, bytes).await
 }
 

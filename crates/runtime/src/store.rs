@@ -1,5 +1,5 @@
 //! The asynchronous object-store boundary of the runtime. Network operations
-//! run on Tokio and their completions wake the shared actor executor. Versions are
+//! run on Tokio and their completions wake the waiting actor tasks. Versions are
 //! opaque u64s the store itself derives — a version must survive process
 //! restarts and be comparable across hosts, because the head CAS (R6.3) is the
 //! cluster's single-writer authority.

@@ -9,8 +9,7 @@ members = [
     "crates/platform",
     "crates/runtime",
     "crates/sim",
-    "crates/sqlite-vfs",
-    "crates/vsetfs",
+    "crates/transport",
     "crates/workload",
 ]
 
@@ -24,9 +23,9 @@ async-trait = "0.1.91"
 axum = "0.8.9"
 libc = "0.2.189"
 reqwest = { version = "0.13.4", default-features = false }
-rusqlite = "0.40.1"
 tokio = "1.53.1"
 tracing = "0.1.44"
+turmoil = "0.7.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -44,9 +43,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 # The simulation processes millions of virtual-time events per test; the
-# daemon and sim kernel run optimized even in dev/test builds (pure
-# integer state machines — optimization cannot change behavior, and the
-# determinism suite would catch it if it somehow did).
+# daemon and simulated world models run optimized even in dev/test builds.
 [profile.dev.package.blockd-core]
 opt-level = 2
 

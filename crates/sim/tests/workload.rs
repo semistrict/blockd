@@ -8,7 +8,7 @@ struct ReferenceBackend;
 impl Backend for ReferenceBackend {
     type Error = std::convert::Infallible;
 
-    fn execute(
+    async fn execute(
         &mut self,
         _operation: Operation,
         _model: &WorkloadModel,
@@ -20,22 +20,35 @@ impl Backend for ReferenceBackend {
 fn config_for(spec: &WorkloadSpec) -> HarnessConfig {
     let mut config = blockd_sim::presets::single_host_base();
     config.vset_count = 1;
-    config.vset_config = VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
+    config.vset = VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
     config.horizon = millis(10_000);
     config.think = (micros(1), micros(2));
     config.checkpoint_interval = None;
     config.faults = FaultPlan::none();
-    config.rot_records_at.clear();
-    config.crash_at.clear();
+    config.faults.rot_records_at.clear();
+    config.faults.crash_at.clear();
     config
 }
 
-#[test]
-fn steady_io_matches_the_reference_outcome_and_replays() {
+async fn simulated(
+    seed: u64,
+    config: HarnessConfig,
+    spec: WorkloadSpec,
+) -> blockd_sim::harness::WorkloadRunReport {
+    tokio::task::spawn_blocking(move || run_workload(seed, config, spec))
+        .await
+        .expect("simulation task")
+        .expect("simulated run")
+}
+
+#[tokio::test]
+async fn steady_io_matches_the_reference_outcome_and_replays() {
     let spec = blockd_workload::load("steady-io").expect("workload");
-    let expected = blockd_workload::run(&spec, &mut ReferenceBackend).expect("reference run");
-    let first = run_workload(0x51_51, config_for(&spec), spec.clone()).expect("simulated run");
-    let replay = run_workload(0x51_51, config_for(&spec), spec).expect("simulated replay");
+    let expected = blockd_workload::run(&spec, &mut ReferenceBackend)
+        .await
+        .expect("reference run");
+    let first = simulated(0x51_51, config_for(&spec), spec.clone()).await;
+    let replay = simulated(0x51_51, config_for(&spec), spec).await;
 
     assert!(first.simulation.violations.is_empty());
     assert_eq!(first.workload, expected);
@@ -48,11 +61,13 @@ fn steady_io_matches_the_reference_outcome_and_replays() {
     );
 }
 
-#[test]
-fn checkpoint_crash_restore_matches_the_reference_outcome() {
+#[tokio::test]
+async fn checkpoint_crash_restore_matches_the_reference_outcome() {
     let spec = blockd_workload::load("checkpoint-recovery").expect("workload");
-    let expected = blockd_workload::run(&spec, &mut ReferenceBackend).expect("reference run");
-    let actual = run_workload(0x52_52, config_for(&spec), spec).expect("simulated run");
+    let expected = blockd_workload::run(&spec, &mut ReferenceBackend)
+        .await
+        .expect("reference run");
+    let actual = simulated(0x52_52, config_for(&spec), spec).await;
 
     assert!(actual.simulation.violations.is_empty());
     assert_eq!(actual.workload, expected);
@@ -65,7 +80,7 @@ fn checkpoint_crash_restore_matches_the_reference_outcome() {
 fn scripted_workload_honors_fault_schedules_and_horizon() {
     let spec = blockd_workload::load("steady-io").expect("workload");
     let mut scheduled = config_for(&spec);
-    scheduled.rot_records_at = vec![(0, false)];
+    scheduled.faults.rot_records_at = vec![(0, false)];
     let report = run_workload(0x54_54, scheduled, spec.clone()).expect("scheduled run");
     assert_eq!(report.simulation.bitflips, 1);
 

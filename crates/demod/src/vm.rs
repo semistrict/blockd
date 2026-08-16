@@ -70,7 +70,7 @@ pub struct Vm {
     pub state: String,
     /// The snapshot prefix this VM was restored from.
     pub prefix: String,
-    fc: Option<Arc<Mutex<FcVm>>>,
+    fc: Option<Arc<tokio::sync::Mutex<FcVm>>>,
 }
 
 struct FillServer {
@@ -89,12 +89,12 @@ pub struct Demod {
     next_vm: AtomicU64,
     next_fork: AtomicU64,
     next_server: AtomicU64,
-    servers: Mutex<BTreeMap<String, Arc<FillServer>>>,
+    servers: Mutex<BTreeMap<String, Arc<tokio::sync::OnceCell<Arc<FillServer>>>>>,
 }
 
 impl Demod {
-    fn pem(path: &Path) -> Vec<u8> {
-        let text = std::fs::read_to_string(path).expect("read PEM");
+    async fn pem(path: &Path) -> Vec<u8> {
+        let text = tokio::fs::read_to_string(path).await.expect("read PEM");
         let body: String = text
             .lines()
             .filter(|line| !line.starts_with("-----"))
@@ -104,21 +104,22 @@ impl Demod {
             .expect("PEM base64")
     }
 
-    fn peer_tls(cfg: &DemodConfig) -> PeerTlsConfig {
+    async fn peer_tls(cfg: &DemodConfig) -> PeerTlsConfig {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut roots = RootCertStore::empty();
         let mut certificate_identities = BTreeMap::new();
         for (&host, paths) in &cfg.identities {
             for path in paths {
-                let certificate = Self::pem(path);
+                let certificate = Self::pem(path).await;
                 roots
                     .add(CertificateDer::from(certificate.clone()))
                     .expect("trust anchor");
                 certificate_identities.insert(certificate, host);
             }
         }
-        let certificate = CertificateDer::from(Self::pem(&cfg.certificate));
-        let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(Self::pem(&cfg.private_key)));
+        let certificate = CertificateDer::from(Self::pem(&cfg.certificate).await);
+        let private_key = Self::pem(&cfg.private_key).await;
+        let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key.clone()));
         let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
             .build()
             .expect("client verifier");
@@ -145,12 +146,15 @@ impl Demod {
             .lock()
             .expect("lock")
             .values()
+            .filter_map(|cell| cell.get())
             .map(|fill| (fill.server.source(), fill.server.fault_latency()))
             .collect()
     }
 
-    pub fn start(cfg: DemodConfig) -> Demod {
-        std::fs::create_dir_all(&cfg.scratch).expect("scratch dir");
+    pub async fn start(cfg: DemodConfig) -> Demod {
+        tokio::fs::create_dir_all(&cfg.scratch)
+            .await
+            .expect("scratch dir");
         let store = Arc::new(GcsStore::new(GcsConfig {
             bucket: cfg.gcs_bucket.clone(),
             prefix: cfg.gcs_prefix.clone(),
@@ -198,10 +202,10 @@ impl Demod {
             peer: Some(PeerConfig {
                 listen: cfg.peer_listen,
                 peers: cfg.peers.clone(),
-                tls: Some(Self::peer_tls(&cfg)),
+                tls: Some(Self::peer_tls(&cfg).await),
             }),
         };
-        let rt = Runtime::new(&runtime_config, store.clone());
+        let rt = Runtime::new(&runtime_config, store.clone()).await;
         Demod {
             next_vm: AtomicU64::new(u64::from(cfg.host.0) * 1000 + 1),
             cfg,
@@ -223,83 +227,67 @@ impl Demod {
     /// state, snapshot, and publish the snapshot to the store. Returns
     /// the guest's own checksum of the baked state.
     #[tracing::instrument(skip(self), name = "vm.bake_base")]
-    pub fn bake_base(&self) -> String {
+    pub async fn bake_base(&self) -> String {
         let scratch = &self.cfg.scratch;
-        let mut vm = FcVm::spawn(&self.fc_bin(), &scratch.join("bake.sock"));
+        let mut vm = FcVm::spawn(&self.fc_bin(), &scratch.join("bake.sock")).await;
         vm.boot(
             &self.cfg.fc_dir.join("vmlinux"),
             &self.cfg.fc_dir.join("initramfs.cpio"),
             MEM_MIB,
-        );
-        vm.wait_line("READY");
-        vm.cmd("fill 7 4096", "FILLED ");
-        let sum = vm.cmd("sum 4096", "SUM ");
+        )
+        .await;
+        vm.wait_line("READY").await;
+        vm.cmd("fill 7 4096", "FILLED ").await;
+        let sum = vm.cmd("sum 4096", "SUM ").await;
         let vmstate = scratch.join("base.vmstate");
         let mem = scratch.join("base.mem");
-        let _ = std::fs::remove_file(&vmstate);
-        let _ = std::fs::remove_file(&mem);
-        vm.pause();
-        vm.snapshot(&vmstate, &mem);
-        vm.kill();
+        let _ = tokio::fs::remove_file(&vmstate).await;
+        let _ = tokio::fs::remove_file(&mem).await;
+        vm.pause().await;
+        vm.snapshot(&vmstate, &mem).await;
+        vm.kill().await;
         // A re-bake replaces the store objects; a cached fill server for
         // the old snapshot would serve stale memory against the new
         // vmstate. Drop it so the next boot re-fetches.
         self.servers.lock().expect("lock").remove("base");
-        self.publish_snapshot("base", &vmstate, &mem);
-        tokio::runtime::Handle::current()
-            .block_on(GcsStore::put(
-                self.store.as_ref(),
-                "base/sum",
-                sum.clone().into_bytes(),
-            ))
+        self.publish_snapshot("base", &vmstate, &mem).await;
+        GcsStore::put(self.store.as_ref(), "base/sum", sum.clone().into_bytes())
+            .await
             .expect("publish sum");
         sum
     }
 
     /// Upload a snapshot (vmstate + memory parts) under `prefix`.
     #[tracing::instrument(skip(self, vmstate, mem), fields(snapshot_prefix = prefix))]
-    fn publish_snapshot(&self, prefix: &str, vmstate: &Path, mem: &Path) {
-        // Control operations run in the API's bounded blocking lane because
-        // Firecracker and durable files are synchronous. Their GCS futures are
-        // still driven by Tokio; this worker only waits for completion.
-        let parts = tokio::runtime::Handle::current().block_on(upload_mem_parts_async(
+    async fn publish_snapshot(&self, prefix: &str, vmstate: &Path, mem: &Path) {
+        let parts = upload_mem_parts_async(
             self.store.clone() as Arc<dyn ObjectStore>,
             mem.to_owned(),
             format!("{prefix}/mem"),
             PART_BYTES,
-        ));
+        )
+        .await;
         assert_eq!(parts, u64::from(MEM_MIB) * 1024 * 1024 / PART_BYTES);
-        let bytes = std::fs::read(vmstate).expect("vmstate file");
-        tokio::runtime::Handle::current()
-            .block_on(GcsStore::put(
-                self.store.as_ref(),
-                &format!("{prefix}/vmstate"),
-                bytes,
-            ))
+        let bytes = tokio::fs::read(vmstate).await.expect("vmstate file");
+        GcsStore::put(self.store.as_ref(), &format!("{prefix}/vmstate"), bytes)
+            .await
             .expect("publish vmstate");
-        tokio::runtime::Handle::current()
-            .block_on(GcsStore::put(
-                self.store.as_ref(),
-                &format!("{prefix}/ready"),
-                Vec::new(),
-            ))
+        GcsStore::put(self.store.as_ref(), &format!("{prefix}/ready"), Vec::new())
+            .await
             .expect("publish snapshot readiness");
     }
 
-    fn snapshot_generation(&self, prefix: &str) -> Option<u64> {
-        tokio::runtime::Handle::current()
-            .block_on(GcsStore::get(
-                self.store.as_ref(),
-                &format!("{prefix}/ready"),
-            ))
+    async fn snapshot_generation(&self, prefix: &str) -> Option<u64> {
+        GcsStore::get(self.store.as_ref(), &format!("{prefix}/ready"))
+            .await
             .expect("store up")
             .map(|(generation, _)| generation)
     }
 
-    fn wait_snapshot_after(&self, prefix: &str, previous: Option<u64>) {
+    async fn wait_snapshot_after(&self, prefix: &str, previous: Option<u64>) {
         let deadline = Instant::now() + Duration::from_mins(5);
         loop {
-            let current = self.snapshot_generation(prefix);
+            let current = self.snapshot_generation(prefix).await;
             if current.is_some() && current != previous {
                 return;
             }
@@ -307,87 +295,94 @@ impl Demod {
                 Instant::now() < deadline,
                 "migration snapshot was not published"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
     /// The fill server for a snapshot prefix — one per host per prefix;
     /// every VM restored from that prefix shares its one memory copy.
-    fn ensure_server(&self, prefix: &str) -> Arc<FillServer> {
-        let mut servers = self.servers.lock().expect("lock");
-        if let Some(server) = servers.get(prefix) {
-            return server.clone();
-        }
-        let tag = format!(
-            "{}-{}",
-            self.cfg.host.0,
-            self.next_server.fetch_add(1, Ordering::Relaxed)
-        );
-        let sock = self.cfg.scratch.join(format!("fill-{tag}.sock"));
-        let shmem = self.cfg.shmem_dir.join(format!("blockd-{tag}.shmem"));
-        let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(&shmem);
-        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("fill sock");
-        let server = ShmemServer::start_s3(
-            listener,
-            self.store.clone() as Arc<dyn ObjectStore>,
-            format!("{prefix}/mem"),
-            PART_BYTES,
-            &shmem,
-            u64::from(MEM_MIB) * 1024 * 1024,
-            2, // readahead: a sequential cold reader streams
-        );
-        let entry = Arc::new(FillServer {
-            server,
-            sock,
-            shmem,
-        });
-        servers.insert(prefix.to_owned(), entry.clone());
-        entry
+    async fn ensure_server(&self, prefix: &str) -> Arc<FillServer> {
+        let cell = self
+            .servers
+            .lock()
+            .expect("lock")
+            .entry(prefix.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
+        cell.get_or_init(|| async {
+            let tag = format!(
+                "{}-{}",
+                self.cfg.host.0,
+                self.next_server.fetch_add(1, Ordering::Relaxed)
+            );
+            let sock = self.cfg.scratch.join(format!("fill-{tag}.sock"));
+            let shmem = self.cfg.shmem_dir.join(format!("blockd-{tag}.shmem"));
+            let _ = tokio::fs::remove_file(&sock).await;
+            let _ = tokio::fs::remove_file(&shmem).await;
+            let listener = tokio::net::UnixListener::bind(&sock).expect("fill sock");
+            let server = ShmemServer::start_store(
+                listener,
+                self.store.clone() as Arc<dyn ObjectStore>,
+                format!("{prefix}/mem"),
+                PART_BYTES,
+                &shmem,
+                u64::from(MEM_MIB) * 1024 * 1024,
+                2,
+            )
+            .await;
+            Arc::new(FillServer {
+                server,
+                sock,
+                shmem,
+            })
+        })
+        .await
+        .clone()
     }
 
     /// Restore one FC microVM from a store-held snapshot prefix.
     #[tracing::instrument(skip(self), fields(vm_id = id, snapshot_prefix = prefix))]
-    fn boot_from(&self, id: u64, prefix: &str) -> FcVm {
-        let fill = self.ensure_server(prefix);
+    async fn boot_from(&self, id: u64, prefix: &str) -> FcVm {
+        let fill = self.ensure_server(prefix).await;
         let vmstate = self.cfg.scratch.join(format!("vm{id}.vmstate"));
-        let (_, bytes) = tokio::runtime::Handle::current()
-            .block_on(GcsStore::get(
-                self.store.as_ref(),
-                &format!("{prefix}/vmstate"),
-            ))
+        let (_, bytes) = GcsStore::get(self.store.as_ref(), &format!("{prefix}/vmstate"))
+            .await
             .expect("store up")
             .expect("vmstate published");
-        std::fs::write(&vmstate, bytes).expect("write vmstate");
+        tokio::fs::write(&vmstate, bytes)
+            .await
+            .expect("write vmstate");
         let vm = FcVm::spawn(
             &self.fc_bin(),
             &self.cfg.scratch.join(format!("vm{id}.sock")),
-        );
-        vm.load_snapshot_shmem(&vmstate, &fill.sock, &fill.shmem);
+        )
+        .await;
+        vm.load_snapshot_shmem(&vmstate, &fill.sock, &fill.shmem)
+            .await;
         vm
     }
 
     /// Start a fresh VM from the base snapshot with its paired vset.
     #[tracing::instrument(skip(self), fields(vm_id = tracing::field::Empty))]
-    pub fn start_vm(&self) -> u64 {
+    pub async fn start_vm(&self) -> u64 {
         let id = self.next_vm.fetch_add(1, Ordering::SeqCst);
         tracing::Span::current().record("vm_id", id);
-        let mut fc = self.boot_from(id, "base");
-        fc.cmd("ping", "PONG");
-        self.rt.create_vset(VsetId(id), vset_config());
+        let mut fc = self.boot_from(id, "base").await;
+        fc.cmd("ping", "PONG").await;
+        self.rt.create_vset(VsetId(id), vset_config()).await;
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
                 state: "running".to_owned(),
                 prefix: "base".to_owned(),
-                fc: Some(Arc::new(Mutex::new(fc))),
+                fc: Some(Arc::new(tokio::sync::Mutex::new(fc))),
             },
         );
         tracing::info!(vm_id = id, "VM started");
         id
     }
 
-    fn fc_of(&self, id: u64) -> Arc<Mutex<FcVm>> {
+    fn fc_of(&self, id: u64) -> Arc<tokio::sync::Mutex<FcVm>> {
         self.vms.lock().expect("lock")[&id]
             .fc
             .clone()
@@ -398,26 +393,28 @@ impl Demod {
     /// burst is mirrored into the vset — counter plus data pages — with a
     /// sync making it a durable consistency point.
     #[tracing::instrument(skip(self), fields(vm_id = id, burst_count = bursts))]
-    pub fn work(&self, id: u64, bursts: u64) -> (u64, String) {
+    pub async fn work(&self, id: u64, bursts: u64) -> (u64, String) {
         let vset = VsetId(id);
         let fc = self.fc_of(id);
         let mut sum = String::new();
         let mut burst = 0;
         for _ in 0..bursts {
-            let counter = self.rt.guest_read(vset, disk_page(vset, 0));
+            let counter = self.rt.guest_read(vset, disk_page(vset, 0)).await;
             burst = u64::from_le_bytes(counter[0..8].try_into().expect("sized")) + 1;
             let seed = id * 31 + burst;
             {
-                let mut fc = fc.lock().expect("lock");
-                fc.cmd(&format!("fill {seed} {GUEST_FILL_PAGES}"), "FILLED ");
-                sum = fc.cmd(&format!("sum {GUEST_FILL_PAGES}"), "SUM ");
+                let mut fc = fc.lock().await;
+                fc.cmd(&format!("fill {seed} {GUEST_FILL_PAGES}"), "FILLED ")
+                    .await;
+                sum = fc.cmd(&format!("sum {GUEST_FILL_PAGES}"), "SUM ").await;
             }
             for page in 1..=MIRROR_PAGES {
                 self.rt
-                    .guest_write(vset, disk_page(vset, page), mirror_value(id, burst, page));
+                    .guest_write(vset, disk_page(vset, page), mirror_value(id, burst, page))
+                    .await;
             }
-            self.rt.guest_write(vset, disk_page(vset, 0), burst);
-            assert!(self.rt.guest_sync(vset, VolumeIdx(1)), "sync failed");
+            self.rt.guest_write(vset, disk_page(vset, 0), burst).await;
+            assert!(self.rt.guest_sync(vset, VolumeIdx(1)).await, "sync failed");
         }
         (burst, sum)
     }
@@ -426,13 +423,13 @@ impl Demod {
     /// the burst, every data page must match it. Returns (burst,
     /// mismatches).
     #[tracing::instrument(skip(self), fields(vm_id = id))]
-    pub fn verify(&self, id: u64) -> (u64, u32) {
+    pub async fn verify(&self, id: u64) -> (u64, u32) {
         let vset = VsetId(id);
-        let counter = self.rt.guest_read(vset, disk_page(vset, 0));
+        let counter = self.rt.guest_read(vset, disk_page(vset, 0)).await;
         let burst = u64::from_le_bytes(counter[0..8].try_into().expect("sized"));
         let mut mismatches = 0;
         for page in 1..=MIRROR_PAGES {
-            let bytes = self.rt.guest_read(vset, disk_page(vset, page));
+            let bytes = self.rt.guest_read(vset, disk_page(vset, page)).await;
             let got = u64::from_le_bytes(bytes[0..8].try_into().expect("sized"));
             let want = if burst == 0 {
                 0
@@ -454,47 +451,52 @@ impl Demod {
     /// this host (the fill server's file), diverging copy-on-write.
     /// Returns (fork ids, sum of Rss, sum of Pss, fill-server resident).
     #[tracing::instrument(skip(self), fields(vm_id = id, fork_count = n))]
-    pub fn fork(&self, id: u64, n: u32) -> (Vec<u64>, usize, usize, usize) {
+    pub async fn fork(&self, id: u64, n: u32) -> (Vec<u64>, usize, usize, usize) {
         let prefix = format!("vm{id}/f{}", self.next_fork.fetch_add(1, Ordering::SeqCst));
         let vmstate = self.cfg.scratch.join(format!("fork-{id}.vmstate"));
         let mem = self.cfg.scratch.join(format!("fork-{id}.mem"));
-        let _ = std::fs::remove_file(&vmstate);
-        let _ = std::fs::remove_file(&mem);
+        let _ = tokio::fs::remove_file(&vmstate).await;
+        let _ = tokio::fs::remove_file(&mem).await;
         {
             let fc = self.fc_of(id);
-            let fc = fc.lock().expect("lock");
-            fc.pause();
-            fc.snapshot(&vmstate, &mem);
-            fc.resume();
+            let fc = fc.lock().await;
+            fc.pause().await;
+            fc.snapshot(&vmstate, &mem).await;
+            fc.resume().await;
         }
-        self.publish_snapshot(&prefix, &vmstate, &mem);
+        self.publish_snapshot(&prefix, &vmstate, &mem).await;
 
         let mut ids = Vec::new();
         let (mut rss_sum, mut pss_sum) = (0, 0);
         for _ in 0..n {
             let fork_id = self.next_vm.fetch_add(1, Ordering::SeqCst);
-            let mut fc = self.boot_from(fork_id, &prefix);
-            fc.cmd("ping", "PONG");
-            let (rss, pss) = rss_pss_of_pid(fc.pid());
+            let mut fc = self.boot_from(fork_id, &prefix).await;
+            fc.cmd("ping", "PONG").await;
+            let (rss, pss) = rss_pss_of_pid(fc.pid()).await;
             rss_sum += rss;
             pss_sum += pss;
-            self.rt.create_vset(VsetId(fork_id), vset_config());
+            self.rt.create_vset(VsetId(fork_id), vset_config()).await;
             self.vms.lock().expect("lock").insert(
                 fork_id,
                 Vm {
                     state: "running".to_owned(),
                     prefix: prefix.clone(),
-                    fc: Some(Arc::new(Mutex::new(fc))),
+                    fc: Some(Arc::new(tokio::sync::Mutex::new(fc))),
                 },
             );
             ids.push(fork_id);
         }
-        let resident = self
+        let server = self
             .servers
             .lock()
             .expect("lock")
             .get(&prefix)
-            .map_or(0, |s| s.server.resident_bytes());
+            .and_then(|cell| cell.get().cloned());
+        let resident = if let Some(server) = server {
+            server.server.resident_bytes().await
+        } else {
+            0
+        };
         tracing::info!(
             vm_id = id,
             fork_count = n,
@@ -510,9 +512,9 @@ impl Demod {
     /// pre-created), then — once the handoff lands — restore the microVM
     /// from the snapshot the source published.
     #[tracing::instrument(skip(self, ready), fields(vm_id = id))]
-    pub fn expect(self: &Arc<Demod>, id: u64, ready: impl FnOnce()) {
+    pub async fn expect(self: &Arc<Demod>, id: u64, ready: impl FnOnce()) {
         let prefix = format!("vm{id}/mig");
-        let previous_snapshot = self.snapshot_generation(&prefix);
+        let previous_snapshot = self.snapshot_generation(&prefix).await;
         self.rt.expect_migration(VsetId(id), vset_config());
         self.vms.lock().expect("lock").insert(
             id,
@@ -523,68 +525,67 @@ impl Demod {
             },
         );
         ready();
-        let span = tracing::info_span!("migration.receive", vm_id = id);
-        span.in_scope(|| {
-            let verdict = self.rt.wait_migrated_in(VsetId(id));
+        {
+            let verdict = self.rt.wait_migrated_in(VsetId(id)).await;
             assert!(
                 matches!(verdict, Verdict::Resume { .. }),
                 "migration verdict {verdict:?}"
             );
-            self.wait_snapshot_after(&prefix, previous_snapshot);
+            self.wait_snapshot_after(&prefix, previous_snapshot).await;
             self.servers.lock().expect("lock").remove(&prefix);
-            let mut fc = self.boot_from(id, &prefix);
-            fc.cmd("ping", "PONG");
+            let mut fc = self.boot_from(id, &prefix).await;
+            fc.cmd("ping", "PONG").await;
             let mut vms = self.vms.lock().expect("lock");
             let vm = vms.get_mut(&id).expect("expected vm");
-            vm.fc = Some(Arc::new(Mutex::new(fc)));
+            vm.fc = Some(Arc::new(tokio::sync::Mutex::new(fc)));
             "running".clone_into(&mut vm.state);
             tracing::info!(vm_id = id, "inbound migration resumed");
-        });
+        }
     }
 
     /// Source side: pause + snapshot the microVM, publish it, kill it,
     /// and live-migrate the vset over TCP. Snapshot publication and the vset
     /// handoff overlap; the returned timings expose the saved serial time.
     #[tracing::instrument(skip(self), fields(vm_id = id, destination_host = to))]
-    pub fn migrate(&self, id: u64, to: u16) -> MigrationTimings {
+    pub async fn migrate(&self, id: u64, to: u16) -> MigrationTimings {
         let vmstate = self.cfg.scratch.join(format!("mig-{id}.vmstate"));
         let mem = self.cfg.scratch.join(format!("mig-{id}.mem"));
-        let _ = std::fs::remove_file(&vmstate);
-        let _ = std::fs::remove_file(&mem);
+        let _ = tokio::fs::remove_file(&vmstate).await;
+        let _ = tokio::fs::remove_file(&mem).await;
         let snap_started = Instant::now();
         {
             let fc = self.fc_of(id);
-            let fc = fc.lock().expect("lock");
-            fc.pause();
-            fc.snapshot(&vmstate, &mem);
+            let fc = fc.lock().await;
+            fc.pause().await;
+            fc.snapshot(&vmstate, &mem).await;
         }
         let snapshot_write_ms = snap_started.elapsed().as_millis();
         let prefix = format!("vm{id}/mig");
-        let runtime = tokio::runtime::Handle::current();
-        let (publish_ms, handoff_ms) = std::thread::scope(|scope| {
-            let publisher = scope.spawn(|| {
-                let _runtime = runtime.enter();
-                let publish_started = Instant::now();
-                self.publish_snapshot(&prefix, &vmstate, &mem);
-                publish_started.elapsed().as_millis()
-            });
+        let publish = async {
+            let publish_started = Instant::now();
+            self.publish_snapshot(&prefix, &vmstate, &mem).await;
+            publish_started.elapsed().as_millis()
+        };
+        let handoff = async {
             let handoff_started = Instant::now();
-            self.rt.migrate_out(VsetId(id), HostId(to));
-            let handoff_ms = handoff_started.elapsed().as_millis();
-            let publish_ms = publisher.join().expect("snapshot publisher");
-            (publish_ms, handoff_ms)
-        });
+            self.rt.migrate_out(VsetId(id), HostId(to)).await;
+            handoff_started.elapsed().as_millis()
+        };
+        let (publish_ms, handoff_ms) = tokio::join!(publish, handoff);
         let total_ms = snap_started.elapsed().as_millis();
         let serial_ms = snapshot_write_ms + publish_ms + handoff_ms;
         let overlap_ms = serial_ms.saturating_sub(total_ms);
-        let mut vms = self.vms.lock().expect("lock");
-        let vm = vms.get_mut(&id).expect("vm");
-        if let Some(fc) = vm.fc.take()
+        let fc = {
+            let mut vms = self.vms.lock().expect("lock");
+            let vm = vms.get_mut(&id).expect("vm");
+            "migrated-out".clone_into(&mut vm.state);
+            vm.fc.take()
+        };
+        if let Some(fc) = fc
             && let Ok(fc) = Arc::try_unwrap(fc)
         {
-            fc.into_inner().expect("lock").kill();
+            fc.into_inner().kill().await;
         }
-        "migrated-out".clone_into(&mut vm.state);
         tracing::info!(
             vm_id = id,
             destination_host = to,
@@ -607,16 +608,16 @@ impl Demod {
     /// After the owning host died: restore a vset from the store
     /// alone (R6.1) and give it a fresh microVM from the base image.
     #[tracing::instrument(skip(self), fields(vm_id = id))]
-    pub fn restore(&self, id: u64) -> String {
-        let verdict = self.rt.restore_vset(VsetId(id), vset_config());
-        let mut fc = self.boot_from(id, "base");
-        fc.cmd("ping", "PONG");
+    pub async fn restore(&self, id: u64) -> String {
+        let verdict = self.rt.restore_vset(VsetId(id), vset_config()).await;
+        let mut fc = self.boot_from(id, "base").await;
+        fc.cmd("ping", "PONG").await;
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
                 state: "restored".to_owned(),
                 prefix: "base".to_owned(),
-                fc: Some(Arc::new(Mutex::new(fc))),
+                fc: Some(Arc::new(tokio::sync::Mutex::new(fc))),
             },
         );
         tracing::info!(vm_id = id, ?verdict, "VM restored");

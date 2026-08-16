@@ -9,11 +9,6 @@ pub(crate) fn encode_artifact(e: &mut Enc, artifact: ReplicaArtifact) {
             e.u64(fence);
             e.u64(seg.0);
         }
-        ReplicaArtifact::Leaf { fence, id } => {
-            e.u8(1);
-            e.u64(fence);
-            e.u64(id);
-        }
     }
 }
 
@@ -22,10 +17,6 @@ pub(crate) fn decode_artifact(d: &mut Dec<'_>) -> Result<ReplicaArtifact, Decode
         0 => Ok(ReplicaArtifact::Segment {
             fence: d.u64()?,
             seg: SegId(d.u64()?),
-        }),
-        1 => Ok(ReplicaArtifact::Leaf {
-            fence: d.u64()?,
-            id: d.u64()?,
         }),
         _ => Err(DecodeError),
     }

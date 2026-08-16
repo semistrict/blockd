@@ -4,8 +4,8 @@
 //! reusable definitions by recursively merging objects; arrays and scalar
 //! values replace their parents. Bounded distributions are realized from an
 //! independent, path-keyed RNG stream, so scenario choices never consume or
-//! perturb the simulation kernel's RNG. Fixed legacy scenarios therefore keep
-//! their byte-for-byte traces while exploratory scenarios can vary topology,
+//! perturb the actor scope's RNG. Fixed scenarios therefore keep byte-for-byte
+//! traces while exploratory scenarios can vary topology,
 //! workload, nemeses, and operational knobs by seed.
 
 use std::fmt;
@@ -20,9 +20,8 @@ use serde_json::{Map, Value};
 use crate::cluster::{ClusterConfig, FaultPoint, PeerKind};
 use crate::harness::{FaultPlan, HarnessConfig};
 use crate::hash::Fnv64;
+use crate::model::{BlobDevConfig, StoreConfig};
 use crate::rng::{Pcg64, Ppm};
-use crate::world::blobdev::BlobDevConfig;
-use crate::world::store::StoreConfig;
 
 const DOCUMENTS: &[(&str, &str)] = &[
     (
@@ -53,16 +52,8 @@ const DOCUMENTS: &[(&str, &str)] = &[
         include_str!("../scenarios/nvme-pressure-backed.json"),
     ),
     (
-        "nvme-pressure-unbacked",
-        include_str!("../scenarios/nvme-pressure-unbacked.json"),
-    ),
-    (
         "migration-release-blackout",
         include_str!("../scenarios/migration-release-blackout.json"),
-    ),
-    (
-        "migration-leaf-blackout",
-        include_str!("../scenarios/migration-leaf-blackout.json"),
     ),
     (
         "hot-compaction",
@@ -72,7 +63,6 @@ const DOCUMENTS: &[(&str, &str)] = &[
         "resume-set-rot",
         include_str!("../scenarios/resume-set-rot.json"),
     ),
-    ("leaf-rot", include_str!("../scenarios/leaf-rot.json")),
     (
         "peer-commit-crashes",
         include_str!("../scenarios/peer-commit-crashes.json"),
@@ -105,12 +95,9 @@ pub const SWEEP_SCENARIOS: &[&str] = &[
     "explore",
     "cold-restore-outage",
     "nvme-pressure-backed",
-    "nvme-pressure-unbacked",
     "migration-release-blackout",
-    "migration-leaf-blackout",
     "hot-compaction",
     "resume-set-rot",
-    "leaf-rot",
     "peer-commit-crashes",
     "peer-transfer-crashes",
     "peer-transition-before-cas",
@@ -169,7 +156,6 @@ pub enum CoverageMetric {
     WedgeHydration,
     WedgeOutbound,
     Release,
-    LeafFill,
     PrefetchFill,
     ParkedEnd,
     HydratingEnd,
@@ -409,7 +395,7 @@ impl Scenario {
                 .ok_or_else(|| ScenarioError::new("nemeses.restart-delay is required"))?,
             "nemeses.restart-delay",
         )?;
-        let faults = FaultPlan {
+        let mut faults = FaultPlan {
             crash_mean_interval: r.optional_duration_or_zero(
                 nemeses.crash_mean_interval.as_ref(),
                 "nemeses.crash-mean-interval",
@@ -428,8 +414,9 @@ impl Scenario {
                 .as_ref()
                 .map(|window| r.window(window, "nemeses.store-outage"))
                 .transpose()?,
+            ..FaultPlan::default()
         };
-        let rot_records_at = nemeses
+        faults.rot_records_at = nemeses
             .rot_records
             .iter()
             .enumerate()
@@ -440,27 +427,26 @@ impl Scenario {
                 ))
             })
             .collect::<Result<Vec<_>, ScenarioError>>()?;
-        let crash_at = nemeses
+        faults.crash_at = nemeses
             .crash_at
             .iter()
             .enumerate()
             .map(|(index, at)| r.duration(at, &format!("nemeses.crash-at.{index}")))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(HarnessConfig {
-            daemon: common.daemon,
-            bdev: common.bdev,
+            host: common.daemon,
+            blobs: common.bdev,
             store: common.store,
             vset_count: common.vset_count,
-            vset_config: common.vset_config,
+            vset: common.vset_config,
             horizon: common.horizon,
             think: common.think,
             checkpoint_interval: common.checkpoint_interval,
             faults,
-            sabotage: None,
-            guest_sync_share: common.guest_sync_share,
-            guest_hot_pages: common.guest_hot_pages,
-            rot_records_at,
-            crash_at,
+            sync_share: common.guest_sync_share,
+            hot_pages: common.guest_hot_pages,
+            corrupt_fills: false,
+            drop_write_protect: false,
         })
     }
 
@@ -538,11 +524,6 @@ impl Scenario {
                 .rot_resume_set_at
                 .as_ref()
                 .map(|v| r.duration(v, "nemeses.rot-resume-set-at"))
-                .transpose()?,
-            rot_leaves_at: nemeses
-                .rot_leaves_at
-                .as_ref()
-                .map(|v| r.duration(v, "nemeses.rot-leaves-at"))
                 .transpose()?,
             drop_peer: nemeses
                 .drop_peer
@@ -911,7 +892,6 @@ struct NemesisSpec {
     rot_records: Vec<RotRecordSpec>,
     crash_at: Vec<DurationSpec>,
     rot_resume_set_at: Option<DurationSpec>,
-    rot_leaves_at: Option<DurationSpec>,
     drop_peer: Option<DropPeerSpec>,
     race_restore: bool,
     migrate_at: Option<MigrateAtSpec>,
@@ -1032,8 +1012,6 @@ enum PeerKindSpec {
     Accept,
     FetchRange,
     Page,
-    FetchLeaf,
-    Leaf,
     Released,
     ReleasedAck,
     ReplicaPut,
@@ -1053,8 +1031,6 @@ impl From<PeerKindSpec> for PeerKind {
             PeerKindSpec::Accept => Self::Accept,
             PeerKindSpec::FetchRange => Self::FetchRange,
             PeerKindSpec::Page => Self::Page,
-            PeerKindSpec::FetchLeaf => Self::FetchLeaf,
-            PeerKindSpec::Leaf => Self::Leaf,
             PeerKindSpec::Released => Self::Released,
             PeerKindSpec::ReleasedAck => Self::ReleasedAck,
             PeerKindSpec::ReplicaPut => Self::ReplicaPut,
@@ -1383,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_scenarios_replay_exactly_on_the_actor_executor() {
+    fn checked_in_scenarios_replay_exactly_on_the_actor_runtime() {
         let single = [("single-host-base", 31), ("chaos", 31)];
         let mut hashes = BTreeSet::new();
         for (name, seed) in single {

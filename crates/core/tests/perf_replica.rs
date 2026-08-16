@@ -14,7 +14,7 @@ use std::time::Instant;
 use blockd_core::format::crc32c;
 use blockd_core::protocol::ReplicaArtifact;
 use blockd_core::replica_spool::seal_verified_replica_artifact;
-use blockd_core::segment::SegmentBuilder;
+use blockd_core::segment::SegmentBatchBuilder;
 use blockd_core::types::{
     Gen, HostId, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,
 };
@@ -25,7 +25,7 @@ fn artifact_bytes() -> (VsetId, ReplicaArtifact, Vec<u8>) {
     let fence = 11;
     let seg = SegId(13);
     let artifact = ReplicaArtifact::Segment { fence, seg };
-    let mut builder = SegmentBuilder::new(vset, fence, seg);
+    let mut builder = SegmentBatchBuilder::new(vset, fence, seg);
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut raw = vec![0u8; page_size()];
     let pages = TARGET_BYTES.div_ceil(page_size());
@@ -48,7 +48,7 @@ fn artifact_bytes() -> (VsetId, ReplicaArtifact, Vec<u8>) {
             &raw,
         );
     }
-    let (bytes, _) = builder.finish();
+    let (_, bytes, _) = builder.finish().pop().expect("profile object");
     (vset, artifact, bytes)
 }
 

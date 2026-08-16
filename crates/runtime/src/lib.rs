@@ -11,9 +11,6 @@
 mod actor_host;
 mod blobscan;
 mod capacity;
-#[cfg(target_os = "linux")]
-pub mod database;
-pub mod directory_store;
 pub mod fakegcs;
 #[cfg(target_os = "linux")]
 pub mod fc;
@@ -23,11 +20,7 @@ mod loopstats;
 mod metrics;
 mod peer;
 mod replica_recovery;
-#[cfg(target_os = "linux")]
-mod s3;
 mod store;
-#[cfg(target_os = "linux")]
-pub mod vsetfs;
 pub mod world;
 
 #[cfg(target_os = "linux")]
@@ -46,6 +39,4 @@ pub use peer::{PeerConfig, PeerNet, PeerTlsConfig};
 pub use replica_recovery::{
     InstallReplicaRecoveryError, InstalledReplicaRecovery, install_replica_recovery,
 };
-#[cfg(target_os = "linux")]
-pub use s3::{ListObjectsV2Output, S3Error, S3LatencyModel, S3Sim, S3Stats, S3Store};
 pub use store::{GetResult, ObjectStore};

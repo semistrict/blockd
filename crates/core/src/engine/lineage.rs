@@ -6,11 +6,13 @@ use blockd_exec::delay;
 use super::SharedHost;
 use super::backup::claim_new_head_with_stash;
 use super::capture::write_record_copies;
+use super::recovery_policy::{manifest_verdict, recovery_metadata};
 use super::replica::initial_stash;
+use super::store_retry::{read as get_retry, write_immutable as put_immutable_retry};
 use crate::blx::{BatchMeta, BlxCompactor, MAX_OVERLAPPING_FILES, NamespaceKind, open_object};
 use crate::format::checksum64;
 use crate::head::{HeadRecord, ManifestPtr};
-use crate::journal::{JournalRecord, RecordKind, VsetConfig, VsetKind};
+use crate::journal::{JournalRecord, RecordKind, VsetConfig};
 use crate::layout;
 use crate::manifest::{
     BaseManifest, BaseRoot, Manifest, ObjectRef, RecoveryKind, validate_object_refs,
@@ -161,7 +163,6 @@ where
         recovery_kind,
         checkpoint_epoch,
         config: record.config,
-        database: record.database,
         vmstate_logical_length,
         post_state_checksum: state_checksum,
         metadata_checksum: checksum64(&record.encode(vset)),
@@ -227,7 +228,11 @@ where
         return Some(Err(AdminError::Rejected));
     };
 
-    let (verdict, kind) = fork_recovery(base_manifest.recovery_kind, &base_manifest);
+    let (verdict, kind) = manifest_verdict(
+        base_manifest.recovery_kind,
+        Epoch(0),
+        base_manifest.vmstate_logical_length,
+    );
     let record = JournalRecord {
         config,
         seq: JournalSeq(0),
@@ -236,10 +241,8 @@ where
         capture_seq: base_manifest.capture_seq,
         sync_covered_through: base_manifest.sync_covered_through,
         post_state_checksum: base_manifest.post_state_checksum,
-        database: base_manifest.database,
         files: Vec::new(),
         overlay: BTreeMap::new(),
-        leaves: BTreeMap::new(),
         migrated_from: None,
     };
     {
@@ -248,16 +251,17 @@ where
         vset_state.fence = fence;
         vset_state.head_version = Some(fence);
         vset_state.stash_assignment = Some(stash);
-        vset_state.database = base_manifest.database;
         vset_state.mutation_seq = base_manifest.capture_seq;
         vset_state.state_checksum = base_manifest.post_state_checksum;
         vset_state.archived_memory_usable = !matches!(verdict, Verdict::ColdBoot);
         vset_state.archive_base = Some(root.as_base_ref());
-        vset_state.archive_objects = base_manifest.objects.clone();
+        vset_state
+            .archive_objects
+            .clone_from(&base_manifest.objects);
         vset_state.best_record = Some(record.clone());
         host.counters.assignment_claims += 1;
     }
-    if !write_record_copies(&state, world.as_ref(), vset, &record).await {
+    if !write_record_copies(&state, world.as_ref(), vset, &record, &BTreeMap::new()).await {
         state.borrow_mut().vsets.remove(&vset);
         state.borrow_mut().fail("fork journal write failed");
         return None;
@@ -277,7 +281,6 @@ where
             base_manifest.checkpoint_epoch
         },
         config,
-        database: base_manifest.database,
         vmstate_logical_length: base_manifest.vmstate_logical_length,
         base: Some(root.as_base_ref()),
         complete_list: None,
@@ -345,20 +348,6 @@ where
     Some(Ok(AdminSuccess::VsetForked { vset, verdict }))
 }
 
-fn recovery_metadata(record: &JournalRecord) -> (RecoveryKind, Epoch, u64) {
-    match record.kind {
-        RecordKind::Checkpoint {
-            epoch,
-            vmstate_logical_length,
-            ..
-        } if record.capture_seq >= record.sync_covered_through => {
-            (RecoveryKind::Whole, epoch, vmstate_logical_length)
-        }
-        _ if record.config.kind == VsetKind::Database => (RecoveryKind::Database, Epoch(0), 0),
-        _ => (RecoveryKind::DiskOnly, Epoch(0), 0),
-    }
-}
-
 fn maximum_overlap(objects: &[ObjectRef]) -> usize {
     objects
         .iter()
@@ -373,29 +362,6 @@ fn maximum_overlap(objects: &[ObjectRef]) -> usize {
         })
         .max()
         .unwrap_or(0)
-}
-
-fn fork_recovery(kind: RecoveryKind, manifest: &BaseManifest) -> (Verdict, RecordKind) {
-    match kind {
-        RecoveryKind::Whole => (
-            Verdict::Resume {
-                epoch: Epoch(0),
-                vmstate: manifest.vmstate_logical_length,
-            },
-            RecordKind::Checkpoint {
-                epoch: Epoch(0),
-                vmstate: manifest.vmstate_logical_length,
-                vmstate_logical_length: manifest.vmstate_logical_length,
-            },
-        ),
-        RecoveryKind::DiskOnly => (Verdict::ColdBoot, RecordKind::Commit),
-        RecoveryKind::Database => (
-            Verdict::DatabaseReady {
-                synced_through: manifest.sync_covered_through,
-            },
-            RecordKind::Commit,
-        ),
-    }
 }
 
 async fn collect_record_objects<W: Blobs + Store>(
@@ -474,52 +440,6 @@ async fn get_base<W: Store>(
     Some((root, manifest))
 }
 
-async fn get_retry<W: Store>(
-    state: &SharedHost,
-    world: &W,
-    key: &str,
-    retry: u64,
-) -> Option<Vec<u8>> {
-    loop {
-        match Store::get(world, key).await {
-            Ok(Some((_, bytes))) => return Some(bytes),
-            Ok(None)
-            | Err(StoreError::TooLarge | StoreError::Fault(StoreFault::CasConflict { .. })) => {
-                return None;
-            }
-            Err(StoreError::Fault(StoreFault::Unavailable)) => {
-                state.borrow_mut().counters.store_retries += 1;
-                delay(retry).await;
-            }
-        }
-    }
-}
-
-async fn put_immutable_retry<W: Store>(
-    state: &SharedHost,
-    world: &W,
-    key: String,
-    bytes: Vec<u8>,
-    retry: u64,
-) -> Option<u64> {
-    loop {
-        match Store::put_cas(world, key.clone(), None, bytes.clone()).await {
-            Ok(version) => return Some(version),
-            Err(StoreError::Fault(StoreFault::CasConflict { .. })) => {
-                let Some((version, found)) = Store::get(world, &key).await.ok().flatten() else {
-                    return None;
-                };
-                return (found == bytes).then_some(version);
-            }
-            Err(StoreError::Fault(StoreFault::Unavailable)) => {
-                state.borrow_mut().counters.store_retries += 1;
-                delay(retry).await;
-            }
-            Err(StoreError::TooLarge) => return None,
-        }
-    }
-}
-
 async fn put_head_retry<W: Store>(
     state: &SharedHost,
     world: &W,
@@ -539,8 +459,9 @@ async fn put_head_retry<W: Store>(
                 match Store::get(world, &layout::head_key(vset)).await {
                     Ok(Some((version, bytes))) if bytes == head.encode() => return Some(version),
                     Ok(Some(_) | None)
-                    | Err(StoreError::TooLarge)
-                    | Err(StoreError::Fault(StoreFault::CasConflict { .. })) => return None,
+                    | Err(
+                        StoreError::TooLarge | StoreError::Fault(StoreFault::CasConflict { .. }),
+                    ) => return None,
                     Err(StoreError::Fault(StoreFault::Unavailable)) => delay(retry).await,
                 }
             }

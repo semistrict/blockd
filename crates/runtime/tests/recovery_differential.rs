@@ -17,7 +17,7 @@ use blockd_core::layout::{self, BlobName};
 use blockd_core::protocol::Verdict;
 use blockd_core::types::VsetId;
 use blockd_core::world::{BlobEntry, BlobError, Blobs};
-use blockd_exec::Executor;
+use blockd_exec::ProductionContext;
 use blockd_runtime::world::FileBlobs;
 use blockd_sim::harness::run_final_blobs;
 use blockd_sim::presets;
@@ -93,17 +93,17 @@ impl Blobs for MemoryBlobs {
     }
 }
 
-fn recover<W: Blobs + 'static>(
+async fn recover<W: Blobs + 'static>(
     config: HostConfig,
     world: Rc<W>,
 ) -> (BTreeMap<VsetId, Verdict>, DaemonStats) {
     let state = Rc::new(RefCell::new(HostState::new(config)));
-    let mut executor = Executor::production();
-    let verdicts = executor
-        .block_on({
+    let verdicts = ProductionContext::new(|_| {})
+        .scope({
             let state = Rc::clone(&state);
             async move { recover_local(state, world.as_ref()).await }
         })
+        .await
         .expect("recovery succeeds");
     let observability = state.borrow().stats();
     (verdicts, observability)
@@ -117,23 +117,25 @@ fn write_blobs(root: &Path, blobs: &[(String, Vec<u8>)]) {
     }
 }
 
-#[test]
-fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
+#[tokio::test]
+async fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
     let mut nontrivial = 0u64;
     for seed in [3, 5, 7, 11, 29, 104] {
         let mut config = presets::single_host_base();
         // This test exercises local directory recovery. Keep the local
         // recovery points present instead of letting archival publication
         // reclaim every one before the snapshot is taken.
-        config.daemon.archive.interval = blockd_core::types::secs(60);
-        config.daemon.archive.max_unpublished_bytes = u64::MAX;
-        let host_config = config.daemon.clone();
-        let (report, blobs) = run_final_blobs(seed, config);
+        config.host.archive.interval = blockd_core::types::secs(60);
+        config.host.archive.max_unpublished_bytes = u64::MAX;
+        let host_config = config.host.clone();
+        let (report, blobs) = tokio::task::spawn_blocking(move || run_final_blobs(seed, config))
+            .await
+            .expect("Turmoil fixture run");
         assert_eq!(report.violations, Vec::<String>::new(), "seed {seed}");
         if blobs.is_empty() {
             continue;
         }
-        let memory_side = recover(host_config.clone(), Rc::new(MemoryBlobs::new(&blobs)));
+        let memory_side = recover(host_config.clone(), Rc::new(MemoryBlobs::new(&blobs))).await;
 
         let root = tempfile::tempdir().expect("recovery fixture");
         write_blobs(root.path(), &blobs);
@@ -141,10 +143,7 @@ fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
         std::fs::write(root.path().join("lost+found/fsck.0000"), b"noise").expect("write");
         std::fs::write(root.path().join("daemon.pid"), b"12345").expect("write");
 
-        let disk_side = recover(
-            host_config.clone(),
-            Rc::new(FileBlobs::new(root.path()).expect("file world")),
-        );
+        let disk_side = recover(host_config.clone(), Rc::new(FileBlobs::new(root.path()))).await;
         assert_eq!(
             memory_side, disk_side,
             "seed {seed}: actor recovery diverged across world implementations"
@@ -152,7 +151,7 @@ fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
 
         let mut reversed = blobs.clone();
         reversed.reverse();
-        let reversed_side = recover(host_config, Rc::new(MemoryBlobs::new(&reversed)));
+        let reversed_side = recover(host_config, Rc::new(MemoryBlobs::new(&reversed))).await;
         assert_eq!(
             memory_side, reversed_side,
             "seed {seed}: actor recovery depends on scan order"

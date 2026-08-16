@@ -1,4 +1,4 @@
-//! Bare actor/executor profiles over the deterministic model world.
+//! Bare actor-task profiles over the deterministic model world.
 
 #![allow(clippy::cast_precision_loss)] // presentation math
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // wall profile only
@@ -9,16 +9,13 @@ use blockd_core::hostmeta::{Counters, HostConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::types::{HostId, millis};
 use blockd_exec::rng::Ppm;
-use blockd_sim::actor_harness::{
-    ActorFaultPlan, ActorHarnessConfig, ActorRunReport, run, run_capture_profile,
-};
-use blockd_sim::world::blobdev::BlobDevConfig;
-use blockd_sim::world::store::StoreConfig;
+use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run, run_capture_profile};
+use blockd_sim::model::{BlobDevConfig, StoreConfig};
 
 const DRAIN_PAGES_PER_POLL: u64 = 64;
 
-fn config(vsets: u16, pages: u32) -> ActorHarnessConfig {
-    ActorHarnessConfig {
+fn config(vsets: u16, pages: u32) -> HarnessConfig {
+    HarnessConfig {
         host: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
@@ -55,13 +52,13 @@ fn config(vsets: u16, pages: u32) -> ActorHarnessConfig {
         sync_share: Some(Ppm(20_000)),
         hot_pages: Some((Ppm(800_000), pages.min(32))),
         checkpoint_interval: None,
-        faults: ActorFaultPlan::default(),
+        faults: FaultPlan::default(),
         corrupt_fills: false,
         drop_write_protect: false,
     }
 }
 
-fn assert_paths_ran(report: &ActorRunReport) {
+fn assert_paths_ran(report: &RunReport) {
     let Counters {
         zero_fills,
         records_written,
@@ -72,7 +69,7 @@ fn assert_paths_ran(report: &ActorRunReport) {
     assert!(zero_fills > 0, "no first-touch zero fills happened");
     assert!(records_written > 0, "writeback never ran");
     assert!(pages_flushed > 0, "capture never flushed a page");
-    assert!(report.executor_polls > 0, "executor did no work");
+    assert!(report.actor_polls > 0, "actor tasks did no work");
     assert!(
         report.max_page_reads_in_poll <= DRAIN_PAGES_PER_POLL,
         "one poll read {} pages; cooperative capture bound is {DRAIN_PAGES_PER_POLL}",
@@ -99,7 +96,7 @@ fn profile_huge_vset_capture_stall() {
     );
     eprintln!(
         "capture profile: {dirty_pages} dirty pages, {} polls, max {} page reads/poll, {wall:.1?}",
-        report.executor_polls, report.max_page_reads_in_poll
+        report.actor_polls, report.max_page_reads_in_poll
     );
 }
 
@@ -115,10 +112,10 @@ fn profile_actor_poll_ceiling() {
             "no write-protect faults happened"
         );
         assert!(report.completed_ops > u64::from(vsets));
-        let mean_poll_ns = wall.as_nanos() / u128::from(report.executor_polls);
+        let mean_poll_ns = wall.as_nanos() / u128::from(report.actor_polls);
         eprintln!(
             "actor profile: {vsets:>3} vsets, {} ops, {} polls, {wall:.1?}, mean {mean_poll_ns}ns/poll",
-            report.completed_ops, report.executor_polls
+            report.completed_ops, report.actor_polls
         );
         assert!(
             mean_poll_ns < 1_000_000,

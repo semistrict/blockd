@@ -6,13 +6,8 @@ standing design decisions and their rationale. Formats and protocols live in
 
 ## Non-goals
 
-- General-purpose POSIX filesystem semantics. The database export implements
-  only the Linux/FUSE file, mapping, synchronization, and locking behavior
-  required by stock SQLite.
 - Pre-copy migration. Migration is post-copy: cut over first, fault the
   remainder (R7.1).
-- Concurrent writable attachment of one SQLite database to multiple VMs.
-- Atomic SQLite transactions spanning independently fenced database vsets.
 
 ## Why a daemon (not a library)
 
@@ -46,66 +41,6 @@ Assignment authority is the head object's conditional-write version
 artifact the holder writes — journal records, segments, manifests — lives
 under that fence in its names. A fenced former holder's writes dangle
 unreachably (R6.4) without any revocation protocol.
-
-### The host owns database page residency
-
-Compute disks are virtio-pmem with DAX. Database files use virtio-fs: eligible
-main/WAL pages may be mapped through its shared DAX window, while unsupported
-or pressured pages fall back to FUSE reads and writes. This DAX region is
-ordinary volatile shared memory, not persistent memory. The backend, rather
-than a guest-visible block device, owns durable page residency and eviction.
-SQLite's userspace page cache and unavoidable guest virtio-fs metadata/page
-state are bounded parts of the data path; correctness never relies on either
-surviving cold recovery. Eviction of a clean compute page uses
-`MADV_DONTNEED` plus a hole punch; database pages are reclaimed from the DAX
-window/backend cache. Refault or a FUSE read reloads from a local `.blx` file.
-The eviction structure mirrors the multi-generational LRU, with compute memory
-receiving the higher residency affinity of R2.4 and every storage page sharing
-the lower class.
-
-### SQLite databases are independent vsets
-
-One SQLite database is a storage-only vset containing its main, WAL and
-rollback-journal file pages plus atomic existence and logical-size metadata.
-WAL is the only supported steady state; the journal persists SQLite's
-crash-safe transition of a new database into WAL. It has no guest RAM or
-vmstate. One always-present virtio-fs MMIO device and mount per VM multiplexes
-any number of database namespaces, so hotplug changes the exported inode tree
-without adding a Firecracker device or mount. A distinct vhost-user connection
-binds each export to a trusted VM identity; an attachment generation resolved
-from every inode/handle fences delayed traffic after detach. Attachments are
-volatile subordinate leases: uncoordinated daemon recovery starts databases
-detached.
-
-The external backend implements the FUSE operations, POSIX byte-range locks,
-WAL shared memory, and DAX mapping lifecycle expected by the stock Unix VFS.
-`FUSE_FSYNC` is the durable door: it completes only after a mirrored local
-record covers all accepted file and metadata mutations through its barrier and
-the recovery closure is durable on the assigned passive or already archived.
-Object-store archival remains asynchronous.
-
-### VM snapshots coordinate attached databases
-
-A memory snapshot pauses vCPUs, freezes and drains the filesystem backend,
-synchronizes writable DAX state, and pins an immutable version of every
-attached database before RAM and device state are captured. The filesystem
-snapshot serializes stable handles, POSIX locks, WAL shared-memory bytes,
-VirtIO queue state, and DAX mappings. Restore recreates the same MMIO layout and
-guest-physical DAX mappings before any vCPU resumes. Restoring one image more
-than once branches every attached database version, so writable authority is
-never duplicated. This coordinated path preserves already-open SQLite
-connections; cold database recovery remains detached and reconstructs SHM from
-WAL.
-
-An ordinary file-backed Firecracker restore maps RAM privately. That is not
-compatible with an external vhost-user process: guest VirtIO queue writes can
-become private copy-on-write pages that the backend's independent mapping
-cannot observe. The patched `FileShared` restore backend first copies the
-immutable memory snapshot into an unlinked per-VM working file and maps that
-copy shared. The vhost-user backend and Firecracker therefore observe the same
-queue memory while the source snapshot stays immutable. This mode is for a
-unique restore; restoring the snapshot again still requires the database-vset
-branching rule above before either VM can become writable.
 
 ### Shared-memory fault handling
 
@@ -168,13 +103,11 @@ the guest, and releases stale peer residue through the normal watermark path.
 
 ### Migration is a durable two-sided handoff
 
-Post-copy: a compute source pauses and captures a final whole record; a
-database source first retires its attachment and captures a final commit
-record. Either source makes an outbound handoff marker durable before offering,
-and the destination makes the record durable as its own first journal entry
-before resuming a compute guest or declaring a database ready and detached. A
-compute offer normally carries the captured VMM bytes directly; if it cannot,
-the destination verifies and reads those bytes from the source before resume.
+Post-copy: a source pauses and captures a final whole record, then makes an
+outbound handoff marker durable before offering it. The destination makes the
+record durable as its own first journal entry before resuming the guest. An
+offer normally carries the captured VMM bytes directly; if it cannot, the
+destination verifies and reads those bytes from the source before resume.
 Whichever side crashes, at most one host can own the vset (R6.3/R7.2); a source
 recovering with an intact marker serves fetches and never runs or attaches it.
 
@@ -190,28 +123,29 @@ and emits signals without discarding state (R2.5/R2.7).
 
 The core protocol is expressed as current-thread async actors over the
 contracts in `crates/core/src/world.rs`. Fault service, capture, publication,
-restore, migration, replication, database I/O, compaction, and store garbage
+restore, migration, replication, compaction, and store garbage
 collection are straight-line futures sharing host state only between await
 points. A host owns those children as one cancellation tree: a simulated crash
 or production teardown drops the root, then recovery reconstructs state from
 durable bytes rather than continuing an in-memory conversation.
 
-`crates/exec` is the scheduler in both environments. Simulation owns virtual
-time, seeded randomness, fault-point decisions, and a closed ready queue;
-production adds monotonic timers and a thread-safe external-event injector.
-FIFO wake ordering and declaration-order selection are fixed. Every simulated
-poll folds virtual time, task identity, and wake source into the trace hash, so
-R10.1 replay checks the actual actor interleaving rather than a second model of
-the protocol. Simulation and production differ only in their world trait
+Tokio is the actor scheduler in both environments. Production uses an
+application-owned multi-thread runtime: the non-`Send` actor tree runs on one
+`LocalSet`, while network, process, timer, and blocking-pool work use Tokio's
+runtime services and feed typed events back into that tree.
+Simulation runs each complete scenario as a Turmoil client on Turmoil's paused
+Tokio runtime; Turmoil owns virtual time and task execution while the actor
+scope supplies seeded domain randomness, fault-point decisions, and trace
+observations. Simulation and production differ only in their world trait
 implementations for blobs, object storage, peers, guest memory, and admin I/O.
 
-In-process operations use typed request envelopes. Each administrative,
-database, and guest-sync call carries its own one-shot reply promise, so
+In-process operations use typed request envelopes. Each administrative and
+guest-sync call carries its own one-shot reply promise, so
 completion routing has no shared reply stream, request table, or scan for a
-matching identifier. The synchronous Firecracker and VFS adapters block on
-that call's promise only. Checkpoint keeps a request identity because durable
-retry idempotency is part of its protocol; database and peer identifiers
-remain only at their wire boundaries. Recovery and inbound migration are not
+matching identifier. The synchronous Firecracker adapter blocks on that
+call's promise only. Checkpoint keeps a request identity because durable retry
+idempotency is part of its protocol; peer identifiers remain only at their
+wire boundaries. Recovery and inbound migration are not
 request completions and therefore arrive on a separate typed lifecycle-event
 stream.
 
@@ -225,8 +159,8 @@ the same rule; mandatory unservable pages are reported to the root rather than
 terminating from a world callback.
 
 Each vset has typed ownership slots for mutation, migration, publication, and
-replication. A mutation owner is capture (writeback, checkpoint, or migration),
-database persistence, or hydration; only capture can own a page-drain state,
+replication. A mutation owner is capture (writeback, checkpoint, or migration)
+or hydration; only capture can own a page-drain state,
 and cancellation leases release exactly the owner they acquired. This makes
 overlapping invalid flag combinations unrepresentable through the operation
 API while retaining orthogonal publication and replication progress.

@@ -1,152 +1,37 @@
-//! Current-thread deterministic task executor.
+//! Tokio-backed current-thread actor support.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::channel::{OneReceiver, oneshot};
+use tokio::time::Instant as TokioInstant;
+
 use crate::fault::{FaultConfig, FaultPoint};
 use crate::rng::Pcg64;
 use crate::trace::TraceHasher;
 
 pub type TaskId = u64;
+type DurationObserver = Arc<dyn Fn(u64) + Send + Sync>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WakeSource {
-    Spawn,
-    Waker,
-    Timer,
-    Yield,
-    Oneshot,
-    Channel,
-    External,
-    Cancellation,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Ready {
-    task: TaskId,
-    source: WakeSource,
-}
-
-#[derive(Default)]
-struct ReadyState {
-    queue: VecDeque<Ready>,
-    queued: BTreeSet<TaskId>,
-}
-
-pub(crate) struct Scheduler {
-    ready: Mutex<ReadyState>,
-    changed: Condvar,
-}
-
-impl Scheduler {
-    fn new() -> Self {
-        Self {
-            ready: Mutex::new(ReadyState::default()),
-            changed: Condvar::new(),
-        }
-    }
-
-    pub(crate) fn schedule(&self, task: TaskId, source: WakeSource) {
-        let mut ready = self.ready.lock().expect("ready mutex poisoned");
-        if ready.queued.insert(task) {
-            ready.queue.push_back(Ready { task, source });
-            self.changed.notify_one();
-        }
-    }
-
-    fn pop(&self) -> Option<Ready> {
-        let mut ready = self.ready.lock().expect("ready mutex poisoned");
-        let item = ready.queue.pop_front()?;
-        ready.queued.remove(&item.task);
-        Some(item)
-    }
-
-    fn wait(&self) {
-        let ready = self.ready.lock().expect("ready mutex poisoned");
-        drop(
-            self.changed
-                .wait_while(ready, |ready| ready.queue.is_empty())
-                .expect("ready mutex poisoned"),
-        );
-    }
-
-    fn wait_timeout(&self, duration: Duration) {
-        let ready = self.ready.lock().expect("ready mutex poisoned");
-        drop(
-            self.changed
-                .wait_timeout_while(ready, duration, |ready| ready.queue.is_empty())
-                .expect("ready mutex poisoned"),
-        );
-    }
-}
-
-pub type MonotonicClock = Arc<dyn Fn() -> u64 + Send + Sync>;
-
-struct TaskWake {
-    task: TaskId,
-    scheduler: Arc<Scheduler>,
-}
-
-impl Wake for TaskWake {
-    fn wake(self: Arc<Self>) {
-        self.scheduler.schedule(self.task, WakeSource::Waker);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.scheduler.schedule(self.task, WakeSource::Waker);
-    }
-}
-
-struct TimerRequest {
-    at: u64,
-    sequence: u64,
-    task: TaskId,
-    alive: Arc<AtomicBool>,
-}
-
+#[derive(Clone)]
 struct RuntimeContext {
-    now: Rc<Cell<u64>>,
-    scheduler: Arc<Scheduler>,
-    current_task: Rc<Cell<Option<TaskId>>>,
+    mode: Mode,
+    epoch: Rc<RefCell<Option<tokio::time::Instant>>>,
     poll_sequence: Rc<Cell<u64>>,
-    timer_sequence: Rc<Cell<u64>>,
-    timer_requests: Rc<RefCell<Vec<TimerRequest>>>,
-    observations: Rc<RefCell<Vec<String>>>,
+    trace: Rc<RefCell<TraceHasher>>,
     rng: Rc<RefCell<Option<Pcg64>>>,
     faults: Rc<RefCell<FaultConfig>>,
     fault_hits: Rc<RefCell<BTreeMap<FaultPoint, u64>>>,
-    clock: Option<MonotonicClock>,
+    poll_observer: Option<DurationObserver>,
     next_task: Rc<Cell<TaskId>>,
-    spawn_requests: Rc<RefCell<Vec<SpawnRequest>>>,
-}
-
-impl Clone for RuntimeContext {
-    fn clone(&self) -> Self {
-        Self {
-            now: Rc::clone(&self.now),
-            scheduler: Arc::clone(&self.scheduler),
-            current_task: Rc::clone(&self.current_task),
-            poll_sequence: Rc::clone(&self.poll_sequence),
-            timer_sequence: Rc::clone(&self.timer_sequence),
-            timer_requests: Rc::clone(&self.timer_requests),
-            observations: Rc::clone(&self.observations),
-            rng: Rc::clone(&self.rng),
-            faults: Rc::clone(&self.faults),
-            fault_hits: Rc::clone(&self.fault_hits),
-            clock: self.clock.clone(),
-            next_task: Rc::clone(&self.next_task),
-            spawn_requests: Rc::clone(&self.spawn_requests),
-        }
-    }
+    live_tasks: Rc<Cell<usize>>,
+    trace_task_polls: Rc<Cell<bool>>,
 }
 
 thread_local! {
@@ -161,7 +46,7 @@ impl Drop for Entered {
             current
                 .borrow_mut()
                 .pop()
-                .expect("executor context stack empty");
+                .expect("actor runtime context stack empty");
         });
     }
 }
@@ -177,57 +62,57 @@ fn with_context<T>(operation: impl FnOnce(&RuntimeContext) -> T) -> T {
         operation(
             current
                 .last()
-                .expect("async primitive used outside executor"),
+                .expect("async primitive used outside a Tokio actor scope"),
         )
     })
 }
 
-pub fn now() -> u64 {
-    with_context(refresh_now)
+fn context(
+    mode: Mode,
+    seed: Option<u64>,
+    poll_observer: Option<DurationObserver>,
+) -> RuntimeContext {
+    RuntimeContext {
+        mode,
+        epoch: Rc::new(RefCell::new(None)),
+        poll_sequence: Rc::new(Cell::new(0)),
+        trace: Rc::new(RefCell::new(TraceHasher::new())),
+        rng: Rc::new(RefCell::new(seed.map(|seed| Pcg64::new(seed, 0)))),
+        faults: Rc::new(RefCell::new(FaultConfig::default())),
+        fault_hits: Rc::new(RefCell::new(BTreeMap::new())),
+        poll_observer,
+        next_task: Rc::new(Cell::new(0)),
+        live_tasks: Rc::new(Cell::new(0)),
+        trace_task_polls: Rc::new(Cell::new(true)),
+    }
 }
 
-/// Monotonically increasing identity of the task poll currently in progress.
-///
-/// Simulation worlds use this to account bounded cooperative work without
-/// consulting wall time. Calls made during one future poll return the same
-/// value; a wake and subsequent poll advances it.
+pub fn now() -> u64 {
+    with_context(now_for)
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn now_for(context: &RuntimeContext) -> u64 {
+    let current = tokio::time::Instant::now();
+    let mut epoch = context.epoch.borrow_mut();
+    let epoch = epoch.get_or_insert(current);
+    let elapsed = current.saturating_duration_since(*epoch);
+    match context.mode {
+        Mode::Simulation => u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        Mode::Production => nanos(elapsed),
+    }
+}
+
+/// Monotonically increasing identity of the current Tokio task poll.
 pub fn current_poll() -> u64 {
     with_context(|context| context.poll_sequence.get())
 }
 
-fn refresh_now(context: &RuntimeContext) -> u64 {
-    if let Some(clock) = &context.clock {
-        context.now.set(clock());
-    }
-    context.now.get()
-}
-
-pub(crate) struct Waiter {
-    pub(crate) task: TaskId,
-    pub(crate) scheduler: Arc<Scheduler>,
-}
-
-pub(crate) fn current_waiter() -> Waiter {
-    with_context(|context| Waiter {
-        task: context
-            .current_task
-            .get()
-            .expect("primitive polled outside a task"),
-        scheduler: Arc::clone(&context.scheduler),
-    })
-}
-
-pub(crate) fn wake(waiter: &Waiter, source: WakeSource) {
-    waiter.scheduler.schedule(waiter.task, source);
-}
-
 pub fn observe(record: &dyn fmt::Debug) {
-    with_context(|context| {
-        context
-            .observations
-            .borrow_mut()
-            .push(format!("{record:?}"));
-    });
+    with_context(|context| context.trace.borrow_mut().record(record));
 }
 
 pub fn random_u64() -> u64 {
@@ -239,9 +124,9 @@ pub fn random_u64() -> u64 {
             .expect("randomness is available only in simulation")
             .next_u64();
         context
-            .observations
+            .trace
             .borrow_mut()
-            .push(format!("Random({value})"));
+            .record(&format_args!("Random({value})"));
         value
     })
 }
@@ -261,97 +146,49 @@ pub fn fault_point(point: FaultPoint) -> bool {
             }
         };
         context
-            .observations
+            .trace
             .borrow_mut()
-            .push(format!("Fault({point:?}, {result})"));
+            .record(&format_args!("Fault({point:?}, {result})"));
         if result {
-            let mut hits = context.fault_hits.borrow_mut();
-            *hits.entry(point).or_default() += 1;
+            *context.fault_hits.borrow_mut().entry(point).or_default() += 1;
         }
         result
     })
 }
 
-pub struct Delay {
-    duration: u64,
-    deadline: Option<u64>,
-    alive: Arc<AtomicBool>,
-}
+pub struct Delay(Pin<Box<dyn Future<Output = ()>>>);
 
 pub fn delay(nanoseconds: u64) -> Delay {
-    Delay {
-        duration: nanoseconds,
-        deadline: None,
-        alive: Arc::new(AtomicBool::new(true)),
+    if nanoseconds == 0 {
+        return Delay(Box::pin(tokio::task::yield_now()));
     }
+    let duration = with_context(|context| match context.mode {
+        Mode::Simulation => Duration::from_millis(nanoseconds),
+        Mode::Production => Duration::from_nanos(nanoseconds),
+    });
+    Delay(Box::pin(tokio::time::sleep(duration)))
 }
 
 impl Future for Delay {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let current_now = now();
-        if self
-            .deadline
-            .is_some_and(|deadline| current_now >= deadline)
-        {
-            self.alive.store(false, Ordering::Release);
-            return Poll::Ready(());
-        }
-        if self.deadline.is_none() {
-            let task = current_waiter().task;
-            with_context(|context| {
-                let sequence = context.timer_sequence.get();
-                context.timer_sequence.set(sequence + 1);
-                let at = current_now.saturating_add(self.duration);
-                context.timer_requests.borrow_mut().push(TimerRequest {
-                    at,
-                    sequence,
-                    task,
-                    alive: Arc::clone(&self.alive),
-                });
-                self.deadline = Some(at);
-            });
-        }
-        Poll::Pending
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
     }
 }
 
-impl Drop for Delay {
-    fn drop(&mut self) {
-        self.alive.store(false, Ordering::Release);
-    }
-}
-
-pub struct YieldNow(bool);
+pub struct YieldNow(Pin<Box<dyn Future<Output = ()>>>);
 
 pub fn yield_now() -> YieldNow {
-    YieldNow(false)
+    YieldNow(Box::pin(tokio::task::yield_now()))
 }
 
 impl Future for YieldNow {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            let waiter = current_waiter();
-            waiter.scheduler.schedule(waiter.task, WakeSource::Yield);
-            Poll::Pending
-        }
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
     }
-}
-
-struct Task {
-    future: Pin<Box<dyn Future<Output = ()>>>,
-    cancelled: Arc<AtomicBool>,
-}
-
-struct SpawnRequest {
-    task: TaskId,
-    actor: Task,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,10 +196,7 @@ pub struct Cancelled;
 
 pub struct TaskHandle<T> {
     task: TaskId,
-    result: OneReceiver<T>,
-    cancelled: Arc<AtomicBool>,
-    scheduler: Arc<Scheduler>,
-    cancel_on_drop: bool,
+    handle: Option<tokio::task::JoinHandle<T>>,
 }
 
 impl<T> TaskHandle<T> {
@@ -371,16 +205,21 @@ impl<T> TaskHandle<T> {
     }
 
     pub fn cancel(&mut self) {
-        if self.cancel_on_drop {
-            self.cancelled.store(true, Ordering::Release);
-            self.scheduler.schedule(self.task, WakeSource::Cancellation);
-            self.cancel_on_drop = false;
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 
     pub fn detach(mut self) -> TaskId {
-        self.cancel_on_drop = false;
+        self.handle.take();
         self.task
+    }
+
+    pub(crate) fn detach_abort_handle(mut self) -> (TaskId, tokio::task::AbortHandle) {
+        let handle = self.handle.take().expect("task handle already consumed");
+        let abort = handle.abort_handle();
+        drop(handle);
+        (self.task, abort)
     }
 }
 
@@ -388,13 +227,16 @@ impl<T> Future for TaskHandle<T> {
     type Output = Result<T, Cancelled>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.result).poll(cx) {
+        let Some(handle) = self.handle.as_mut() else {
+            return Poll::Ready(Err(Cancelled));
+        };
+        match Pin::new(handle).poll(cx) {
             Poll::Ready(Ok(value)) => {
-                self.cancel_on_drop = false;
+                self.handle.take();
                 Poll::Ready(Ok(value))
             }
             Poll::Ready(Err(_)) => {
-                self.cancel_on_drop = false;
+                self.handle.take();
                 Poll::Ready(Err(Cancelled))
             }
             Poll::Pending => Poll::Pending,
@@ -408,546 +250,294 @@ impl<T> Drop for TaskHandle<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Simulation,
-    Production,
+struct TaskGuard(Rc<Cell<usize>>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
+struct Scoped<F> {
+    context: RuntimeContext,
+    task: TaskId,
+    count_polls: bool,
+    trace_polls: bool,
+    future: Pin<Box<F>>,
+}
+
 struct PollRecord {
     time: u64,
     task: TaskId,
-    source: WakeSource,
 }
 
-pub struct Executor {
-    mode: Mode,
+impl fmt::Debug for PollRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Poll({}, {})", self.time, self.task)
+    }
+}
+
+impl<F: Future> Future for Scoped<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let context = self.context.clone();
+        let started = context.poll_observer.as_ref().map(|_| TokioInstant::now());
+        if self.count_polls {
+            let sequence = context.poll_sequence.get();
+            context.poll_sequence.set(sequence.saturating_add(1));
+        }
+        if self.trace_polls {
+            context.trace.borrow_mut().record(&PollRecord {
+                time: now_for(&context),
+                task: self.task,
+            });
+        }
+        let _entered = enter(context);
+        let result = self.future.as_mut().poll(cx);
+        if let (Some(observer), Some(started)) = (&self.context.poll_observer, started) {
+            observer(nanos(started.elapsed()));
+        }
+        result
+    }
+}
+
+fn scoped<F: Future>(
     context: RuntimeContext,
-    tasks: BTreeMap<TaskId, Task>,
-    timers: BTreeMap<(u64, u64), TimerRequest>,
-    trace: TraceHasher,
+    task: TaskId,
+    count_polls: bool,
+    trace_polls: bool,
+    future: F,
+) -> Scoped<F> {
+    Scoped {
+        context,
+        task,
+        count_polls,
+        trace_polls,
+        future: Box::pin(future),
+    }
 }
 
-impl Executor {
-    pub fn simulation(seed: u64) -> Self {
-        Self::new(Mode::Simulation, Some(Pcg64::new(seed, 0)), None)
-    }
+fn next_task(context: &RuntimeContext) -> TaskId {
+    let task = context.next_task.get();
+    context.next_task.set(task.saturating_add(1));
+    task
+}
 
-    pub fn production() -> Self {
-        Self::new(Mode::Production, None, None)
+fn spawn_with<F, T>(context: &RuntimeContext, future: F) -> TaskHandle<T>
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    let task = next_task(context);
+    context.live_tasks.set(context.live_tasks.get() + 1);
+    let live_tasks = Rc::clone(&context.live_tasks);
+    let trace_polls = context.trace_task_polls.get();
+    let handle = tokio::task::spawn_local(scoped(
+        context.clone(),
+        task,
+        true,
+        trace_polls,
+        async move {
+            let _guard = TaskGuard(live_tasks);
+            future.await
+        },
+    ));
+    TaskHandle {
+        task,
+        handle: Some(handle),
     }
+}
 
-    pub fn production_with_clock(clock: MonotonicClock) -> Self {
-        Self::new(Mode::Production, None, Some(clock))
-    }
+/// Spawn a child actor on the current Tokio `LocalSet`.
+pub fn spawn<F, T>(future: F) -> TaskHandle<T>
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    with_context(|context| spawn_with(context, future))
+}
 
-    fn new(mode: Mode, rng: Option<Pcg64>, clock: Option<MonotonicClock>) -> Self {
-        let scheduler = Arc::new(Scheduler::new());
+/// Install deterministic actor hooks around a future already running on Tokio.
+///
+/// Turmoil simulations use this entry point so their per-host Tokio runtime is
+/// the only scheduler and clock in the process.
+pub async fn simulation_scope<F, T>(seed: u64, faults: FaultConfig, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    SimulationContext::new(seed, faults).scope(future).await
+}
+
+/// Production actor hooks for futures running on an application-owned Tokio
+/// `LocalSet`.
+#[derive(Clone)]
+pub struct ProductionContext {
+    context: RuntimeContext,
+}
+
+impl ProductionContext {
+    pub fn new(poll_observer: impl Fn(u64) + Send + Sync + 'static) -> Self {
         Self {
-            mode,
-            context: RuntimeContext {
-                now: Rc::new(Cell::new(0)),
-                scheduler,
-                current_task: Rc::new(Cell::new(None)),
-                poll_sequence: Rc::new(Cell::new(0)),
-                timer_sequence: Rc::new(Cell::new(0)),
-                timer_requests: Rc::new(RefCell::new(Vec::new())),
-                observations: Rc::new(RefCell::new(Vec::new())),
-                rng: Rc::new(RefCell::new(rng)),
-                faults: Rc::new(RefCell::new(FaultConfig::default())),
-                fault_hits: Rc::new(RefCell::new(BTreeMap::new())),
-                clock,
-                next_task: Rc::new(Cell::new(0)),
-                spawn_requests: Rc::new(RefCell::new(Vec::new())),
-            },
-            tasks: BTreeMap::new(),
-            timers: BTreeMap::new(),
-            trace: TraceHasher::new(),
+            context: context(Mode::Production, None, Some(Arc::new(poll_observer))),
         }
     }
 
-    pub fn mode(&self) -> Mode {
-        self.mode
+    pub async fn scope<F, T>(&self, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        scoped(
+            self.context.clone(),
+            next_task(&self.context),
+            true,
+            false,
+            future,
+        )
+        .await
+    }
+}
+
+/// Deterministic hooks shared by successive incarnations of one simulated host.
+///
+/// Turmoil destroys a host's Tokio runtime on crash. Keeping these hooks outside
+/// that runtime preserves the host's RNG stream, trace, and fault coverage when
+/// Turmoil later constructs a fresh software incarnation.
+#[derive(Clone)]
+pub struct SimulationContext {
+    context: RuntimeContext,
+}
+
+impl SimulationContext {
+    pub fn new(seed: u64, faults: FaultConfig) -> Self {
+        let context = context(Mode::Simulation, Some(seed), None);
+        *context.faults.borrow_mut() = faults;
+        Self { context }
     }
 
-    pub fn now(&self) -> u64 {
-        refresh_now(&self.context)
+    /// Keep semantic observations, RNG choices, and fault decisions in the
+    /// replay hash while excluding Tokio poll order. Turmoil's socket internals
+    /// may wake equivalent tasks in a different order across fresh simulations.
+    #[must_use]
+    pub fn semantic_trace_only(self) -> Self {
+        self.context.trace_task_polls.set(false);
+        self
     }
 
-    pub fn set_fault_config(&mut self, config: FaultConfig) {
-        *self.context.faults.borrow_mut() = config;
+    pub async fn scope<F, T>(&self, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        scoped(
+            self.context.clone(),
+            next_task(&self.context),
+            true,
+            self.context.trace_task_polls.get(),
+            future,
+        )
+        .await
+    }
+
+    pub fn trace_hash(&self) -> u64 {
+        self.context.trace.borrow().finish()
     }
 
     pub fn fault_hits(&self) -> BTreeMap<FaultPoint, u64> {
         self.context.fault_hits.borrow().clone()
     }
 
-    pub fn spawn<F, T>(&mut self, future: F) -> TaskHandle<T>
-    where
-        F: Future<Output = T> + 'static,
-        T: 'static,
-    {
-        let (task, actor, handle) = prepare_spawn(&self.context, future);
-        self.tasks.insert(task, actor);
-        self.context.scheduler.schedule(task, WakeSource::Spawn);
-        handle
+    pub fn set_fault_config(&self, config: FaultConfig) {
+        *self.context.faults.borrow_mut() = config;
     }
 
-    pub fn block_on<F, T>(&mut self, future: F) -> T
-    where
-        F: Future<Output = T> + 'static,
-        T: 'static,
-    {
-        let output = Rc::new(RefCell::new(None));
-        let target = Rc::clone(&output);
-        self.spawn(async move {
-            *target.borrow_mut() = Some(future.await);
-        })
-        .detach();
-        loop {
-            if let Some(value) = output.borrow_mut().take() {
-                return value;
-            }
-            if !self.run_one() {
-                assert_eq!(
-                    self.mode,
-                    Mode::Production,
-                    "root actor stalled with no possible wake"
-                );
-                self.wait_for_wake();
-            }
-        }
-    }
-
-    pub fn run_until_stalled(&mut self) {
-        while self.run_one() {}
-    }
-
-    pub fn run_until(&mut self, horizon: u64) {
-        assert!(horizon >= self.now(), "cannot run backwards");
-        loop {
-            while self.poll_ready() {}
-            let next_timer = self.timers.keys().next().map(|key| key.0);
-            if next_timer.is_some_and(|at| at <= horizon) {
-                self.fire_next_timers();
-            } else {
-                break;
-            }
-        }
-        self.context.now.set(horizon);
-    }
-
-    pub fn advance_to(&mut self, time: u64) {
-        assert!(time >= self.now(), "cannot move clock backwards");
-        self.context.now.set(time);
-        self.fire_due_timers();
-    }
-
-    pub fn run_ready(&mut self) {
-        while self.poll_ready() {}
-    }
-
-    pub fn wait_for_wake(&self) {
-        if let Some((&(deadline, _), _)) = self.timers.first_key_value() {
-            let remaining = deadline.saturating_sub(self.now());
-            self.context
-                .scheduler
-                .wait_timeout(Duration::from_nanos(remaining));
-        } else {
-            self.context.scheduler.wait();
-        }
+    pub fn now(&self) -> u64 {
+        now_for(&self.context)
     }
 
     pub fn task_count(&self) -> usize {
-        self.tasks.len()
-    }
-
-    pub fn trace_hash(&self) -> u64 {
-        self.trace.finish()
+        self.context.live_tasks.get()
     }
 
     pub fn trace_records(&self) -> u64 {
-        self.trace.records()
+        self.context.trace.borrow().records()
     }
 
     pub fn polls(&self) -> u64 {
         self.context.poll_sequence.get()
     }
+}
 
-    fn run_one(&mut self) -> bool {
-        if self.mode == Mode::Production {
-            refresh_now(&self.context);
-            self.fire_due_timers();
-        }
-        loop {
-            if self.poll_ready() {
-                return true;
-            }
-            if self.mode != Mode::Simulation || self.timers.is_empty() {
-                return false;
-            }
-            self.fire_next_timers();
-        }
-    }
-
-    fn poll_ready(&mut self) -> bool {
-        let Some(ready) = self.context.scheduler.pop() else {
-            return false;
-        };
-        let Some(mut task) = self.tasks.remove(&ready.task) else {
-            return true;
-        };
-        if task.cancelled.load(Ordering::Acquire) {
-            return true;
-        }
-        let record = PollRecord {
-            time: self.now(),
-            task: ready.task,
-            source: ready.source,
-        };
-        self.trace.record(&record);
-        self.context
-            .poll_sequence
-            .set(self.context.poll_sequence.get().saturating_add(1));
-        self.context.current_task.set(Some(ready.task));
-        let waker = Waker::from(Arc::new(TaskWake {
-            task: ready.task,
-            scheduler: Arc::clone(&self.context.scheduler),
-        }));
-        let mut context = Context::from_waker(&waker);
-        let entered = enter(self.context.clone());
-        let result = task.future.as_mut().poll(&mut context);
-        drop(entered);
-        self.context.current_task.set(None);
-        self.drain_registrations();
-        if result.is_pending() && !task.cancelled.load(Ordering::Acquire) {
-            self.tasks.insert(ready.task, task);
-        }
-        true
-    }
-
-    fn drain_registrations(&mut self) {
-        for request in self.context.spawn_requests.borrow_mut().drain(..) {
-            self.tasks.insert(request.task, request.actor);
-            self.context
-                .scheduler
-                .schedule(request.task, WakeSource::Spawn);
-        }
-        for timer in self.context.timer_requests.borrow_mut().drain(..) {
-            self.timers.insert((timer.at, timer.sequence), timer);
-        }
-        for observation in self.context.observations.borrow_mut().drain(..) {
-            self.trace.record(&observation);
-        }
-    }
-
-    fn fire_next_timers(&mut self) {
-        let Some(time) = self.timers.keys().next().map(|key| key.0) else {
-            return;
-        };
-        self.context.now.set(time);
-        self.fire_due_timers();
-    }
-
-    fn fire_due_timers(&mut self) {
-        let now = self.now();
-        let keys: Vec<(u64, u64)> = self
-            .timers
-            .range(..=(now, u64::MAX))
-            .map(|(key, _)| *key)
-            .collect();
-        for key in keys {
-            let timer = self.timers.remove(&key).expect("timer key observed");
-            if timer.alive.swap(false, Ordering::AcqRel) {
-                self.context
-                    .scheduler
-                    .schedule(timer.task, WakeSource::Timer);
-            }
-        }
+/// Drain currently runnable local actors without advancing a paused clock.
+pub async fn run_ready() {
+    for _ in 0..256 {
+        tokio::task::yield_now().await;
     }
 }
 
-fn prepare_spawn<F, T>(context: &RuntimeContext, future: F) -> (TaskId, Task, TaskHandle<T>)
-where
-    F: Future<Output = T> + 'static,
-    T: 'static,
-{
-    let task = context.next_task.get();
-    context.next_task.set(task + 1);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let (sender, result) = oneshot();
-    let wrapped = async move {
-        let value = future.await;
-        let _ = sender.send(value);
-    };
-    let actor = Task {
-        future: Box::pin(wrapped),
-        cancelled: Arc::clone(&cancelled),
-    };
-    let handle = TaskHandle {
-        task,
-        result,
-        cancelled,
-        scheduler: Arc::clone(&context.scheduler),
-        cancel_on_drop: true,
-    };
-    (task, actor, handle)
+/// Advance a paused simulation clock to the absolute millisecond horizon.
+pub async fn advance_to(horizon: u64) {
+    delay(horizon.saturating_sub(now())).await;
+    run_ready().await;
 }
 
-/// Spawn a child actor from the currently running actor.
-pub fn spawn<F, T>(future: F) -> TaskHandle<T>
-where
-    F: Future<Output = T> + 'static,
-    T: 'static,
-{
-    with_context(|context| {
-        let (task, actor, handle) = prepare_spawn(context, future);
-        context
-            .spawn_requests
-            .borrow_mut()
-            .push(SpawnRequest { task, actor });
-        handle
-    })
+pub fn simulation_trace_hash() -> u64 {
+    with_context(|context| context.trace.borrow().finish())
+}
+
+pub fn simulation_polls() -> u64 {
+    with_context(|context| context.poll_sequence.get())
+}
+
+pub fn simulation_fault_hits() -> BTreeMap<FaultPoint, u64> {
+    with_context(|context| context.fault_hits.borrow().clone())
+}
+
+pub fn set_simulation_fault_config(config: FaultConfig) {
+    with_context(|context| *context.faults.borrow_mut() = config);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Simulation,
+    Production,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
-    use std::collections::BTreeSet;
-    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{Executor, delay, random_u64, yield_now};
-    use crate::channel::{bounded, oneshot, unbounded};
-    use crate::select::{Either, select2, timeout};
+    use super::{ProductionContext, SimulationContext, delay, observe, random_u64};
+    use crate::FaultConfig;
 
-    #[test]
-    fn spawn_and_wake_order_is_fifo() {
-        let mut executor = Executor::simulation(1);
-        let order = Rc::new(RefCell::new(Vec::new()));
-        for value in 0..8 {
-            let order = Rc::clone(&order);
-            executor
-                .spawn(async move {
-                    order.borrow_mut().push(value);
-                    yield_now().await;
-                    order.borrow_mut().push(value + 10);
-                })
-                .detach();
-        }
-        executor.run_until_stalled();
-        assert_eq!(
-            *order.borrow(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17]
-        );
-    }
-
-    #[test]
-    fn same_deadline_timers_fire_in_registration_order() {
-        let mut executor = Executor::simulation(1);
-        let order = Rc::new(RefCell::new(Vec::new()));
-        for value in 0..8 {
-            let order = Rc::clone(&order);
-            executor
-                .spawn(async move {
-                    delay(10).await;
-                    order.borrow_mut().push(value);
-                })
-                .detach();
-        }
-        executor.run_until_stalled();
-        assert_eq!(*order.borrow(), [0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(executor.now(), 10);
-    }
-
-    #[test]
-    fn dropping_handle_cancels_actor() {
-        struct DropFlag(Rc<Cell<bool>>);
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.0.set(true);
-            }
-        }
-
-        let mut executor = Executor::simulation(1);
-        let dropped = Rc::new(Cell::new(false));
-        let actor_flag = Rc::clone(&dropped);
-        let handle = executor.spawn(async move {
-            let _flag = DropFlag(actor_flag);
-            delay(100).await;
-        });
-        executor.run_ready();
-        drop(handle);
-        executor.run_ready();
-        assert!(dropped.get());
-        assert_eq!(executor.task_count(), 0);
-    }
-
-    #[test]
-    fn cancelled_timer_does_not_hide_a_later_live_timer() {
-        let mut executor = Executor::simulation(1);
-        let handle = executor.spawn(async { delay(10).await });
-        executor.run_ready();
-        drop(handle);
-        executor.run_ready();
-
-        executor.block_on(async { delay(20).await });
-
-        assert_eq!(executor.now(), 20);
-    }
-
-    #[test]
-    fn promises_and_bounded_channels_defer_wakes() {
-        let mut executor = Executor::simulation(2);
-        let (ready, waiting) = oneshot();
-        let (sender, mut receiver) = bounded(1);
-        executor
-            .spawn(async move {
-                sender.send(1).await.unwrap();
-                ready.send(()).unwrap();
-                sender.send(2).await.unwrap();
-            })
-            .detach();
-        let values = executor.block_on(async move {
-            waiting.await.unwrap();
-            vec![
-                receiver.recv().await.unwrap(),
-                receiver.recv().await.unwrap(),
-            ]
-        });
-        assert_eq!(values, [1, 2]);
-    }
-
-    #[test]
-    fn bounded_sender_requeues_after_losing_the_freed_slot() {
-        let mut executor = Executor::simulation(2);
-        let (sender, mut receiver) = bounded(1);
-        executor.block_on({
-            let sender = sender.clone();
-            async move { sender.send(0).await.unwrap() }
-        });
-
-        let first = sender.clone();
-        executor
-            .spawn(async move { first.send(1).await.unwrap() })
-            .detach();
-        let second = sender.clone();
-        let (release, released) = oneshot();
-        executor
-            .spawn(async move {
-                released.await.unwrap();
-                second.send(2).await.unwrap();
-            })
-            .detach();
-        executor.run_ready();
-
-        release.send(()).unwrap();
-        assert_eq!(receiver.try_recv(), Ok(0));
-        executor.run_ready();
-        assert_eq!(receiver.try_recv(), Ok(2));
-        executor.run_ready();
-
-        assert_eq!(receiver.try_recv(), Ok(1));
-        assert_eq!(executor.task_count(), 0);
-    }
-
-    #[test]
-    fn production_timer_fires_while_an_actor_remains_ready() {
-        let clock = Arc::new(AtomicU64::new(0));
-        let timer_clock = Arc::clone(&clock);
-        let mut executor =
-            Executor::production_with_clock(Arc::new(move || timer_clock.load(Ordering::Relaxed)));
-        let polls = Rc::new(Cell::new(0));
-        let fired_after = Rc::new(Cell::new(None));
-        let timer_polls = Rc::clone(&polls);
-        let timer_fired_after = Rc::clone(&fired_after);
-        executor
-            .spawn(async move {
+    async fn simulation_trace(seed: u64) -> u64 {
+        let context = SimulationContext::new(seed, FaultConfig::default());
+        context
+            .scope(async {
+                observe(&"begin");
+                let _ = random_u64();
                 delay(1).await;
-                timer_fired_after.set(Some(timer_polls.get()));
             })
-            .detach();
-        let spinner_polls = Rc::clone(&polls);
-        executor
-            .spawn(async move {
-                for poll in 1..=64 {
-                    spinner_polls.set(poll);
-                    clock.store(1, Ordering::Relaxed);
-                    yield_now().await;
-                }
-            })
-            .detach();
-
-        executor.run_until_stalled();
-
-        assert!(
-            fired_after.get().is_some_and(|poll| poll < 64),
-            "a due timer must not wait for continuously ready work to finish"
-        );
+            .await;
+        context.trace_hash()
     }
 
-    #[test]
-    fn select_is_declaration_ordered_and_timeout_cancels_timer() {
-        let mut executor = Executor::simulation(3);
-        let selected = executor.block_on(async {
-            let result = select2(std::future::ready(1), std::future::ready(2)).await;
-            let timed = timeout(10, std::future::ready(3)).await;
-            (result, timed)
+    #[tokio::test(start_paused = true)]
+    async fn simulation_trace_is_replayable_and_seeded() {
+        assert_eq!(simulation_trace(7).await, simulation_trace(7).await);
+        assert_ne!(simulation_trace(7).await, simulation_trace(8).await);
+    }
+
+    #[tokio::test]
+    async fn production_observer_sees_task_polls() {
+        let polls = Arc::new(AtomicU64::new(0));
+        let poll_totals = Arc::clone(&polls);
+        let context = ProductionContext::new(move |nanoseconds| {
+            poll_totals.fetch_add(nanoseconds.saturating_add(1), Ordering::Relaxed);
         });
-        assert_eq!(selected, (Either::First(1), Ok(3)));
-        assert_eq!(executor.now(), 0);
-    }
 
-    fn channel_storm(seed: u64) -> u64 {
-        let mut executor = Executor::simulation(seed);
-        let (sender, mut receiver) = unbounded();
-        for _ in 0..12 {
-            let sender = sender.clone();
-            executor
-                .spawn(async move {
-                    for _ in 0..8 {
-                        sender.send(random_u64()).unwrap();
-                        yield_now().await;
-                    }
-                })
-                .detach();
-        }
-        drop(sender);
-        executor
-            .spawn(async move { while receiver.recv().await.is_some() {} })
-            .detach();
-        executor.run_until_stalled();
-        executor.trace_hash()
-    }
+        context.scope(async { delay(1_000_000).await }).await;
 
-    #[test]
-    fn replay_identity_and_seed_divergence() {
-        for seed in 0..100 {
-            assert_eq!(channel_storm(seed), channel_storm(seed));
-        }
-        let hashes: BTreeSet<u64> = (0..100).map(channel_storm).collect();
-        assert_eq!(hashes.len(), 100);
-    }
-
-    #[test]
-    fn actors_can_spawn_owned_children() {
-        let mut executor = Executor::simulation(8);
-        let values = Rc::new(RefCell::new(Vec::new()));
-        let output = Rc::clone(&values);
-        executor.block_on(async move {
-            let child_output = Rc::clone(&output);
-            let child = super::spawn(async move {
-                yield_now().await;
-                child_output.borrow_mut().push(2);
-                7
-            });
-            output.borrow_mut().push(1);
-            assert_eq!(child.await, Ok(7));
-            output.borrow_mut().push(3);
-        });
-        assert_eq!(*values.borrow(), [1, 2, 3]);
+        assert!(polls.load(Ordering::Relaxed) > 0);
     }
 }

@@ -8,9 +8,8 @@ use crate::blx::{
     BlxFooter, EntryKind, HEADER_BYTES, NamespaceKind, TRAILER_BYTES, open_footer, open_header,
     open_trailer, scan_object,
 };
-use crate::journal::{JournalRecord, RecordKind, VsetKind};
+use crate::journal::{JournalRecord, RecordKind};
 use crate::layout::{self, BlobName};
-use crate::mapleaf::{LeafPtr, MapLeaf};
 use crate::protocol::Verdict;
 use crate::replica_spool::scan_replica_spool;
 use crate::segment::PageLoc;
@@ -28,11 +27,9 @@ struct Found {
     tombstone_segments: BTreeSet<(u64, SegId)>,
     segment_refs: BTreeMap<(u64, SegId), crate::manifest::ObjectRef>,
     segment_footers: BTreeMap<(u64, SegId), BlxFooter>,
-    leaves: BTreeMap<LeafPtr, (u64, MapLeaf)>,
     names: Vec<String>,
     max_seq: u64,
     max_seg: u64,
-    max_leaf: u64,
     handoff: Option<crate::types::HostId>,
 }
 
@@ -151,11 +148,7 @@ pub async fn recover_local<W: Blobs>(
         let mut state_checksum = chosen.post_state_checksum;
         let mut vmm_segments = materialize_vmm_segments(&chosen.files, &found);
         let mut pending_tombstones = BTreeSet::new();
-        let verdict = if chosen.config.kind == VsetKind::Database {
-            Verdict::DatabaseReady {
-                synced_through: chosen.sync_covered_through,
-            }
-        } else if let RecordKind::Checkpoint { epoch, vmstate, .. } = chosen.kind
+        let verdict = if let RecordKind::Checkpoint { epoch, vmstate, .. } = chosen.kind
             && chosen.capture_seq >= watermark
         {
             Verdict::Resume { epoch, vmstate }
@@ -190,7 +183,6 @@ pub async fn recover_local<W: Blobs>(
         let incarnation = host.allocate_incarnation();
         let mut recovered = VsetState::fresh(chosen.config, incarnation);
         recovered.ready = false;
-        recovered.database = chosen.database;
         recovered.peer_source = chosen.migrated_from.map(|source| source.host);
         recovered.peer_source_offer_fence =
             chosen.migrated_from.and_then(|source| source.offer_fence);
@@ -198,7 +190,6 @@ pub async fn recover_local<W: Blobs>(
         recovered.mutation_seq = chosen.capture_seq;
         recovered.next_seq = found.max_seq;
         recovered.next_seg = found.max_seg;
-        recovered.next_leaf = found.max_leaf;
         recovered.next_gen = found
             .segment_footers
             .values()
@@ -214,7 +205,6 @@ pub async fn recover_local<W: Blobs>(
         recovered.local_covered_through = watermark.max(chosen.sync_covered_through);
         recovered.sync_ack_through = chosen.sync_covered_through;
         recovered.peer_committed_through = chosen.sync_covered_through;
-        recovered.overlay = page_locs.clone();
         recovered.page_locs = page_locs;
         recovered.block_checksums = block_checksums;
         recovered.state_checksum = state_checksum;
@@ -348,8 +338,6 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: &BlobEntry) {
     let vset = match parsed {
         BlobName::Journal { vset, .. }
         | BlobName::Segment { vset, .. }
-        | BlobName::Leaf { vset, .. }
-        | BlobName::BaseLeaf { vset, .. }
         | BlobName::Handoff { vset } => vset,
         BlobName::ReplicaSpool { .. } => return,
     };
@@ -401,23 +389,6 @@ fn collect_blob(found: &mut BTreeMap<VsetId, Found>, blob: &BlobEntry) {
                     .segment_refs
                     .insert((fence, seg), crate::manifest::ObjectRef::from_blx(&object));
                 entry.segment_footers.insert((fence, seg), object.footer);
-            }
-        }
-        BlobName::Leaf { fence, id, .. } => {
-            entry.max_leaf = entry.max_leaf.max(id + 1);
-            if let Ok(leaf) = MapLeaf::decode(vset, fence, id, &blob.bytes) {
-                entry
-                    .leaves
-                    .insert(LeafPtr { base: 0, fence, id }, (blob.len, leaf));
-            }
-        }
-        BlobName::BaseLeaf {
-            base, fence, id, ..
-        } => {
-            if let Ok(leaf) = MapLeaf::decode(VsetId(base), fence, id, &blob.bytes) {
-                entry
-                    .leaves
-                    .insert(LeafPtr { base, fence, id }, (blob.len, leaf));
             }
         }
         BlobName::Handoff { .. } => {
@@ -666,18 +637,19 @@ fn materialize_vmm_segments(
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::future::Future;
     use std::rc::Rc;
 
-    use blockd_exec::Executor;
+    use blockd_exec::{FaultConfig, simulation_scope};
 
     use super::*;
     use crate::blx::BlockKey;
     use crate::format::{checksum64, crc32c};
     use crate::hostmeta::HostConfig;
-    use crate::journal::{DatabaseMeta, RecordKind, VsetConfig, VsetKind};
+    use crate::journal::{RecordKind, VsetConfig, VsetKind};
     use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
     use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
-    use crate::segment::{SegmentBatchBuilder, SegmentBuilder};
+    use crate::segment::SegmentBatchBuilder;
     use crate::types::{Gen, HostId, PageNo, VolumeId, VolumeIdx, page_size};
     use crate::world::BlobError;
 
@@ -807,12 +779,16 @@ mod tests {
         )))
     }
 
+    async fn simulate<T>(seed: u64, future: impl Future<Output = T>) -> T {
+        simulation_scope(seed, FaultConfig::default(), future).await
+    }
+
     fn file_ref(bytes: &[u8]) -> crate::manifest::ObjectRef {
         crate::manifest::ObjectRef::from_blx(&crate::blx::open_object(bytes).expect("valid BLX"))
     }
 
-    #[test]
-    fn recovery_rejects_a_record_with_a_missing_segment() {
+    #[tokio::test(start_paused = true)]
+    async fn recovery_rejects_a_record_with_a_missing_segment() {
         let vset = VsetId(1);
         let page = PageId {
             volume: VolumeId {
@@ -821,9 +797,9 @@ mod tests {
             },
             page: PageNo(0),
         };
-        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        let mut builder = SegmentBatchBuilder::new(vset, 1, SegId(0));
         builder.add(page, Gen(1), &vec![7; page_size()]);
-        let (segment, locations) = builder.finish();
+        let (_, segment, locations) = builder.finish().pop().expect("fixture object");
         let record = JournalRecord {
             config: VsetConfig::compute(1, 4),
             seq: JournalSeq(0),
@@ -832,10 +808,8 @@ mod tests {
             capture_seq: 1,
             sync_covered_through: 1,
             post_state_checksum: 0,
-            database: DatabaseMeta::default(),
             files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let world = Rc::new(TestBlobs::default());
@@ -844,18 +818,17 @@ mod tests {
             record.encode(vset),
         );
         let state = test_state();
-        let mut executor = Executor::simulation(2);
-        let verdicts = executor
-            .block_on({
-                let world = Rc::clone(&world);
-                async move { recover_local(state, world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        let verdicts = simulate(2, {
+            let world = Rc::clone(&world);
+            async move { recover_local(state, world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
         assert_eq!(verdicts.get(&vset), Some(&Verdict::Unrestorable));
     }
 
-    #[test]
-    fn recovery_uses_segment_metadata_without_reading_payloads() {
+    #[tokio::test(start_paused = true)]
+    async fn recovery_uses_segment_metadata_without_reading_payloads() {
         let vset = VsetId(3);
         let page = PageId {
             volume: VolumeId {
@@ -864,9 +837,9 @@ mod tests {
             },
             page: PageNo(0),
         };
-        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        let mut builder = SegmentBatchBuilder::new(vset, 1, SegId(0));
         builder.add(page, Gen(1), &vec![7; page_size()]);
-        let (segment, locations) = builder.finish();
+        let (_, segment, locations) = builder.finish().pop().expect("fixture object");
         let record = JournalRecord {
             config: VsetConfig::compute(1, 4),
             seq: JournalSeq(0),
@@ -875,10 +848,8 @@ mod tests {
             capture_seq: 1,
             sync_covered_through: 1,
             post_state_checksum: 0,
-            database: DatabaseMeta::default(),
             files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let blobs = TestBlobs::default();
@@ -891,23 +862,21 @@ mod tests {
             record.encode(vset),
         );
         let world = Rc::new(MetadataOnlyBlobs(blobs));
-        let mut executor = Executor::simulation(2);
-
         let state = test_state();
-        let verdicts = executor
-            .block_on({
-                let state = Rc::clone(&state);
-                let world = Rc::clone(&world);
-                async move { recover_local(state, world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        let verdicts = simulate(2, {
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move { recover_local(state, world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
 
         assert_eq!(verdicts.get(&vset), None);
         assert_eq!(state.borrow().vsets[&vset].local_covered_through, 1);
     }
 
-    #[test]
-    fn recovery_accepts_a_local_delta_over_an_archived_baseline() {
+    #[tokio::test(start_paused = true)]
+    async fn recovery_accepts_a_local_delta_over_an_archived_baseline() {
         let vset = VsetId(6);
         let page = PageId {
             volume: VolumeId {
@@ -948,10 +917,8 @@ mod tests {
             capture_seq: 8,
             sync_covered_through: 8,
             post_state_checksum,
-            database: DatabaseMeta::default(),
             files: vec![file_ref(&segment_bytes)],
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let world = Rc::new(TestBlobs::default());
@@ -964,15 +931,13 @@ mod tests {
             record.encode(vset),
         );
         let state = test_state();
-        let mut executor = Executor::simulation(8);
-
-        let verdicts = executor
-            .block_on({
-                let state = Rc::clone(&state);
-                let world = Rc::clone(&world);
-                async move { recover_local(state, world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        let verdicts = simulate(8, {
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move { recover_local(state, world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
 
         assert_eq!(verdicts.get(&vset), None);
         assert_eq!(
@@ -981,8 +946,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recovery_accepts_an_empty_local_delta_over_an_archived_baseline() {
+    #[tokio::test(start_paused = true)]
+    async fn recovery_accepts_an_empty_local_delta_over_an_archived_baseline() {
         let vset = VsetId(7);
         let post_state_checksum = 0xfeed_face_cafe_beef;
         let record = JournalRecord {
@@ -997,10 +962,8 @@ mod tests {
             capture_seq: 11,
             sync_covered_through: 11,
             post_state_checksum,
-            database: DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let world = Rc::new(TestBlobs::default());
@@ -1009,15 +972,13 @@ mod tests {
             record.encode(vset),
         );
         let state = test_state();
-        let mut executor = Executor::simulation(9);
-
-        let verdicts = executor
-            .block_on({
-                let state = Rc::clone(&state);
-                let world = Rc::clone(&world);
-                async move { recover_local(state, world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        let verdicts = simulate(9, {
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move { recover_local(state, world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
 
         assert_eq!(verdicts.get(&vset), None);
         assert_eq!(
@@ -1026,8 +987,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cold_boot_schedules_tombstones_for_discarded_state_in_mixed_batches() {
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)]
+    async fn cold_boot_schedules_tombstones_for_discarded_state_in_mixed_batches() {
         let vset = VsetId(5);
         let config = VsetConfig::compute(1, 4);
         let memory_page = PageId {
@@ -1085,13 +1047,11 @@ mod tests {
             capture_seq: 1,
             sync_covered_through: 1,
             post_state_checksum: state_checksum,
-            database: DatabaseMeta::default(),
             files: objects
                 .iter()
                 .map(|(_, bytes, _)| file_ref(bytes))
                 .collect(),
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let world = Rc::new(TestBlobs::default());
@@ -1106,14 +1066,13 @@ mod tests {
             record.encode(vset),
         );
         let state = test_state();
-        let mut executor = Executor::simulation(6);
-        executor
-            .block_on({
-                let state = Rc::clone(&state);
-                let world = Rc::clone(&world);
-                async move { recover_local(state, world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        simulate(6, {
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move { recover_local(state, world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
 
         let host = state.borrow();
         let recovered = &host.vsets[&vset];
@@ -1136,10 +1095,10 @@ mod tests {
         assert!(!recovered.archived_memory_usable);
     }
 
-    #[test]
-    fn unrestorable_outbound_handoff_keeps_source_blobs() {
+    #[tokio::test(start_paused = true)]
+    async fn unrestorable_outbound_handoff_keeps_source_blobs() {
         let vset = VsetId(4);
-        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        let mut builder = SegmentBatchBuilder::new(vset, 1, SegId(0));
         let page = PageId {
             volume: VolumeId {
                 vset,
@@ -1148,29 +1107,27 @@ mod tests {
             page: PageNo(0),
         };
         builder.add(page, Gen(1), &vec![9; page_size()]);
-        let (segment, _) = builder.finish();
+        let (_, segment, _) = builder.finish().pop().expect("fixture object");
         let segment_name = layout::segment_blob(vset, 1, SegId(0));
         let handoff_name = layout::handoff_blob(vset);
         let handoff = super::super::migration::encode_handoff(vset, HostId(9));
         let world = Rc::new(TestBlobs::default());
         world.0.borrow_mut().insert(segment_name.clone(), segment);
         world.0.borrow_mut().insert(handoff_name.clone(), handoff);
-        let mut executor = Executor::simulation(3);
-
-        let verdicts = executor
-            .block_on({
-                let world = Rc::clone(&world);
-                async move { recover_local(test_state(), world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        let verdicts = simulate(3, {
+            let world = Rc::clone(&world);
+            async move { recover_local(test_state(), world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
 
         assert_eq!(verdicts.get(&vset), Some(&Verdict::Unrestorable));
         assert!(world.0.borrow().contains_key(&segment_name));
         assert!(world.0.borrow().contains_key(&handoff_name));
     }
 
-    #[test]
-    fn unusable_newer_record_does_not_advance_recovery_watermark() {
+    #[tokio::test(start_paused = true)]
+    async fn unusable_newer_record_does_not_advance_recovery_watermark() {
         let vset = VsetId(2);
         let page = PageId {
             volume: VolumeId {
@@ -1180,9 +1137,9 @@ mod tests {
             page: PageNo(0),
         };
         let page_bytes = vec![3; page_size()];
-        let mut builder = SegmentBuilder::new(vset, 1, SegId(0));
+        let mut builder = SegmentBatchBuilder::new(vset, 1, SegId(0));
         builder.add(page, Gen(1), &page_bytes);
-        let (segment, locations) = builder.finish();
+        let (_, segment, locations) = builder.finish().pop().expect("fixture object");
         let config = VsetConfig::compute(1, 4);
         let checkpoint = JournalRecord {
             config,
@@ -1200,10 +1157,8 @@ mod tests {
                 Gen(1),
                 checksum64(&page_bytes),
             ),
-            database: DatabaseMeta::default(),
             files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let mut missing = locations[0].2;
@@ -1220,55 +1175,55 @@ mod tests {
             ..checkpoint.clone()
         };
         let world = Rc::new(TestBlobs::default());
-        let mut blobs = world.0.borrow_mut();
-        blobs.insert(layout::segment_blob(vset, 1, SegId(0)), segment.clone());
-        blobs.insert(
-            layout::journal_blob(vset, 1, checkpoint.seq),
-            checkpoint.encode(vset),
-        );
-        blobs.insert(
-            layout::journal_blob(vset, 1, unusable.seq),
-            unusable.encode(vset),
-        );
-        drop(blobs);
+        {
+            let mut blobs = world.0.borrow_mut();
+            blobs.insert(layout::segment_blob(vset, 1, SegId(0)), segment.clone());
+            blobs.insert(
+                layout::journal_blob(vset, 1, checkpoint.seq),
+                checkpoint.encode(vset),
+            );
+            blobs.insert(
+                layout::journal_blob(vset, 1, unusable.seq),
+                unusable.encode(vset),
+            );
+        }
         let state = test_state();
-        let mut executor = Executor::simulation(3);
-        let verdicts = executor
-            .block_on({
-                let state = Rc::clone(&state);
-                let world = Rc::clone(&world);
-                async move { recover_local(state, world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        let verdicts = simulate(3, {
+            let state = Rc::clone(&state);
+            let world = Rc::clone(&world);
+            async move { recover_local(state, world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
         assert_eq!(verdicts.get(&vset), None);
         assert_eq!(state.borrow().vsets[&vset].local_covered_through, 5);
 
         let mut sane_unusable = unusable;
         sane_unusable.sync_covered_through = sane_unusable.capture_seq;
         let world = Rc::new(TestBlobs::default());
-        let mut blobs = world.0.borrow_mut();
-        blobs.insert(layout::segment_blob(vset, 1, SegId(0)), segment);
-        blobs.insert(
-            layout::journal_blob(vset, 1, checkpoint.seq),
-            checkpoint.encode(vset),
-        );
-        blobs.insert(
-            layout::journal_blob(vset, 1, sane_unusable.seq),
-            sane_unusable.encode(vset),
-        );
-        drop(blobs);
-        let mut executor = Executor::simulation(4);
-        let verdicts = executor
-            .block_on({
-                let world = Rc::clone(&world);
-                async move { recover_local(test_state(), world.as_ref()).await }
-            })
-            .expect("scan succeeds");
+        {
+            let mut blobs = world.0.borrow_mut();
+            blobs.insert(layout::segment_blob(vset, 1, SegId(0)), segment);
+            blobs.insert(
+                layout::journal_blob(vset, 1, checkpoint.seq),
+                checkpoint.encode(vset),
+            );
+            blobs.insert(
+                layout::journal_blob(vset, 1, sane_unusable.seq),
+                sane_unusable.encode(vset),
+            );
+        }
+        let verdicts = simulate(4, {
+            let world = Rc::clone(&world);
+            async move { recover_local(test_state(), world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
         assert_eq!(verdicts.get(&vset), Some(&Verdict::Unrestorable));
     }
 
-    #[test]
-    fn replica_recovery_joins_generations_and_truncates_only_the_torn_tail() {
+    #[tokio::test(start_paused = true)]
+    async fn replica_recovery_joins_generations_and_truncates_only_the_torn_tail() {
         let source = HostId(4);
         let vset = VsetId(9);
         let assignment_epoch = 2;
@@ -1279,9 +1234,9 @@ mod tests {
             },
             page: PageNo(0),
         };
-        let mut builder = SegmentBuilder::new(vset, 7, SegId(3));
+        let mut builder = SegmentBatchBuilder::new(vset, 7, SegId(3));
         builder.add(page, Gen(1), &vec![0x61; page_size()]);
-        let (segment, locations) = builder.finish();
+        let (_, segment, locations) = builder.finish().pop().expect("fixture object");
         let artifact = ReplicaArtifact::Segment {
             fence: 7,
             seg: SegId(3),
@@ -1303,10 +1258,8 @@ mod tests {
             capture_seq: 11,
             sync_covered_through: info.sync_covered_through,
             post_state_checksum: 0,
-            database: DatabaseMeta::default(),
             files: vec![file_ref(&segment)],
             overlay: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         }
         .encode(vset);
@@ -1339,12 +1292,12 @@ mod tests {
                 replica_placement: None,
             },
         )));
-        let mut executor = Executor::simulation(1);
-        let recovered = executor.block_on({
+        let recovered = simulate(1, {
             let state = Rc::clone(&state);
             let world = Rc::clone(&world);
             async move { recover_local(state, world.as_ref()).await }
-        });
+        })
+        .await;
         assert_eq!(recovered.expect("recovery succeeds"), BTreeMap::new());
         let host = state.borrow();
         let key = ReplicaKey {

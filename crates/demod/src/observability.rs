@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter, Write as _};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -23,9 +25,6 @@ use opentelemetry_otlp::{SpanExporter, WithHttpConfig as _};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
-};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -156,10 +155,30 @@ fn otlp_enabled() -> bool {
 }
 
 pub struct Metrics {
-    registry: Registry,
-    http_requests: IntCounterVec,
-    http_duration: HistogramVec,
-    http_in_flight: IntGauge,
+    requests: Mutex<BTreeMap<(String, String, u16), u64>>,
+    durations: Mutex<BTreeMap<(String, String), HttpHistogram>>,
+    in_flight: AtomicU64,
+}
+
+const HTTP_DURATION_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+#[derive(Clone, Debug)]
+struct HttpHistogram {
+    buckets: Vec<u64>,
+    count: u64,
+    sum: f64,
+}
+
+impl Default for HttpHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: vec![0; HTTP_DURATION_BUCKETS.len()],
+            count: 0,
+            sum: 0.0,
+        }
+    }
 }
 
 pub struct RequestMetrics {
@@ -178,15 +197,30 @@ impl RequestMetrics {
 
 impl Drop for RequestMetrics {
     fn drop(&mut self) {
-        self.metrics.http_in_flight.dec();
-        self.metrics
-            .http_requests
-            .with_label_values(&[&self.method, &self.route, &self.status.to_string()])
-            .inc();
-        self.metrics
-            .http_duration
-            .with_label_values(&[&self.method, &self.route])
-            .observe(self.started.elapsed().as_secs_f64());
+        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+        *self
+            .metrics
+            .requests
+            .lock()
+            .expect("HTTP request metrics lock")
+            .entry((self.method.clone(), self.route.clone(), self.status))
+            .or_default() += 1;
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let mut histograms = self
+            .metrics
+            .durations
+            .lock()
+            .expect("HTTP duration metrics lock");
+        let histogram = histograms
+            .entry((self.method.clone(), self.route.clone()))
+            .or_default();
+        histogram.count += 1;
+        histogram.sum += elapsed;
+        for (index, bound) in HTTP_DURATION_BUCKETS.iter().enumerate() {
+            if elapsed <= *bound {
+                histogram.buckets[index] += 1;
+            }
+        }
     }
 }
 
@@ -233,58 +267,15 @@ pub struct StoreMetrics {
 
 impl Metrics {
     pub fn new() -> Metrics {
-        let registry = Registry::new();
-        let http_requests = IntCounterVec::new(
-            Opts::new(
-                "blockd_http_requests_total",
-                "HTTP requests completed by the control API.",
-            ),
-            &["method", "route", "status_code"],
-        )
-        .expect("HTTP request counter");
-        let http_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "blockd_http_request_duration_seconds",
-                "Control API request duration in seconds.",
-            )
-            .buckets(vec![
-                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-            ]),
-            &["method", "route"],
-        )
-        .expect("HTTP duration histogram");
-        let http_in_flight = IntGauge::with_opts(Opts::new(
-            "blockd_http_requests_in_flight",
-            "Control API requests currently being handled.",
-        ))
-        .expect("HTTP in-flight gauge");
-
-        registry
-            .register(Box::new(http_requests.clone()))
-            .expect("register HTTP request counter");
-        registry
-            .register(Box::new(http_duration.clone()))
-            .expect("register HTTP duration histogram");
-        registry
-            .register(Box::new(http_in_flight.clone()))
-            .expect("register HTTP in-flight gauge");
-        #[cfg(target_os = "linux")]
-        registry
-            .register(Box::new(
-                prometheus::process_collector::ProcessCollector::for_self(),
-            ))
-            .expect("register process collector");
-
         Metrics {
-            registry,
-            http_requests,
-            http_duration,
-            http_in_flight,
+            requests: Mutex::new(BTreeMap::new()),
+            durations: Mutex::new(BTreeMap::new()),
+            in_flight: AtomicU64::new(0),
         }
     }
 
     pub fn start_request(self: &Arc<Metrics>, method: &str, route: &str) -> RequestMetrics {
-        self.http_in_flight.inc();
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
         RequestMetrics {
             metrics: self.clone(),
             method: method.to_owned(),
@@ -297,12 +288,8 @@ impl Metrics {
 
     #[allow(clippy::too_many_lines)]
     pub fn encode(&self, snapshot: &MetricsSnapshot) -> String {
-        let encoder = TextEncoder::new();
-        let mut bytes = Vec::new();
-        encoder
-            .encode(&self.registry.gather(), &mut bytes)
-            .expect("encode registered metrics");
-        let mut out = String::from_utf8(bytes).expect("Prometheus text is UTF-8");
+        let mut out = String::new();
+        append_http_metrics(&mut out, self);
 
         append_family(
             &mut out,
@@ -440,8 +427,90 @@ impl Metrics {
     }
 
     pub fn content_type() -> &'static str {
-        prometheus::TEXT_FORMAT
+        "text/plain; version=0.0.4"
     }
+}
+
+fn append_http_metrics(out: &mut String, metrics: &Metrics) {
+    append_family(
+        out,
+        "blockd_http_requests_total",
+        "HTTP requests completed by the control API.",
+        "counter",
+    );
+    for ((method, route, status), count) in metrics
+        .requests
+        .lock()
+        .expect("HTTP request metrics lock")
+        .iter()
+    {
+        append_sample(
+            out,
+            "blockd_http_requests_total",
+            &format!(
+                "method=\"{}\",route=\"{}\",status_code=\"{status}\"",
+                escape_label(method),
+                escape_label(route)
+            ),
+            count,
+        );
+    }
+    append_family(
+        out,
+        "blockd_http_request_duration_seconds",
+        "Control API request duration in seconds.",
+        "histogram",
+    );
+    for ((method, route), histogram) in metrics
+        .durations
+        .lock()
+        .expect("HTTP duration metrics lock")
+        .iter()
+    {
+        let labels = format!(
+            "method=\"{}\",route=\"{}\"",
+            escape_label(method),
+            escape_label(route)
+        );
+        for (bound, count) in HTTP_DURATION_BUCKETS.iter().zip(&histogram.buckets) {
+            append_sample(
+                out,
+                "blockd_http_request_duration_seconds_bucket",
+                &format!("{labels},le=\"{bound}\""),
+                count,
+            );
+        }
+        append_sample(
+            out,
+            "blockd_http_request_duration_seconds_bucket",
+            &format!("{labels},le=\"+Inf\""),
+            histogram.count,
+        );
+        append_sample(
+            out,
+            "blockd_http_request_duration_seconds_sum",
+            &labels,
+            histogram.sum,
+        );
+        append_sample(
+            out,
+            "blockd_http_request_duration_seconds_count",
+            &labels,
+            histogram.count,
+        );
+    }
+    append_family(
+        out,
+        "blockd_http_requests_in_flight",
+        "Control API requests currently being handled.",
+        "gauge",
+    );
+    append_sample(
+        out,
+        "blockd_http_requests_in_flight",
+        "",
+        metrics.in_flight.load(Ordering::Relaxed),
+    );
 }
 
 fn append_source_histograms(
@@ -489,13 +558,6 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
         "Page faults currently waiting for a cache slot.",
         stats.pressure_waiting_faults,
     );
-    append_gauge(
-        out,
-        "blockd_parked_faults",
-        "All page faults currently parked on pressure, storage, or map hydration.",
-        stats.parked_faults,
-    );
-
     append_family(
         out,
         "blockd_nvme_bytes",
@@ -578,7 +640,6 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
         for (page_state, value) in [
             ("dirty", vset.dirty_pages),
             ("unstable", vset.unstable_pages),
-            ("parked", vset.parked_faults),
             ("hydration_remaining", vset.hydration_remaining_pages),
         ] {
             append_sample(
@@ -588,17 +649,12 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
                 value,
             );
         }
-        for (kind, value) in [
-            ("sync", vset.pending_syncs),
-            ("map_leaf", vset.pending_leaf_spans),
-        ] {
-            append_sample(
-                out,
-                "blockd_vset_pending",
-                &format!("vset_id=\"{id}\",kind=\"{kind}\""),
-                value,
-            );
-        }
+        append_sample(
+            out,
+            "blockd_vset_pending",
+            &format!("vset_id=\"{id}\",kind=\"sync\""),
+            vset.pending_syncs,
+        );
         if let Some(lag) = vset.archive_lag_captures {
             append_sample(
                 out,
@@ -973,8 +1029,6 @@ fn append_runtime_counters(out: &mut String, counters: &Counters) {
         wedged_guests => "Guest-service liveness wedge detections.",
         wedged_hydration => "Hydration liveness wedge detections.",
         wedged_outbound => "Outbound migration liveness wedge detections.",
-        leaf_rolls => "Map spans rolled into new leaf blobs.",
-        leaf_fills => "Map leaves hydrated lazily.",
         segs_compacted => "Mostly-dead segments compacted.",
         pages_compacted => "Live pages rewritten by compaction.",
         replica_capacity_backpressure => "Passive writes held because host-wide spool hard capacity is exhausted.",
@@ -1093,7 +1147,7 @@ mod tests {
         let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        assert_eq!((custom.len(), custom_hash), (15_855, 0xf643_0b55_63e8_7571));
+        assert_eq!((custom.len(), custom_hash), (15_290, 0x5435_32e0_7411_814d));
     }
 
     #[test]
@@ -1129,9 +1183,7 @@ mod tests {
                     fence: 8,
                     dirty_pages: 3,
                     unstable_pages: 4,
-                    parked_faults: 1,
                     pending_syncs: 2,
-                    pending_leaf_spans: 5,
                     hydration_remaining_pages: 9,
                     archive_lag_captures: Some(6),
                     archive_lag_bytes: Some(3072),

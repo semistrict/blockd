@@ -7,12 +7,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 use blockd_hostmem::page_size;
-use blockd_runtime::fc::{PartTable, upload_mem_parts};
-use blockd_runtime::{S3LatencyModel, S3Store};
+use blockd_runtime::GcsStore;
+use blockd_runtime::fc::{PartTable, upload_mem_parts_async};
+
+mod support;
 
 const PART_BYTES: u64 = 4 * 1024 * 1024;
 const PARTS: u64 = 6;
@@ -21,7 +22,7 @@ const MEM_BYTES: u64 = PART_BYTES * PARTS;
 /// A latency-injected bucket holding `PARTS` recognizable parts, and the
 /// shmem file fills land in. Same-region GET of a 4 MiB part costs
 /// ~12ms first-byte + ~44ms transfer ≈ 56ms.
-fn store_and_shmem(tag: &str) -> (Arc<S3Store>, Arc<std::fs::File>, PathBuf) {
+async fn store_and_shmem(tag: &str) -> (support::TestGcs, Arc<std::fs::File>, PathBuf) {
     let scratch = PathBuf::from(format!("/var/tmp/blockd-scratch/partfetch-{tag}"));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("scratch");
@@ -30,13 +31,17 @@ fn store_and_shmem(tag: &str) -> (Arc<S3Store>, Arc<std::fs::File>, PathBuf) {
         .map(|i| u8::try_from((i / PART_BYTES + 1) * 17 % 251).expect("fits"))
         .collect();
     std::fs::write(&mem_path, &mem).expect("mem file");
-    let mut store = Arc::new(S3Store::new());
-    let parts = upload_mem_parts(&store, &mem_path, "v/0000000000000009/mem", PART_BYTES);
+    let gcs = support::test_gcs(&format!("part-{tag}")).await;
+    let store = gcs.store.clone();
+    let parts = upload_mem_parts_async(
+        store.clone(),
+        mem_path,
+        "v/0000000000000009/mem".to_owned(),
+        PART_BYTES,
+    )
+    .await;
     assert_eq!(parts, PARTS);
-    Arc::get_mut(&mut store)
-        .expect("upload released its store reference")
-        .s3
-        .set_latency(S3LatencyModel::same_region());
+    gcs.fake.latency_ms.store(56, Ordering::SeqCst);
     let shmem_file = scratch.join("shmem");
     let shmem = Arc::new(
         std::fs::OpenOptions::new()
@@ -47,10 +52,10 @@ fn store_and_shmem(tag: &str) -> (Arc<S3Store>, Arc<std::fs::File>, PathBuf) {
             .expect("shmem"),
     );
     shmem.set_len(MEM_BYTES).expect("size");
-    (store, shmem, scratch)
+    (gcs, shmem, scratch)
 }
 
-fn cold_table(store: &Arc<S3Store>, shmem: &Arc<std::fs::File>, readahead: u64) -> Arc<PartTable> {
+fn cold_table(store: &Arc<GcsStore>, shmem: &Arc<std::fs::File>, readahead: u64) -> Arc<PartTable> {
     PartTable::store(
         store.clone(),
         "v/0000000000000009/mem".to_owned(),
@@ -79,11 +84,11 @@ fn assert_part_filled(shmem: &std::fs::File, part: u64) {
 /// concurrent faults on one part share ONE fetch (exactly one `GetObject`
 /// per part — the dedupe is what keeps a fork fleet from multiplying the
 /// bill).
-#[test]
-fn a_fault_storm_fetches_distinct_parts_concurrently_and_dedupes_within() {
-    let (store, shmem, _scratch) = store_and_shmem("storm");
-    let table = cold_table(&store, &shmem, 0);
-    let (tx, rx) = channel();
+#[tokio::test]
+async fn a_fault_storm_fetches_distinct_parts_concurrently_and_dedupes_within() {
+    let (gcs, shmem, _scratch) = store_and_shmem("storm").await;
+    let table = cold_table(&gcs.store, &shmem, 0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let started = Instant::now();
     for part in 0..PARTS {
         for faulter in 0..3 {
@@ -99,14 +104,19 @@ fn a_fault_storm_fetches_distinct_parts_concurrently_and_dedupes_within() {
     }
     let mut woken = Vec::new();
     for _ in 0..PARTS * 3 {
-        woken.push(rx.recv_timeout(Duration::from_secs(10)).expect("wake"));
+        woken.push(
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("wake timeout")
+                .expect("wake"),
+        );
     }
     let elapsed = started.elapsed();
     woken.sort_unstable();
     let expected: Vec<u64> = (0..PARTS).flat_map(|p| [p, p, p]).collect();
     assert_eq!(woken, expected, "every fault woken exactly once");
     assert_eq!(
-        store.s3.stats.get_object.load(Ordering::SeqCst),
+        u64::try_from(gcs.fake.method_count("GET")).expect("GET count fits u64"),
         PARTS,
         "one GetObject per part, regardless of faulters"
     );
@@ -124,11 +134,11 @@ fn a_fault_storm_fetches_distinct_parts_concurrently_and_dedupes_within() {
 
 /// A fault into a part mid-fetch parks and wakes on the ONE in-flight
 /// fetch; a fault after completion wakes inline with no new request.
-#[test]
-fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
-    let (store, shmem, _scratch) = store_and_shmem("join");
-    let table = cold_table(&store, &shmem, 0);
-    let (tx, rx) = channel();
+#[tokio::test]
+async fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
+    let (gcs, shmem, _scratch) = store_and_shmem("join").await;
+    let table = cold_table(&gcs.store, &shmem, 0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let first = tx.clone();
     table.fault(0, move || first.send("first").expect("send"));
     // Immediately behind it, while the fetch is in flight.
@@ -137,11 +147,17 @@ fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
         second.send("second").expect("send");
     });
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).expect("wake"),
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("wake timeout")
+            .expect("wake"),
         "first"
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).expect("wake"),
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("wake timeout")
+            .expect("wake"),
         "second"
     );
     // Ready now: the wake is synchronous and free.
@@ -151,7 +167,10 @@ fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
         third.send("third").expect("send");
     });
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(1)).expect("wake"),
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("wake timeout")
+            .expect("wake"),
         "third"
     );
     assert!(
@@ -159,7 +178,7 @@ fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
         "ready part stalled"
     );
     assert_eq!(
-        store.s3.stats.get_object.load(Ordering::SeqCst),
+        gcs.fake.method_count("GET"),
         1,
         "three faults on one part cost one GetObject"
     );
@@ -170,25 +189,37 @@ fn late_faults_join_the_inflight_fetch_and_ready_parts_wake_inline() {
 /// flight (or done) instead of paying a full round-trip at each part
 /// boundary — and readahead never chains off its own fills into eagerly
 /// streaming the whole memory.
-#[test]
-fn readahead_keeps_the_next_part_in_flight_for_a_sequential_reader() {
-    let (store, shmem, _scratch) = store_and_shmem("readahead");
-    let table = cold_table(&store, &shmem, 1);
-    let (tx, rx) = channel();
+#[tokio::test]
+async fn readahead_keeps_the_next_part_in_flight_for_a_sequential_reader() {
+    let (gcs, shmem, _scratch) = store_and_shmem("readahead").await;
+    let table = cold_table(&gcs.store, &shmem, 1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let first = tx.clone();
     table.fault(0, move || first.send(0u64).expect("send"));
-    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).expect("wake"), 0);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("wake timeout")
+            .expect("wake"),
+        0
+    );
     // Part 1's fetch was started by part 0's DEMAND fault, concurrently:
     // the sequential reader reaches it with the round-trip already paid.
     assert_eq!(
-        store.s3.stats.get_object.load(Ordering::SeqCst),
+        gcs.fake.method_count("GET"),
         2,
         "part 0's demand fault must have issued part 1's readahead"
     );
     let started = Instant::now();
     let second = tx.clone();
     table.fault(PART_BYTES, move || second.send(1).expect("send"));
-    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).expect("wake"), 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("wake timeout")
+            .expect("wake"),
+        1
+    );
     assert!(
         started.elapsed() < Duration::from_millis(30),
         "part 1 was not prefetched (waited {:?})",
@@ -199,10 +230,10 @@ fn readahead_keeps_the_next_part_in_flight_for_a_sequential_reader() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while table.filled.load(Ordering::SeqCst) < 3 * (PART_BYTES / page_size() as u64) {
         assert!(Instant::now() < deadline, "part 2 readahead never landed");
-        std::thread::park_timeout(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert_eq!(
-        store.s3.stats.get_object.load(Ordering::SeqCst),
+        gcs.fake.method_count("GET"),
         3,
         "exactly parts 0, 1 (readahead), 2 (readahead) were fetched"
     );

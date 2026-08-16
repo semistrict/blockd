@@ -11,8 +11,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -24,6 +23,8 @@ mod linux {
     use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, PeerTlsConfig, Runtime, RuntimeConfig};
     use rustls::RootCertStore;
     use rustls::pki_types::CertificateDer;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
     const VSET: VsetId = VsetId(1);
     const VSET_CONFIG: VsetConfig = VsetConfig {
@@ -50,8 +51,10 @@ mod linux {
         prefix: String,
     }
 
-    fn read_config(path: &Path) -> Config {
-        let text = std::fs::read_to_string(path).expect("read node config");
+    async fn read_config(path: &Path) -> Config {
+        let text = tokio::fs::read_to_string(path)
+            .await
+            .expect("read node config");
         let mut values = BTreeMap::new();
         for line in text.lines() {
             let line = line.trim();
@@ -101,8 +104,8 @@ mod linux {
         }
     }
 
-    fn pem(path: &Path) -> Vec<u8> {
-        let text = std::fs::read_to_string(path).expect("read PEM");
+    async fn pem(path: &Path) -> Vec<u8> {
+        let text = tokio::fs::read_to_string(path).await.expect("read PEM");
         let body: String = text
             .lines()
             .filter(|line| !line.starts_with("-----"))
@@ -112,12 +115,12 @@ mod linux {
             .expect("PEM base64")
     }
 
-    fn tls(config: &Config) -> PeerTlsConfig {
+    async fn tls(config: &Config) -> PeerTlsConfig {
         let mut roots = RootCertStore::empty();
         let mut certificate_identities = BTreeMap::new();
         for (&host, paths) in &config.identities {
             for path in paths {
-                let certificate = pem(path);
+                let certificate = pem(path).await;
                 roots
                     .add(CertificateDer::from(certificate.clone()))
                     .expect("trust anchor");
@@ -126,14 +129,14 @@ mod linux {
         }
         PeerTlsConfig::from_der(
             roots,
-            pem(&config.certificate),
-            &pem(&config.private_key),
+            pem(&config.certificate).await,
+            &pem(&config.private_key).await,
             config.server_names.clone(),
             certificate_identities,
         )
     }
 
-    fn runtime_config(config: &Config) -> RuntimeConfig {
+    async fn runtime_config(config: &Config) -> RuntimeConfig {
         let roster = config
             .peers
             .keys()
@@ -165,7 +168,7 @@ mod linux {
             peer: Some(PeerConfig {
                 listen: config.peer_listen,
                 peers: config.peers.clone(),
-                tls: Some(tls(config)),
+                tls: Some(tls(config).await),
             }),
         }
     }
@@ -180,37 +183,41 @@ mod linux {
         }
     }
 
-    fn reply(stream: &mut TcpStream, text: &str) {
-        stream.write_all(text.as_bytes()).expect("control reply");
-        stream.write_all(b"\n").expect("control newline");
+    async fn reply(stream: &mut tokio::net::tcp::OwnedWriteHalf, text: &str) {
+        stream
+            .write_all(text.as_bytes())
+            .await
+            .expect("control reply");
+        stream.write_all(b"\n").await.expect("control newline");
     }
 
-    fn handle(runtime: &Runtime, stream: &mut TcpStream) {
+    async fn handle(runtime: Arc<Runtime>, stream: TcpStream) {
+        let (stream, mut reply_stream) = stream.into_split();
         let mut command = String::new();
-        BufReader::new(stream.try_clone().expect("clone control stream"))
+        BufReader::new(stream)
             .read_line(&mut command)
+            .await
             .expect("read control command");
         let parts: Vec<&str> = command.split_whitespace().collect();
         match parts.as_slice() {
-            ["PING"] => reply(stream, "OK"),
+            ["PING"] => reply(&mut reply_stream, "OK").await,
             ["WRITE", value] => {
                 let value: u64 = value.parse().expect("write value");
-                runtime.guest_write(VSET, page(), value);
-                assert!(runtime.guest_sync(VSET, VolumeIdx(1)));
-                reply(stream, "OK");
+                runtime.guest_write(VSET, page(), value).await;
+                assert!(runtime.guest_sync(VSET, VolumeIdx(1)).await);
+                reply(&mut reply_stream, "OK").await;
             }
             ["READ"] => {
-                let bytes = runtime.guest_read(VSET, page());
+                let bytes = runtime.guest_read(VSET, page()).await;
                 let value = u64::from_ne_bytes(bytes[..8].try_into().expect("word"));
-                reply(stream, &format!("VALUE {value}"));
+                reply(&mut reply_stream, &format!("VALUE {value}")).await;
             }
             ["METRICS"] => {
                 let counters = runtime.counters();
                 let metrics = runtime.replica_metrics();
-                if let Some(metric) = metrics.iter().find(|metric| metric.vset == VSET) {
-                    reply(
-                        stream,
-                        &format!(
+                let response = metrics.iter().find(|metric| metric.vset == VSET).map_or_else(
+                    || "PASSIVE".to_owned(),
+                    |metric| format!(
                             "active={} transition={} epoch={} ack={} peer={} store={} queued={} \
                              nonactive={} cleanup={} replacement={} incidents={}",
                             metric.active_peer.map_or(-1, |host| i32::from(host.0)),
@@ -224,62 +231,65 @@ mod linux {
                             counters.replica_cleanup_rewrite_bytes,
                             counters.replica_replacement_bytes,
                             runtime.incidents().len(),
-                        ),
-                    );
-                } else {
-                    reply(stream, "PASSIVE");
-                }
+                    ),
+                );
+                reply(&mut reply_stream, &response).await;
             }
             ["SPOOL"] => {
-                let metrics = runtime.replica_spool_metrics();
-                reply(stream, &format!("{metrics:?}"));
+                let response = format!("{:?}", runtime.replica_spool_metrics());
+                reply(&mut reply_stream, &response).await;
             }
-            _ => reply(stream, "ERROR unknown command"),
+            _ => reply(&mut reply_stream, "ERROR unknown command").await,
         }
     }
 
-    pub fn main() {
+    pub async fn main() {
         let path = std::env::args().nth(1).unwrap_or_else(|| {
             eprintln!("usage: peer_stash_node CONFIG");
             std::process::exit(2)
         });
-        let config = read_config(Path::new(&path));
-        let runtime_config = runtime_config(&config);
-        let existed = config.blob_dir.exists();
+        let config = read_config(Path::new(&path)).await;
+        let runtime_config = runtime_config(&config).await;
+        let existed = tokio::fs::try_exists(&config.blob_dir)
+            .await
+            .expect("inspect blob directory");
         let store = Arc::new(GcsStore::new(GcsConfig {
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone(),
             endpoint: config.endpoint.clone(),
             metadata_endpoint: config.metadata_endpoint.clone(),
         }));
-        let runtime = if existed {
+        let runtime = Arc::new(if existed {
             let vsets = if config.primary {
                 BTreeMap::from([(VSET, VSET_CONFIG)])
             } else {
                 BTreeMap::new()
             };
-            let (runtime, _) = Runtime::recover(&runtime_config, store, &vsets);
+            let (runtime, _) = Runtime::recover(&runtime_config, store, &vsets).await;
             if config.primary {
-                let _ = runtime.wait_recovered(VSET);
+                let _ = runtime.wait_recovered(VSET).await;
             }
             runtime
         } else {
-            let runtime = Runtime::new(&runtime_config, store);
+            let runtime = Runtime::new(&runtime_config, store).await;
             if config.primary {
-                runtime.create_vset(VSET, VSET_CONFIG);
+                runtime.create_vset(VSET, VSET_CONFIG).await;
             }
             runtime
-        };
-        let listener = TcpListener::bind(config.control).expect("control listen");
+        });
+        let listener = TcpListener::bind(config.control)
+            .await
+            .expect("control listen");
         eprintln!("peer-stash node {} ready", config.host.0);
-        for stream in listener.incoming() {
-            let mut stream = stream.expect("control accept");
-            handle(&runtime, &mut stream);
+        loop {
+            let (stream, _) = listener.accept().await.expect("control accept");
+            tokio::spawn(handle(Arc::clone(&runtime), stream));
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn main() {
-    linux::main();
+#[tokio::main]
+async fn main() {
+    tokio::task::LocalSet::new().run_until(linux::main()).await;
 }

@@ -76,22 +76,29 @@ fn parse_args() -> Args {
     }
 }
 
-fn scan_files(base: &Path, directory: &Path, files: &mut Vec<(String, PathBuf)>) {
-    let entries = std::fs::read_dir(directory)
-        .unwrap_or_else(|error| panic!("read residue directory {}: {error}", directory.display()));
-    for entry in entries {
-        let path = entry.expect("directory entry").path();
-        if path.is_dir() {
-            scan_files(base, &path, files);
-        } else if let Ok(relative) = path.strip_prefix(base) {
-            files.push((relative.to_string_lossy().into_owned(), path));
+async fn scan_files(base: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    let mut directories = vec![base.to_owned()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = tokio::fs::read_dir(&directory)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("read residue directory {}: {error}", directory.display())
+            });
+        while let Some(entry) = entries.next_entry().await.expect("directory entry") {
+            let path = entry.path();
+            if entry.file_type().await.expect("entry type").is_dir() {
+                directories.push(path);
+            } else if let Ok(relative) = path.strip_prefix(base) {
+                files.push((relative.to_string_lossy().into_owned(), path));
+            }
         }
     }
+    files
 }
 
-fn load_residues(args: &Args) -> Vec<(u64, Vec<u8>)> {
-    let mut files = Vec::new();
-    scan_files(&args.residue_root, &args.residue_root, &mut files);
+async fn load_residues(args: &Args) -> Vec<(u64, Vec<u8>)> {
+    let files = scan_files(&args.residue_root).await;
     let mut generations: BTreeMap<u64, BTreeMap<u64, PathBuf>> = BTreeMap::new();
     for (name, path) in files {
         if let Some(BlobName::ReplicaSpool {
@@ -108,16 +115,15 @@ fn load_residues(args: &Args) -> Vec<(u64, Vec<u8>)> {
                 .insert(generation, path);
         }
     }
-    generations
-        .into_iter()
-        .map(|(epoch, files)| {
-            let mut bytes = Vec::new();
-            for path in files.into_values() {
-                bytes.extend(std::fs::read(path).expect("read residue spool"));
-            }
-            (epoch, bytes)
-        })
-        .collect()
+    let mut residues = Vec::with_capacity(generations.len());
+    for (epoch, files) in generations {
+        let mut bytes = Vec::new();
+        for path in files.into_values() {
+            bytes.extend(tokio::fs::read(path).await.expect("read residue spool"));
+        }
+        residues.push((epoch, bytes));
+    }
+    residues
 }
 
 fn report_json(report: &ReplicaRecoveryReport) -> String {
@@ -160,7 +166,7 @@ async fn main() {
         .expect("head store available")
         .expect("fenced head exists");
     let head = HeadRecord::decode(args.vset, &head_bytes).expect("fenced head decodes");
-    let owned = load_residues(&args);
+    let owned = load_residues(&args).await;
     assert!(!owned.is_empty(), "no matching peer residue found");
     let residues = || {
         owned

@@ -58,7 +58,6 @@ struct Coverage {
     wedged_hydration: u64,
     wedged_outbound: u64,
     releases: u64,
-    leaf_fills: u64,
     prefetch_fills: u64,
     parked_end: u64,
     hydrating_end: u64,
@@ -93,7 +92,6 @@ impl Coverage {
         self.wedged_hydration += other.wedged_hydration;
         self.wedged_outbound += other.wedged_outbound;
         self.releases += other.releases;
-        self.leaf_fills += other.leaf_fills;
         self.prefetch_fills += other.prefetch_fills;
         self.parked_end += other.parked_end;
         self.hydrating_end += other.hydrating_end;
@@ -138,7 +136,6 @@ impl Coverage {
             CoverageMetric::WedgeHydration => self.wedged_hydration,
             CoverageMetric::WedgeOutbound => self.wedged_outbound,
             CoverageMetric::Release => self.releases,
-            CoverageMetric::LeafFill => self.leaf_fills,
             CoverageMetric::PrefetchFill => self.prefetch_fills,
             CoverageMetric::ParkedEnd => self.parked_end,
             CoverageMetric::HydratingEnd => self.hydrating_end,
@@ -263,7 +260,6 @@ fn run_one(scenario: &Scenario, seed: u64) -> Outcome {
                 wedged_hydration: report.wedged_hydration,
                 wedged_outbound: report.wedged_outbound,
                 releases: report.releases,
-                leaf_fills: report.leaf_fills,
                 prefetch_fills: report.prefetch_fills,
                 parked_end: u64::try_from(report.parked_end).expect("parked count fits u64"),
                 hydrating_end: u64::try_from(report.hydrating_end)
@@ -534,24 +530,6 @@ mod tests {
         coverage.fault_hits.insert(point, 1);
         coverage.peer_faults = 1;
         assert!(coverage.missing_for(scenario.coverage()).is_empty());
-    }
-
-    #[test]
-    fn per_run_outcomes_enforce_lower_and_upper_bounds() {
-        let scenario = scenario::load("leaf-rot").expect("scenario");
-        let matching = Coverage {
-            restores: 1,
-            guest_deaths: 1,
-            ..Coverage::default()
-        };
-        assert!(matching.outcome_violations(scenario.outcomes()).is_empty());
-
-        let wrong = Coverage {
-            restores: 1,
-            guest_deaths: 2,
-            ..Coverage::default()
-        };
-        assert_eq!(wrong.outcome_violations(scenario.outcomes()).len(), 1);
     }
 
     #[test]

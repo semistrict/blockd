@@ -1,16 +1,19 @@
 //! Fenced promotion of a verified passive-replica export. Verification is
-//! read-only in core; this module performs the separate ownership CAS, S3
+//! read-only in core; this module performs the separate ownership CAS, store
 //! publication, durable quarantine write, and atomic local promotion.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blockd_core::head::{HeadRecord, ManifestPtr};
+use blockd_core::head::HeadRecord;
+#[cfg(test)]
+use blockd_core::head::ManifestPtr;
+#[cfg(test)]
 use blockd_core::journal::JournalRecord;
-use blockd_core::layout::{self, BlobName};
+use blockd_core::layout;
 use blockd_core::replica_recovery::{
-    ReplicaExport, prepare_replica_recovery_claim, refence_replica_export,
+    ReplicaExport, prepare_replica_publication, prepare_replica_recovery_claim,
 };
 use blockd_core::types::{HostId, VsetId};
 
@@ -46,7 +49,10 @@ pub async fn install_replica_recovery(
     verified_head_version: u64,
     export: &ReplicaExport,
 ) -> Result<InstalledReplicaRecovery, InstallReplicaRecoveryError> {
-    if target.exists() {
+    if tokio::fs::try_exists(target)
+        .await
+        .map_err(|_| InstallReplicaRecoveryError::LocalIo)?
+    {
         return Err(InstallReplicaRecoveryError::LocalTargetExists);
     }
     let (observed_version, observed_bytes) = store
@@ -70,64 +76,26 @@ pub async fn install_replica_recovery(
         )
         .await
         .map_err(|_| InstallReplicaRecoveryError::ClaimConflict)?;
-    let export = refence_replica_export(vset, export, writer_fence)
-        .map_err(|_| InstallReplicaRecoveryError::ExportCorrupt)?;
-    let record_bytes = export
-        .blobs
-        .iter()
-        .find_map(|(name, bytes)| {
-            matches!(
-                layout::parse_blob(name),
-                Some(BlobName::Journal { fence, .. }) if fence == writer_fence
-            )
-            .then_some(bytes)
-        })
-        .ok_or(InstallReplicaRecoveryError::ExportCorrupt)?;
-    let record = JournalRecord::decode(vset, record_bytes)
-        .map_err(|_| InstallReplicaRecoveryError::ExportCorrupt)?;
-    for (name, bytes) in &export.blobs {
-        let key = match layout::parse_blob(name) {
-            Some(BlobName::Segment { fence, seg, .. }) => {
-                Some(layout::segment_key(vset, fence, seg))
-            }
-            Some(BlobName::Leaf { fence, id, .. }) => Some(layout::leaf_key(vset, fence, id)),
-            _ => None,
-        };
-        if let Some(key) = key {
-            store
-                .clone()
-                .put(key, bytes.clone())
-                .await
-                .map_err(|_| InstallReplicaRecoveryError::PublishFailed)?;
-        }
+    let publication =
+        prepare_replica_publication(vset, claimant, writer_fence, &claim.head, export)
+            .map_err(|_| InstallReplicaRecoveryError::ExportCorrupt)?;
+    for (key, bytes) in &publication.store_objects {
+        store
+            .clone()
+            .put(key.clone(), bytes.clone())
+            .await
+            .map_err(|_| InstallReplicaRecoveryError::PublishFailed)?;
     }
-    store
-        .clone()
-        .put(
-            layout::manifest_key(vset, writer_fence, record.seq),
-            record_bytes.clone(),
-        )
-        .await
-        .map_err(|_| InstallReplicaRecoveryError::PublishFailed)?;
-    let mut published_head = claim.head;
-    published_head.fence = writer_fence;
-    published_head.manifest = Some(ManifestPtr {
-        fence: writer_fence,
-        journal_seq: record.seq,
-        seq: record.seq,
-        capture_seq: record.capture_seq,
-        checksum: blockd_core::format::checksum64(record_bytes),
-    });
     let head_version = store
         .put_cas(
             layout::head_key(vset),
             Some(writer_fence),
-            published_head.encode(),
+            publication.head.encode(),
         )
         .await
         .map_err(|_| InstallReplicaRecoveryError::ClaimConflict)?;
     let target = target.to_owned();
-    let blobs = export.blobs.clone();
+    let blobs = publication.export.blobs;
     tokio::task::spawn_blocking(move || durable_promote(&target, vset, writer_fence, &blobs))
         .await
         .map_err(|_| InstallReplicaRecoveryError::LocalIo)??;
@@ -279,13 +247,11 @@ mod tests {
             seq: JournalSeq(3),
             fence: 1,
             kind: RecordKind::Commit,
-            capture_seq: 4,
+            capture_seq: 5,
             sync_covered_through: 5,
             post_state_checksum: 0,
-            database: blockd_core::journal::DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let bytes = record.encode(vset);
@@ -368,10 +334,8 @@ mod tests {
             capture_seq: 4,
             sync_covered_through: 5,
             post_state_checksum: 0,
-            database: blockd_core::journal::DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         };
         let bytes = record.encode(vset);

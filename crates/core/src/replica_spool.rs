@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
 use crate::journal::JournalRecord;
-use crate::mapleaf::MapLeaf;
 use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
@@ -304,9 +303,6 @@ fn verify_artifact(
                 return Err(ReplicaSpoolError);
             }
         }
-        ReplicaArtifact::Leaf { fence, id } => {
-            MapLeaf::decode(vset, fence, id, bytes)?;
-        }
     }
     Ok(())
 }
@@ -333,7 +329,7 @@ mod tests {
     use super::*;
     use crate::format::crc32c;
     use crate::journal::{RecordKind, VsetConfig};
-    use crate::segment::SegmentBuilder;
+    use crate::segment::SegmentBatchBuilder;
     use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, page_size};
 
     fn fixture() -> (ReplicaArtifact, Vec<u8>, ReplicaCommitInfo, Vec<u8>) {
@@ -345,9 +341,9 @@ mod tests {
             },
             page: PageNo(2),
         };
-        let mut builder = SegmentBuilder::new(vset, 4, SegId(9));
+        let mut builder = SegmentBatchBuilder::new(vset, 4, SegId(9));
         builder.add(page, Gen(3), &vec![0xA5; page_size()]);
-        let (segment, locs) = builder.finish();
+        let (_, segment, locs) = builder.finish().pop().expect("fixture object");
         let artifact = ReplicaArtifact::Segment {
             fence: 4,
             seg: SegId(9),
@@ -369,10 +365,8 @@ mod tests {
             capture_seq: 12,
             sync_covered_through: info.sync_covered_through,
             post_state_checksum: 0,
-            database: crate::journal::DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         }
         .encode(vset);
@@ -420,10 +414,8 @@ mod tests {
             capture_seq: 12,
             sync_covered_through: info.sync_covered_through,
             post_state_checksum: 0,
-            database: crate::journal::DatabaseMeta::default(),
             files: Vec::new(),
             overlay: BTreeMap::new(),
-            leaves: BTreeMap::new(),
             migrated_from: None,
         }
         .encode(VsetId(7));
@@ -452,9 +444,9 @@ mod tests {
             },
             page: PageNo(3),
         };
-        let mut builder = SegmentBuilder::new(VsetId(7), 4, SegId(10));
+        let mut builder = SegmentBatchBuilder::new(VsetId(7), 4, SegId(10));
         builder.add(page, Gen(4), &vec![0x5A; page_size()]);
-        let (next_segment, _) = builder.finish();
+        let (_, next_segment, _) = builder.finish().pop().expect("fixture object");
         let next = ReplicaArtifact::Segment {
             fence: 4,
             seg: SegId(10),

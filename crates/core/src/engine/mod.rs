@@ -4,11 +4,9 @@ mod authority;
 mod backup;
 mod blob;
 mod capture;
-mod database;
 mod error;
 mod fault;
 mod host;
-mod hydration;
 mod keyed_queue;
 mod lease;
 mod lineage;
@@ -16,10 +14,12 @@ mod migration;
 mod peer_client;
 mod reclaim;
 mod recovery;
+pub(crate) mod recovery_policy;
 mod replica;
 mod restore;
 mod state;
 mod store_gc;
+mod store_retry;
 mod vnode_member;
 
 pub use authority::{
@@ -29,20 +29,15 @@ pub use authority::{
     verify_authority_proof,
 };
 pub(crate) use backup::reconcile_backed_recovery_event;
-pub use backup::{create_backed, publish_latest, reconcile_backed_recovery};
-pub use capture::{capture_local, checkpoint_local, create_fresh_local};
-pub(crate) use database::database_source;
-pub use database::{
-    attach_database, begin_detach_database, drain_detached_database, finish_detach_database,
-};
+pub use backup::{publish_latest, reconcile_backed_recovery};
+pub use capture::{capture_local, checkpoint_local};
 pub use error::HostFatal;
 pub use fault::serve_fault;
 pub use host::{host_actor, host_actor_with_state};
-pub(crate) use hydration::hydrate_mapping;
 pub use lineage::{create_fork, delete_base, keep_base};
 pub use migration::{
-    hydrate_tail, migrate_out, peer_fetch_leaf, peer_fetch_page, peer_fetch_replica_page,
-    peer_source, reoffer_outbound,
+    hydrate_tail, migrate_out, peer_fetch_page, peer_fetch_replica_page, peer_source,
+    reoffer_outbound,
 };
 pub use reclaim::{cleanup_local, reclaim_backed_segments};
 pub use recovery::recover_local;

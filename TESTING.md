@@ -23,6 +23,9 @@ in this script.
 
 ## Simulation
 
+Simulation scenarios run on Turmoil's deterministic, paused Tokio runtime.
+The scenario seed controls both Turmoil and the domain fault models.
+
 Run one deterministic simulation shard with:
 
 ```sh
@@ -52,7 +55,6 @@ cargo test --release -p blockd-core --test perf_replica -- --ignored --nocapture
 cargo test --release -p blockd-runtime --test perf_decider -- --nocapture
 cargo test --release -p blockd-runtime --test loop_interference_linux -- --nocapture
 cargo test --release -p blockd-runtime --test fc_perf_linux -- --ignored --nocapture
-cargo test --release -p blockd-vsetfs -- --ignored --nocapture
 ```
 
 Compare performance results only on the same machine, build profile, CPU

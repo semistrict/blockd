@@ -7,29 +7,37 @@
 //! userfaultfd over a unix socket, and every guest touch becomes OUR fill.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, channel};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use blockd_hostmem::{Uffd, page_size, recv_with_fd};
+use bytes::Bytes;
 use futures_util::{FutureExt as _, StreamExt as _};
+use http_body_util::{BodyExt as _, Full};
+use hyper::{Method, Request, StatusCode};
+use hyper_util::rt::TokioIo;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _, BufReader,
+    Lines,
+};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 
 /// One HTTP request over the Firecracker API socket.
-fn api_request(sock: &Path, method: &str, path: &str, body: &str) -> (u16, String) {
+async fn api_request(sock: &Path, method: Method, path: &str, body: Value) -> (StatusCode, String) {
     // The socket file appears at bind time, a beat before Firecracker
     // listens — connect with retry instead of racing it.
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stream = loop {
-        match UnixStream::connect(sock) {
+    let stream = loop {
+        match tokio::net::UnixStream::connect(sock).await {
             Ok(stream) => break stream,
             Err(e)
                 if matches!(
@@ -37,111 +45,85 @@ fn api_request(sock: &Path, method: &str, path: &str, body: &str) -> (u16, Strin
                     std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
                 ) && Instant::now() < deadline =>
             {
-                thread::park_timeout(Duration::from_millis(5));
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(e) => panic!("api socket: {e}"),
         }
     };
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(request.as_bytes()).expect("api write");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .expect("timeout");
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 4096];
-    let (headers_end, header_text) = loop {
-        let n = stream.read(&mut buf).expect("api read");
-        assert!(n > 0, "{method} {path}: api connection closed mid-response");
-        raw.extend_from_slice(&buf[..n]);
-        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-            break (pos + 4, String::from_utf8_lossy(&raw[..pos]).into_owned());
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("Firecracker HTTP handshake");
+    let connection = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::debug!(%error, "Firecracker HTTP connection closed");
         }
-    };
-    let status: u16 = header_text
-        .split_whitespace()
-        .nth(1)
-        .expect("status")
-        .parse()
-        .expect("status code");
-    let content_length: usize = header_text
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().expect("length"))
-        })
-        .unwrap_or(0);
-    let mut body_bytes = raw[headers_end..].to_vec();
-    while body_bytes.len() < content_length {
-        let n = stream.read(&mut buf).expect("api read body");
-        assert!(n > 0, "api connection closed mid-body");
-        body_bytes.extend_from_slice(&buf[..n]);
-    }
-    (status, String::from_utf8_lossy(&body_bytes).into_owned())
+    });
+    let bytes = serde_json::to_vec(&body).expect("serialize Firecracker request");
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(hyper::header::HOST, "localhost")
+        .header(hyper::header::ACCEPT, "application/json")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::CONNECTION, "close")
+        .body(Full::new(Bytes::from(bytes)))
+        .expect("build Firecracker request");
+    let response = tokio::time::timeout(Duration::from_secs(30), sender.send_request(request))
+        .await
+        .expect("Firecracker API response timeout")
+        .expect("Firecracker API response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("read Firecracker API response")
+        .to_bytes();
+    drop(sender);
+    let _ = connection.await;
+    (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// A running Firecracker process with its API socket and serial console.
 pub struct FcVm {
     child: Child,
     stdin: ChildStdin,
-    lines: Receiver<String>,
+    lines: Lines<BufReader<ChildStdout>>,
     api_sock: PathBuf,
 }
 
 impl FcVm {
     /// Spawn Firecracker with an API socket; stdout is the guest serial.
-    pub fn spawn(fc_bin: &Path, api_sock: &Path) -> FcVm {
-        let _ = std::fs::remove_file(api_sock);
+    pub async fn spawn(fc_bin: &Path, api_sock: &Path) -> FcVm {
+        let _ = tokio::fs::remove_file(api_sock).await;
         let mut child = Command::new(fc_bin)
             .arg("--api-sock")
             .arg(api_sock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn firecracker");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");
-        let (line_tx, lines) = channel();
-        thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if line_tx.send(line).is_err() {
-                    break;
-                }
-            }
+        tokio::spawn(async move {
+            let mut stderr = BufReader::new(stderr).lines();
+            while stderr.next_line().await.is_ok_and(|line| line.is_some()) {}
         });
-        thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stderr).lines() {
-                if line.is_err() {
-                    break;
-                }
-            }
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !api_sock.exists() {
-            assert!(Instant::now() < deadline, "api socket never appeared");
-            thread::park_timeout(Duration::from_millis(10));
-        }
         FcVm {
             child,
             stdin,
-            lines,
+            lines: BufReader::new(stdout).lines(),
             api_sock: api_sock.to_owned(),
         }
     }
 
-    pub fn api(&self, method: &str, path: &str, body: &str) {
-        let (status, reply) = api_request(&self.api_sock, method, path, body);
+    pub async fn api(&self, method: Method, path: &str, body: Value) {
+        let (status, reply) = api_request(&self.api_sock, method.clone(), path, body).await;
         assert!(
-            (200..300).contains(&status),
+            status.is_success(),
             "{method} {path} failed: {status} {reply}"
         );
     }
@@ -149,80 +131,71 @@ impl FcVm {
     /// Add Firecracker's single virtio-vsock device before boot. Guest
     /// connections to host CID 2 and port P are forwarded to
     /// `<uds_path>_P` on the host.
-    pub fn configure_vsock(&self, guest_cid: u32, uds_path: &Path) {
+    pub async fn configure_vsock(&self, guest_cid: u32, uds_path: &Path) {
         self.api(
-            "PUT",
+            Method::PUT,
             "/vsock",
-            &format!(
-                "{{\"guest_cid\": {guest_cid}, \"uds_path\": \"{}\"}}",
-                uds_path.display()
-            ),
-        );
-    }
-
-    /// Add the VM-wide vhost-user virtio-fs device. The patched frontend
-    /// reserves drive id `vsetfs`; all database vsets share this one device.
-    pub fn configure_vsetfs(&self, uds_path: &Path) {
-        self.api(
-            "PUT",
-            "/drives/vsetfs",
-            &format!(
-                "{{\"drive_id\": \"vsetfs\", \"is_root_device\": false, \
-                 \"cache_type\": \"Unsafe\", \"socket\": \"{}\"}}",
-                uds_path.display()
-            ),
-        );
+            json!({"guest_cid": guest_cid, "uds_path": uds_path}),
+        )
+        .await;
     }
 
     /// Configure and boot a fresh microVM from kernel + initramfs (no
     /// disks: the workload lives in the initramfs, so forks never contend
     /// on a writable block device).
-    pub fn boot(&self, kernel: &Path, initrd: &Path, mem_mib: u32) {
-        self.boot_with_vcpus(kernel, initrd, mem_mib, 1);
+    pub async fn boot(&self, kernel: &Path, initrd: &Path, mem_mib: u32) {
+        self.boot_with_vcpus(kernel, initrd, mem_mib, 1).await;
     }
 
     /// Configure and boot a fresh microVM with an explicit virtual CPU count.
-    pub fn boot_with_vcpus(&self, kernel: &Path, initrd: &Path, mem_mib: u32, vcpu_count: u8) {
+    pub async fn boot_with_vcpus(
+        &self,
+        kernel: &Path,
+        initrd: &Path,
+        mem_mib: u32,
+        vcpu_count: u8,
+    ) {
         assert!(vcpu_count > 0, "microVM must have at least one vCPU");
         self.api(
-            "PUT",
+            Method::PUT,
             "/machine-config",
-            &format!("{{\"vcpu_count\": {vcpu_count}, \"mem_size_mib\": {mem_mib}}}"),
-        );
+            json!({"vcpu_count": vcpu_count, "mem_size_mib": mem_mib}),
+        )
+        .await;
         self.api(
-            "PUT",
+            Method::PUT,
             "/boot-source",
-            &format!(
-                "{{\"kernel_image_path\": \"{}\", \"initrd_path\": \"{}\", \
-                 \"boot_args\": \"keep_bootcon console=ttyS0 reboot=k panic=-1 quiet \
-                 no-kvmapf rdinit=/init\"}}",
-                kernel.display(),
-                initrd.display()
-            ),
-        );
-        self.api("PUT", "/actions", "{\"action_type\": \"InstanceStart\"}");
+            json!({
+                "kernel_image_path": kernel,
+                "initrd_path": initrd,
+                "boot_args": "keep_bootcon console=ttyS0 reboot=k panic=-1 quiet no-kvmapf rdinit=/init",
+            }),
+        ).await;
+        self.api(
+            Method::PUT,
+            "/actions",
+            json!({"action_type": "InstanceStart"}),
+        )
+        .await;
     }
 
-    pub fn pause(&self) {
-        self.api("PATCH", "/vm", "{\"state\": \"Paused\"}");
+    pub async fn pause(&self) {
+        self.api(Method::PATCH, "/vm", json!({"state": "Paused"}))
+            .await;
     }
 
-    pub fn resume(&self) {
-        self.api("PATCH", "/vm", "{\"state\": \"Resumed\"}");
+    pub async fn resume(&self) {
+        self.api(Method::PATCH, "/vm", json!({"state": "Resumed"}))
+            .await;
     }
 
     /// Full snapshot of a paused microVM: vmstate + guest memory file.
-    pub fn snapshot(&self, snapshot_path: &Path, mem_path: &Path) {
+    pub async fn snapshot(&self, snapshot_path: &Path, mem_path: &Path) {
         self.api(
-            "PUT",
+            Method::PUT,
             "/snapshot/create",
-            &format!(
-                "{{\"snapshot_type\": \"Full\", \"snapshot_path\": \"{}\", \
-                 \"mem_file_path\": \"{}\"}}",
-                snapshot_path.display(),
-                mem_path.display()
-            ),
-        );
+            json!({"snapshot_type": "Full", "snapshot_path": snapshot_path, "mem_file_path": mem_path}),
+        ).await;
     }
 
     /// Restore from a snapshot with the patched `UffdShmem` backend:
@@ -230,87 +203,87 @@ impl FcVm {
     /// shared-memory file; missing faults reach the handler through the
     /// socket. Forks restored from one snapshot share every clean page
     /// physically; writes diverge via copy-on-write.
-    pub fn load_snapshot_shmem(&self, snapshot_path: &Path, uffd_sock: &Path, shmem: &Path) {
+    pub async fn load_snapshot_shmem(&self, snapshot_path: &Path, uffd_sock: &Path, shmem: &Path) {
         self.api(
-            "PUT",
+            Method::PUT,
             "/snapshot/load",
-            &format!(
-                "{{\"snapshot_path\": \"{}\", \"mem_backend\": \
-                 {{\"backend_type\": \"UffdShmem\", \"backend_path\": \"{}\", \
-                 \"shmem_path\": \"{}\"}}, \"resume_vm\": true}}",
-                snapshot_path.display(),
-                uffd_sock.display(),
-                shmem.display()
-            ),
-        );
+            json!({
+                "snapshot_path": snapshot_path,
+                "mem_backend": {"backend_type": "UffdShmem", "backend_path": uffd_sock, "shmem_path": shmem},
+                "resume_vm": true,
+            }),
+        ).await;
     }
 
     /// Restore (fork) from a snapshot. `uffd_sock` selects the memory
     /// backend: `None` maps the memory file directly (kernel page-cache
     /// sharing across forks); `Some` hands the guest memory to OUR
     /// page-fault handler over the socket (blockd's fill door).
-    pub fn load_snapshot(&self, snapshot_path: &Path, mem_path: &Path, uffd_sock: Option<&Path>) {
+    pub async fn load_snapshot(
+        &self,
+        snapshot_path: &Path,
+        mem_path: &Path,
+        uffd_sock: Option<&Path>,
+    ) {
         let backend = match uffd_sock {
-            None => format!(
-                "{{\"backend_type\": \"File\", \"backend_path\": \"{}\"}}",
-                mem_path.display()
-            ),
-            Some(sock) => format!(
-                "{{\"backend_type\": \"Uffd\", \"backend_path\": \"{}\"}}",
-                sock.display()
-            ),
+            None => json!({"backend_type": "File", "backend_path": mem_path}),
+            Some(sock) => json!({"backend_type": "Uffd", "backend_path": sock}),
         };
         self.api(
-            "PUT",
+            Method::PUT,
             "/snapshot/load",
-            &format!(
-                "{{\"snapshot_path\": \"{}\", \"mem_backend\": {backend}, \
-                 \"resume_vm\": true}}",
-                snapshot_path.display()
-            ),
-        );
+            json!({"snapshot_path": snapshot_path, "mem_backend": backend, "resume_vm": true}),
+        )
+        .await;
     }
 
     /// Restore from an immutable memory snapshot through a per-VM shared
     /// working copy. Vhost-user backends need shared visibility of virtqueue
     /// writes, while the source snapshot must remain unchanged.
-    pub fn load_snapshot_shared(&self, snapshot_path: &Path, mem_path: &Path) {
+    pub async fn load_snapshot_shared(&self, snapshot_path: &Path, mem_path: &Path) {
         self.api(
-            "PUT",
+            Method::PUT,
             "/snapshot/load",
-            &format!(
-                "{{\"snapshot_path\": \"{}\", \"mem_backend\": \
-                 {{\"backend_type\": \"FileShared\", \"backend_path\": \"{}\"}}, \
-                 \"resume_vm\": true}}",
-                snapshot_path.display(),
-                mem_path.display()
-            ),
-        );
+            json!({
+                "snapshot_path": snapshot_path,
+                "mem_backend": {"backend_type": "FileShared", "backend_path": mem_path},
+                "resume_vm": true,
+            }),
+        )
+        .await;
     }
 
     /// Send one workload command and wait for its reply line (replies are
     /// uppercase; the tty echo of commands can never match).
-    pub fn cmd(&mut self, command: &str, reply_prefix: &str) -> String {
-        writeln!(self.stdin, "{command}").expect("serial write");
-        self.stdin.flush().expect("serial flush");
-        self.wait_line(reply_prefix)
+    pub async fn cmd(&mut self, command: &str, reply_prefix: &str) -> String {
+        self.stdin
+            .write_all(command.as_bytes())
+            .await
+            .expect("serial write");
+        self.stdin.write_all(b"\n").await.expect("serial newline");
+        self.stdin.flush().await.expect("serial flush");
+        self.wait_line(reply_prefix).await
     }
 
-    pub fn try_cmd(
+    pub async fn try_cmd(
         &mut self,
         command: &str,
         reply_prefix: &str,
         timeout: Duration,
     ) -> Option<String> {
-        writeln!(self.stdin, "{command}").ok()?;
-        self.stdin.flush().ok()?;
+        self.stdin.write_all(command.as_bytes()).await.ok()?;
+        self.stdin.write_all(b"\n").await.ok()?;
+        self.stdin.flush().await.ok()?;
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining == Duration::ZERO {
                 return None;
             }
-            let line = self.lines.recv_timeout(remaining).ok()?;
+            let received = tokio::time::timeout(remaining, self.lines.next_line())
+                .await
+                .ok()?;
+            let line = received.ok()??;
             if let Some(rest) = line.trim_start().strip_prefix(reply_prefix) {
                 return Some(rest.trim().to_owned());
             }
@@ -318,7 +291,7 @@ impl FcVm {
     }
 
     /// Wait for a serial line starting with `prefix`.
-    pub fn wait_line(&mut self, prefix: &str) -> String {
+    pub async fn wait_line(&mut self, prefix: &str) -> String {
         let deadline = Instant::now() + Duration::from_mins(1);
         let mut skipped: Vec<String> = Vec::new();
         loop {
@@ -327,7 +300,9 @@ impl FcVm {
                 remaining > Duration::ZERO,
                 "guest never produced a {prefix:?} line; serial transcript: {skipped:?}"
             );
-            if let Ok(line) = self.lines.recv_timeout(remaining) {
+            if let Ok(Ok(Some(line))) =
+                tokio::time::timeout(remaining, self.lines.next_line()).await
+            {
                 if let Some(rest) = line.trim_start().strip_prefix(prefix) {
                     return rest.trim().to_owned();
                 }
@@ -337,20 +312,19 @@ impl FcVm {
     }
 
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.id().expect("Firecracker process is running")
     }
 
     /// Host death for this microVM.
-    pub fn kill(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    pub async fn kill(mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
     }
 }
 
 impl Drop for FcVm {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.start_kill();
     }
 }
 
@@ -358,8 +332,10 @@ impl Drop for FcVm {
 /// (Rss, Pss) in bytes. Rss counts every resident page mapped; Pss divides
 /// shared pages among their mappers — `Pss < Rss` IS the kernel saying
 /// pages are shared.
-pub fn rss_pss_of_pid(pid: u32) -> (usize, usize) {
-    let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).expect("smaps");
+pub async fn rss_pss_of_pid(pid: u32) -> (usize, usize) {
+    let rollup = tokio::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .await
+        .expect("smaps");
     let field = |name: &str| -> usize {
         let kb: usize = rollup
             .lines()
@@ -379,40 +355,32 @@ pub fn rss_pss_of_pid(pid: u32) -> (usize, usize) {
 
 /// One guest-memory region as Firecracker describes it to its page-fault
 /// handler at snapshot restore.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 struct Region {
     base_host_virt_addr: u64,
     size: u64,
     offset: u64,
 }
 
-fn json_field(object: &str, key: &str) -> u64 {
-    let at = object.find(&format!("\"{key}\"")).expect("key present");
-    let rest = &object[at..];
-    let colon = rest.find(':').expect("colon");
-    rest[colon + 1..]
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .expect("number")
-}
-
-fn parse_regions(body: &str) -> Vec<Region> {
-    let mut regions = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find('{') {
-        let end = rest[start..].find('}').expect("object end") + start;
-        let object = &rest[start..=end];
-        regions.push(Region {
-            base_host_virt_addr: json_field(object, "base_host_virt_addr"),
-            size: json_field(object, "size"),
-            offset: json_field(object, "offset"),
-        });
-        rest = &rest[end + 1..];
-    }
-    regions
+async fn receive_uffd(stream: &tokio::net::UnixStream) -> (Vec<Region>, Uffd) {
+    let mut buf = vec![0u8; 65_536];
+    let (n, fd) = loop {
+        stream.readable().await.expect("uffd handshake readiness");
+        match stream.try_io(tokio::io::Interest::READABLE, || {
+            recv_with_fd(stream, &mut buf)
+        }) {
+            Ok(result) => break result,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("receive uffd handshake: {error}"),
+        }
+    };
+    let regions: Vec<Region> = serde_json::from_slice(&buf[..n])
+        .unwrap_or_else(|error| panic!("invalid Firecracker uffd mapping: {error}"));
+    assert!(!regions.is_empty(), "Firecracker sent no uffd regions");
+    (
+        regions,
+        Uffd::from_fd_nonblocking(fd.expect("Firecracker sent no uffd descriptor")),
+    )
 }
 
 /// Serve one restored microVM's page faults from its snapshot memory file:
@@ -420,19 +388,26 @@ fn parse_regions(body: &str) -> Vec<Region> {
 /// `SCM_RIGHTS`), then fill every fault with `UFFDIO_COPY` from the file.
 /// This is blockd's fill door running against a REAL VMM — each served
 /// page is counted so tests can prove demand paging actually happened.
-pub fn serve_uffd(listener: UnixListener, mem_file: PathBuf, served: Arc<AtomicU64>) {
-    thread::spawn(move || {
-        use std::os::unix::fs::FileExt;
-        let (stream, _) = listener.accept().expect("uffd handshake");
-        let mut buf = vec![0u8; 65536];
-        let (n, fd) = recv_with_fd(&stream, &mut buf).expect("recv uffd");
-        let body = String::from_utf8_lossy(&buf[..n]).into_owned();
-        let regions = parse_regions(&body);
-        assert!(!regions.is_empty(), "no regions in handshake: {body}");
-        let uffd = Uffd::from_fd(fd.expect("uffd fd"));
-        let file = std::fs::File::open(&mem_file).expect("mem file");
+pub fn serve_uffd(
+    listener: tokio::net::UnixListener,
+    mem_file: PathBuf,
+    served: Arc<AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("uffd handshake");
+        let (regions, uffd) = receive_uffd(&stream).await;
+        let uffd = AsyncFd::new(uffd).expect("register userfaultfd");
+        let mut file = tokio::fs::File::open(&mem_file).await.expect("mem file");
         let mut page = vec![0u8; page_size()];
-        while let Ok(events) = uffd.read_events() {
+        loop {
+            let Ok(mut ready) = uffd.readable().await else {
+                return;
+            };
+            let events = match ready.try_io(|inner| inner.get_ref().read_events()) {
+                Ok(Ok(events)) => events,
+                Ok(Err(_)) => return,
+                Err(_) => continue,
+            };
             for event in events {
                 let addr = event.address as u64 & !(page_size() as u64 - 1);
                 let region = regions
@@ -442,8 +417,14 @@ pub fn serve_uffd(listener: UnixListener, mem_file: PathBuf, served: Arc<AtomicU
                     })
                     .expect("fault outside every region");
                 let offset = addr - region.base_host_virt_addr + region.offset;
-                file.read_exact_at(&mut page, offset).expect("mem read");
-                match uffd.copy(usize::try_from(addr).expect("fits"), &page) {
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .expect("seek memory snapshot");
+                file.read_exact(&mut page).await.expect("mem read");
+                match uffd
+                    .get_ref()
+                    .copy(usize::try_from(addr).expect("fits"), &page)
+                {
                     Ok(()) => {
                         served.fetch_add(1, Ordering::SeqCst);
                     }
@@ -453,7 +434,7 @@ pub fn serve_uffd(listener: UnixListener, mem_file: PathBuf, served: Arc<AtomicU
                 }
             }
         }
-    });
+    })
 }
 
 fn libc_exist() -> i32 {
@@ -473,30 +454,32 @@ pub struct ShmemServer {
     pub faults: Arc<AtomicU64>,
     /// Cumulative end-to-end shmem fault latency, bounded in memory.
     fault_latency: Arc<crate::metrics::AtomicHistogram>,
+    accept_task: tokio::task::JoinHandle<()>,
 }
 
 impl ShmemServer {
     /// Create the shmem file (sparse) and start accepting handshakes from
     /// any number of restoring microVMs.
-    pub fn start(
-        listener: UnixListener,
+    pub async fn start(
+        listener: tokio::net::UnixListener,
         source_mem: PathBuf,
         shmem_path: &Path,
         mem_bytes: u64,
     ) -> ShmemServer {
-        let parts = PartTable::local(source_mem, &create_shmem(shmem_path, mem_bytes), mem_bytes);
+        let shmem = create_shmem(shmem_path, mem_bytes).await;
+        let parts = PartTable::local(source_mem, &shmem, mem_bytes);
         ShmemServer::accepting(listener, parts)
     }
 
-    /// The cold-tier variant: fills come from the S3-shaped store at
+    /// The cold-tier variant: fills come from object storage at
     /// segment granularity — a fault on any page of a `part_bytes` part
     /// fetches the whole part object with one `GetObject` (the store tier
     /// of R2.3: segment-granular, never per-page round trips). Distinct
     /// parts fetch concurrently, concurrent faults on one part share one
     /// fetch, and each demand fault keeps the next `readahead_parts` parts
     /// in flight ahead of a sequential reader.
-    pub fn start_s3(
-        listener: UnixListener,
+    pub async fn start_store(
+        listener: tokio::net::UnixListener,
         store: Arc<dyn crate::store::ObjectStore>,
         prefix: String,
         part_bytes: u64,
@@ -504,55 +487,41 @@ impl ShmemServer {
         mem_bytes: u64,
         readahead_parts: u64,
     ) -> ShmemServer {
+        let shmem = create_shmem(shmem_path, mem_bytes).await;
         let parts = PartTable::store(
             store,
             prefix,
             part_bytes,
-            &create_shmem(shmem_path, mem_bytes),
+            &shmem,
             mem_bytes,
             readahead_parts,
         );
         ShmemServer::accepting(listener, parts)
     }
 
-    fn accepting(listener: UnixListener, parts: Arc<PartTable>) -> ShmemServer {
-        let server = ShmemServer {
-            parts,
-            faults: Arc::new(AtomicU64::new(0)),
-            fault_latency: Arc::new(crate::metrics::AtomicHistogram::default()),
-        };
-        let (parts, fault_count, latencies) = (
-            server.parts.clone(),
-            server.faults.clone(),
-            server.fault_latency.clone(),
-        );
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking shmem listener");
-        thread::Builder::new()
-            .name("blockd-shmem-uffd".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .build()
-                    .expect("shmem UFFD runtime");
-                runtime.block_on(async move {
-                    let listener =
-                        tokio::net::UnixListener::from_std(listener).expect("async shmem listener");
-                    loop {
-                        let Ok((stream, _)) = listener.accept().await else {
-                            return;
-                        };
-                        let (parts, fault_count, latencies) =
-                            (parts.clone(), fault_count.clone(), latencies.clone());
-                        tokio::spawn(async move {
-                            serve_one_shmem(&stream, &parts, &fault_count, &latencies).await;
-                        });
-                    }
+    fn accepting(listener: tokio::net::UnixListener, parts: Arc<PartTable>) -> ShmemServer {
+        let faults = Arc::new(AtomicU64::new(0));
+        let fault_latency = Arc::new(crate::metrics::AtomicHistogram::default());
+        let (task_parts, fault_count, latencies) =
+            (parts.clone(), faults.clone(), fault_latency.clone());
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (parts, fault_count, latencies) =
+                    (task_parts.clone(), fault_count.clone(), latencies.clone());
+                tokio::spawn(async move {
+                    serve_one_shmem(&stream, &parts, &fault_count, &latencies).await;
                 });
-            })
-            .expect("spawn shmem UFFD runtime");
-        server
+            }
+        });
+        ShmemServer {
+            parts,
+            faults,
+            fault_latency,
+            accept_task,
+        }
     }
 
     /// Pages filled from the source (unique work — the R5.3 measure).
@@ -572,31 +541,48 @@ impl ShmemServer {
     }
 
     /// Physical bytes the shared base holds right now.
-    pub fn resident_bytes(&self) -> usize {
-        blockd_hostmem::file_resident_bytes(&self.parts.shmem).expect("fstat")
+    pub async fn resident_bytes(&self) -> usize {
+        let shmem = self.parts.shmem.clone();
+        tokio::task::spawn_blocking(move || {
+            blockd_hostmem::file_resident_bytes(&shmem).expect("fstat")
+        })
+        .await
+        .expect("resident-byte task")
     }
 
     /// Backing reclaim (R2.7): free the whole base file. Forks' private
     /// copy-on-write pages survive; clean pages will refault and refill.
-    pub fn reclaim_all(&self, mem_bytes: u64) {
+    pub async fn reclaim_all(&self, mem_bytes: u64) {
         self.parts.states.lock().expect("lock").clear();
-        blockd_hostmem::punch_hole_file(&self.parts.shmem, 0, mem_bytes).expect("punch");
+        let shmem = self.parts.shmem.clone();
+        tokio::task::spawn_blocking(move || {
+            blockd_hostmem::punch_hole_file(&shmem, 0, mem_bytes).expect("punch");
+        })
+        .await
+        .expect("reclaim task");
     }
 }
 
-fn create_shmem(shmem_path: &Path, mem_bytes: u64) -> Arc<std::fs::File> {
-    let shmem = std::fs::OpenOptions::new()
+impl Drop for ShmemServer {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+async fn create_shmem(shmem_path: &Path, mem_bytes: u64) -> Arc<std::fs::File> {
+    let shmem = tokio::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .open(shmem_path)
+        .await
         .expect("shmem file");
-    shmem.set_len(mem_bytes).expect("shmem size");
-    Arc::new(shmem)
+    shmem.set_len(mem_bytes).await.expect("shmem size");
+    Arc::new(shmem.into_std().await)
 }
 
 /// Where a shmem fill's bytes come from: the snapshot memory file (warm
-/// local tier, page granules) or the S3-shaped store (cold tier,
+/// local tier, page granules) or object storage (cold tier,
 /// `part_bytes` segment-object granules).
 enum Filler {
     File(PathBuf),
@@ -609,37 +595,44 @@ enum Filler {
 
 impl Filler {
     /// Fill the granule starting at `base` into the shmem file.
-    fn fill_local(&self, shmem: &std::fs::File, base: u64, granule: u64) {
-        use std::os::unix::fs::FileExt;
+    async fn fill(&self, shmem: Arc<std::fs::File>, base: u64, granule: u64) -> usize {
         match self {
             Filler::File(path) => {
-                let source = std::fs::File::open(path).expect("source mem");
-                let mut bytes = vec![0u8; usize::try_from(granule).expect("fits")];
-                source.read_exact_at(&mut bytes, base).expect("source read");
-                shmem.write_all_at(&bytes, base).expect("populate");
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::os::unix::fs::FileExt;
+                    let source = std::fs::File::open(path).expect("source mem");
+                    let mut bytes = vec![0u8; usize::try_from(granule).expect("fits")];
+                    source.read_exact_at(&mut bytes, base).expect("source read");
+                    shmem.write_all_at(&bytes, base).expect("populate");
+                    bytes.len()
+                })
+                .await
+                .expect("snapshot fill task")
             }
-            Filler::Store { .. } => unreachable!("store fills are asynchronous"),
+            Filler::Store {
+                store,
+                prefix,
+                part_bytes,
+            } => {
+                let part = base / part_bytes;
+                let key = format!("{prefix}/{part:08}");
+                let (_, bytes) = store
+                    .clone()
+                    .get(key)
+                    .await
+                    .expect("store up")
+                    .expect("part object exists");
+                let len = bytes.len();
+                tokio::task::spawn_blocking(move || {
+                    use std::os::unix::fs::FileExt;
+                    shmem.write_all_at(&bytes, base).expect("populate");
+                })
+                .await
+                .expect("snapshot populate task");
+                len
+            }
         }
-    }
-
-    async fn fetch_store(&self, base: u64) -> Vec<u8> {
-        let Filler::Store {
-            store,
-            prefix,
-            part_bytes,
-        } = self
-        else {
-            unreachable!("only store-backed tables queue fetches");
-        };
-        let part = base / part_bytes;
-        let key = format!("{prefix}/{part:08}");
-        let (_, bytes) = store
-            .clone()
-            .get(key)
-            .await
-            .expect("store up")
-            .expect("part object exists");
-        bytes
     }
 }
 
@@ -696,7 +689,7 @@ impl Fetch {
 /// The part-fetch engine behind [`ShmemServer`]: the cold path must never
 /// serialize on the store's latency. Concurrent faults on one part share a
 /// single in-flight fetch (one `GetObject` no matter how many forks storm
-/// it); distinct parts fetch concurrently on a bounded async executor; and each
+/// it); distinct parts fetch concurrently on bounded Tokio tasks; and each
 /// demand fault keeps the next `readahead` parts in flight, so a
 /// sequential reader streams at transfer speed instead of stalling
 /// per-part. Fault callers hand over a wake action and never block —
@@ -711,7 +704,7 @@ pub struct PartTable {
     /// Pages filled from the source (unique work — the R5.3 measure).
     pub filled: Arc<AtomicU64>,
     states: Mutex<BTreeMap<u64, PartState>>,
-    fetch_tx: Option<mpsc::Sender<FetchJob>>,
+    fetch_tx: mpsc::Sender<FetchJob>,
 }
 
 type FetchJob = (u64, Arc<Fetch>);
@@ -727,7 +720,8 @@ impl PartTable {
         shmem: &Arc<std::fs::File>,
         mem_bytes: u64,
     ) -> Arc<PartTable> {
-        Arc::new(PartTable {
+        let (fetch_tx, fetch_rx) = mpsc::channel::<FetchJob>(256);
+        let table = Arc::new(PartTable {
             granule: page_size() as u64,
             mem_bytes,
             readahead: 0,
@@ -735,8 +729,10 @@ impl PartTable {
             shmem: shmem.clone(),
             filled: Arc::new(AtomicU64::new(0)),
             states: Mutex::new(BTreeMap::new()),
-            fetch_tx: None,
-        })
+            fetch_tx,
+        });
+        tokio::spawn(part_fetch_loop(fetch_rx, Arc::downgrade(&table)));
+        table
     }
 
     /// Cold store tier: `part_bytes`-granular fetches, concurrent and
@@ -762,19 +758,10 @@ impl PartTable {
             shmem: shmem.clone(),
             filled: Arc::new(AtomicU64::new(0)),
             states: Mutex::new(BTreeMap::new()),
-            fetch_tx: Some(fetch_tx),
+            fetch_tx,
         });
         let weak = Arc::downgrade(&table);
-        thread::Builder::new()
-            .name("blockd-part-fetch-io".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("part fetch I/O runtime");
-                runtime.block_on(part_fetch_loop(fetch_rx, weak));
-            })
-            .expect("spawn part fetch I/O runtime");
+        tokio::spawn(part_fetch_loop(fetch_rx, weak));
         table
     }
 
@@ -782,21 +769,6 @@ impl PartTable {
     /// populated — inline if it already is. Never blocks on a fetch.
     pub fn fault(self: &Arc<PartTable>, offset: u64, waker: impl FnOnce() + Send + 'static) {
         let base = offset / self.granule * self.granule;
-        if matches!(self.filler, Filler::File(_)) {
-            // Local fills are microseconds: fill under the lock, like a
-            // page-cache hit path. ONE fill serves every fork — the page
-            // lands in the shared cache where all MAP_PRIVATE mappers
-            // find it.
-            let mut states = self.states.lock().expect("lock");
-            if !matches!(states.get(&base), Some(PartState::Ready)) {
-                self.filler.fill_local(&self.shmem, base, self.granule);
-                self.filled.fetch_add(1, Ordering::SeqCst);
-                states.insert(base, PartState::Ready);
-            }
-            drop(states);
-            waker();
-            return;
-        }
         match self.state_of(base) {
             None => waker(),
             Some(fetch) => fetch.park(waker),
@@ -825,24 +797,23 @@ impl PartTable {
         states.insert(base, PartState::Fetching(fetch.clone()));
         drop(states);
         self.fetch_tx
-            .as_ref()
-            .expect("store-backed table has a fetch executor")
             .try_send((base, fetch.clone()))
-            .expect("part fetch executor lives with table");
+            .expect("part fetch task lives with table");
         Some(fetch)
     }
 
     /// Fetch one part and wake everyone parked on it.
     async fn fetch(self: Arc<Self>, base: u64, fetch: Arc<Fetch>) {
-        use std::os::unix::fs::FileExt;
-
-        let bytes = self.filler.fetch_store(base).await;
-        let shmem = self.shmem.clone();
-        tokio::task::spawn_blocking(move || shmem.write_all_at(&bytes, base).expect("populate"))
-            .await
-            .expect("snapshot populate task");
-        self.filled
-            .fetch_add(self.granule / page_size() as u64, Ordering::SeqCst);
+        let bytes = self
+            .filler
+            .fill(self.shmem.clone(), base, self.granule)
+            .await;
+        self.filled.fetch_add(
+            u64::try_from(bytes)
+                .expect("fill length fits")
+                .div_ceil(page_size() as u64),
+            Ordering::SeqCst,
+        );
         {
             let mut states = self.states.lock().expect("lock");
             // A reclaim may have cleared the table mid-fetch: the punched
@@ -863,7 +834,7 @@ async fn part_fetch_loop(mut rx: mpsc::Receiver<FetchJob>, table: std::sync::Wea
             .clone()
             .acquire_owned()
             .await
-            .expect("part fetch executor open");
+            .expect("part fetch task semaphore open");
         let Some(table) = table.upgrade() else {
             return;
         };
@@ -886,24 +857,8 @@ async fn serve_one_shmem(
     fault_count: &AtomicU64,
     latencies: &Arc<crate::metrics::AtomicHistogram>,
 ) {
-    let mut buf = vec![0u8; 65536];
-    let (n, fd) = loop {
-        stream.readable().await.expect("uffd handshake readiness");
-        match stream.try_io(tokio::io::Interest::READABLE, || {
-            recv_with_fd(stream, &mut buf)
-        }) {
-            Ok(result) => break result,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => panic!("recv uffd: {error}"),
-        }
-    };
-    let body = String::from_utf8_lossy(&buf[..n]).into_owned();
-    let regions = parse_regions(&body);
-    assert!(!regions.is_empty(), "no regions in handshake: {body}");
-    let uffd = Arc::new(
-        AsyncFd::new(Uffd::from_fd_nonblocking(fd.expect("uffd fd")))
-            .expect("register userfaultfd"),
-    );
+    let (regions, uffd) = receive_uffd(stream).await;
+    let uffd = Arc::new(AsyncFd::new(uffd).expect("register userfaultfd"));
     loop {
         let Ok(mut ready) = uffd.readable().await else {
             return;
@@ -931,24 +886,6 @@ async fn serve_one_shmem(
             });
         }
     }
-}
-
-/// Upload a snapshot memory file into the store as `part_bytes`-sized
-/// segment objects under `prefix` (each well inside the 64 MiB object
-/// contract, R4.6). Returns the part count.
-pub fn upload_mem_parts(
-    store: &Arc<crate::s3::S3Store>,
-    mem_path: &Path,
-    prefix: &str,
-    part_bytes: u64,
-) -> u64 {
-    let runtime = tokio::runtime::Runtime::new().expect("snapshot upload runtime");
-    runtime.block_on(upload_mem_parts_async(
-        store.clone(),
-        mem_path.to_owned(),
-        prefix.to_owned(),
-        part_bytes,
-    ))
 }
 
 /// Asynchronous production uploader. File reading stays on Tokio's blocking

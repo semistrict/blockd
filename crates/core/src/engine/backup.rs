@@ -4,81 +4,27 @@ use std::rc::Rc;
 use blockd_exec::delay;
 
 use super::SharedHost;
-use super::capture::finish_creation;
+use super::recovery_policy::recovery_metadata;
 use super::replica::retry_replica_releases;
 use super::state::PublicationOwner;
+use super::store_retry::{
+    read as get_retry, write as put_retry, write_immutable as put_immutable_retry,
+};
 use crate::blx::{
     BatchMeta, BlxCompactor, MAX_OVERLAPPING_FILES, NamespaceKind, compaction_object_id_start,
     open_object,
 };
 use crate::format::checksum64;
 use crate::head::{HeadRecord, ManifestPtr, StashAssignment};
-use crate::journal::{JournalRecord, RecordKind, VsetConfig, VsetKind};
+use crate::journal::JournalRecord;
 use crate::layout;
 use crate::manifest::{
-    BaseManifest, BaseRef, BaseRoot, CompleteFileList, Manifest, ObjectRef, RecoveryKind,
-    bound_manifest, max_object_overlap, validate_file_state_chain, validate_object_refs,
+    BaseManifest, BaseRef, BaseRoot, CompleteFileList, Manifest, ObjectRef, bound_manifest,
+    decode_manifest_closure, max_object_overlap, validate_file_state_chain, validate_object_refs,
 };
-use crate::protocol::{AdminError, AdminEvent, AdminResult, AdminSuccess, StoreFault};
+use crate::protocol::{AdminEvent, StoreFault};
 use crate::types::{JournalSeq, SegId, VsetId};
 use crate::world::{AdminIo, Blobs, GuestMem, Peers, Store, StoreError};
-
-pub async fn create_backed<W>(
-    state: SharedHost,
-    world: Rc<W>,
-    vset: VsetId,
-    config: VsetConfig,
-) -> Option<AdminResult>
-where
-    W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
-{
-    let duplicate = state.borrow().vsets.contains_key(&vset);
-    if duplicate {
-        return Some(Err(AdminError::Busy));
-    }
-    let incarnation = state.borrow_mut().insert_fresh(vset, config);
-    let Some(version) = claim_new_head(&state, world.as_ref(), vset, incarnation).await else {
-        state.borrow_mut().vsets.remove(&vset);
-        return Some(Err(AdminError::Rejected));
-    };
-    {
-        let mut host = state.borrow_mut();
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
-            .filter(|state| state.incarnation == incarnation)?;
-        vset_state.fence = version;
-        vset_state.head_version = Some(version);
-        host.counters.assignment_claims += 1;
-    }
-    if !finish_creation(Rc::clone(&state), world.as_ref(), vset, incarnation).await {
-        state.borrow_mut().fail("backed journal creation failed");
-        return None;
-    }
-    publish_latest(Rc::clone(&state), Rc::clone(&world), vset).await;
-    let published = state.borrow().vsets.get(&vset).is_some_and(|vset_state| {
-        let Some(record) = vset_state.best_record.as_ref() else {
-            return false;
-        };
-        vset_state.backed.is_some_and(|pointer| {
-            (pointer.capture_seq, pointer.journal_seq) >= (record.capture_seq, record.seq)
-        })
-    });
-    if published {
-        Some(Ok(AdminSuccess::VsetCreated { vset }))
-    } else {
-        Some(Err(AdminError::Unavailable))
-    }
-}
-
-pub(super) async fn claim_new_head<W: Store>(
-    state: &SharedHost,
-    world: &W,
-    vset: VsetId,
-    incarnation: u64,
-) -> Option<u64> {
-    claim_new_head_with_stash(state, world, vset, incarnation, None).await
-}
 
 pub(super) async fn claim_new_head_with_stash<W: Store>(
     state: &SharedHost,
@@ -597,11 +543,8 @@ async fn load_archive_closure<W: Store>(
     let Some(pointer) = pointer else {
         return Some((Vec::new(), None));
     };
-    let Some((manifest, list)) =
-        load_archive_metadata(state, world, vset, Some(pointer), retry).await?
-    else {
-        return None;
-    };
+    let (manifest, list) =
+        load_archive_metadata(state, world, vset, Some(pointer), retry).await??;
     let mut objects = match manifest.base {
         None => Vec::new(),
         Some(reference) => {
@@ -765,6 +708,7 @@ fn source_object_is_covered(frontier: Option<(u64, u64)>, writer_fence: u64, max
     frontier.is_some_and(|(fence, seq)| writer_fence == fence && max_seq <= seq)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn prepare_archive<W: Blobs + Store>(
     state: &SharedHost,
     world: &W,
@@ -774,10 +718,7 @@ async fn prepare_archive<W: Blobs + Store>(
     retry: u64,
     force_compaction: bool,
 ) -> Option<PreparedArchive> {
-    let Some(previous) = load_archive_metadata(state, world, vset, snapshot.backed, retry).await
-    else {
-        return None;
-    };
+    let previous = load_archive_metadata(state, world, vset, snapshot.backed, retry).await?;
     if publication_interrupted(state, vset, incarnation) {
         return None;
     }
@@ -937,19 +878,8 @@ async fn prepare_archive<W: Blobs + Store>(
             (previous_manifest.complete_list, added, removed, None)
         }
     };
-    let (recovery_kind, checkpoint_epoch, vmstate_logical_length) = match snapshot.record.kind {
-        RecordKind::Checkpoint {
-            epoch,
-            vmstate_logical_length,
-            ..
-        } if snapshot.record.capture_seq >= snapshot.record.sync_covered_through => {
-            (RecoveryKind::Whole, epoch, vmstate_logical_length)
-        }
-        _ if snapshot.record.config.kind == VsetKind::Database => {
-            (RecoveryKind::Database, crate::types::Epoch(0), 0)
-        }
-        _ => (RecoveryKind::DiskOnly, crate::types::Epoch(0), 0),
-    };
+    let (recovery_kind, checkpoint_epoch, vmstate_logical_length) =
+        recovery_metadata(&snapshot.record);
     let archive_seq = previous
         .as_ref()
         .map_or(0, |(manifest, _)| manifest.archive_seq.saturating_add(1));
@@ -963,7 +893,6 @@ async fn prepare_archive<W: Blobs + Store>(
         recovery_kind,
         checkpoint_epoch,
         config: snapshot.record.config,
-        database: snapshot.record.database,
         vmstate_logical_length,
         base: snapshot.base,
         complete_list,
@@ -1042,81 +971,21 @@ async fn load_archive_metadata<W: Store>(
         retry,
     )
     .await?;
-    if checksum64(&bytes) != pointer.checksum {
-        return None;
-    }
-    let manifest = Manifest::decode(vset, &bytes).ok()?;
-    if (
-        manifest.writer_fence,
-        manifest.journal_seq,
-        manifest.archive_seq,
-        manifest.capture_seq,
-    ) != (
-        pointer.fence,
-        pointer.journal_seq.0,
-        pointer.seq.0,
-        pointer.capture_seq,
-    ) {
-        return None;
-    }
-    let list = if let Some(reference) = manifest.complete_list {
-        let bytes = get_retry(
-            state,
-            world,
-            &layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id),
-            retry,
+    let list_bytes = if let Some(reference) = Manifest::decode(vset, &bytes).ok()?.complete_list {
+        Some(
+            get_retry(
+                state,
+                world,
+                &layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id),
+                retry,
+            )
+            .await?,
         )
-        .await?;
-        Some(CompleteFileList::decode(reference, vset, &bytes).ok()?)
     } else {
         None
     };
-    Some(Some((manifest, list)))
-}
-
-async fn get_retry<W: Store>(
-    state: &SharedHost,
-    world: &W,
-    key: &str,
-    retry: u64,
-) -> Option<Vec<u8>> {
-    loop {
-        match Store::get(world, key).await {
-            Ok(Some((_, bytes))) => return Some(bytes),
-            Ok(None) | Err(StoreError::TooLarge) => return None,
-            Err(StoreError::Fault(StoreFault::Unavailable)) => {
-                state.borrow_mut().counters.store_retries += 1;
-                delay(retry).await;
-            }
-            Err(StoreError::Fault(StoreFault::CasConflict { .. })) => return None,
-        }
-    }
-}
-
-async fn put_immutable_retry<W: Store>(
-    state: &SharedHost,
-    world: &W,
-    key: String,
-    bytes: Vec<u8>,
-    retry: u64,
-) -> Option<u64> {
-    loop {
-        match Store::put_cas(world, key.clone(), None, bytes.clone()).await {
-            Ok(version) => return Some(version),
-            Err(StoreError::Fault(StoreFault::CasConflict { .. })) => {
-                let Some((version, found)) = Store::get(world, &key).await.ok().flatten() else {
-                    delay(retry).await;
-                    continue;
-                };
-                return (found == bytes).then_some(version);
-            }
-            Err(StoreError::Fault(StoreFault::Unavailable)) => {
-                state.borrow_mut().counters.store_retries += 1;
-                delay(retry).await;
-            }
-            Err(StoreError::TooLarge) => return None,
-        }
-    }
+    let closure = decode_manifest_closure(vset, pointer, &bytes, list_bytes.as_deref()).ok()?;
+    Some(Some((closure.manifest, closure.complete_list)))
 }
 
 async fn read_blob_retry<W: Blobs>(world: &W, name: &str, retry: u64) -> Option<Vec<u8>> {
@@ -1125,27 +994,6 @@ async fn read_blob_retry<W: Blobs>(world: &W, name: &str, retry: u64) -> Option<
             Ok(Some(bytes)) => return Some(bytes),
             Ok(None) => return None,
             Err(_) => delay(retry).await,
-        }
-    }
-}
-
-async fn put_retry<W: Store>(
-    state: &SharedHost,
-    world: &W,
-    key: String,
-    bytes: Vec<u8>,
-    retry: u64,
-) -> Option<u64> {
-    loop {
-        match Store::put(world, key.clone(), bytes.clone()).await {
-            Ok(version) => return Some(version),
-            Err(StoreError::Fault(StoreFault::Unavailable)) => {
-                state.borrow_mut().counters.store_retries += 1;
-                delay(retry).await;
-            }
-            Err(StoreError::Fault(StoreFault::CasConflict { .. }) | StoreError::TooLarge) => {
-                return None;
-            }
         }
     }
 }

@@ -1,13 +1,7 @@
-//! Thread-safe two-lane external event injection.
+//! Thread-safe, two-lane Tokio event injection.
 
-use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll};
-
-use crate::TaskId;
-use crate::runtime::{Scheduler, WakeSource, current_waiter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const BACKGROUND_SHARE: u32 = 32;
 
@@ -17,31 +11,30 @@ pub enum Lane {
     Background,
 }
 
-struct Waiter {
-    task: TaskId,
-    scheduler: Weak<Scheduler>,
+struct Depths {
+    capacity: Option<usize>,
+    total: AtomicUsize,
+    critical: AtomicUsize,
+    background: AtomicUsize,
 }
 
-struct State<T> {
-    critical: VecDeque<T>,
-    background: VecDeque<T>,
-    capacity: Option<usize>,
+struct Receivers<T> {
+    critical: tokio::sync::mpsc::UnboundedReceiver<T>,
+    background: tokio::sync::mpsc::UnboundedReceiver<T>,
+    critical_closed: bool,
+    background_closed: bool,
     streak: u32,
-    senders: usize,
-    receiver_alive: bool,
-    waiter: Option<Waiter>,
 }
 
 pub struct Injector<T> {
-    state: Arc<Mutex<State<T>>>,
+    critical: tokio::sync::mpsc::UnboundedSender<T>,
+    background: tokio::sync::mpsc::UnboundedSender<T>,
+    depths: Arc<Depths>,
 }
 
 pub struct Injected<T> {
-    state: Arc<Mutex<State<T>>>,
-}
-
-pub struct Recv<'a, T> {
-    receiver: &'a Injected<T>,
+    receivers: tokio::sync::Mutex<Receivers<T>>,
+    depths: Arc<Depths>,
 }
 
 pub fn injector<T>() -> (Injector<T>, Injected<T>) {
@@ -54,191 +47,241 @@ pub fn bounded_injector<T>(capacity: usize) -> (Injector<T>, Injected<T>) {
 }
 
 fn injector_with_capacity<T>(capacity: Option<usize>) -> (Injector<T>, Injected<T>) {
-    let state = Arc::new(Mutex::new(State {
-        critical: VecDeque::new(),
-        background: VecDeque::new(),
+    let (critical, critical_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (background, background_rx) = tokio::sync::mpsc::unbounded_channel();
+    let depths = Arc::new(Depths {
         capacity,
-        streak: 0,
-        senders: 1,
-        receiver_alive: true,
-        waiter: None,
-    }));
+        total: AtomicUsize::new(0),
+        critical: AtomicUsize::new(0),
+        background: AtomicUsize::new(0),
+    });
     (
         Injector {
-            state: Arc::clone(&state),
+            critical,
+            background,
+            depths: Arc::clone(&depths),
         },
-        Injected { state },
+        Injected {
+            receivers: tokio::sync::Mutex::new(Receivers {
+                critical: critical_rx,
+                background: background_rx,
+                critical_closed: false,
+                background_closed: false,
+                streak: 0,
+            }),
+            depths,
+        },
     )
+}
+
+impl Depths {
+    fn reserve(&self) -> bool {
+        let mut current = self.total.load(Ordering::Acquire);
+        loop {
+            if self.capacity.is_some_and(|capacity| current >= capacity) {
+                return false;
+            }
+            match self.total.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn sent(&self, lane: Lane) {
+        self.lane(lane).fetch_add(1, Ordering::Release);
+    }
+
+    fn rollback(&self, lane: Lane) {
+        self.lane(lane).fetch_sub(1, Ordering::AcqRel);
+        self.total.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn received(&self, lane: Lane) {
+        self.lane(lane).fetch_sub(1, Ordering::AcqRel);
+        self.total.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn lane(&self, lane: Lane) -> &AtomicUsize {
+        match lane {
+            Lane::Critical => &self.critical,
+            Lane::Background => &self.background,
+        }
+    }
 }
 
 impl<T> Injector<T> {
     pub fn push(&self, lane: Lane, value: T) -> Result<(), T> {
-        let waiter = {
-            let mut state = self.state.lock().expect("injector mutex poisoned");
-            if !state.receiver_alive {
-                return Err(value);
-            }
-            if state
-                .capacity
-                .is_some_and(|capacity| state.critical.len() + state.background.len() >= capacity)
-            {
-                return Err(value);
-            }
-            match lane {
-                Lane::Critical => state.critical.push_back(value),
-                Lane::Background => state.background.push_back(value),
-            }
-            state.waiter.take()
-        };
-        if let Some(waiter) = waiter.and_then(|waiter| {
-            waiter
-                .scheduler
-                .upgrade()
-                .map(|scheduler| (waiter.task, scheduler))
-        }) {
-            waiter.1.schedule(waiter.0, WakeSource::External);
+        if !self.depths.reserve() {
+            return Err(value);
         }
-        Ok(())
+        self.depths.sent(lane);
+        let result = match lane {
+            Lane::Critical => self.critical.send(value),
+            Lane::Background => self.background.send(value),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.depths.rollback(lane);
+                Err(error.0)
+            }
+        }
     }
 
-    /// Current external backlog by priority lane. This is observational
-    /// only; scheduling still applies the fairness valve when values are
-    /// received.
     pub fn depths(&self) -> (usize, usize) {
-        let state = self.state.lock().expect("injector mutex poisoned");
-        (state.critical.len(), state.background.len())
+        (
+            self.depths.critical.load(Ordering::Acquire),
+            self.depths.background.load(Ordering::Acquire),
+        )
     }
 }
 
 impl<T> Clone for Injector<T> {
     fn clone(&self) -> Self {
-        self.state.lock().expect("injector mutex poisoned").senders += 1;
         Self {
-            state: Arc::clone(&self.state),
-        }
-    }
-}
-
-impl<T> Drop for Injector<T> {
-    fn drop(&mut self) {
-        let waiter = {
-            let mut state = self.state.lock().expect("injector mutex poisoned");
-            state.senders -= 1;
-            (state.senders == 0).then(|| state.waiter.take()).flatten()
-        };
-        if let Some(waiter) = waiter.and_then(|waiter| {
-            waiter
-                .scheduler
-                .upgrade()
-                .map(|scheduler| (waiter.task, scheduler))
-        }) {
-            waiter.1.schedule(waiter.0, WakeSource::External);
+            critical: self.critical.clone(),
+            background: self.background.clone(),
+            depths: Arc::clone(&self.depths),
         }
     }
 }
 
 impl<T> Injected<T> {
-    pub fn recv(&self) -> Recv<'_, T> {
-        Recv { receiver: self }
-    }
-
-    pub fn try_recv(&self) -> Option<T> {
-        let mut state = self.state.lock().expect("injector mutex poisoned");
-        let use_background = !state.background.is_empty()
-            && (state.critical.is_empty() || state.streak >= BACKGROUND_SHARE);
-        if use_background {
-            state.streak = 0;
-            state.background.pop_front()
-        } else {
-            let value = state.critical.pop_front();
-            if value.is_some() {
-                state.streak = state.streak.saturating_add(1);
+    pub async fn recv(&self) -> Option<T> {
+        let mut receivers = self.receivers.lock().await;
+        loop {
+            let prefer_background = receivers.streak >= BACKGROUND_SHARE;
+            let immediate = if prefer_background {
+                receivers
+                    .background
+                    .try_recv()
+                    .ok()
+                    .map(|value| (Lane::Background, value))
+                    .or_else(|| {
+                        receivers
+                            .critical
+                            .try_recv()
+                            .ok()
+                            .map(|value| (Lane::Critical, value))
+                    })
+            } else {
+                receivers
+                    .critical
+                    .try_recv()
+                    .ok()
+                    .map(|value| (Lane::Critical, value))
+                    .or_else(|| {
+                        receivers
+                            .background
+                            .try_recv()
+                            .ok()
+                            .map(|value| (Lane::Background, value))
+                    })
+            };
+            if let Some((lane, value)) = immediate {
+                Self::received(&mut receivers, lane);
+                self.depths.received(lane);
+                return Some(value);
             }
-            value
+            if receivers.critical_closed && receivers.background_closed {
+                return None;
+            }
+
+            let critical_open = !receivers.critical_closed;
+            let background_open = !receivers.background_closed;
+            let Receivers {
+                critical,
+                background,
+                ..
+            } = &mut *receivers;
+            let received = if prefer_background {
+                tokio::select! {
+                    biased;
+                    value = background.recv(), if background_open => {
+                        (Lane::Background, value)
+                    }
+                    value = critical.recv(), if critical_open => {
+                        (Lane::Critical, value)
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    value = critical.recv(), if critical_open => {
+                        (Lane::Critical, value)
+                    }
+                    value = background.recv(), if background_open => {
+                        (Lane::Background, value)
+                    }
+                }
+            };
+            match received {
+                (lane, Some(value)) => {
+                    Self::received(&mut receivers, lane);
+                    self.depths.received(lane);
+                    return Some(value);
+                }
+                (Lane::Critical, None) => receivers.critical_closed = true,
+                (Lane::Background, None) => receivers.background_closed = true,
+            }
         }
     }
-}
 
-impl<T> Drop for Injected<T> {
-    fn drop(&mut self) {
-        self.state
-            .lock()
-            .expect("injector mutex poisoned")
-            .receiver_alive = false;
-    }
-}
-
-impl<T> Future for Recv<'_, T> {
-    type Output = Option<T>;
-
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let current = current_waiter();
-        let mut state = self.receiver.state.lock().expect("injector mutex poisoned");
-        let use_background = !state.background.is_empty()
-            && (state.critical.is_empty() || state.streak >= BACKGROUND_SHARE);
-        let value = if use_background {
-            state.streak = 0;
-            state.background.pop_front()
-        } else {
-            let value = state.critical.pop_front();
-            if value.is_some() {
-                state.streak = state.streak.saturating_add(1);
-            }
-            value
-        };
-        if let Some(value) = value {
-            Poll::Ready(Some(value))
-        } else if state.senders == 0 {
-            Poll::Ready(None)
-        } else {
-            state.waiter = Some(Waiter {
-                task: current.task,
-                scheduler: Arc::downgrade(&current.scheduler),
-            });
-            Poll::Pending
+    fn received(receivers: &mut Receivers<T>, lane: Lane) {
+        match lane {
+            Lane::Critical => receivers.streak = receivers.streak.saturating_add(1),
+            Lane::Background => receivers.streak = 0,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::Executor;
+    use crate::ProductionContext;
 
     use super::{BACKGROUND_SHARE, Lane, bounded_injector, injector};
 
-    #[test]
-    fn background_lane_cannot_starve() {
+    #[tokio::test]
+    async fn background_lane_cannot_starve() {
         let (sender, receiver) = injector();
         for value in 0..(BACKGROUND_SHARE + 2) {
             sender.push(Lane::Critical, value).unwrap();
         }
         sender.push(Lane::Background, u32::MAX).unwrap();
 
-        let mut executor = Executor::production();
-        let values = executor.block_on(async move {
-            let mut values = Vec::new();
-            for _ in 0..=BACKGROUND_SHARE {
-                values.push(receiver.recv().await.unwrap());
-            }
-            values
-        });
+        let values = ProductionContext::new(|_| {})
+            .scope(async move {
+                let mut values = Vec::new();
+                for _ in 0..=BACKGROUND_SHARE {
+                    values.push(receiver.recv().await.unwrap());
+                }
+                values
+            })
+            .await;
         assert_eq!(values[BACKGROUND_SHARE as usize], u32::MAX);
     }
 
-    #[test]
-    fn bounded_injector_rejects_excess_backlog_and_recovers_capacity() {
+    #[tokio::test]
+    async fn bounded_injector_rejects_excess_backlog_and_recovers_capacity() {
         let (sender, stream) = bounded_injector(2);
         assert_eq!(sender.push(Lane::Critical, 1), Ok(()));
         assert_eq!(sender.push(Lane::Background, 2), Ok(()));
         assert_eq!(sender.push(Lane::Critical, 3), Err(3));
 
-        let mut executor = Executor::production();
         let task_sender = sender.clone();
-        let (item, pushed, depths) = executor.block_on(async move {
-            let item = stream.recv().await;
-            let pushed = task_sender.push(Lane::Critical, 3);
-            (item, pushed, task_sender.depths())
-        });
+        let (item, pushed, depths) = ProductionContext::new(|_| {})
+            .scope(async move {
+                let item = stream.recv().await;
+                let pushed = task_sender.push(Lane::Critical, 3);
+                (item, pushed, task_sender.depths())
+            })
+            .await;
         assert_eq!(item, Some(1));
         assert_eq!(pushed, Ok(()));
         assert_eq!(depths, (1, 1));

@@ -5,8 +5,6 @@
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::atomic::Ordering;
 
 use blockd_core::protocol::StoreFault;
@@ -22,23 +20,18 @@ fn store_against(endpoint: &str) -> GcsStore {
     })
 }
 
-fn control(endpoint: &str, path: &str) {
-    let address = endpoint.strip_prefix("http://").expect("HTTP endpoint");
-    let mut stream = TcpStream::connect(address).expect("connect control");
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
-    )
-    .expect("send control");
-    let mut response = [0u8; 512];
-    let read = stream.read(&mut response).expect("read control");
-    let response = String::from_utf8_lossy(&response[..read]);
-    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+async fn control(endpoint: &str, path: &str) {
+    let response = reqwest::Client::new()
+        .get(format!("{endpoint}{path}"))
+        .send()
+        .await
+        .expect("control request");
+    assert!(response.status().is_success(), "{response:?}");
 }
 
 #[tokio::test]
 async fn availability_controls_distinguish_fencing_from_immutable_data() {
-    let (_, endpoint) = FakeGcs::start();
+    let (_server, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     store
         .put("v/01/head", b"head".to_vec())
@@ -49,21 +42,21 @@ async fn availability_controls_distinguish_fencing_from_immutable_data() {
         .await
         .expect("data");
 
-    control(&endpoint, "/__control/data-outage/on");
+    control(&endpoint, "/__control/data-outage/on").await;
     assert!(matches!(store.get("v/01/head").await, Ok(Some(_))));
     assert_eq!(store.get("v/01/data").await, Err(StoreFault::Unavailable));
-    control(&endpoint, "/__control/data-outage/off");
+    control(&endpoint, "/__control/data-outage/off").await;
     assert!(matches!(store.get("v/01/data").await, Ok(Some(_))));
 
-    control(&endpoint, "/__control/outage/on");
+    control(&endpoint, "/__control/outage/on").await;
     assert_eq!(store.get("v/01/head").await, Err(StoreFault::Unavailable));
-    control(&endpoint, "/__control/outage/off");
+    control(&endpoint, "/__control/outage/off").await;
     assert!(matches!(store.get("v/01/head").await, Ok(Some(_))));
 }
 
 #[tokio::test]
 async fn prefix_listing_returns_complete_logical_keys() {
-    let (_, endpoint) = FakeGcs::start();
+    let (_server, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     for key in ["v/01/head", "v/01/s/1", "v/02/head", "b/01/rec"] {
         store.put(key, vec![1]).await.expect("put listed object");
@@ -79,7 +72,7 @@ async fn prefix_listing_returns_complete_logical_keys() {
 /// `Ok(None)`, ranged reads with EOF semantics, delete.
 #[tokio::test]
 async fn the_store_contract_holds_against_generation_semantics() {
-    let (fake, endpoint) = FakeGcs::start();
+    let (fake, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
 
     // Create-only CAS wins once, then conflicts with the current version.
@@ -167,7 +160,7 @@ async fn the_store_contract_holds_against_generation_semantics() {
 /// A 412 is followed by a HEAD to fill in `actual` — visible on the wire.
 #[tokio::test]
 async fn a_cas_conflict_heads_for_the_current_generation() {
-    let (fake, endpoint) = FakeGcs::start();
+    let (fake, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     let v1 = store
         .put_cas("k", None, b"one".to_vec())
@@ -188,7 +181,7 @@ async fn a_cas_conflict_heads_for_the_current_generation() {
 /// data.
 #[tokio::test]
 async fn transient_faults_retry_then_map_exhaustion_to_unavailable() {
-    let (fake, endpoint) = FakeGcs::start();
+    let (fake, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     store.put("k", b"seed".to_vec()).await.expect("seed");
     for fault in [
@@ -213,7 +206,7 @@ async fn transient_faults_retry_then_map_exhaustion_to_unavailable() {
 /// One 401 buys one token refresh and a retry; the operation succeeds.
 #[tokio::test]
 async fn a_401_refreshes_the_token_once_and_retries() {
-    let (fake, endpoint) = FakeGcs::start();
+    let (fake, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     store.put("k", b"seed".to_vec()).await.expect("seed");
     assert_eq!(fake.tokens_served.load(Ordering::SeqCst), 1);
@@ -238,7 +231,7 @@ async fn a_401_refreshes_the_token_once_and_retries() {
 /// remaining life dips under the refresh slack.
 #[tokio::test]
 async fn tokens_are_cached_until_the_slack_window() {
-    let (fake, endpoint) = FakeGcs::start();
+    let (fake, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     store.put("a", b"1".to_vec()).await.expect("put");
     store.put("b", b"2".to_vec()).await.expect("put");
@@ -259,7 +252,7 @@ async fn tokens_are_cached_until_the_slack_window() {
 
 #[tokio::test]
 async fn independent_requests_are_in_flight_together() {
-    let (fake, endpoint) = FakeGcs::start();
+    let (fake, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     store.put("a", b"1".to_vec()).await.expect("put");
     store.put("b", b"2".to_vec()).await.expect("put");
@@ -276,7 +269,7 @@ async fn independent_requests_are_in_flight_together() {
 
 #[tokio::test]
 async fn reads_and_uploads_use_independent_connection_pools() {
-    let (fake, endpoint) = FakeGcs::start();
+    let (fake, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
     store.put("a", b"1".to_vec()).await.expect("put");
     assert!(matches!(store.get("a").await, Ok(Some(_))));

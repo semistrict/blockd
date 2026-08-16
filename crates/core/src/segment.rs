@@ -6,7 +6,7 @@
 
 use crate::blx::{
     BatchMeta, BlockKey, BlxBatchBuilder, BlxEntry, NamespaceKind, TARGET_FILE_BYTES,
-    open_entry as open_blx_entry, scan_object,
+    open_entry as open_blx_entry, scan_object, vmm_snapshot_blocks,
 };
 use crate::format::DecodeError;
 use crate::journal::VsetKind;
@@ -34,76 +34,6 @@ pub struct PageLoc {
 /// Every page a segment holds: identity, generation, and byte range.
 pub type SegmentEntries = Vec<(PageId, Gen, PageLoc)>;
 
-#[derive(Clone, Debug)]
-struct PendingEntry {
-    page: PageId,
-    generation: Gen,
-    bytes: Option<Vec<u8>>,
-}
-
-/// Builds one BLX object, returning the exact byte range of every entry.
-#[derive(Debug)]
-pub struct SegmentBuilder {
-    kind: VsetKind,
-    vset: VsetId,
-    fence: u64,
-    seg: SegId,
-    entries: Vec<PendingEntry>,
-}
-
-impl SegmentBuilder {
-    pub fn new(vset: VsetId, fence: u64, seg: SegId) -> SegmentBuilder {
-        Self::new_for_kind(VsetKind::Compute, vset, fence, seg)
-    }
-
-    pub fn new_for_kind(kind: VsetKind, vset: VsetId, fence: u64, seg: SegId) -> SegmentBuilder {
-        SegmentBuilder {
-            kind,
-            vset,
-            fence,
-            seg,
-            entries: Vec::new(),
-        }
-    }
-
-    /// Append one page. `page_bytes` must be exactly one page.
-    pub fn add(&mut self, page: PageId, generation: Gen, page_bytes: &[u8]) {
-        assert_eq!(page_bytes.len(), page_size(), "segments store whole pages");
-        assert_eq!(page.volume.vset, self.vset, "segment is per-vset");
-        self.entries.push(PendingEntry {
-            page,
-            generation,
-            bytes: Some(page_bytes.to_vec()),
-        });
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Finish the blob: bytes plus every entry's location.
-    pub fn finish(self) -> (Vec<u8>, SegmentEntries) {
-        let mut batch = SegmentBatchBuilder::new_unpartitioned_for_kind(
-            self.kind, self.vset, self.fence, self.seg,
-        );
-        for entry in self.entries {
-            batch.add(
-                entry.page,
-                entry.generation,
-                entry.bytes.as_deref().expect("segment builder stores data"),
-            );
-        }
-        let mut objects = batch.finish();
-        assert_eq!(
-            objects.len(),
-            1,
-            "single segment builder exceeded BLX target"
-        );
-        let (_, bytes, entries) = objects.pop().expect("nonempty segment builder");
-        (bytes, entries)
-    }
-}
-
 /// Builds one capture's page entries into consecutive, independently bounded
 /// segment blobs. Rotation happens before an entry, so an entry is never split.
 #[derive(Debug)]
@@ -111,15 +41,7 @@ pub struct SegmentBatchBuilder {
     kind: VsetKind,
     vset: VsetId,
     fence: u64,
-    first_seg: SegId,
-    sequence: u64,
-    entries: Vec<PendingEntry>,
-    vmm_entries: Vec<(u32, Gen, Option<Vec<u8>>)>,
-    estimated_current_bytes: usize,
-    estimated_chunks: u64,
-    pre_state_checksum: u64,
-    post_state_checksum: u64,
-    split_at_file_partitions: bool,
+    builder: BlxBatchBuilder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,31 +75,23 @@ impl SegmentBatchBuilder {
         pre_state_checksum: u64,
         post_state_checksum: u64,
     ) -> Self {
+        let meta = BatchMeta {
+            namespace_kind: NamespaceKind::Vset,
+            namespace_id: vset.0,
+            writer_fence: fence,
+            first_object_id: first_seg.0,
+            min_seq: sequence,
+            max_seq: sequence,
+            batch_id: sequence,
+            pre_state_checksum,
+            post_state_checksum,
+        };
         Self {
             kind,
             vset,
             fence,
-            first_seg,
-            sequence,
-            entries: Vec::new(),
-            vmm_entries: Vec::new(),
-            estimated_current_bytes: 0,
-            estimated_chunks: 1,
-            pre_state_checksum,
-            post_state_checksum,
-            split_at_file_partitions: true,
+            builder: BlxBatchBuilder::new_partitioned(meta),
         }
-    }
-
-    fn new_unpartitioned_for_kind(
-        kind: VsetKind,
-        vset: VsetId,
-        fence: u64,
-        first_seg: SegId,
-    ) -> Self {
-        let mut builder = Self::new_for_kind(kind, vset, fence, first_seg);
-        builder.split_at_file_partitions = false;
-        builder
     }
 
     pub fn add(&mut self, page: PageId, generation: Gen, page_bytes: &[u8]) {
@@ -193,24 +107,15 @@ impl SegmentBatchBuilder {
     ) -> Result<(), SegmentIdOverflow> {
         assert_eq!(page_bytes.len(), page_size(), "BLX stores whole pages");
         assert_eq!(page.volume.vset, self.vset, "BLX object is per-vset");
-        let estimate = page_size() + 128;
-        if self.estimated_current_bytes != 0
-            && self.estimated_current_bytes.saturating_add(estimate) > TARGET_FILE_BYTES
-        {
-            self.first_seg
-                .0
-                .checked_add(self.estimated_chunks)
-                .ok_or(SegmentIdOverflow)?;
-            self.estimated_chunks += 1;
-            self.estimated_current_bytes = 0;
-        }
-        self.estimated_current_bytes += estimate;
-        self.entries.push(PendingEntry {
-            page,
+        self.builder.add_data(
+            BlockKey::from_page(self.kind, page),
             generation,
-            bytes: Some(page_bytes.to_vec()),
-        });
-        Ok(())
+            page_bytes.to_vec(),
+        );
+        self.builder
+            .object_ids_fit()
+            .then_some(())
+            .ok_or(SegmentIdOverflow)
     }
 
     pub fn try_add_tombstone(
@@ -219,89 +124,48 @@ impl SegmentBatchBuilder {
         generation: Gen,
     ) -> Result<(), SegmentIdOverflow> {
         assert_eq!(page.volume.vset, self.vset, "BLX object is per-vset");
-        let estimate = 128;
-        if self.estimated_current_bytes != 0
-            && self.estimated_current_bytes.saturating_add(estimate) > TARGET_FILE_BYTES
-        {
-            self.first_seg
-                .0
-                .checked_add(self.estimated_chunks)
-                .ok_or(SegmentIdOverflow)?;
-            self.estimated_chunks += 1;
-            self.estimated_current_bytes = 0;
-        }
-        self.estimated_current_bytes += estimate;
-        self.entries.push(PendingEntry {
-            page,
-            generation,
-            bytes: None,
-        });
-        Ok(())
+        self.builder
+            .add_tombstone(BlockKey::from_page(self.kind, page), generation);
+        self.builder
+            .object_ids_fit()
+            .then_some(())
+            .ok_or(SegmentIdOverflow)
     }
 
     /// Store a canonical VMM snapshot as padded BLX blocks. The manifest
     /// carries the exact logical byte length.
     pub fn add_vmm_snapshot(&mut self, generation: Gen, bytes: &[u8]) {
-        for (block, chunk) in bytes.chunks(page_size()).enumerate() {
-            let mut padded = vec![0; page_size()];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            self.vmm_entries.push((
-                u32::try_from(block).expect("VMM snapshot block fits u32"),
-                generation,
-                Some(padded),
-            ));
+        for (key, padded) in vmm_snapshot_blocks(bytes) {
+            self.builder.add_data(key, generation, padded);
         }
     }
 
     pub fn add_vmm_block(&mut self, block: u32, generation: Gen, bytes: &[u8]) {
         assert_eq!(bytes.len(), page_size(), "BLX stores whole VMM blocks");
-        self.vmm_entries
-            .push((block, generation, Some(bytes.to_vec())));
-    }
-
-    pub fn add_vmm_tombstone(&mut self, block: u32, generation: Gen) {
-        self.vmm_entries.push((block, generation, None));
-    }
-
-    pub fn finish(self) -> Vec<(SegId, Vec<u8>, SegmentEntries)> {
-        if self.entries.is_empty() && self.vmm_entries.is_empty() {
-            return Vec::new();
-        }
-        let meta = BatchMeta {
-            namespace_kind: NamespaceKind::Vset,
-            namespace_id: self.vset.0,
-            writer_fence: self.fence,
-            first_object_id: self.first_seg.0,
-            min_seq: self.sequence,
-            max_seq: self.sequence,
-            batch_id: self.sequence,
-            pre_state_checksum: self.pre_state_checksum,
-            post_state_checksum: self.post_state_checksum,
-        };
-        let mut builder = if self.split_at_file_partitions {
-            BlxBatchBuilder::new_partitioned(meta)
-        } else {
-            BlxBatchBuilder::new(meta)
-        };
-        for entry in self.entries {
-            let key = BlockKey::from_page(self.kind, entry.page);
-            match entry.bytes {
-                Some(bytes) => builder.add_data(key, entry.generation, bytes),
-                None => builder.add_tombstone(key, entry.generation),
-            }
-        }
-        for (block, generation, bytes) in self.vmm_entries {
-            let key = BlockKey {
+        self.builder.add_data(
+            BlockKey {
                 space: crate::blx::BlockSpace::Vmm,
                 volume: 0,
                 block,
-            };
-            match bytes {
-                Some(bytes) => builder.add_data(key, generation, bytes),
-                None => builder.add_tombstone(key, generation),
-            }
-        }
-        builder
+            },
+            generation,
+            bytes.to_vec(),
+        );
+    }
+
+    pub fn add_vmm_tombstone(&mut self, block: u32, generation: Gen) {
+        self.builder.add_tombstone(
+            BlockKey {
+                space: crate::blx::BlockSpace::Vmm,
+                volume: 0,
+                block,
+            },
+            generation,
+        );
+    }
+
+    pub fn finish(self) -> Vec<(SegId, Vec<u8>, SegmentEntries)> {
+        self.builder
             .finish()
             .into_iter()
             .map(|object| {
@@ -407,10 +271,11 @@ mod tests {
     }
 
     fn sample_segment() -> (Vec<u8>, SegmentEntries) {
-        let mut b = SegmentBuilder::new(VsetId(0xA1), 6, SegId(2));
+        let mut b = SegmentBatchBuilder::new(VsetId(0xA1), 6, SegId(2));
         b.add(sample_page(0, 3), Gen(7), &pattern_page(0x55));
         b.add(sample_page(1, 0), Gen(9), &pattern_page(0xAA));
-        b.finish()
+        let (_, bytes, entries) = b.finish().pop().expect("sample object");
+        (bytes, entries)
     }
 
     #[test]

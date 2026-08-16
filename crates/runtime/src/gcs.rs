@@ -1,12 +1,12 @@
 //! Google Cloud Storage as the object store, spoken over the XML API.
 //!
-//! GCS is a better fit for the store seam than S3's shape: every object
+//! GCS generations fit the store seam directly: every object
 //! carries a native, monotone `generation` (int64), returned in the
 //! `x-goog-generation` header on writes and reads, and conditional writes
 //! take `x-goog-if-generation-match: 0|N` — exactly the seam's u64 CAS
 //! (R6.3), with no client-side version bookkeeping at all. Versions
-//! therefore survive process restarts and compare across hosts, which the
-//! in-process `S3Store` registry cannot do.
+//! therefore survive process restarts and compare across hosts without
+//! client-side version bookkeeping.
 //!
 //! Fault taxonomy (R8.3/R8.2): anything transient — timeouts, connection
 //! errors, 408/429/5xx — maps to `StoreFault::Unavailable` and the
@@ -262,7 +262,7 @@ impl GcsStore {
     async fn token(&self) -> Result<String, StoreFault> {
         // Serialize refreshes so an expiry burst sends one metadata request,
         // not one per concurrent object request. This is an async mutex: no
-        // executor thread is occupied while the metadata request is in flight.
+        // runtime worker is occupied while the metadata request is in flight.
         let mut cached = self.token.lock().await;
         if let Some(token) = cached.as_ref()
             && token.expires_at > Instant::now() + TOKEN_SLACK

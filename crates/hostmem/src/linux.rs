@@ -172,13 +172,6 @@ impl HostRegion {
         self.pages
     }
 
-    /// Duplicate the memfd backing this region. Virtio-fs DAX passes this
-    /// descriptor to the VMM so selected file pages can be mapped into the
-    /// guest's device-owned shared-memory window.
-    pub fn try_clone_file(&self) -> io::Result<std::fs::File> {
-        self.fd.try_clone().map(std::fs::File::from)
-    }
-
     /// Fill's first half: write bytes through the daemon view, populating
     /// the shared page-cache page a `UFFDIO_CONTINUE` will then map.
     pub fn write_page(&self, page: usize, bytes: &[u8]) {

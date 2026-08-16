@@ -1,17 +1,14 @@
 //! Production host for the shared async protocol actors.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use blockd_core::database::{AttachmentId, DatabaseError, DatabaseReply, DatabaseRequest};
 use blockd_core::engine::{HostFatal, HostState, host_actor_with_state};
 use blockd_core::hostmeta::{
     Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVsetMetrics, VsetOperations,
@@ -20,14 +17,13 @@ use blockd_core::journal::{VsetConfig, VsetKind};
 use blockd_core::protocol::{
     AdminCall, AdminEvent, AdminResult, AdminSuccess, PeerMsg, ReqId, Verdict,
 };
-use blockd_core::types::{HostId, PageId, PageNo, VmId, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
 use blockd_core::world::{
-    AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, DatabaseActorRequest, FillSource,
-    GuestFault, GuestMem, GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store,
-    StoreError,
+    AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem,
+    GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store, StoreError,
 };
 use blockd_exec::inject::{Injected, Injector, Lane, bounded_injector, injector};
-use blockd_exec::{Executor, bridge_request, delay};
+use blockd_exec::{ProductionContext, delay, request};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 use tokio::io::unix::AsyncFd;
 
@@ -72,7 +68,7 @@ struct VsetHost {
 #[derive(Default)]
 struct GuestCtl {
     state: Mutex<CtlState>,
-    cv: Condvar,
+    ready: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -200,7 +196,7 @@ const PAUSE_NAMES: [&str; 2] = ["checkpoint", "migration"];
 struct Shared {
     vsets: Mutex<BTreeMap<VsetId, Arc<VsetHost>>>,
     admin_events: Mutex<VecDeque<AdminEvent>>,
-    admin_event_ready: Condvar,
+    admin_event_ready: tokio::sync::Notify,
     incidents: Mutex<Vec<String>>,
     counters: Mutex<Counters>,
     daemon_stats: Mutex<DaemonStats>,
@@ -226,7 +222,7 @@ impl Shared {
         Self {
             vsets: Mutex::new(vsets),
             admin_events: Mutex::new(VecDeque::new()),
-            admin_event_ready: Condvar::new(),
+            admin_event_ready: tokio::sync::Notify::new(),
             incidents: Mutex::new(Vec::new()),
             counters: Mutex::new(Counters::default()),
             daemon_stats: Mutex::new(state.stats()),
@@ -280,7 +276,7 @@ impl Drop for PendingGuestPause {
         state.pause_waiter = None;
         drop(state);
         complete_pause(&self.shared, self.vset);
-        self.host.ctl.cv.notify_all();
+        self.host.ctl.ready.notify_waiters();
     }
 }
 
@@ -306,72 +302,19 @@ enum FaultWork {
         hosts: Vec<(Arc<VsetHost>, Vec<usize>)>,
         reply: Injector<Result<(), ()>>,
     },
-    Install {
-        host: Arc<VsetHost>,
-        page: PageId,
-        bytes: Vec<u8>,
-        reply: Injector<Result<(), ()>>,
-    },
     Barrier {
-        done: SyncSender<()>,
+        done: tokio::sync::oneshot::Sender<()>,
     },
 }
 
-struct FaultIo {
-    handle: tokio::runtime::Handle,
-    work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl FaultIo {
-    fn shutdown(&mut self) {
-        let (done, drained) = sync_channel(0);
-        if self.work.send(FaultWork::Barrier { done }).is_ok() {
-            let _ = drained.recv();
+async fn fault_work_loop(mut work: tokio::sync::mpsc::UnboundedReceiver<FaultWork>) {
+    while let Some(item) = work.recv().await {
+        if tokio::task::spawn_blocking(move || execute_fault_work(item))
+            .await
+            .is_err()
+        {
+            return;
         }
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn spawn_fault_io_runtime() -> FaultIo {
-    let (ready_tx, ready_rx) = sync_channel(1);
-    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-    let (work, mut work_rx) = tokio::sync::mpsc::unbounded_channel();
-    let thread = thread::Builder::new()
-        .name("blockd-fault-io".to_owned())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .build()
-                .expect("fault I/O runtime");
-            ready_tx
-                .send(runtime.handle().clone())
-                .expect("runtime owner alive");
-            runtime.block_on(async {
-                tokio::pin!(shutdown_rx);
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => break,
-                        item = work_rx.recv() => {
-                            let Some(item) = item else { break };
-                            execute_fault_work(item);
-                        }
-                    }
-                }
-            });
-        })
-        .expect("spawn fault I/O runtime");
-    FaultIo {
-        handle: ready_rx.recv().expect("fault I/O runtime started"),
-        work,
-        shutdown: Some(shutdown),
-        thread: Some(thread),
     }
 }
 
@@ -427,15 +370,6 @@ fn execute_fault_work(work: FaultWork) {
             }
             let _ = reply.push(Lane::Critical, result);
         }
-        FaultWork::Install {
-            host,
-            page,
-            bytes,
-            reply,
-        } => {
-            host.region.write_page(host.page_index(page), &bytes);
-            let _ = reply.push(Lane::Critical, Ok(()));
-        }
         FaultWork::Barrier { done } => {
             let _ = done.send(());
         }
@@ -473,7 +407,6 @@ struct ProductionWorld {
     fault_rx: Injected<GuestFault>,
     sync_rx: Injected<GuestSyncRequest>,
     admin_rx: Injected<AdminRequest>,
-    database_rx: Injected<DatabaseActorRequest>,
     shared: Arc<Shared>,
     fault_work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
     shared_pages: RefCell<BTreeMap<SharedPageKey, Vec<u8>>>,
@@ -814,20 +747,6 @@ impl GuestMem for ProductionWorld {
         self.fault_response(&response, world_kind::EVICT).await
     }
 
-    async fn install_database(&self, page: PageId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
-        let (reply, response) = injector();
-        self.fault_work
-            .send(FaultWork::Install {
-                host: self.host(page.volume.vset),
-                page,
-                bytes,
-                reply,
-            })
-            .map_err(|_| GuestMemoryError::Unavailable)?;
-        self.fault_response(&response, world_kind::DATABASE_INSTALL)
-            .await
-    }
-
     async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
         let raw: [u8; 8] = bytes
             .get(..8)
@@ -902,7 +821,7 @@ impl GuestMem for ProductionWorld {
         state.paused = false;
         drop(state);
         complete_pause(&self.shared, vset);
-        host.ctl.cv.notify_all();
+        host.ctl.ready.notify_waiters();
         self.shared.stats.record_world(world_kind::RESUME_GUEST, 0);
         Ok(())
     }
@@ -954,12 +873,8 @@ impl AdminIo for ProductionWorld {
             .lock()
             .expect("admin event lock")
             .push_back(event);
-        self.shared.admin_event_ready.notify_all();
+        self.shared.admin_event_ready.notify_waiters();
         self.shared.stats.record_world(world_kind::ADMIN, 0);
-    }
-
-    async fn next_database(&self) -> Option<DatabaseActorRequest> {
-        self.database_rx.recv().await
     }
 
     async fn host_failed(&self, failure: HostFatal) {
@@ -977,11 +892,9 @@ impl AdminIo for ProductionWorld {
 #[derive(Clone)]
 struct Inputs {
     admin: Injector<AdminRequest>,
-    database: Injector<DatabaseActorRequest>,
     faults: Injector<GuestFault>,
     syncs: Injector<GuestSyncRequest>,
     peers: Injector<(HostId, PeerMsg)>,
-    stop: Injector<()>,
 }
 
 const PEER_INPUT_CAPACITY: usize = 4;
@@ -990,7 +903,6 @@ impl Inputs {
     fn depths(&self) -> (usize, usize) {
         [
             self.admin.depths(),
-            self.database.depths(),
             self.faults.depths(),
             self.syncs.depths(),
             self.peers.depths(),
@@ -1010,19 +922,19 @@ pub struct Runtime {
     shared: Arc<Shared>,
     blob_dir: PathBuf,
     peers: Option<Arc<PeerNet>>,
-    fault_io: FaultIo,
     authenticated_peers: bool,
-    loop_thread: Option<thread::JoinHandle<()>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    actor_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Runtime {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(config: &RuntimeConfig, store: Arc<dyn ObjectStore>) -> Self {
-        Self::start(BTreeMap::new(), config, store)
+    pub async fn new(config: &RuntimeConfig, store: Arc<dyn ObjectStore>) -> Self {
+        Self::start(BTreeMap::new(), config, store).await
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn recover(
+    pub async fn recover(
         config: &RuntimeConfig,
         store: Arc<dyn ObjectStore>,
         vset_configs: &BTreeMap<VsetId, VsetConfig>,
@@ -1035,91 +947,82 @@ impl Runtime {
             );
             hosts.insert(vset, VsetHost::new(vset_config));
         }
-        let runtime = Self::start(hosts, config, store);
+        let runtime = Self::start(hosts, config, store).await;
         (runtime, BTreeMap::new())
     }
 
     #[allow(clippy::too_many_lines)]
-    fn start(
+    async fn start(
         hosts: BTreeMap<VsetId, Arc<VsetHost>>,
         config: &RuntimeConfig,
         store: Arc<dyn ObjectStore>,
     ) -> Self {
-        std::fs::create_dir_all(&config.blob_dir).expect("blob directory");
-        let fault_io = spawn_fault_io_runtime();
+        tokio::fs::create_dir_all(&config.blob_dir)
+            .await
+            .expect("blob directory");
+        let (fault_work, fault_work_rx) = tokio::sync::mpsc::unbounded_channel();
         let (admin, admin_rx_actor) = injector();
-        let (database, database_rx_actor) = injector();
         let (faults, fault_rx_actor) = injector();
         let (syncs, sync_rx_actor) = injector();
         let (peer_input, peer_rx_actor) = bounded_injector(PEER_INPUT_CAPACITY);
-        let (stop, stop_rx_actor) = injector();
         let inputs = Inputs {
             admin,
-            database,
             faults,
             syncs,
             peers: peer_input,
-            stop,
         };
         let shared = Arc::new(Shared::new(hosts, &config.daemon));
-        let peers = config.peer.as_ref().map(|peer_config| {
-            let incoming = inputs.peers.clone();
-            PeerNet::start(peer_config, config.daemon.host, move |from, message| {
-                let lane = peer_lane(&message);
-                let _ = incoming.push(lane, (from, message));
-            })
-        });
-        let authenticated_peers = peers.as_ref().is_some_and(|peers| peers.authenticated());
-        let tokio = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("store runtime");
-        let blobs = FileBlobs::new(&config.blob_dir).expect("file blob world");
-        let runtime_store = RuntimeStore::new(tokio.handle().clone(), store);
-        let (ready, started) = sync_channel(0);
+        let blobs = FileBlobs::new(&config.blob_dir);
+        let runtime_store = RuntimeStore::new(store);
         let actor_config = config.daemon.clone();
+        let peer_input = inputs.peers.clone();
+        let peers = match config.peer.clone() {
+            Some(peer_config) => Some(
+                PeerNet::start(&peer_config, actor_config.host, move |from, message| {
+                    let lane = peer_lane(&message);
+                    let _ = peer_input.push(lane, (from, message));
+                })
+                .await
+                .expect("peer listen"),
+            ),
+            None => None,
+        };
+        let authenticated_peers = peers.as_ref().is_some_and(|peers| peers.authenticated());
         let actor_shared = Arc::clone(&shared);
         let actor_inputs = inputs.clone();
+        let world_fault_work = fault_work.clone();
+        let shutdown_fault_work = fault_work.clone();
         let actor_peers = peers.clone();
-        let fault_work = fault_io.work.clone();
-        let monotonic_epoch = Instant::now();
-        let loop_thread = thread::Builder::new()
-            .name("blockd-actor-host".to_owned())
-            .spawn(move || {
-                let world = Rc::new(ProductionWorld {
-                    blobs,
-                    store: runtime_store,
-                    peers: actor_peers,
-                    self_id: actor_config.host,
-                    peer_rx: peer_rx_actor,
-                    fault_rx: fault_rx_actor,
-                    sync_rx: sync_rx_actor,
-                    admin_rx: admin_rx_actor,
-                    database_rx: database_rx_actor,
-                    shared: Arc::clone(&actor_shared),
-                    fault_work,
-                    shared_pages: RefCell::new(BTreeMap::new()),
-                });
-                let clock = Arc::new(move || elapsed_ns(monotonic_epoch.elapsed()));
-                let mut executor = Executor::production_with_clock(clock);
-                let state = Rc::new(RefCell::new(HostState::new(actor_config.clone())));
-                executor
-                    .spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)))
-                    .detach();
-                let stopped = Rc::new(Cell::new(false));
-                let stop_flag = Rc::clone(&stopped);
-                executor
-                    .spawn(async move {
-                        let _ = stop_rx_actor.recv().await;
-                        stop_flag.set(true);
-                    })
-                    .detach();
-                let observation_state = Rc::clone(&state);
-                let observation_shared = Arc::clone(&actor_shared);
-                let observation_inputs = actor_inputs.clone();
-                let observation_interval = actor_config.writeback_interval.clamp(1, 1_000_000);
-                executor
-                    .spawn(async move {
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let poll_stats = Arc::clone(&actor_shared);
+        let context = ProductionContext::new(move |ns| poll_stats.stats.record_actor_poll(ns));
+        let actor_task = tokio::task::spawn_local(async move {
+            context
+                .scope(async move {
+                    let fault_worker = tokio::task::spawn_local(fault_work_loop(fault_work_rx));
+                    let world = Rc::new(ProductionWorld {
+                        blobs,
+                        store: runtime_store,
+                        peers: actor_peers.clone(),
+                        self_id: actor_config.host,
+                        peer_rx: peer_rx_actor,
+                        fault_rx: fault_rx_actor,
+                        sync_rx: sync_rx_actor,
+                        admin_rx: admin_rx_actor,
+                        shared: Arc::clone(&actor_shared),
+                        fault_work: world_fault_work,
+                        shared_pages: RefCell::new(BTreeMap::new()),
+                    });
+                    let state = Rc::new(RefCell::new(HostState::new(actor_config.clone())));
+                    let mut host_actor = blockd_exec::spawn(host_actor_with_state(
+                        Rc::clone(&state),
+                        Rc::clone(&world),
+                    ));
+                    let observation_state = Rc::clone(&state);
+                    let observation_shared = Arc::clone(&actor_shared);
+                    let observation_inputs = actor_inputs.clone();
+                    let observation_interval = actor_config.writeback_interval.clamp(1, 1_000_000);
+                    let mut observation = blockd_exec::spawn(async move {
                         loop {
                             publish_observability(
                                 &observation_shared,
@@ -1128,36 +1031,35 @@ impl Runtime {
                             );
                             delay(observation_interval).await;
                         }
-                    })
-                    .detach();
-                ready.send(()).expect("runtime owner alive");
-                while !stopped.get() {
-                    let busy = Instant::now();
-                    executor.run_until_stalled();
-                    actor_shared
-                        .stats
-                        .record_actor_poll(elapsed_ns(busy.elapsed()));
-                    if stopped.get() {
-                        break;
+                    });
+                    let _ = shutdown_rx.await;
+                    host_actor.cancel();
+                    observation.cancel();
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
                     }
-                    let idle = Instant::now();
-                    executor.wait_for_wake();
-                    actor_shared.stats.record_idle(elapsed_ns(idle.elapsed()));
-                }
-                publish_observability(&actor_shared, &state, &actor_inputs);
-                drop(tokio);
-            })
-            .expect("spawn actor host");
-        started.recv().expect("actor host started");
+                    let (drained, drain) = tokio::sync::oneshot::channel();
+                    if shutdown_fault_work
+                        .send(FaultWork::Barrier { done: drained })
+                        .is_ok()
+                    {
+                        let _ = drain.await;
+                    }
+                    fault_worker.abort();
+                    let _ = fault_worker.await;
+                    publish_observability(&actor_shared, &state, &actor_inputs);
+                })
+                .await;
+        });
 
         let runtime = Self {
             inputs,
             shared,
             blob_dir: config.blob_dir.clone(),
             peers,
-            fault_io,
             authenticated_peers,
-            loop_thread: Some(loop_thread),
+            shutdown: Some(shutdown),
+            actor_task: Some(actor_task),
         };
         let hosts = runtime
             .shared
@@ -1294,7 +1196,7 @@ impl Runtime {
             .expect("compute vset has userfaultfd")
             .clone();
         uffd.set_nonblocking(true).expect("nonblocking userfaultfd");
-        self.fault_io.handle.spawn(async move {
+        tokio::spawn(async move {
             let uffd = AsyncFd::new(SharedUffd(uffd)).expect("register runtime userfaultfd");
             loop {
                 let Ok(mut ready) = uffd.readable().await else {
@@ -1348,49 +1250,53 @@ impl Runtime {
         ReqId(self.shared.next_req.fetch_add(1, Ordering::SeqCst))
     }
 
-    fn admin_request(&self, call: AdminCall) -> AdminResult {
-        let (request, reply) = bridge_request(call);
+    async fn admin_request(&self, call: AdminCall) -> AdminResult {
+        let (request, reply) = request(call);
         self.inputs
             .admin
             .push(Lane::Background, request)
             .unwrap_or_else(|_| panic!("actor host alive"));
-        reply
-            .blocking_recv_timeout(Duration::from_secs(30))
+        tokio::time::timeout(Duration::from_secs(30), reply)
+            .await
             .expect("admin reply within 30 seconds")
+            .expect("actor host alive")
     }
 
-    fn wait_admin_event<T>(&self, mut want: impl FnMut(&AdminEvent) -> Option<T>) -> T {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut events = self.shared.admin_events.lock().expect("admin event lock");
-        loop {
-            if let Some((index, output)) = events
-                .iter()
-                .enumerate()
-                .find_map(|(index, event)| want(event).map(|output| (index, output)))
-            {
-                events.remove(index);
-                return output;
+    async fn wait_admin_event<T>(&self, mut want: impl FnMut(&AdminEvent) -> Option<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let notified = self.shared.admin_event_ready.notified();
+                if let Some(output) = {
+                    let mut events = self.shared.admin_events.lock().expect("admin event lock");
+                    events
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, event)| want(event).map(|output| (index, output)))
+                        .map(|(index, output)| {
+                            events.remove(index);
+                            output
+                        })
+                } {
+                    return output;
+                }
+                notified.await;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "admin event within 30 seconds");
-            let (next, timeout) = self
-                .shared
-                .admin_event_ready
-                .wait_timeout(events, remaining)
-                .expect("admin event lock");
-            events = next;
-            assert!(!timeout.timed_out(), "admin event within 30 seconds");
-        }
+        })
+        .await
+        .expect("admin event within 30 seconds")
     }
 
-    pub fn create_vset(&self, vset: VsetId, config: VsetConfig) {
+    pub async fn create_vset(&self, vset: VsetId, config: VsetConfig) {
         let started = Instant::now();
         self.install_vset_host(vset, config);
-        let created = match self.admin_request(AdminCall::CreateVset {
-            vset,
-            config,
-            from_base: None,
-        }) {
+        let created = match self
+            .admin_request(AdminCall::CreateVset {
+                vset,
+                config,
+                from_base: None,
+            })
+            .await
+        {
             Ok(AdminSuccess::VsetCreated { vset: found }) if found == vset => true,
             Err(_) => false,
             result => panic!("unexpected create result: {result:?}"),
@@ -1399,11 +1305,14 @@ impl Runtime {
         assert!(created, "vset creation failed");
     }
 
-    pub fn checkpoint(&self, vset: VsetId) -> u64 {
+    pub async fn checkpoint(&self, vset: VsetId) -> u64 {
         let started = Instant::now();
         let req = self.req();
         self.expect_pause(vset, 0);
-        let result = match self.admin_request(AdminCall::Checkpoint { retry: req, vset }) {
+        let result = match self
+            .admin_request(AdminCall::Checkpoint { retry: req, vset })
+            .await
+        {
             Ok(AdminSuccess::CheckpointDone { epoch, .. }) => Some(epoch.0),
             Err(_) => None,
             result => panic!("unexpected checkpoint result: {result:?}"),
@@ -1415,64 +1324,10 @@ impl Runtime {
         result.expect("checkpoint failed")
     }
 
-    pub fn attach_database(&self, vset: VsetId, vm: VmId) -> AttachmentId {
-        self.try_attach_database(vset, vm)
-            .expect("database attach failed")
-    }
-
-    pub fn try_attach_database(&self, vset: VsetId, vm: VmId) -> Option<AttachmentId> {
-        match self.admin_request(AdminCall::AttachDatabase { vset, vm }) {
-            Ok(AdminSuccess::DatabaseAttached {
-                vset: found_vset,
-                attachment,
-            }) if found_vset == vset => Some(attachment),
-            Err(_) => None,
-            result => panic!("unexpected database attach result: {result:?}"),
-        }
-    }
-
-    pub fn begin_detach_database(
-        &self,
-        vset: VsetId,
-        attachment: AttachmentId,
-        mode: blockd_core::protocol::DetachMode,
-    ) {
-        match self.admin_request(AdminCall::BeginDetachDatabase {
-            vset,
-            attachment,
-            mode,
-        }) {
-            Ok(AdminSuccess::DatabaseDetachStarted { .. }) => {}
-            Err(error) => panic!("database detach failed: {error:?}"),
-            result => panic!("unexpected database detach result: {result:?}"),
-        }
-    }
-
-    pub fn finish_detach_database(&self, vset: VsetId, attachment: AttachmentId) -> bool {
-        match self.admin_request(AdminCall::FinishDetachDatabase { vset, attachment }) {
-            Ok(AdminSuccess::DatabaseDetached { .. }) => true,
-            Err(_) => false,
-            result => panic!("unexpected database detach result: {result:?}"),
-        }
-    }
-
-    pub fn database_request(&self, request: DatabaseRequest) -> DatabaseReply {
-        let (req, call) = request.into_call();
-        let (request, reply) = bridge_request(call);
-        self.inputs
-            .database
-            .push(Lane::Background, request)
-            .unwrap_or_else(|_| panic!("actor host alive"));
-        let result = reply
-            .blocking_recv_timeout(Duration::from_secs(30))
-            .unwrap_or(Err(DatabaseError::Io));
-        DatabaseReply::from_result(req, result)
-    }
-
-    pub fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
+    pub async fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
         let started = Instant::now();
         self.install_vset_host(vset, config);
-        let result = match self.admin_request(AdminCall::RestoreVset { vset }) {
+        let result = match self.admin_request(AdminCall::RestoreVset { vset }).await {
             Ok(AdminSuccess::VsetRestored { verdict, .. }) => Some(verdict),
             Err(_) => None,
             result => panic!("unexpected restore result: {result:?}"),
@@ -1481,7 +1336,7 @@ impl Runtime {
         result.expect("restore failed")
     }
 
-    pub fn wait_recovered(&self, vset: VsetId) -> Verdict {
+    pub async fn wait_recovered(&self, vset: VsetId) -> Verdict {
         self.wait_admin_event(|event| match event {
             AdminEvent::VsetRecovered {
                 vset: found,
@@ -1489,6 +1344,7 @@ impl Runtime {
             } if *found == vset => Some(*verdict),
             _ => None,
         })
+        .await
     }
 
     pub fn expect_migration(&self, vset: VsetId, config: VsetConfig) {
@@ -1508,10 +1364,10 @@ impl Runtime {
         }
     }
 
-    pub fn migrate_out(&self, vset: VsetId, to: HostId) {
+    pub async fn migrate_out(&self, vset: VsetId, to: HostId) {
         let started = Instant::now();
         self.expect_pause(vset, 1);
-        let migrated = match self.admin_request(AdminCall::MigrateOut { vset, to }) {
+        let migrated = match self.admin_request(AdminCall::MigrateOut { vset, to }).await {
             Ok(AdminSuccess::MigratedOut { .. }) => true,
             Err(_) => false,
             result => panic!("unexpected migration result: {result:?}"),
@@ -1525,7 +1381,7 @@ impl Runtime {
         assert!(migrated, "migrate out failed");
     }
 
-    pub fn wait_migrated_in(&self, vset: VsetId) -> Verdict {
+    pub async fn wait_migrated_in(&self, vset: VsetId) -> Verdict {
         self.wait_admin_event(|event| match event {
             AdminEvent::VsetMigratedIn {
                 vset: found,
@@ -1533,6 +1389,7 @@ impl Runtime {
             } if *found == vset => Some(*verdict),
             _ => None,
         })
+        .await
     }
 
     pub fn counters(&self) -> Counters {
@@ -1571,38 +1428,22 @@ impl Runtime {
         ))
     }
 
-    pub fn database_dax_file(
-        &self,
-        vset: VsetId,
-        file: blockd_core::database::DatabaseFile,
-    ) -> std::io::Result<(std::fs::File, u64)> {
-        let host = self
-            .shared
-            .vsets
-            .lock()
-            .expect("vset lock")
-            .get(&vset)
-            .cloned()
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-        if host.config.kind != VsetKind::Database {
-            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        let file_offset = u64::from(file.volume_index().0)
-            * u64::from(host.config.pages_per_volume)
-            * page_size() as u64;
-        Ok((host.region.try_clone_file()?, file_offset))
-    }
-
     fn host(&self, vset: VsetId) -> Arc<VsetHost> {
         self.shared.vsets.lock().expect("vset lock")[&vset].clone()
     }
 
-    fn op_start(host: &VsetHost) {
-        let mut state = host.ctl.state.lock().expect("guest control lock");
-        while state.pause_requested || state.paused {
-            state = host.ctl.cv.wait(state).expect("guest control wait");
+    async fn op_start(host: &VsetHost) {
+        loop {
+            let notified = host.ctl.ready.notified();
+            {
+                let mut state = host.ctl.state.lock().expect("guest control lock");
+                if !state.pause_requested && !state.paused {
+                    state.in_op = true;
+                    return;
+                }
+            }
+            notified.await;
         }
-        state.in_op = true;
     }
 
     fn op_end(host: &VsetHost) {
@@ -1616,29 +1457,31 @@ impl Runtime {
                 let _ = waiter.push(Lane::Critical, applied);
             }
         }
+        drop(state);
+        host.ctl.ready.notify_waiters();
     }
 
-    pub fn guest_write(&self, vset: VsetId, page: PageId, value: u64) {
+    pub async fn guest_write(&self, vset: VsetId, page: PageId, value: u64) {
         let host = self.host(vset);
-        Self::op_start(&host);
+        Self::op_start(&host).await;
         host.view.write_word(host.page_index(page), value);
         Self::op_end(&host);
     }
 
-    pub fn guest_read(&self, vset: VsetId, page: PageId) -> Vec<u8> {
+    pub async fn guest_read(&self, vset: VsetId, page: PageId) -> Vec<u8> {
         let host = self.host(vset);
-        Self::op_start(&host);
+        Self::op_start(&host).await;
         let bytes = host.view.read_page(host.page_index(page));
         Self::op_end(&host);
         bytes
     }
 
-    pub fn guest_sync(&self, vset: VsetId, volume: VolumeIdx) -> bool {
+    pub async fn guest_sync(&self, vset: VsetId, volume: VolumeIdx) -> bool {
         let started = Instant::now();
         let host = self.host(vset);
-        Self::op_start(&host);
+        Self::op_start(&host).await;
         let req = self.req();
-        let (request, reply) = bridge_request(GuestSync {
+        let (request, reply) = request(GuestSync {
             req,
             volume: VolumeId { vset, idx: volume },
         });
@@ -1646,9 +1489,10 @@ impl Runtime {
             .syncs
             .push(Lane::Critical, request)
             .unwrap_or_else(|_| panic!("actor host alive"));
-        let ok = reply
-            .blocking_recv_timeout(Duration::from_secs(30))
-            .expect("sync reply within 30 seconds");
+        let ok = tokio::time::timeout(Duration::from_secs(30), reply)
+            .await
+            .expect("sync reply within 30 seconds")
+            .expect("actor host alive");
         Self::op_end(&host);
         self.observe_operation(4, ok, started.elapsed());
         ok
@@ -1692,15 +1536,25 @@ impl Runtime {
             queue.remove(position);
         }
     }
+
+    pub async fn shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(actor_task) = self.actor_task.take() {
+            let _ = actor_task.await;
+        }
+    }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        let _ = self.inputs.stop.push(Lane::Critical, ());
-        if let Some(handle) = self.loop_thread.take() {
-            let _ = handle.join();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
         }
-        self.fault_io.shutdown();
+        if let Some(actor_task) = self.actor_task.take() {
+            actor_task.abort();
+        }
     }
 }
 
@@ -1723,13 +1577,7 @@ fn latency_snapshots<const N: usize>(
 }
 
 fn peer_lane(message: &PeerMsg) -> Lane {
-    if matches!(
-        message,
-        PeerMsg::Page { .. }
-            | PeerMsg::Leaf { .. }
-            | PeerMsg::FetchRange { .. }
-            | PeerMsg::FetchLeaf { .. }
-    ) {
+    if matches!(message, PeerMsg::Page { .. } | PeerMsg::FetchRange { .. }) {
         Lane::Critical
     } else {
         Lane::Background
@@ -1948,52 +1796,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn concurrent_admin_requests_keep_out_of_order_replies_with_their_callers() {
+    #[tokio::test]
+    async fn concurrent_admin_requests_keep_out_of_order_replies_with_their_callers() {
         let (admin, incoming) = injector::<AdminRequest>();
-        let actor = thread::spawn(move || {
-            let mut executor = Executor::production();
-            executor.block_on(async move {
-                let first = incoming.recv().await.expect("first request");
-                let second = incoming.recv().await.expect("second request");
-                let (first, mut first_reply) = first.into_parts();
-                let (second, mut second_reply) = second.into_parts();
-                let AdminCall::DeleteBase { base: second_base } = second else {
-                    panic!("delete-base request");
-                };
-                let AdminCall::DeleteBase { base: first_base } = first else {
-                    panic!("delete-base request");
-                };
-                second_reply
-                    .send(Ok(AdminSuccess::BaseDeleted { base: second_base }))
-                    .expect("second caller alive");
-                first_reply
-                    .send(Ok(AdminSuccess::BaseDeleted { base: first_base }))
-                    .expect("first caller alive");
-            });
+        let actor = tokio::spawn(async move {
+            let first = incoming.recv().await.expect("first request");
+            let second = incoming.recv().await.expect("second request");
+            let (first, mut first_reply) = first.into_parts();
+            let (second, mut second_reply) = second.into_parts();
+            let AdminCall::DeleteBase { base: second_base } = second else {
+                panic!("delete-base request");
+            };
+            let AdminCall::DeleteBase { base: first_base } = first else {
+                panic!("delete-base request");
+            };
+            second_reply
+                .send(Ok(AdminSuccess::BaseDeleted { base: second_base }))
+                .expect("second caller alive");
+            first_reply
+                .send(Ok(AdminSuccess::BaseDeleted { base: first_base }))
+                .expect("first caller alive");
         });
 
-        let call = |base: u64, admin: Injector<AdminRequest>| {
-            thread::spawn(move || {
-                let (request, reply) = bridge_request(AdminCall::DeleteBase { base });
-                admin
-                    .push(Lane::Background, request)
-                    .unwrap_or_else(|_| panic!("actor alive"));
-                reply
-                    .blocking_recv_timeout(Duration::from_secs(1))
-                    .expect("reply without shared-stream timeout")
-            })
+        let call = async |base: u64, admin: Injector<AdminRequest>| {
+            let (request, reply) = request(AdminCall::DeleteBase { base });
+            admin
+                .push(Lane::Background, request)
+                .unwrap_or_else(|_| panic!("actor alive"));
+            tokio::time::timeout(Duration::from_secs(1), reply)
+                .await
+                .expect("reply without shared-stream timeout")
+                .expect("actor alive")
         };
-        let first = call(1, admin.clone());
-        let second = call(2, admin);
+        let (first, second) = tokio::join!(call(1, admin.clone()), call(2, admin));
 
-        for (expected, caller) in [(1, first), (2, second)] {
-            assert_eq!(
-                caller.join().expect("caller thread"),
-                Ok(AdminSuccess::BaseDeleted { base: expected })
-            );
+        for (expected, reply) in [(1, first), (2, second)] {
+            assert_eq!(reply, Ok(AdminSuccess::BaseDeleted { base: expected }));
         }
-        actor.join().expect("actor thread");
+        actor.await.expect("actor task");
     }
 
     #[test]
@@ -2033,7 +1873,7 @@ mod tests {
     #[test]
     fn cancelled_pending_pause_releases_guest_control() {
         let vset = VsetId(8);
-        let host = VsetHost::new(VsetConfig::database(1));
+        let host = VsetHost::new(VsetConfig::compute(1, 1));
         let shared = Arc::new(Shared::new(
             BTreeMap::from([(vset, Arc::clone(&host))]),
             &test_host_config(),

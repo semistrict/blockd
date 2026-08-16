@@ -13,17 +13,15 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
-use blockd_core::format::{Dec, FRAME_HEADER};
-use blockd_core::peer::{MAGIC_PEER, MAX_PEER_PAYLOAD, decode_peer, encode_peer};
+use blockd_core::peer::encode_peer;
 use blockd_core::protocol::PeerMsg;
 use blockd_core::types::HostId;
+use blockd_transport::{DecodePolicy, receive_loop, write_frame};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use tokio::time::timeout;
@@ -31,10 +29,6 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 /// What the transport does with a verified inbound message.
 type Deliver = dyn Fn(HostId, PeerMsg) + Send + Sync;
-
-fn header_allowed(magic: u32, payload_len: u32) -> bool {
-    magic == MAGIC_PEER && payload_len <= MAX_PEER_PAYLOAD
-}
 
 #[derive(Clone, Debug)]
 pub struct PeerConfig {
@@ -123,8 +117,7 @@ pub struct PeerNet {
     /// visibility into how hard the retry timers are working.
     pub dropped_sends: Arc<AtomicU64>,
     connected: BTreeMap<HostId, Arc<AtomicBool>>,
-    shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    io_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     authenticated: bool,
 }
 
@@ -132,15 +125,16 @@ impl PeerNet {
     /// Start the listener and one lazy sender per configured peer;
     /// verified inbound frames reach `deliver` (the runtime injects them
     /// into the actor peer inbox).
-    pub fn start(
+    pub async fn start(
         config: &PeerConfig,
         self_id: HostId,
         deliver: impl Fn(HostId, PeerMsg) + Send + Sync + 'static,
-    ) -> Arc<PeerNet> {
+    ) -> std::io::Result<Arc<PeerNet>> {
+        let listener = TcpListener::bind(config.listen).await?;
         let dropped_sends = Arc::new(AtomicU64::new(0));
         let mut senders = BTreeMap::new();
         let mut connected = BTreeMap::new();
-        let mut receivers = Vec::new();
+        let mut tasks = Vec::new();
         for (&peer, &addr) in &config.peers {
             if peer == self_id {
                 continue;
@@ -153,60 +147,27 @@ impl PeerNet {
                 identities: tls.certificate_identities.clone(),
                 expected: peer,
             });
-            receivers.push((peer, addr, rx, peer_connected.clone(), tls));
+            let dropped = dropped_sends.clone();
+            let task_connected = peer_connected.clone();
+            tasks.push(tokio::spawn(async move {
+                sender_loop(rx, addr, peer, task_connected, dropped, tls).await;
+            }));
             senders.insert(peer, tx);
             connected.insert(peer, peer_connected);
         }
-        let listen = config.listen;
         let deliver: Arc<Deliver> = Arc::new(deliver);
-        let dropped = dropped_sends.clone();
         let server_tls = config.tls.as_ref().map(|tls| ServerTls {
             config: tls.server.clone(),
             identities: tls.certificate_identities.clone(),
         });
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-        let io_thread = thread::Builder::new()
-            .name("blockd-peer-io".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .expect("peer I/O runtime");
-                runtime.block_on(async move {
-                    let listener = match TcpListener::bind(listen).await {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(error.to_string()));
-                            return;
-                        }
-                    };
-                    for (peer, addr, rx, connected, tls) in receivers {
-                        let dropped = dropped.clone();
-                        tokio::spawn(async move {
-                            sender_loop(rx, addr, peer, connected, dropped, tls).await;
-                        });
-                    }
-                    let _ = ready_tx.send(Ok(()));
-                    let listener = tokio::spawn(listener_loop(listener, deliver, server_tls));
-                    let _ = shutdown_rx.await;
-                    listener.abort();
-                });
-            })
-            .expect("spawn peer I/O runtime");
-        ready_rx
-            .recv()
-            .expect("peer I/O runtime stopped during startup")
-            .unwrap_or_else(|error| panic!("peer listen: {error}"));
-        Arc::new(PeerNet {
+        tasks.push(tokio::spawn(listener_loop(listener, deliver, server_tls)));
+        Ok(Arc::new(PeerNet {
             senders,
             dropped_sends,
             connected,
-            shutdown: Mutex::new(Some(shutdown)),
-            io_thread: Mutex::new(Some(io_thread)),
+            tasks: Mutex::new(tasks),
             authenticated: config.tls.is_some(),
-        })
+        }))
     }
 
     pub fn authenticated(&self) -> bool {
@@ -236,11 +197,8 @@ impl PeerNet {
 
 impl Drop for PeerNet {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.lock().expect("lock").take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(thread) = self.io_thread.lock().expect("lock").take() {
-            let _ = thread.join();
+        for task in self.tasks.lock().expect("lock").drain(..) {
+            task.abort();
         }
     }
 }
@@ -331,7 +289,7 @@ async fn write_peer_frame(conn: &mut Option<Box<dyn PeerIo>>, frame: &[u8]) -> b
         return false;
     };
     matches!(
-        timeout(Duration::from_secs(5), stream.write_all(frame)).await,
+        timeout(Duration::from_secs(5), write_frame(stream, frame)).await,
         Ok(Ok(()))
     )
 }
@@ -414,52 +372,25 @@ async fn accepted_reader(stream: TcpStream, tls: Option<&ServerTls>, deliver: Ar
 }
 
 async fn reader_loop(
-    mut stream: impl tokio::io::AsyncRead + Unpin,
+    stream: impl tokio::io::AsyncRead + Unpin,
     authenticated: Option<HostId>,
     deliver: Arc<Deliver>,
 ) {
-    loop {
-        let mut header = [0u8; FRAME_HEADER];
-        if stream.read_exact(&mut header).await.is_err() {
-            return;
-        }
-        let mut d = Dec::new(&header);
-        let magic = d.u32().expect("12 bytes");
-        let len = d.u32().expect("12 bytes");
-        if !header_allowed(magic, len) {
-            return; // desynced or hostile: drop the connection
-        }
-        let mut frame = header.to_vec();
-        let start = frame.len();
-        frame.resize(start + usize::try_from(len).expect("fits"), 0);
-        if stream.read_exact(&mut frame[start..]).await.is_err() {
-            return;
-        }
-        let decoded = if frame.len() >= DECODE_OFFLOAD_THRESHOLD {
-            tokio::task::spawn_blocking(move || decode_peer(&frame))
-                .await
-                .unwrap_or(Err(blockd_core::format::DecodeError))
-        } else {
-            decode_peer(&frame)
-        };
-        let Ok((from, msg)) = decoded else {
-            return; // damage: drop it and the connection (R8.1)
-        };
-        if authenticated.is_some_and(|identity| identity != from) {
-            return;
-        }
-        deliver(from, msg);
-    }
+    let _ = receive_loop(
+        stream,
+        authenticated,
+        DecodePolicy::BlockingAbove(DECODE_OFFLOAD_THRESHOLD),
+        move |from, message| deliver(from, message),
+    )
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-    use std::sync::mpsc::channel;
-
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use rustls::RootCertStore;
     use rustls::pki_types::CertificateDer;
+    use std::sync::OnceLock;
 
     use super::*;
     use blockd_core::types::VsetId;
@@ -522,11 +453,11 @@ mod tests {
             .expect("address")
     }
 
-    #[test]
-    fn mutual_tls_derives_identity_and_rejects_a_spoofed_envelope() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutual_tls_derives_identity_and_rejects_a_spoofed_envelope() {
         let addresses = [free_addr(), free_addr()];
         let roster = BTreeMap::from([(HostId(0), addresses[0]), (HostId(1), addresses[1])]);
-        let (tx, rx) = channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let b = PeerNet::start(
             &PeerConfig {
                 listen: addresses[1],
@@ -537,7 +468,9 @@ mod tests {
             move |from, msg| {
                 let _ = tx.send((from, msg));
             },
-        );
+        )
+        .await
+        .unwrap();
         let a = PeerNet::start(
             &PeerConfig {
                 listen: addresses[0],
@@ -546,7 +479,9 @@ mod tests {
             },
             HostId(0),
             |_, _| {},
-        );
+        )
+        .await
+        .unwrap();
         assert!(a.authenticated() && b.authenticated());
         let msg = PeerMsg::Released {
             vset: VsetId(7),
@@ -554,8 +489,10 @@ mod tests {
         };
         a.send(HostId(0), HostId(1), &msg);
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5))
-                .expect("mTLS delivery"),
+            timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("mTLS delivery timeout")
+                .expect("mTLS receiver closed"),
             (HostId(0), msg)
         );
 
@@ -568,15 +505,10 @@ mod tests {
             },
         );
         assert!(
-            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
             "certificate identity must override the claimed sender"
         );
-    }
-
-    #[test]
-    fn hostile_outer_lengths_are_rejected_before_allocation() {
-        assert!(header_allowed(MAGIC_PEER, MAX_PEER_PAYLOAD));
-        assert!(!header_allowed(MAGIC_PEER, MAX_PEER_PAYLOAD + 1));
-        assert!(!header_allowed(0, 0));
     }
 }

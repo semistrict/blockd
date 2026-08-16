@@ -1,27 +1,27 @@
-//! Executor-owned simulation implementations of the async core world.
+//! Turmoil-hosted simulation implementations of the async core world.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use blockd_core::blx::scan_object;
-use blockd_core::database::{DatabaseReply, DatabaseRequest};
 use blockd_core::engine::HostFatal;
-use blockd_core::head::HeadRecord;
+use blockd_core::head::{HeadRecord, ManifestPtr};
 use blockd_core::layout;
-use blockd_core::manifest::{CompleteFileList, Manifest};
+use blockd_core::manifest::{Manifest, ManifestClosure, decode_manifest_closure};
 use blockd_core::protocol::{AdminCall, AdminEvent, AdminResult, PeerMsg, StoreFault};
 use blockd_core::types::{Gen, HostId, PageId, VsetId, page_size};
 use blockd_core::world::{
-    AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, DatabaseActorRequest, FillSource,
-    GuestFault, GuestMem, GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store,
-    StoreError,
+    AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem,
+    GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store, StoreError,
 };
-use blockd_exec::channel::{OneSender, Receiver, UnboundedSender, oneshot, unbounded};
-use blockd_exec::{BridgeReceiver, bridge_request, current_poll, delay, now, random_u64, spawn};
+use blockd_exec::channel::{OneSender, UnboundedReceiver, UnboundedSender, oneshot, unbounded};
+use blockd_exec::{Response, current_poll, delay, now, random_u64, request};
 
-use crate::world::blobdev::{BlobDevConfig, CrashFate};
-use crate::world::store::{MAX_OBJECT_BYTES, StoreConfig, StoreCounters, StoreObjectKind};
+use crate::model::{
+    BlobDevConfig, CrashFate, MAX_OBJECT_BYTES, StoreConfig, StoreCounters, StoreObjectKind,
+};
+use crate::peer_transport::PeerTransport;
 
 fn random_between(low: u64, high: u64) -> u64 {
     assert!(low <= high);
@@ -29,8 +29,9 @@ fn random_between(low: u64, high: u64) -> u64 {
 }
 
 struct ReceiverLease<'a, T> {
-    slot: &'a RefCell<Option<Receiver<T>>>,
-    receiver: Option<Receiver<T>>,
+    slot: &'a RefCell<Option<UnboundedReceiver<T>>>,
+    discard: &'a Cell<bool>,
+    receiver: Option<UnboundedReceiver<T>>,
 }
 
 struct PendingGuestPause<'a> {
@@ -38,6 +39,26 @@ struct PendingGuestPause<'a> {
     vset: VsetId,
     generation: u64,
     active: bool,
+}
+
+struct PendingGuestOperation<'a> {
+    world: &'a SimWorld,
+    vset: VsetId,
+    active: bool,
+}
+
+impl PendingGuestOperation<'_> {
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingGuestOperation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.world.cancel_guest_op(self.vset);
+        }
+    }
 }
 
 impl PendingGuestPause<'_> {
@@ -86,11 +107,14 @@ impl<T> ReceiverLease<'_, T> {
 
 impl<T> Drop for ReceiverLease<'_, T> {
     fn drop(&mut self) {
-        let previous = self.slot.borrow_mut().replace(
-            self.receiver
-                .take()
-                .expect("receiver lease always owns the receiver"),
-        );
+        let mut receiver = self
+            .receiver
+            .take()
+            .expect("receiver lease always owns the receiver");
+        if self.discard.replace(false) {
+            while receiver.try_recv().is_ok() {}
+        }
+        let previous = self.slot.borrow_mut().replace(receiver);
         assert!(
             previous.is_none(),
             "receiver returned into an occupied slot"
@@ -100,7 +124,8 @@ impl<T> Drop for ReceiverLease<'_, T> {
 
 struct Stream<T> {
     sender: UnboundedSender<T>,
-    receiver: RefCell<Option<Receiver<T>>>,
+    receiver: RefCell<Option<UnboundedReceiver<T>>>,
+    discard: Cell<bool>,
 }
 
 impl<T> Stream<T> {
@@ -109,6 +134,7 @@ impl<T> Stream<T> {
         Self {
             sender,
             receiver: RefCell::new(Some(receiver)),
+            discard: Cell::new(false),
         }
     }
 
@@ -119,6 +145,7 @@ impl<T> Stream<T> {
     fn lease(&self) -> ReceiverLease<'_, T> {
         ReceiverLease {
             slot: &self.receiver,
+            discard: &self.discard,
             receiver: Some(
                 self.receiver
                     .borrow_mut()
@@ -142,7 +169,16 @@ impl<T> Stream<T> {
     }
 
     fn discard_pending(&self) -> usize {
-        self.sender.discard_pending()
+        let mut slot = self.receiver.borrow_mut();
+        let Some(receiver) = slot.as_mut() else {
+            self.discard.set(true);
+            return 0;
+        };
+        let mut discarded = 0;
+        while receiver.try_recv().is_ok() {
+            discarded += 1;
+        }
+        discarded
     }
 }
 
@@ -183,6 +219,25 @@ struct StoreState {
 }
 
 impl StoreState {
+    fn manifest_closure(&self, vset: VsetId, pointer: ManifestPtr) -> Option<ManifestClosure> {
+        let (_, manifest_bytes) =
+            self.objects
+                .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))?;
+        let list_bytes = Manifest::decode(vset, manifest_bytes)
+            .ok()?
+            .complete_list
+            .and_then(|reference| {
+                self.objects
+                    .get(&layout::complete_file_list_key(
+                        vset,
+                        reference.writer_fence,
+                        reference.list_id,
+                    ))
+                    .map(|(_, bytes)| bytes.as_slice())
+            });
+        decode_manifest_closure(vset, pointer, manifest_bytes, list_bytes).ok()
+    }
+
     fn object_kind(key: &str) -> StoreObjectKind {
         if key.ends_with("/head") {
             StoreObjectKind::Head
@@ -194,8 +249,6 @@ impl StoreState {
             StoreObjectKind::ResumeSet
         } else if key.contains("/s/") {
             StoreObjectKind::Segment
-        } else if key.contains("/l/") || key.contains("/lb/") {
-            StoreObjectKind::Leaf
         } else {
             StoreObjectKind::Other
         }
@@ -266,24 +319,11 @@ impl StoreState {
         let Some(pointer) = head.manifest else {
             return;
         };
-        let Some((_, record_bytes)) =
-            self.objects
-                .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
-        else {
+        let Some(closure) = self.manifest_closure(vset, pointer) else {
             return;
         };
-        let Ok(manifest) = Manifest::decode(vset, record_bytes) else {
-            return;
-        };
-        let list = manifest.complete_list.and_then(|reference| {
-            let key =
-                layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id);
-            let (_, bytes) = self.objects.get(&key)?;
-            CompleteFileList::decode(reference, vset, bytes).ok()
-        });
-        let Ok(files) = manifest.current_files(list.as_ref()) else {
-            return;
-        };
+        let manifest = closure.manifest;
+        let files = closure.files;
         let mut current = BTreeMap::new();
         for file in files {
             let Some((_, bytes)) = self.objects.get(&file.identity.store_key()) else {
@@ -320,12 +360,17 @@ struct MemoryState {
     failed: BTreeSet<PageId>,
 }
 
-type PeerInbox = UnboundedSender<(HostId, PeerMsg)>;
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OracleSnapshot {
     pub(crate) pages: BTreeMap<PageId, Vec<u8>>,
     pub(crate) unknown: BTreeSet<PageId>,
+}
+
+#[derive(Default)]
+struct CheckpointOracle {
+    by_vmstate: BTreeMap<(VsetId, u64), Vec<OracleSnapshot>>,
+    latest: BTreeMap<VsetId, OracleSnapshot>,
+    by_capture: BTreeMap<(VsetId, u64), OracleSnapshot>,
 }
 
 type OracleState = (
@@ -333,70 +378,13 @@ type OracleState = (
     Rc<RefCell<BTreeSet<PageId>>>,
 );
 
-#[derive(Default)]
-pub(crate) struct SimNetwork {
-    inboxes: RefCell<BTreeMap<HostId, PeerInbox>>,
-    blocked: RefCell<BTreeSet<(HostId, HostId)>>,
-    down: RefCell<BTreeSet<HostId>>,
-    outages: RefCell<Vec<(u64, u64, HostId, HostId)>>,
-    targeted_drop: Cell<Option<(u8, u64, u64)>>,
-    drop_odds: Cell<(u64, u64)>,
-    dup_odds: Cell<(u64, u64)>,
-    drops: Cell<u64>,
-    dups: Cell<u64>,
-    clogs: Cell<u64>,
-    targeted_drops: Cell<u64>,
-    delivered: RefCell<BTreeMap<u8, u64>>,
-    latency: Cell<(u64, u64)>,
+pub(crate) struct PeerAttachment {
+    world: Rc<SimWorld>,
 }
 
-impl SimNetwork {
-    pub(crate) fn set_latency(&self, low: u64, high: u64) {
-        self.latency.set((low, high));
-    }
-
-    pub(crate) fn configure_faults(
-        &self,
-        drop_odds: (u64, u64),
-        dup_odds: (u64, u64),
-        outages: Vec<(u64, u64, HostId, HostId)>,
-        targeted_drop: Option<(u8, u64, u64)>,
-    ) {
-        self.drop_odds.set(drop_odds);
-        self.dup_odds.set(dup_odds);
-        *self.outages.borrow_mut() = outages;
-        self.targeted_drop.set(targeted_drop);
-    }
-
-    pub(crate) fn set_host_down(&self, host: HostId, down: bool) {
-        if down {
-            self.down.borrow_mut().insert(host);
-        } else {
-            self.down.borrow_mut().remove(&host);
-        }
-    }
-
-    pub(crate) fn counters(&self) -> (u64, u64, u64, u64, u64) {
-        (
-            self.drops.get(),
-            self.dups.get(),
-            self.clogs.get(),
-            self.targeted_drops.get(),
-            self.delivered.borrow().get(&6).copied().unwrap_or(0),
-        )
-    }
-
-    fn unavailable(&self, from: HostId, to: HostId, at: u64) -> bool {
-        self.down.borrow().contains(&from)
-            || self.down.borrow().contains(&to)
-            || self.blocked.borrow().contains(&(from, to))
-            || self
-                .outages
-                .borrow()
-                .iter()
-                .any(|&(begin, end, source, dest)| {
-                    source == from && dest == to && (begin..end).contains(&at)
-                })
+impl Drop for PeerAttachment {
+    fn drop(&mut self) {
+        self.world.peer_transport.borrow_mut().take();
     }
 }
 
@@ -412,13 +400,11 @@ pub(crate) struct SimWorld {
     admin_event_generations: RefCell<BTreeMap<VsetId, u64>>,
     admin_event_generation_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
     incarnation: Cell<u64>,
-    database: Stream<DatabaseRequest>,
-    database_replies: Rc<RefCell<Vec<DatabaseReply>>>,
     faults: Stream<GuestFault>,
     syncs: Stream<GuestSyncRequest>,
     peers: Stream<(HostId, PeerMsg)>,
+    peer_transport: RefCell<Option<Rc<PeerTransport>>>,
     aborts: Stream<&'static str>,
-    network: Rc<SimNetwork>,
     fault_waiters: RefCell<BTreeMap<PageId, Vec<OneSender<bool>>>>,
     faults_inflight: RefCell<BTreeSet<PageId>>,
     aborted: Cell<bool>,
@@ -428,6 +414,7 @@ pub(crate) struct SimWorld {
     drop_handoff_writes: Cell<bool>,
     handoff_full_remaining: Cell<u8>,
     eio_fired: Cell<bool>,
+    blob_fault_epoch: Cell<u64>,
     page_read_poll: Cell<Option<u64>>,
     page_reads_in_poll: Cell<u64>,
     max_page_reads_in_poll: Cell<u64>,
@@ -436,7 +423,7 @@ pub(crate) struct SimWorld {
     pause_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
     operation_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
     oracle_pages: RefCell<BTreeMap<VsetId, OracleState>>,
-    checkpoint_snapshots: RefCell<BTreeMap<(VsetId, u64), Vec<OracleSnapshot>>>,
+    checkpoint_oracle: Rc<RefCell<CheckpointOracle>>,
     max_pause_ns: Cell<u64>,
 }
 
@@ -450,14 +437,13 @@ impl SimWorld {
         host: HostId,
         blob_config: BlobDevConfig,
         store_config: StoreConfig,
-        network: &Rc<SimNetwork>,
     ) -> Rc<Self> {
         Self::with_store(
             host,
             blob_config,
             store_config,
-            network,
             Rc::new(RefCell::new(StoreState::default())),
+            Rc::new(RefCell::new(CheckpointOracle::default())),
         )
     }
 
@@ -473,44 +459,48 @@ impl SimWorld {
         hosts: u16,
         blob_config: BlobDevConfig,
         store_config: StoreConfig,
-    ) -> (Rc<SimNetwork>, Vec<Rc<Self>>) {
-        let network = Rc::new(SimNetwork::default());
+    ) -> Vec<Rc<Self>> {
         let store = Rc::new(RefCell::new(StoreState::default()));
-        let worlds = (0..hosts)
+        let checkpoint_oracle = Rc::new(RefCell::new(CheckpointOracle::default()));
+        (0..hosts)
             .map(|host| {
                 Self::with_store(
                     HostId(host),
                     blob_config,
                     store_config,
-                    &network,
                     Rc::clone(&store),
+                    Rc::clone(&checkpoint_oracle),
                 )
             })
-            .collect();
-        (network, worlds)
+            .collect()
     }
 
     pub(crate) fn pair(
         hosts: [HostId; 2],
         blob_config: BlobDevConfig,
         store_config: StoreConfig,
-    ) -> (Rc<SimNetwork>, [Rc<Self>; 2]) {
-        let network = Rc::new(SimNetwork::default());
+    ) -> [Rc<Self>; 2] {
         let store = Rc::new(RefCell::new(StoreState::default()));
-        let worlds = hosts.map(|host| {
-            Self::with_store(host, blob_config, store_config, &network, Rc::clone(&store))
-        });
-        (network, worlds)
+        let checkpoint_oracle = Rc::new(RefCell::new(CheckpointOracle::default()));
+        hosts.map(|host| {
+            Self::with_store(
+                host,
+                blob_config,
+                store_config,
+                Rc::clone(&store),
+                Rc::clone(&checkpoint_oracle),
+            )
+        })
     }
 
     fn with_store(
         host: HostId,
         blob_config: BlobDevConfig,
         store_config: StoreConfig,
-        network: &Rc<SimNetwork>,
         store: Rc<RefCell<StoreState>>,
+        checkpoint_oracle: Rc<RefCell<CheckpointOracle>>,
     ) -> Rc<Self> {
-        let world = Rc::new(Self {
+        Rc::new(Self {
             host,
             blob_config,
             store_config,
@@ -522,13 +512,11 @@ impl SimWorld {
             admin_event_generations: RefCell::new(BTreeMap::new()),
             admin_event_generation_waiters: RefCell::new(BTreeMap::new()),
             incarnation: Cell::new(0),
-            database: Stream::new(),
-            database_replies: Rc::new(RefCell::new(Vec::new())),
             faults: Stream::new(),
             syncs: Stream::new(),
             peers: Stream::new(),
+            peer_transport: RefCell::new(None),
             aborts: Stream::new(),
-            network: Rc::clone(network),
             fault_waiters: RefCell::new(BTreeMap::new()),
             faults_inflight: RefCell::new(BTreeSet::new()),
             aborted: Cell::new(false),
@@ -538,6 +526,7 @@ impl SimWorld {
             drop_handoff_writes: Cell::new(false),
             handoff_full_remaining: Cell::new(blob_config.handoff_full_writes),
             eio_fired: Cell::new(false),
+            blob_fault_epoch: Cell::new(0),
             page_read_poll: Cell::new(None),
             page_reads_in_poll: Cell::new(0),
             max_page_reads_in_poll: Cell::new(0),
@@ -546,18 +535,24 @@ impl SimWorld {
             pause_waiters: RefCell::new(BTreeMap::new()),
             operation_waiters: RefCell::new(BTreeMap::new()),
             oracle_pages: RefCell::new(BTreeMap::new()),
-            checkpoint_snapshots: RefCell::new(BTreeMap::new()),
+            checkpoint_oracle,
             max_pause_ns: Cell::new(0),
-        });
-        network
-            .inboxes
-            .borrow_mut()
-            .insert(host, world.peers.sender.clone());
-        world
+        })
     }
 
-    pub(crate) fn request_admin(&self, call: AdminCall) -> BridgeReceiver<AdminResult> {
-        let (request, reply) = bridge_request(call);
+    pub(crate) fn attach_peer_transport(
+        self: &Rc<Self>,
+        transport: Rc<PeerTransport>,
+    ) -> PeerAttachment {
+        let previous = self.peer_transport.borrow_mut().replace(transport);
+        assert!(previous.is_none(), "peer transport already attached");
+        PeerAttachment {
+            world: Rc::clone(self),
+        }
+    }
+
+    pub(crate) fn request_admin(&self, call: AdminCall) -> Response<AdminResult> {
+        let (request, reply) = request(call);
         assert!(self.admin.send(request), "admin actor is alive");
         reply
     }
@@ -574,11 +569,24 @@ impl SimWorld {
     }
 
     pub(crate) fn checkpoint_snapshots(&self, vset: VsetId, vmstate: u64) -> Vec<OracleSnapshot> {
-        self.checkpoint_snapshots
+        self.checkpoint_oracle
             .borrow()
+            .by_vmstate
             .get(&(vset, vmstate))
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub(crate) fn capture_snapshot(
+        &self,
+        vset: VsetId,
+        capture_seq: u64,
+    ) -> Option<OracleSnapshot> {
+        self.checkpoint_oracle
+            .borrow()
+            .by_capture
+            .get(&(vset, capture_seq))
+            .cloned()
     }
 
     pub(crate) async fn next_admin_event(&self) -> Option<AdminEvent> {
@@ -711,26 +719,10 @@ impl SimWorld {
             let Some(pointer) = head.manifest else {
                 continue;
             };
-            let Some((_, manifest_bytes)) =
-                store
-                    .objects
-                    .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
-            else {
+            let Some(closure) = store.manifest_closure(vset, pointer) else {
                 continue;
             };
-            let Ok(manifest) = Manifest::decode(vset, manifest_bytes) else {
-                continue;
-            };
-            let list = manifest.complete_list.and_then(|reference| {
-                let key =
-                    layout::complete_file_list_key(vset, reference.writer_fence, reference.list_id);
-                let (_, bytes) = store.objects.get(&key)?;
-                CompleteFileList::decode(reference, vset, bytes).ok()
-            });
-            let Ok(current) = manifest.current_files(list.as_ref()) else {
-                continue;
-            };
-            files.extend(current.into_iter().map(|file| (file.identity, file)));
+            files.extend(closure.files.into_iter().map(|file| (file.identity, file)));
         }
 
         let mut total = 0_u64;
@@ -818,37 +810,6 @@ impl SimWorld {
         changed
     }
 
-    pub(crate) fn rot_store_leaf(&self) -> bool {
-        let keys = self
-            .store
-            .borrow()
-            .objects
-            .iter()
-            .filter_map(|(key, (_, bytes))| {
-                (!bytes.is_empty()
-                    && matches!(
-                        blockd_core::layout::parse_key(key),
-                        Some(
-                            blockd_core::layout::StoreKey::Leaf { .. }
-                                | blockd_core::layout::StoreKey::BaseLeaf { .. }
-                        )
-                    ))
-                .then_some(key.clone())
-            })
-            .collect::<Vec<_>>();
-        if keys.is_empty() {
-            return false;
-        }
-        let key = &keys[usize::try_from(random_u64() % keys.len() as u64).expect("index fits")];
-        self.store
-            .borrow_mut()
-            .objects
-            .get_mut(key)
-            .expect("selected leaf exists")
-            .1[0] ^= 1;
-        true
-    }
-
     pub(crate) fn set_store_outage(&self, outage: bool) {
         self.store.borrow_mut().outage = outage;
     }
@@ -863,6 +824,10 @@ impl SimWorld {
 
     pub(crate) fn set_drop_handoff_writes(&self, enabled: bool) {
         self.drop_handoff_writes.set(enabled);
+    }
+
+    pub(crate) fn set_blob_fault_epoch(&self, epoch: u64) {
+        self.blob_fault_epoch.set(epoch);
     }
 
     pub(crate) fn clear_abort(&self) {
@@ -891,7 +856,6 @@ impl SimWorld {
         self.faults.discard_pending();
         self.syncs.discard_pending();
         self.admin.discard_pending();
-        self.database.discard_pending();
         self.peers.discard_pending();
         self.aborts.discard_pending();
         let pause_waiters = std::mem::take(&mut *self.pause_waiters.borrow_mut());
@@ -904,6 +868,17 @@ impl SimWorld {
             let _ = waiter.send(());
         }
         *self.memory.borrow_mut() = MemoryState::default();
+    }
+
+    pub(crate) fn reset_guest_memory(&self, vset: VsetId) {
+        let mut memory = self.memory.borrow_mut();
+        memory.pages.retain(|page, _| page.volume.vset != vset);
+        memory.accessed.retain(|page| page.volume.vset != vset);
+        memory.protected.retain(|page| page.volume.vset != vset);
+        memory.failed.retain(|page| page.volume.vset != vset);
+        memory.paused.remove(&vset);
+        memory.in_ops.remove(&vset);
+        memory.vmstate.remove(&vset);
     }
 
     pub(crate) fn bitflip_segment(&self) -> bool {
@@ -1000,6 +975,18 @@ impl SimWorld {
         }
     }
 
+    fn cancel_guest_op(&self, vset: VsetId) {
+        self.memory.borrow_mut().in_ops.remove(&vset);
+        for waiter in self
+            .pause_waiters
+            .borrow_mut()
+            .remove(&vset)
+            .unwrap_or_default()
+        {
+            let _ = waiter.send(());
+        }
+    }
+
     async fn begin_guest_op(&self, vset: VsetId) {
         loop {
             let wait = {
@@ -1050,13 +1037,13 @@ impl SimWorld {
         true
     }
 
-    pub(crate) fn write_fault_mutates(&self, page: PageId) -> bool {
-        let memory = self.memory.borrow();
-        !memory.pages.contains_key(&page) || memory.protected.contains(&page)
-    }
-
     pub(crate) async fn fault(&self, page: PageId, write: bool) -> bool {
         self.begin_guest_op(page.volume.vset).await;
+        let operation = PendingGuestOperation {
+            world: self,
+            vset: page.volume.vset,
+            active: true,
+        };
         loop {
             let (ready, paused) = {
                 let memory = self.memory.borrow();
@@ -1071,6 +1058,7 @@ impl SimWorld {
             };
             if ready {
                 self.memory.borrow_mut().accessed.insert(page);
+                operation.disarm();
                 return true;
             }
             if self.memory.borrow().failed.contains(&page) {
@@ -1097,11 +1085,20 @@ impl SimWorld {
 
     pub(crate) async fn sync(&self, sync: GuestSync) -> bool {
         self.begin_guest_op(sync.volume.vset).await;
-        let (request, receive) = bridge_request(sync);
+        let operation = PendingGuestOperation {
+            world: self,
+            vset: sync.volume.vset,
+            active: true,
+        };
+        let (request, receive) = request(sync);
         if !self.syncs.send(request) {
             return false;
         }
-        receive.await.unwrap_or(false)
+        let synced = receive.await.unwrap_or(false);
+        if synced {
+            operation.disarm();
+        }
+        synced
     }
 
     pub(crate) fn crash_pending(&self) -> Vec<(String, CrashFate)> {
@@ -1198,7 +1195,11 @@ impl SimWorld {
 
     fn blob_write_fault(&self, name: &str) -> Option<BlobError> {
         let submitted = now();
-        if self.blob_config.eio_at.is_some_and(|at| submitted >= at)
+        let fault_epoch = self.blob_fault_epoch.get();
+        if self
+            .blob_config
+            .eio_at
+            .is_some_and(|at| submitted >= fault_epoch.saturating_add(at))
             && !self.eio_fired.replace(true)
         {
             return Some(BlobError::Io);
@@ -1210,7 +1211,10 @@ impl SimWorld {
         }
         self.blob_config
             .full_window
-            .filter(|(start, stop)| (*start..*stop).contains(&submitted))
+            .filter(|(start, stop)| {
+                (fault_epoch.saturating_add(*start)..fault_epoch.saturating_add(*stop))
+                    .contains(&submitted)
+            })
             .map(|_| BlobError::Full)
     }
 
@@ -1332,6 +1336,7 @@ impl Blobs for SimWorld {
 
 impl Store for SimWorld {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
+        let parsed_key = layout::parse_key(&key);
         let result = {
             let mut store = self.store.borrow_mut();
             let kind = store.write_attempt(&key, &bytes, false);
@@ -1349,6 +1354,20 @@ impl Store for SimWorld {
                 Ok(version)
             }
         };
+        if result.is_ok()
+            && let Some(
+                layout::StoreKey::Manifest { vset, .. }
+                | layout::StoreKey::ArchiveManifest { vset, .. },
+            ) = parsed_key
+            && let Ok(manifest) = Manifest::decode(vset, &bytes)
+        {
+            let mut oracle = self.checkpoint_oracle.borrow_mut();
+            if let Some(snapshot) = oracle.latest.get(&vset).cloned() {
+                oracle
+                    .by_capture
+                    .insert((vset, manifest.capture_seq), snapshot);
+            }
+        }
         delay(self.store_latency(bytes.len())).await;
         result
     }
@@ -1487,102 +1506,20 @@ impl Store for SimWorld {
 
 impl Peers for SimWorld {
     async fn send(&self, to: HostId, message: PeerMsg) {
-        let from = self.host;
-        let network = Rc::clone(&self.network);
-        let sent_at = now();
-        if network
-            .targeted_drop
-            .get()
-            .is_some_and(|(kind, begin, end)| {
-                kind == peer_tag(&message) && (begin..end).contains(&sent_at)
-            })
-        {
-            network
-                .targeted_drops
-                .set(network.targeted_drops.get().saturating_add(1));
-            return;
-        }
-        if network
-            .outages
+        let transport = self
+            .peer_transport
             .borrow()
-            .iter()
-            .any(|&(begin, end, source, dest)| {
-                source == from && dest == to && (begin..end).contains(&sent_at)
-            })
-        {
-            network.clogs.set(network.clogs.get().saturating_add(1));
-            return;
-        }
-        if network.down.borrow().contains(&from)
-            || network.down.borrow().contains(&to)
-            || network.blocked.borrow().contains(&(from, to))
-            || odds(network.drop_odds.get())
-        {
-            network.drops.set(network.drops.get().saturating_add(1));
-            return;
-        }
-        let copies = if odds(network.dup_odds.get()) {
-            network.dups.set(network.dups.get().saturating_add(1));
-            2
-        } else {
-            1
-        };
-        let (low, high) = network.latency.get();
-        for _ in 0..copies {
-            let network = Rc::clone(&network);
-            let message = message.clone();
-            spawn(async move {
-                if high != 0 {
-                    delay(random_between(low, high)).await;
-                }
-                if network.unavailable(from, to, now()) {
-                    network.drops.set(network.drops.get().saturating_add(1));
-                    return;
-                }
-                if let Some(inbox) = network.inboxes.borrow().get(&to) {
-                    let mut delivered = network.delivered.borrow_mut();
-                    *delivered.entry(peer_tag(&message)).or_default() += 1;
-                    drop(delivered);
-                    let _ = inbox.send((from, message));
-                }
-            })
-            .detach();
-        }
+            .clone()
+            .expect("peer send requires an attached Tokio transport");
+        let _ = transport.send(to, &message).await;
     }
 
     async fn recv(&self) -> Option<(HostId, PeerMsg)> {
+        let transport = self.peer_transport.borrow().clone();
+        if let Some(transport) = transport {
+            return transport.recv().await;
+        }
         self.peers.recv().await
-    }
-}
-
-fn odds((numerator, denominator): (u64, u64)) -> bool {
-    numerator != 0 && denominator != 0 && random_u64() % denominator < numerator
-}
-
-fn peer_tag(message: &PeerMsg) -> u8 {
-    match message {
-        PeerMsg::MigrateOffer { .. } => 0,
-        PeerMsg::MigrateAccept { .. } => 1,
-        PeerMsg::FetchRange { .. } => 2,
-        PeerMsg::Page { .. } => 3,
-        PeerMsg::FetchLeaf { .. } => 4,
-        PeerMsg::Leaf { .. } => 5,
-        PeerMsg::Released { .. } => 6,
-        PeerMsg::ReleasedAck { .. } => 7,
-        PeerMsg::ReplicaPut { .. } => 8,
-        PeerMsg::ReplicaPutAck { .. } => 9,
-        PeerMsg::ReplicaCommit { .. } => 10,
-        PeerMsg::ReplicaCommitAck { .. } => 11,
-        PeerMsg::ReplicaStatus { .. } => 13,
-        PeerMsg::ReplicaStatusReply { .. } => 14,
-        PeerMsg::ReplicaRelease { .. } => 16,
-        PeerMsg::ReplicaReleaseAck { .. } => 17,
-        PeerMsg::VnodeAdopt { .. } => 18,
-        PeerMsg::VnodeAdoptAck { .. } => 19,
-        PeerMsg::VnodeFetchClosure { .. } => 20,
-        PeerMsg::VnodeClosure { .. } => 21,
-        PeerMsg::VnodeCommit { .. } => 22,
-        PeerMsg::VnodeCommitAck { .. } => 23,
     }
 }
 
@@ -1673,11 +1610,6 @@ impl GuestMem for SimWorld {
         Ok(())
     }
 
-    async fn install_database(&self, page: PageId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
-        self.memory.borrow_mut().pages.insert(page, bytes);
-        Ok(())
-    }
-
     async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
         let raw: [u8; 8] = bytes
             .get(..8)
@@ -1745,8 +1677,9 @@ impl GuestMem for SimWorld {
                             );
                         }
                         drop(memory);
-                        let mut snapshots = self.checkpoint_snapshots.borrow_mut();
-                        let candidates = snapshots.entry((vset, vmstate)).or_default();
+                        let mut oracle = self.checkpoint_oracle.borrow_mut();
+                        oracle.latest.insert(vset, snapshot.clone());
+                        let candidates = oracle.by_vmstate.entry((vset, vmstate)).or_default();
                         if candidates.last() != Some(&snapshot) {
                             candidates.push(snapshot);
                         }
@@ -1878,22 +1811,6 @@ impl AdminIo for SimWorld {
             .send((self.incarnation.get(), generation, event));
     }
 
-    async fn next_database(&self) -> Option<DatabaseActorRequest> {
-        let request = self.database.recv().await?;
-        let (req, call) = request.into_call();
-        let (request, receive) = bridge_request(call);
-        let replies = Rc::clone(&self.database_replies);
-        spawn(async move {
-            if let Ok(result) = receive.await {
-                replies
-                    .borrow_mut()
-                    .push(DatabaseReply::from_result(req, result));
-            }
-        })
-        .detach();
-        Some(request)
-    }
-
     async fn host_failed(&self, failure: HostFatal) {
         let reason = failure.reason;
         self.aborted.set(true);
@@ -1905,6 +1822,9 @@ impl AdminIo for SimWorld {
 #[cfg(test)]
 #[allow(clippy::default_trait_access)]
 mod tests {
+    use std::future::Future;
+    use std::time::Duration;
+
     use blockd_core::authority::{
         HostSessionRecord, PlacementRecord, VnodeAuthority, VnodeId, VnodePlacement,
     };
@@ -1922,9 +1842,104 @@ mod tests {
     use blockd_core::protocol::{AdminCall, AdminSuccess, ReqId};
     use blockd_core::types::VsetId;
     use blockd_core::vnode_member::adoption_quorum;
-    use blockd_exec::Executor;
+    use blockd_exec::{FaultConfig, SimulationContext, delay, spawn, yield_now};
 
     use super::*;
+    use crate::peer_transport::{PeerTransportFaults, PeerTransportStats};
+
+    macro_rules! simulate {
+        ($seed:expr, $future:expr) => {{
+            tokio::task::LocalSet::new()
+                .run_until(blockd_exec::simulation_scope(
+                    $seed,
+                    FaultConfig::default(),
+                    $future,
+                ))
+                .await
+        }};
+    }
+
+    fn run_on_turmoil_hosts<T: 'static>(
+        seed: u64,
+        worlds: &[Rc<SimWorld>],
+        future: impl Future<Output = T> + 'static,
+    ) -> T {
+        let output = Rc::new(RefCell::new(None));
+        let host_output = Rc::clone(&output);
+        let host_future = Rc::new(RefCell::new(Some(future)));
+        let ready = Rc::new(Cell::new(0_usize));
+        let ready_notify = Rc::new(tokio::sync::Notify::new());
+        let finished = Rc::new(tokio::sync::Notify::new());
+        let client_finished = Rc::clone(&finished);
+        let roster = worlds
+            .iter()
+            .map(|world| (world.host_id(), format!("host-{}", world.host_id().0)))
+            .collect::<BTreeMap<_, _>>();
+        let stats = Rc::new(PeerTransportStats::default());
+        let mut simulation = turmoil::Builder::new()
+            .rng_seed(seed)
+            .simulation_duration(Duration::from_secs(10))
+            .min_message_latency(Duration::from_micros(100))
+            .max_message_latency(Duration::from_micros(500))
+            .build();
+        for world in worlds {
+            let host = world.host_id();
+            let world = Rc::clone(world);
+            let roster = roster.clone();
+            let stats = Rc::clone(&stats);
+            let ready = Rc::clone(&ready);
+            let ready_notify = Rc::clone(&ready_notify);
+            simulation.host(format!("host-{}", host.0), move || {
+                let world = Rc::clone(&world);
+                let roster = roster.clone();
+                let stats = Rc::clone(&stats);
+                let ready = Rc::clone(&ready);
+                let ready_notify = Rc::clone(&ready_notify);
+                async move {
+                    let transport = PeerTransport::start(
+                        host,
+                        roster,
+                        PeerTransportFaults {
+                            max_frames_per_connection: 1,
+                            ..PeerTransportFaults::default()
+                        },
+                        stats,
+                    )
+                    .await?;
+                    let _attachment = world.attach_peer_transport(transport);
+                    ready.set(ready.get() + 1);
+                    ready_notify.notify_waiters();
+                    std::future::pending::<()>().await;
+                    Ok(())
+                }
+            });
+        }
+        let expected = worlds.len();
+        let context = SimulationContext::new(seed, FaultConfig::disabled());
+        simulation.client("controller", async move {
+            while ready.get() != expected {
+                ready_notify.notified().await;
+            }
+            let future = host_future
+                .borrow_mut()
+                .take()
+                .expect("test software runs once");
+            *host_output.borrow_mut() = Some(context.scope(future).await);
+            finished.notify_one();
+            Ok(())
+        });
+        simulation.client("completion", async move {
+            client_finished.notified().await;
+            Ok(())
+        });
+        if let Err(error) = simulation.run() {
+            panic!(
+                "Turmoil test cluster: {error:?}, transport={:?}",
+                stats.snapshot()
+            );
+        }
+        output.borrow_mut().take().expect("test completed")
+    }
 
     fn authority_placement() -> PlacementRecord {
         PlacementRecord::new(
@@ -1939,29 +1954,20 @@ mod tests {
         .expect("valid test placement")
     }
 
-    #[test]
-    fn healthy_session_polling_uses_reads_without_lease_writes() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
-        let mut executor = Executor::simulation(8);
-
+    #[tokio::test(start_paused = true)]
+    async fn healthy_session_polling_uses_reads_without_lease_writes() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let actor_world = Rc::clone(&world);
-        executor
-            .block_on(async move {
-                create_host_session(actor_world.as_ref(), HostId(1), 101).await?;
-                for _ in 0..4 {
-                    let polled =
-                        poll_or_defend_host_session(actor_world.as_ref(), HostId(1), 101).await?;
-                    assert!(matches!(polled, PollSession::Active(_)));
-                }
-                Ok::<_, AuthorityError>(())
-            })
-            .expect("healthy holder remains active");
+        simulate!(8, async move {
+            create_host_session(actor_world.as_ref(), HostId(1), 101).await?;
+            for _ in 0..4 {
+                let polled =
+                    poll_or_defend_host_session(actor_world.as_ref(), HostId(1), 101).await?;
+                assert!(matches!(polled, PollSession::Active(_)));
+            }
+            Ok::<_, AuthorityError>(())
+        })
+        .expect("healthy holder remains active");
 
         let metrics = world.store_metrics();
         assert_eq!(metrics.gets, 4);
@@ -1969,19 +1975,11 @@ mod tests {
         assert_eq!(metrics.cas_successes, 1);
     }
 
-    #[test]
-    fn exact_challenge_cas_fences_the_losing_side() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
-        let mut executor = Executor::simulation(9);
-
+    #[tokio::test(start_paused = true)]
+    async fn exact_challenge_cas_fences_the_losing_side() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let actor_world = Rc::clone(&world);
-        executor.block_on(async move {
+        simulate!(9, async move {
             create_host_session(actor_world.as_ref(), HostId(1), 101)
                 .await
                 .expect("create session");
@@ -2011,18 +2009,10 @@ mod tests {
         assert_eq!(metrics.cas_conflicts, 1);
     }
 
-    #[test]
-    fn revocation_must_land_before_replacement_session_activates() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
-        let mut executor = Executor::simulation(10);
-
-        executor.block_on(async move {
+    #[tokio::test(start_paused = true)]
+    async fn revocation_must_land_before_replacement_session_activates() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        simulate!(10, async move {
             create_host_session(world.as_ref(), HostId(1), 101)
                 .await
                 .expect("create session");
@@ -2050,19 +2040,11 @@ mod tests {
         });
     }
 
-    #[test]
-    fn replicas_reread_vnode_authority_and_reject_stale_proofs() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn replicas_reread_vnode_authority_and_reject_stale_proofs() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let placement = authority_placement();
-        let mut executor = Executor::simulation(11);
-
-        executor.block_on(async move {
+        simulate!(11, async move {
             create_host_session(world.as_ref(), HostId(1), 101)
                 .await
                 .expect("create initial primary session");
@@ -2106,9 +2088,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn intersecting_adoption_quorum_preserves_the_latest_protected_closure() {
-        let (_, worlds) = SimWorld::cluster(4, BlobDevConfig::nvme(), StoreConfig::s3());
+    #[tokio::test(start_paused = true)]
+    async fn intersecting_adoption_quorum_preserves_the_latest_protected_closure() {
+        let worlds = SimWorld::cluster(4, BlobDevConfig::nvme(), StoreConfig::gcs());
         let placement = authority_placement();
         let old = VnodeAuthority {
             cluster_id: placement.cluster_id,
@@ -2119,9 +2101,7 @@ mod tests {
             primary_session: 101,
             primary_host_epoch: 1,
         };
-        let mut executor = Executor::simulation(12);
-
-        executor.block_on(async move {
+        simulate!(12, async move {
             create_host_session(worlds[1].as_ref(), HostId(1), 101)
                 .await
                 .expect("create old primary session");
@@ -2199,9 +2179,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn host_self_fences_when_session_gets_exceed_the_staleness_bound() {
-        let (_, worlds) = SimWorld::cluster(
+    #[tokio::test(start_paused = true)]
+    async fn host_self_fences_when_session_gets_exceed_the_staleness_bound() {
+        let worlds = SimWorld::cluster(
             3,
             BlobDevConfig {
                 read_latency_min: 1,
@@ -2260,28 +2240,29 @@ mod tests {
             }),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
-        let mut executor = Executor::simulation(13);
-        executor
-            .block_on({
+        simulate!(13, async move {
+            {
                 let world = Rc::clone(&worlds[0]);
-                async move { cas_placement(world.as_ref(), None, placement).await }
-            })
-            .expect("install placement");
-        let mut host = executor.spawn(host_actor_with_state(
-            Rc::clone(&state),
-            Rc::clone(&worlds[0]),
-        ));
-        let boot_horizon = executor.now().saturating_add(60);
-        executor.run_until(boot_horizon);
-        assert!(state.borrow().authority_serving());
-        assert!(state.borrow().counters.lease_gets > 0);
+                cas_placement(world.as_ref(), None, placement)
+                    .await
+                    .expect("install placement");
+            }
+            let mut host = spawn(host_actor_with_state(
+                Rc::clone(&state),
+                Rc::clone(&worlds[0]),
+            ));
+            let boot_horizon = now().saturating_add(60);
+            blockd_exec::advance_to(boot_horizon).await;
+            assert!(state.borrow().authority_serving());
+            assert!(state.borrow().counters.lease_gets > 0);
 
-        worlds[0].set_store_outage(true);
-        executor.run_until(boot_horizon.saturating_add(40));
-        assert!(!state.borrow().authority_serving());
-        assert_eq!(state.borrow().counters.lease_self_fences, 1);
-        assert_eq!(worlds[0].abort_reason(), Some("host session fenced"));
-        host.cancel();
+            worlds[0].set_store_outage(true);
+            blockd_exec::advance_to(boot_horizon.saturating_add(40)).await;
+            assert!(!state.borrow().authority_serving());
+            assert_eq!(state.borrow().counters.lease_self_fences, 1);
+            assert_eq!(worlds[0].abort_reason(), Some("host session fenced"));
+            host.cancel();
+        });
     }
 
     #[test]
@@ -2302,7 +2283,7 @@ mod tests {
             latency_max: 1,
             ns_per_byte: 0,
         };
-        let (_, worlds) = SimWorld::cluster(3, blob, store);
+        let worlds = SimWorld::cluster(3, blob, store);
         let placement = PlacementRecord::new(
             71,
             1,
@@ -2329,7 +2310,7 @@ mod tests {
                     host: HostId(host),
                     cache_pages: 8,
                     writeback_interval: 1_000,
-                    backup_retry: 5,
+                    backup_retry: 100,
                     disk_capacity: None,
                     disk_headroom: 0,
                     wedge_ticks: 0,
@@ -2347,172 +2328,135 @@ mod tests {
                 })))
             })
             .collect::<Vec<_>>();
-        let mut executor = Executor::simulation(14);
-        executor
-            .block_on({
-                let world = Rc::clone(&worlds[0]);
-                let placement = placement.clone();
-                async move { cas_placement(world.as_ref(), None, placement).await }
-            })
-            .expect("install placement");
-        let mut hosts = states
-            .iter()
-            .zip(&worlds)
-            .map(|(state, world)| {
-                executor.spawn(host_actor_with_state(Rc::clone(state), Rc::clone(world)))
-            })
-            .collect::<Vec<_>>();
-        executor.run_until(executor.now().saturating_add(100));
-        assert!(
-            states
+        let test_worlds = worlds.clone();
+        run_on_turmoil_hosts(14, &worlds, async move {
+            cas_placement(test_worlds[0].as_ref(), None, placement.clone())
+                .await
+                .expect("install placement");
+            let mut hosts = states
                 .iter()
-                .all(|state| state.borrow().authority_serving())
-        );
-
-        let old_record = executor
-            .block_on({
-                let world = Rc::clone(&worlds[0]);
-                async move { read_host_session(world.as_ref(), HostId(0)).await }
-            })
-            .expect("read old session")
-            .expect("old session exists")
-            .record;
-        let HostSessionRecord::Active {
-            session: old_session,
-            epoch: old_epoch,
-            ..
-        } = old_record
-        else {
-            panic!("old session must be active");
-        };
-        let old = VnodeAuthority {
-            cluster_id: 71,
-            placement_epoch: 1,
-            vnode: VnodeId(0),
-            generation: 1,
-            primary: HostId(0),
-            primary_session: old_session,
-            primary_host_epoch: old_epoch,
-        };
-        let old_proof = executor
-            .block_on({
-                let state = Rc::clone(&states[0]);
-                let world = Rc::clone(&worlds[0]);
-                async move { claim_vnode_authority(&state, world.as_ref(), VnodeId(0)).await }
-            })
-            .expect("claim initial authority on a quorum");
-        assert_eq!(old_proof.authority, old);
-        executor
-            .block_on({
-                let worlds = worlds.clone();
-                let placement = placement.clone();
-                async move {
-                    adopt_vnode_generation(worlds[2].as_ref(), &placement, HostId(2), old_proof)
-                        .await?;
-                    let bytes = b"quorum protected before failover".to_vec();
-                    commit_vnode_closure(
-                        worlds[0].as_ref(),
-                        &placement,
-                        old,
-                        VsetId(7),
-                        88,
-                        bytes.clone(),
-                    )
-                    .await?;
-                    commit_vnode_closure(worlds[2].as_ref(), &placement, old, VsetId(7), 88, bytes)
-                        .await?;
-                    Ok::<_, AuthorityError>(())
-                }
-            })
-            .expect("commit old quorum closure");
-
-        hosts[0].cancel();
-        executor.run_ready();
-        let (proof, inventory) =
-            executor
-                .block_on({
-                    let state = Rc::clone(&states[1]);
-                    let world = Rc::clone(&worlds[1]);
-                    async move {
-                        failover_vnode(&state, world.as_ref(), VnodeId(0), HostId(0), 91).await
-                    }
+                .zip(&test_worlds)
+                .map(|(state, world)| {
+                    spawn(host_actor_with_state(Rc::clone(state), Rc::clone(world)))
                 })
-                .expect("fail over to host one");
-        assert_eq!(proof.authority.generation, 2);
-        assert_eq!(proof.authority.primary, HostId(1));
-        assert_eq!(inventory[&VsetId(7)].sequence, 88);
-        assert_eq!(
-            read_vnode_closure_sync(&mut executor, &worlds[1], inventory[&VsetId(7)]),
-            b"quorum protected before failover"
-        );
-        let store_before = worlds[1].store_metrics();
-        let committed = executor
-            .block_on({
-                let state = Rc::clone(&states[1]);
-                let world = Rc::clone(&worlds[1]);
-                async move {
-                    commit_active_vnode_quorum(
-                        &state,
-                        world.as_ref(),
-                        VsetId(7),
-                        89,
-                        b"new primary hot-path closure".to_vec(),
-                    )
+                .collect::<Vec<_>>();
+            delay(100).await;
+            assert!(
+                states
+                    .iter()
+                    .all(|state| state.borrow().authority_serving())
+            );
+
+            let old_record = read_host_session(test_worlds[0].as_ref(), HostId(0))
+                .await
+                .expect("read old session")
+                .expect("old session exists")
+                .record;
+            let HostSessionRecord::Active {
+                session: old_session,
+                epoch: old_epoch,
+                ..
+            } = old_record
+            else {
+                panic!("old session must be active");
+            };
+            let old = VnodeAuthority {
+                cluster_id: 71,
+                placement_epoch: 1,
+                vnode: VnodeId(0),
+                generation: 1,
+                primary: HostId(0),
+                primary_session: old_session,
+                primary_host_epoch: old_epoch,
+            };
+            let old_proof = claim_vnode_authority(&states[0], test_worlds[0].as_ref(), VnodeId(0))
+                .await
+                .expect("claim initial authority on a quorum");
+            assert_eq!(old_proof.authority, old);
+            adopt_vnode_generation(test_worlds[2].as_ref(), &placement, HostId(2), old_proof)
+                .await
+                .expect("adopt old generation");
+            let bytes = b"quorum protected before failover".to_vec();
+            commit_vnode_closure(
+                test_worlds[0].as_ref(),
+                &placement,
+                old,
+                VsetId(7),
+                88,
+                bytes.clone(),
+            )
+            .await
+            .expect("commit old closure on primary");
+            commit_vnode_closure(
+                test_worlds[2].as_ref(),
+                &placement,
+                old,
+                VsetId(7),
+                88,
+                bytes,
+            )
+            .await
+            .expect("commit old closure on quorum member");
+
+            hosts[0].cancel();
+            yield_now().await;
+            let (proof, inventory) = failover_vnode(
+                &states[1],
+                test_worlds[1].as_ref(),
+                VnodeId(0),
+                HostId(0),
+                91,
+            )
+            .await
+            .expect("fail over to host one");
+            assert_eq!(proof.authority.generation, 2);
+            assert_eq!(proof.authority.primary, HostId(1));
+            assert_eq!(inventory[&VsetId(7)].sequence, 88);
+            assert_eq!(
+                read_vnode_closure(test_worlds[1].as_ref(), VnodeId(0), inventory[&VsetId(7)],)
                     .await
-                }
-            })
+                    .expect("read protected closure"),
+                b"quorum protected before failover"
+            );
+            let store_before = test_worlds[1].store_metrics();
+            let committed = commit_active_vnode_quorum(
+                &states[1],
+                test_worlds[1].as_ref(),
+                VsetId(7),
+                89,
+                b"new primary hot-path closure".to_vec(),
+            )
+            .await
             .expect("commit on new two-member quorum");
-        let store_after = worlds[1].store_metrics();
-        assert_eq!(store_after.put_attempts, store_before.put_attempts);
-        assert_eq!(
-            read_vnode_closure_sync(&mut executor, &worlds[2], committed),
-            b"new primary hot-path closure"
-        );
-        assert_eq!(
-            executor.block_on({
-                let world = Rc::clone(&worlds[1]);
-                let placement = placement.clone();
-                async move {
-                    commit_vnode_closure(
-                        world.as_ref(),
-                        &placement,
-                        old,
-                        VsetId(7),
-                        90,
-                        b"stale".to_vec(),
-                    )
+            let store_after = test_worlds[1].store_metrics();
+            assert_eq!(store_after.put_attempts, store_before.put_attempts);
+            assert_eq!(
+                read_vnode_closure(test_worlds[2].as_ref(), VnodeId(0), committed)
                     .await
-                }
-            }),
-            Err(AuthorityError::Fenced)
-        );
-        for host in &mut hosts[1..] {
-            host.cancel();
-        }
+                    .expect("read new protected closure"),
+                b"new primary hot-path closure"
+            );
+            assert_eq!(
+                commit_vnode_closure(
+                    test_worlds[1].as_ref(),
+                    &placement,
+                    old,
+                    VsetId(7),
+                    90,
+                    b"stale".to_vec(),
+                )
+                .await,
+                Err(AuthorityError::Fenced)
+            );
+            for host in &mut hosts[1..] {
+                host.cancel();
+            }
+        });
     }
 
-    fn read_vnode_closure_sync(
-        executor: &mut Executor,
-        world: &Rc<SimWorld>,
-        closure: blockd_core::vnode_member::ProtectedClosureRef,
-    ) -> Vec<u8> {
-        executor
-            .block_on({
-                let world = Rc::clone(world);
-                async move { read_vnode_closure(world.as_ref(), VnodeId(0), closure).await }
-            })
-            .expect("read protected closure")
-    }
-
-    #[test]
-    fn unservable_page_failure_matches_the_production_fatal_signal() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn unservable_page_failure_matches_the_production_fatal_signal() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
             volume: blockd_core::types::VolumeId {
                 vset: VsetId(1),
@@ -2520,9 +2464,7 @@ mod tests {
             },
             page: blockd_core::types::PageNo(3),
         };
-        let mut executor = Executor::simulation(8);
-
-        let failed = executor.block_on({
+        let failed = simulate!(8, {
             let world = Rc::clone(&world);
             async move { GuestMem::fail(world.as_ref(), page).await }
         });
@@ -2530,8 +2472,8 @@ mod tests {
         assert!(world.memory.borrow().failed.contains(&page));
     }
 
-    #[test]
-    fn actor_world_runs_creation_through_the_real_async_host() {
+    #[tokio::test(start_paused = true)]
+    async fn actor_world_runs_creation_through_the_real_async_host() {
         let host = HostId(1);
         let passive_host = HostId(2);
         let placement = |local: HostId| ReplicaPlacementConfig {
@@ -2574,7 +2516,7 @@ mod tests {
             latency_max: 1,
             ns_per_byte: 0,
         };
-        let (_, [world, passive_world]) =
+        let [world, passive_world] =
             SimWorld::pair([host, passive_host], blob_config, store_config);
         let state = Rc::new(RefCell::new(HostState::new(config)));
         let passive_state = Rc::new(RefCell::new(HostState::new(HostConfig {
@@ -2593,29 +2535,24 @@ mod tests {
             config: VsetConfig::compute(1, 4),
             from_base: None,
         });
-        let mut executor = Executor::simulation(4);
-        let passive = executor.spawn(host_actor_with_state(passive_state, passive_world));
-        let actor = executor.spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
-        let reply = executor.block_on(reply).ok();
-        assert_eq!(
-            reply,
-            Some(Ok(AdminSuccess::VsetCreated { vset: VsetId(2) }))
-        );
-        assert!(state.borrow().vsets[&VsetId(2)].ready);
-        drop(actor);
-        drop(passive);
-        executor.run_ready();
+        simulate!(4, async move {
+            let passive = spawn(host_actor_with_state(passive_state, passive_world));
+            let actor = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+            let reply = reply.await.ok();
+            assert_eq!(
+                reply,
+                Some(Ok(AdminSuccess::VsetCreated { vset: VsetId(2) }))
+            );
+            assert!(state.borrow().vsets[&VsetId(2)].ready);
+            drop(actor);
+            drop(passive);
+            blockd_exec::run_ready().await;
+        });
     }
 
-    #[test]
-    fn paused_guests_do_not_emit_faults_until_resume() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn paused_guests_do_not_emit_faults_until_resume() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
             volume: blockd_core::types::VolumeId {
                 vset: VsetId(1),
@@ -2624,15 +2561,11 @@ mod tests {
             page: blockd_core::types::PageNo(3),
         };
         let seen_at = Rc::new(Cell::new(None));
-        let mut executor = Executor::simulation(9);
         world.set_vmstate(VsetId(1), 0);
-        let pause = executor.block_on({
-            let world = Rc::clone(&world);
-            async move { GuestMem::pause(world.as_ref(), VsetId(1)).await }
-        });
-        assert_eq!(pause.as_ref().map(|pause| pause.vmstate), Ok(0));
-        executor
-            .spawn({
+        simulate!(9, async move {
+            let pause = GuestMem::pause(world.as_ref(), VsetId(1)).await;
+            assert_eq!(pause.as_ref().map(|pause| pause.vmstate), Ok(0));
+            spawn({
                 let world = Rc::clone(&world);
                 let seen_at = Rc::clone(&seen_at);
                 async move {
@@ -2650,12 +2583,11 @@ mod tests {
                 }
             })
             .detach();
-        let client = executor.spawn({
-            let world = Rc::clone(&world);
-            async move { world.fault(page, false).await }
-        });
-        executor
-            .spawn({
+            let client = spawn({
+                let world = Rc::clone(&world);
+                async move { world.fault(page, false).await }
+            });
+            spawn({
                 let world = Rc::clone(&world);
                 async move {
                     delay(10).await;
@@ -2665,75 +2597,51 @@ mod tests {
                 }
             })
             .detach();
-        assert_eq!(executor.block_on(client), Ok(true));
-        assert_eq!(seen_at.get(), Some(10));
+            assert_eq!(client.await, Ok(true));
+            assert_eq!(seen_at.get(), Some(10));
+        });
     }
 
-    #[test]
-    fn stale_resume_cannot_release_a_newer_pause() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn stale_resume_cannot_release_a_newer_pause() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let vset = VsetId(1);
         world.set_vmstate(vset, 9);
-        let mut executor = Executor::simulation(11);
-        let first = executor
-            .block_on({
-                let world = Rc::clone(&world);
-                async move { GuestMem::pause(world.as_ref(), vset).await }
-            })
-            .expect("first pause");
-        let second = executor
-            .block_on({
-                let world = Rc::clone(&world);
-                async move { GuestMem::pause(world.as_ref(), vset).await }
-            })
-            .expect("second pause");
-
-        executor
-            .block_on({
-                let world = Rc::clone(&world);
-                async move { GuestMem::resume(world.as_ref(), vset, Some(first)).await }
-            })
-            .expect("stale resume is harmless");
-        assert!(world.memory.borrow().paused.contains(&vset));
-        executor
-            .block_on({
-                let world = Rc::clone(&world);
-                async move { GuestMem::resume(world.as_ref(), vset, Some(second)).await }
-            })
-            .expect("matching resume succeeds");
-        assert!(!world.memory.borrow().paused.contains(&vset));
+        simulate!(11, async move {
+            let first = GuestMem::pause(world.as_ref(), vset)
+                .await
+                .expect("first pause");
+            let second = GuestMem::pause(world.as_ref(), vset)
+                .await
+                .expect("second pause");
+            GuestMem::resume(world.as_ref(), vset, Some(first))
+                .await
+                .expect("stale resume is harmless");
+            assert!(world.memory.borrow().paused.contains(&vset));
+            GuestMem::resume(world.as_ref(), vset, Some(second))
+                .await
+                .expect("matching resume succeeds");
+            assert!(!world.memory.borrow().paused.contains(&vset));
+        });
     }
 
-    #[test]
-    fn checkpoint_pause_waits_for_an_inflight_guest_operation() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_pause_waits_for_an_inflight_guest_operation() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let vset = VsetId(1);
         world.memory.borrow_mut().in_ops.insert(vset);
-        let mut executor = Executor::simulation(10);
         let paused_at = Rc::new(Cell::new(None));
-        let pause = executor.spawn({
-            let world = Rc::clone(&world);
-            let paused_at = Rc::clone(&paused_at);
-            async move {
-                let vmstate = GuestMem::pause(world.as_ref(), vset).await;
-                paused_at.set(Some(now()));
-                vmstate
-            }
-        });
-        executor
-            .spawn({
+        simulate!(10, async move {
+            let pause = spawn({
+                let world = Rc::clone(&world);
+                let paused_at = Rc::clone(&paused_at);
+                async move {
+                    let vmstate = GuestMem::pause(world.as_ref(), vset).await;
+                    paused_at.set(Some(now()));
+                    vmstate
+                }
+            });
+            spawn({
                 let world = Rc::clone(&world);
                 async move {
                     delay(10).await;
@@ -2741,53 +2649,62 @@ mod tests {
                 }
             })
             .detach();
-        assert_eq!(
-            executor
-                .block_on(pause)
-                .map(|result| result.map(|pause| pause.vmstate)),
-            Ok(Ok(7))
-        );
-        assert_eq!(paused_at.get(), Some(10));
+            assert_eq!(
+                pause.await.map(|result| result.map(|pause| pause.vmstate)),
+                Ok(Ok(7))
+            );
+            assert_eq!(paused_at.get(), Some(10));
+        });
     }
 
-    #[test]
-    fn cancelling_a_pending_pause_clears_its_bookkeeping() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_pending_pause_clears_its_bookkeeping() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let vset = VsetId(1);
         world.memory.borrow_mut().in_ops.insert(vset);
-        let mut executor = Executor::simulation(12);
-        let pause = executor.spawn({
-            let world = Rc::clone(&world);
-            async move { GuestMem::pause(world.as_ref(), vset).await }
+        simulate!(12, async move {
+            let pause = spawn({
+                let world = Rc::clone(&world);
+                async move { GuestMem::pause(world.as_ref(), vset).await }
+            });
+            blockd_exec::run_ready().await;
+            assert!(world.pause_started.borrow().contains_key(&vset));
+            drop(pause);
+            blockd_exec::run_ready().await;
+            assert!(!world.pause_started.borrow().contains_key(&vset));
+            assert!(!world.memory.borrow().paused.contains(&vset));
         });
-        executor.run_ready();
-        assert!(world.pause_started.borrow().contains_key(&vset));
-
-        drop(pause);
-        executor.run_ready();
-
-        assert!(!world.pause_started.borrow().contains_key(&vset));
-        assert!(!world.memory.borrow().paused.contains(&vset));
     }
 
-    #[test]
-    fn advancing_incarnation_invalidates_active_recovery_generations() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_pending_fault_releases_the_guest_operation() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let vset = VsetId(1);
-        let mut executor = Executor::simulation(13);
-        let (_, generation) = executor.block_on({
+        let page = PageId {
+            volume: blockd_core::types::VolumeId {
+                vset,
+                idx: blockd_core::types::VolumeIdx(1),
+            },
+            page: blockd_core::types::PageNo(3),
+        };
+        simulate!(14, async move {
+            let fault = spawn({
+                let world = Rc::clone(&world);
+                async move { world.fault(page, false).await }
+            });
+            blockd_exec::run_ready().await;
+            assert!(world.memory.borrow().in_ops.contains(&vset));
+            drop(fault);
+            blockd_exec::run_ready().await;
+            assert!(!world.memory.borrow().in_ops.contains(&vset));
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advancing_incarnation_invalidates_active_recovery_generations() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let vset = VsetId(1);
+        let (_, generation) = simulate!(13, {
             let world = Rc::clone(&world);
             async move {
                 AdminIo::emit_admin_event(
@@ -2812,13 +2729,7 @@ mod tests {
 
     #[test]
     fn crash_discards_stale_guest_events() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
             volume: blockd_core::types::VolumeId {
                 vset: VsetId(1),
@@ -2827,7 +2738,7 @@ mod tests {
             page: blockd_core::types::PageNo(3),
         };
         assert!(world.faults.send(GuestFault { page, write: false }));
-        let (sync, _reply) = bridge_request(GuestSync {
+        let (sync, _reply) = request(GuestSync {
             req: ReqId(7),
             volume: page.volume,
         });
@@ -2839,15 +2750,9 @@ mod tests {
         assert!(world.syncs.try_recv().is_none());
     }
 
-    #[test]
-    fn scheduled_record_rot_targets_the_newest_requested_copy() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_record_rot_targets_the_newest_requested_copy() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let older =
             blockd_core::layout::journal_blob(VsetId(1), 2, blockd_core::types::JournalSeq(3));
         let newer =
@@ -2863,9 +2768,8 @@ mod tests {
             .durable
             .insert(newer.clone(), vec![0; 8]);
 
-        let mut executor = Executor::simulation(19);
         let task_world = Rc::clone(&world);
-        let (flipped, older_bytes, newer_bytes) = executor.block_on(async move {
+        let (flipped, older_bytes, newer_bytes) = simulate!(19, async move {
             let flipped = task_world.bitflip_record(Some(false));
             let blobs = task_world.blobs.borrow();
             (
@@ -2879,20 +2783,13 @@ mod tests {
         assert_ne!(newer_bytes, vec![0; 8]);
     }
 
-    #[test]
-    fn write_metrics_include_blobs_deleted_before_the_report() {
-        let network = Rc::new(SimNetwork::default());
-        let world = SimWorld::new(
-            HostId(1),
-            BlobDevConfig::nvme(),
-            StoreConfig::s3(),
-            &network,
-        );
+    #[tokio::test(start_paused = true)]
+    async fn write_metrics_include_blobs_deleted_before_the_report() {
+        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let name =
             blockd_core::layout::journal_blob(VsetId(1), 1, blockd_core::types::JournalSeq(0));
-        let mut executor = Executor::simulation(21);
         let task_world = Rc::clone(&world);
-        executor.block_on(async move {
+        simulate!(21, async move {
             Blobs::write(task_world.as_ref(), name.clone(), vec![1; 32])
                 .await
                 .expect("write record");

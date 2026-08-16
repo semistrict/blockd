@@ -2,21 +2,19 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
-use blockd_exec::ReplyTarget;
+use blockd_exec::Reply;
 use blockd_exec::channel::{OneSender, UnboundedSender};
 
 use crate::authority::{AuthorityProof, PlacementRecord, VnodeId};
 use crate::blx::{BlxFooter, NamespaceKind};
 use crate::cache::Cache;
-use crate::database::{AttachmentId, DatabaseFile};
 use crate::head::ManifestPtr;
 use crate::hostmeta::{
     Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVsetMetrics, VsetOperations,
     VsetRole, VsetStats,
 };
-use crate::journal::{DatabaseMeta, JournalRecord, VsetConfig};
+use crate::journal::{JournalRecord, VsetConfig};
 use crate::manifest::{BaseRef, ObjectIdentity, ObjectRef};
-use crate::mapleaf::LeafPtr;
 use crate::segment::PageLoc;
 use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
 
@@ -51,7 +49,6 @@ pub struct HostState {
     disk_reclaim_scan_cursor: Option<VsetId>,
     disk_reclaim_scan_remaining: usize,
     fatal: Option<OneSender<HostFatal>>,
-    next_attachment_generation: u64,
     next_incarnation: u64,
 }
 
@@ -96,7 +93,6 @@ impl HostState {
             disk_reclaim_scan_cursor: None,
             disk_reclaim_scan_remaining: 0,
             fatal: None,
-            next_attachment_generation: 0,
             next_incarnation: 0,
         }
     }
@@ -248,45 +244,38 @@ impl HostState {
         }
     }
 
-    pub fn allocate_attachment(&mut self, vm: crate::types::VmId) -> AttachmentId {
-        let attachment = AttachmentId {
-            vm,
-            generation: self.next_attachment_generation,
-        };
-        self.next_attachment_generation = self
-            .next_attachment_generation
-            .checked_add(1)
-            .expect("attachment generation overflow");
-        attachment
-    }
-
     pub fn wedge_tick(&mut self) {
         let threshold = self.config.wedge_ticks;
         if threshold == 0 {
             return;
         }
-        for vset in self.vsets.values_mut() {
+        let filling = self
+            .filling_pages
+            .iter()
+            .map(|page| page.volume.vset)
+            .collect::<BTreeSet<_>>();
+        for (&vset, state) in &mut self.vsets {
             watch(
-                !vset.leaf_waiters.is_empty(),
-                vset.wedge.fills,
-                &mut vset.wedge.fills_seen,
-                &mut vset.wedge.parked_ticks,
+                filling.contains(&vset),
+                state.wedge.fills,
+                &mut state.wedge.fills_seen,
+                &mut state.wedge.parked_ticks,
                 threshold,
                 &mut self.counters.wedged_guests,
             );
             watch(
-                vset.peer_source.is_some() || !vset.leaf_waiters.is_empty(),
-                vset.wedge.hydration,
-                &mut vset.wedge.hydration_seen,
-                &mut vset.wedge.hydration_ticks,
+                state.peer_source.is_some(),
+                state.wedge.hydration,
+                &mut state.wedge.hydration_seen,
+                &mut state.wedge.hydration_ticks,
                 threshold,
                 &mut self.counters.wedged_hydration,
             );
             watch(
-                vset.outbound.is_some(),
-                vset.wedge.served,
-                &mut vset.wedge.served_seen,
-                &mut vset.wedge.outbound_ticks,
+                state.outbound.is_some(),
+                state.wedge.served,
+                &mut state.wedge.served_seen,
+                &mut state.wedge.outbound_ticks,
                 threshold,
                 &mut self.counters.wedged_outbound,
             );
@@ -305,9 +294,6 @@ impl HostState {
                     vset: found, fence, ..
                 }
                 | crate::layout::BlobName::Segment {
-                    vset: found, fence, ..
-                }
-                | crate::layout::BlobName::Leaf {
                     vset: found, fence, ..
                 } if found == vset => Some(fence),
                 _ => None,
@@ -455,11 +441,7 @@ impl HostState {
             .vsets
             .iter()
             .map(|(&vset, state)| {
-                let hydrating = state.peer_source.is_some()
-                    || state
-                        .leaf_table
-                        .keys()
-                        .any(|span| !state.hydrated_spans.contains(span));
+                let hydrating = state.peer_source.is_some();
                 let role = if state.outbound.is_some() {
                     VsetRole::Outbound
                 } else if hydrating {
@@ -492,11 +474,6 @@ impl HostState {
                     .as_ref()
                     .map_or(0, |record| record.capture_seq);
                 let backed = state.backed.map_or(0, |pointer| pointer.capture_seq);
-                let pending_leaf_spans = state
-                    .leaf_table
-                    .keys()
-                    .filter(|span| !state.hydrated_spans.contains(span))
-                    .count();
                 let hydration_remaining_pages = if state.peer_source.is_some() {
                     state
                         .page_locs
@@ -512,9 +489,7 @@ impl HostState {
                     fence: state.fence,
                     dirty_pages: self.cache.dirty_pages_of(vset).len(),
                     unstable_pages: self.cache.unstable_pages_of(vset).len(),
-                    parked_faults: state.leaf_waiters.values().map(Vec::len).sum(),
                     pending_syncs: state.pending_syncs.len(),
-                    pending_leaf_spans,
                     hydration_remaining_pages,
                     archive_lag_captures: Some(best.saturating_sub(backed)),
                     archive_lag_bytes: Some(state.backup_lag_bytes()),
@@ -528,13 +503,6 @@ impl HostState {
                 }
             })
             .collect::<Vec<_>>();
-        let parked_faults = self.pressure_waiters.len()
-            + self
-                .vsets
-                .values()
-                .flat_map(|vset| vset.leaf_waiters.values())
-                .map(Vec::len)
-                .sum::<usize>();
         let (live_segment_bytes, local_segment_bytes) = self.seg_space();
         DaemonStats {
             cache_capacity_pages: self.cache.capacity(),
@@ -544,7 +512,6 @@ impl HostState {
             dirty_pages: self.cache.dirty_count(),
             unstable_pages: self.cache.unstable_count(),
             pressure_waiting_faults: self.pressure_waiters.len(),
-            parked_faults,
             local_blob_bytes: self.blob_sizes.values().sum(),
             disk_capacity_bytes: self.config.disk_capacity,
             disk_headroom_bytes: self.config.disk_headroom,
@@ -658,23 +625,6 @@ pub struct WedgeState {
     outbound_ticks: u64,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum AttachmentPhase {
-    #[default]
-    Detached,
-    Attached(AttachmentId),
-    Draining(AttachmentId),
-    Forced(AttachmentId),
-}
-
-#[derive(Default)]
-pub struct DatabaseRuntime {
-    pub phase: AttachmentPhase,
-    pub handles: BTreeMap<u64, DatabaseFile>,
-    pub active: Option<AttachmentId>,
-    pub drain_barrier: u64,
-}
-
 pub struct DrainState {
     pub unread: BTreeMap<PageId, Gen>,
     pub copied_on_fault: BTreeMap<PageId, (Gen, Vec<u8>)>,
@@ -692,7 +642,6 @@ pub(super) enum CaptureKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MutationOwner {
     Capture(CaptureKind),
-    Database,
     Hydration,
 }
 
@@ -855,17 +804,12 @@ impl VsetOperationState {
 pub struct PendingSync {
     id: u64,
     pub barrier: u64,
-    reply: ReplyTarget<bool>,
+    reply: Reply<bool>,
     resolved: Option<UnboundedSender<()>>,
 }
 
 impl PendingSync {
-    pub fn new(
-        id: u64,
-        barrier: u64,
-        reply: ReplyTarget<bool>,
-        resolved: UnboundedSender<()>,
-    ) -> Self {
+    pub fn new(id: u64, barrier: u64, reply: Reply<bool>, resolved: UnboundedSender<()>) -> Self {
         Self {
             id,
             barrier,
@@ -899,7 +843,6 @@ impl Drop for PendingSync {
 pub struct VsetState {
     pub incarnation: u64,
     pub config: VsetConfig,
-    pub database: DatabaseMeta,
     pub fence: u64,
     pub ready: bool,
     pub epoch: Epoch,
@@ -912,16 +855,9 @@ pub struct VsetState {
     /// retain a mixed batch containing values discarded by cold boot.
     pub pending_tombstones: BTreeSet<crate::blx::BlockKey>,
     pub page_locs: BTreeMap<PageId, (Gen, PageLoc)>,
-    pub overlay: BTreeMap<PageId, (Gen, PageLoc)>,
-    pub leaf_table: BTreeMap<u32, LeafPtr>,
-    pub leaf_blobs: BTreeMap<LeafPtr, (u64, BTreeSet<(u64, SegId)>)>,
-    pub hydrated_spans: BTreeSet<u32>,
-    pub failed_spans: BTreeSet<u32>,
-    pub leaf_waiters: BTreeMap<u32, Vec<OneSender<()>>>,
     pub next_gen: u64,
     pub next_seq: u64,
     pub next_seg: u64,
-    pub next_leaf: u64,
     pub best_record: Option<JournalRecord>,
     pub local_covered_through: u64,
     pub sync_ack_through: u64,
@@ -962,7 +898,6 @@ pub struct VsetState {
     /// alone is not enough to protect this older closure from cleanup.
     pub replicating_segments: BTreeSet<(u64, SegId)>,
     pub publishing_segments: BTreeSet<(u64, SegId)>,
-    pub backed_leaves: BTreeSet<(u64, u64)>,
     pub store_manifests: BTreeSet<(u64, JournalSeq)>,
     pub outbound: Option<HostId>,
     pub peer_source: Option<HostId>,
@@ -975,7 +910,6 @@ pub struct VsetState {
     pub peer_published: Option<crate::protocol::ReplicaCommitInfo>,
     pub peer_committed_through: u64,
     pub wedge: WedgeState,
-    pub database_runtime: DatabaseRuntime,
 }
 
 impl VsetState {
@@ -983,7 +917,6 @@ impl VsetState {
         Self {
             incarnation,
             config,
-            database: DatabaseMeta::default(),
             fence: 1,
             ready: false,
             epoch: Epoch(0),
@@ -992,16 +925,9 @@ impl VsetState {
             state_checksum: 0,
             pending_tombstones: BTreeSet::new(),
             page_locs: BTreeMap::new(),
-            overlay: BTreeMap::new(),
-            leaf_table: BTreeMap::new(),
-            leaf_blobs: BTreeMap::new(),
-            hydrated_spans: BTreeSet::new(),
-            failed_spans: BTreeSet::new(),
-            leaf_waiters: BTreeMap::new(),
             next_gen: 0,
             next_seq: 0,
             next_seg: 0,
-            next_leaf: 0,
             best_record: None,
             local_covered_through: 0,
             sync_ack_through: 0,
@@ -1026,7 +952,6 @@ impl VsetState {
             backed_segments: BTreeSet::new(),
             replicating_segments: BTreeSet::new(),
             publishing_segments: BTreeSet::new(),
-            backed_leaves: BTreeSet::new(),
             store_manifests: BTreeSet::new(),
             outbound: None,
             peer_source: None,
@@ -1039,7 +964,6 @@ impl VsetState {
             peer_published: None,
             peer_committed_through: 0,
             wedge: WedgeState::default(),
-            database_runtime: DatabaseRuntime::default(),
         }
     }
 
@@ -1123,52 +1047,6 @@ pub struct CaptureLease {
     cleanup: Option<OneSender<Vec<PageId>>>,
     cleanup_finishes_mutation: bool,
     active: bool,
-}
-
-pub struct CommitFlagLease {
-    state: SharedHost,
-    vset: VsetId,
-    incarnation: u64,
-    owner: MutationOwner,
-    active: bool,
-}
-
-impl CommitFlagLease {
-    pub fn new(state: &SharedHost, vset: VsetId, incarnation: u64, owner: MutationOwner) -> Self {
-        Self {
-            state: Rc::clone(state),
-            vset,
-            incarnation,
-            owner,
-            active: true,
-        }
-    }
-
-    pub fn commit(mut self) {
-        self.state.borrow_mut().schedule_vset(self.vset);
-        self.active = false;
-    }
-}
-
-impl Drop for CommitFlagLease {
-    fn drop(&mut self) {
-        let waiters = if self.active {
-            let mut host = self.state.borrow_mut();
-            host.vsets
-                .get_mut(&self.vset)
-                .filter(|vset| vset.incarnation == self.incarnation)
-                .map_or_else(Vec::new, |vset| {
-                    vset.operations.finish_mutation(self.owner);
-                    std::mem::take(&mut vset.mutation_waiters)
-                })
-        } else {
-            Vec::new()
-        };
-        for waiter in waiters {
-            let _ = waiter.send(());
-        }
-        self.state.borrow_mut().schedule_vset(self.vset);
-    }
 }
 
 impl CaptureLease {
@@ -1303,22 +1181,28 @@ mod tests {
     fn typed_operation_slots_reject_overlapping_owners() {
         let mut operations = VsetOperationState::default();
 
-        assert!(operations.try_start_mutation(MutationOwner::Database));
+        assert!(operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Writeback)));
         assert!(!operations.try_start_mutation(MutationOwner::Hydration));
-        assert_eq!(operations.mutation_owner(), Some(MutationOwner::Database));
+        assert_eq!(
+            operations.mutation_owner(),
+            Some(MutationOwner::Capture(CaptureKind::Writeback))
+        );
         assert!(
             operations
                 .finish_mutation(MutationOwner::Hydration)
                 .is_none()
         );
-        assert_eq!(operations.mutation_owner(), Some(MutationOwner::Database));
-        operations.finish_mutation(MutationOwner::Database);
+        assert_eq!(
+            operations.mutation_owner(),
+            Some(MutationOwner::Capture(CaptureKind::Writeback))
+        );
+        operations.finish_mutation(MutationOwner::Capture(CaptureKind::Writeback));
         assert!(operations.try_start_mutation(MutationOwner::Hydration));
         operations.finish_mutation(MutationOwner::Hydration);
 
         assert!(operations.start_migration());
         assert!(!operations.start_migration());
-        assert!(!operations.try_start_mutation(MutationOwner::Database));
+        assert!(!operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Writeback)));
         assert!(operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Migration)));
         operations.finish_mutation(MutationOwner::Capture(CaptureKind::Migration));
         operations.finish_migration();
@@ -1326,11 +1210,11 @@ mod tests {
 
         assert!(operations.start_guest_resume());
         assert!(operations.guest_resume_pending());
-        assert!(!operations.try_start_mutation(MutationOwner::Database));
+        assert!(!operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Writeback)));
         assert!(!operations.start_migration());
         operations.finish_guest_resume();
-        assert!(operations.try_start_mutation(MutationOwner::Database));
-        operations.finish_mutation(MutationOwner::Database);
+        assert!(operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Writeback)));
+        operations.finish_mutation(MutationOwner::Capture(CaptureKind::Writeback));
 
         assert!(operations.try_start_publication(PublicationOwner::Direct));
         assert!(!operations.try_start_publication(PublicationOwner::Direct));

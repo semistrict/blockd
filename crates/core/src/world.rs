@@ -26,12 +26,11 @@
 //! may still land, which is the crash cut actors are required to tolerate.
 
 // These statically dispatched actor-world traits intentionally return local,
-// non-`Send` futures because one deterministic executor owns the actor tree.
+// non-`Send` futures because one current-thread Tokio runtime owns the actor tree.
 #![allow(async_fn_in_trait)]
 
-use blockd_exec::BridgeRequest;
+use blockd_exec::Request;
 
-use crate::database::{DatabaseCall, DatabaseResult};
 use crate::engine::HostFatal;
 use crate::protocol::{AdminCall, AdminEvent, AdminResult, PeerMsg, ReqId, StoreFault};
 use crate::types::{HostId, PageId, VolumeId, VsetId};
@@ -79,9 +78,8 @@ pub struct GuestSync {
     pub volume: VolumeId,
 }
 
-pub type AdminRequest = BridgeRequest<AdminCall, AdminResult>;
-pub type DatabaseActorRequest = BridgeRequest<DatabaseCall, DatabaseResult>;
-pub type GuestSyncRequest = BridgeRequest<GuestSync, bool>;
+pub type AdminRequest = Request<AdminCall, AdminResult>;
+pub type GuestSyncRequest = Request<GuestSync, bool>;
 
 pub trait Blobs {
     /// Return a canonicalizable snapshot of durable local artifacts. Unknown
@@ -176,7 +174,6 @@ pub trait GuestMem {
     async fn fail(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError>;
-    async fn install_database(&self, page: PageId, bytes: Vec<u8>) -> Result<(), GuestMemoryError>;
     async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError>;
     async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError>;
     async fn resume(&self, vset: VsetId, pause: Option<GuestPause>)
@@ -194,6 +191,5 @@ pub trait GuestMem {
 pub trait AdminIo {
     async fn next_admin(&self) -> Option<AdminRequest>;
     async fn emit_admin_event(&self, event: AdminEvent);
-    async fn next_database(&self) -> Option<DatabaseActorRequest>;
     async fn host_failed(&self, failure: HostFatal);
 }

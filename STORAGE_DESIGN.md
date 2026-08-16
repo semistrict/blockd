@@ -2,8 +2,8 @@
 
 Status: draft
 
-This document defines how blockd stores VM memory, VM disks, VMM state, and
-database files. It replaces the current page maps, map leaves, and segments.
+This document defines how blockd stores VM memory, VM disks, and VMM state. It
+replaces the current page maps, map leaves, and segments.
 
 ## Glossary
 
@@ -18,9 +18,9 @@ The document uses the following storage-specific terms:
 | **Base** | A saved state that one or more forks share without copying its page data. |
 | **Base root** | A small, fixed-size record that makes a kept base discoverable and points to its base manifest. |
 | **Block** | The smallest piece of data stored and fetched independently. It is normally one operating-system memory page. |
-| **Block key** | The fixed-size address of a block: which kind of data it belongs to, which disk or file it belongs to, and its block number. |
+| **Block key** | The fixed-size address of a block: which kind of data it belongs to, which disk it belongs to, and its block number. |
 | **`.blx` file** | A read-only file containing compressed block values, deletion markers, and an index. The document sometimes calls it a data file. |
-| **Capture sequence** | The number of the guest or database state represented by a manifest. Compaction does not change it. |
+| **Capture sequence** | The number of the guest state represented by a manifest. Compaction does not change it. |
 | **Checkpoint epoch** | The VM checkpoint number returned to callers and used when resuming an exact whole-VM state. |
 | **Checksum** | A value computed from stored bytes or visible vset state. A mismatch means the data is corrupt or the wrong pieces were combined. CRC32C checks stored bytes; the state checksum checks the assembled vset state. |
 | **Compare-and-swap (CAS)** | Change a small record only if it still has the value or object-store version that the writer previously read. This prevents an old owner from replacing a newer owner's state. |
@@ -37,17 +37,16 @@ The document uses the following storage-specific terms:
 | **Frame** | One encoded record with a type marker, byte length, checksum, and payload. |
 | **Garbage collection (GC)** | Delete uploaded objects that no current vset, kept base, or in-progress publication needs. |
 | **Generation** | The write number stored with a block value. The highest generation is the newest value. |
-| **Guest sync** | A guest request that requires all earlier accepted disk or database writes to be durable before the request is acknowledged. |
+| **Guest sync** | A guest request that requires all earlier accepted disk writes to be durable before the request is acknowledged. |
 | **Head** | The small per-vset record that names the current manifest and the host allowed to publish the next one. |
 | **Journal** | The ordered local record of recent changes on the primary and passive before those changes are archived. |
 | **Journal sequence** | A number that identifies one exact local journal record. It does not change when compaction republishes the same state in a different file layout. |
 | **KiB / MiB** | 1,024 bytes / 1,048,576 bytes. |
 | **Local checkpoint** | A recovery point saved on the primary's local storage. It is not protected until copied to the passive and not archived until published to object storage. |
 | **Lazy restore** | Start a vset from metadata and fetch each data block only when it is first needed. |
-| **Litestream/LTX** | The existing SQLite replication file design that inspired the sorted, read-only data files used here. |
 | **LZ4** | The compression method used independently for each stored block. |
 | **Manifest** | The current description of an archived vset: recovery information, an optional base, a complete-file-list pointer, and file-list changes. It contains no page data. |
-| **Metadata** | Descriptive information such as file references, sizes, checksums, and recovery mode. It is not VM memory, disk contents, or database contents. |
+| **Metadata** | Descriptive information such as file references, sizes, checksums, and recovery mode. It is not VM memory or disk contents. |
 | **Namespace** | The vset or imported base that originally created an object. It is part of the object's permanent identity. |
 | **Object identity / object reference** | An identity names one uploaded object. A reference also records enough size, range, index, and checksum information to read and verify it. |
 | **Object storage** | The bucket holding named, read-only objects. `GET` reads an object or byte range; `PUT` uploads one. |
@@ -56,7 +55,7 @@ The document uses the following storage-specific terms:
 | **Protected cut / protected frontier** | A point in the journal that is durable on both the primary and passive. The frontier is the newest such point. |
 | **Publish** | Make an uploaded manifest current by changing the vset's head with CAS. Uploading files alone does not publish them. |
 | **Range read** | Read only a selected byte range from an object instead of downloading the whole object. |
-| **Recovery kind** | Whether an archived state can resume a VM exactly, start it normally from saved disks, or open a database. |
+| **Recovery kind** | Whether an archived state can resume a VM exactly or start it normally from saved disks. |
 | **Recovery point** | One complete saved state that recovery is allowed to use. |
 | **Resume set** | A best-effort hint listing blocks likely to be needed immediately when a VM resumes. Correctness does not depend on it. |
 | **Stash** | The passive's durable storage for replicated recent changes. The head records which passive owns the active stash and a bounded list of old stashes still being retired. |
@@ -65,8 +64,7 @@ The document uses the following storage-specific terms:
 | **Trailer** | The fixed-size final bytes of a `.blx` file. They say where the footer is. |
 | **Virtual machine (VM)** | A guest computer run by blockd. |
 | **VMM state** | The saved state of the virtual machine monitor: virtual CPUs and emulated devices, separate from guest memory and disks. |
-| **vset** | Everything saved and restored together: either a VM's memory, disks, and VMM state, or a database's files. |
-| **Write-ahead log (WAL)** | A database file containing committed changes that have not yet been copied into the main database file. |
+| **vset** | A VM's memory, disks, and VMM state saved and restored together. |
 | **Wire integer (`u8`, `u16`, `u32`, `u64`)** | An unsigned integer stored in exactly 1, 2, 4, or 8 bytes. |
 | **Writer fence** | A number assigned when a host becomes primary. It is included in uploaded object names so a former primary cannot collide with the current primary's objects. |
 
@@ -84,10 +82,9 @@ The basic idea is simple:
 - A tiny head record points to the current manifest.
 - A fork points to an existing saved base. It does not copy the base's data.
 
-This is close to the Litestream/LTX file model: sorted read-only files, an
-index at the end of each file, checksums, and background merging. The main
-difference is that blockd does not upload a file for every protected write.
-Replication to the passive already protects those writes until the primary
+The format uses sorted read-only files, an index at the end of each file,
+checksums, and background merging. Blockd does not upload a file for every
+protected write. Replication to the passive already protects those writes until the primary
 combines them into an archive batch.
 
 The requirements document still controls. In plain terms:
@@ -142,7 +139,7 @@ old-format reader, conversion path, or format negotiation.
 ## 2. How blocks are addressed
 
 Every stored block has the same kind of address, whether it came from VM
-memory, a disk, VMM state, or a database file:
+memory, a disk, or VMM state:
 
 ```text
 BlockKey {
@@ -153,12 +150,12 @@ BlockKey {
 }
 ```
 
-`space` says what kind of data this is. `volume` selects a particular disk or
-database file. `block` is the block number within that space and volume.
+`space` says what kind of data this is. `volume` selects a particular disk.
+`block` is the block number within that space and volume.
 `reserved` is unused and must be zero.
 
 Keys are sorted into fixed file partitions. The block-number range comes
-first, followed by a small group of nearby memory, disk, database, and VMM
+first, followed by a small group of nearby memory, disk, and VMM
 namespaces. This means a small VM cut normally remains one `.blx` file, while a
 large cut splits at stable boundaries. Files from later cuts use the same
 boundaries, so compaction can handle one bounded partition at a time instead
@@ -169,14 +166,8 @@ The spaces are:
 | Space | Contents |
 |---|---|
 | `0` | compute memory |
-| `1` | compute disk or database file pages; `volume` selects the disk/file |
+| `1` | compute disk pages; `volume` selects the disk |
 | `2` | VMM state split into blocks; the manifest records its visible byte length |
-
-For a database, fixed `volume` values identify the main database, write-ahead
-log (WAL), and rollback journal. The manifest records whether each file exists
-and its visible length. Those facts and the file's blocks always belong to the
-same recovery point. When a file shrinks or is deleted, deletion markers stop
-old blocks from reappearing if the file later grows.
 
 The block size is the host process's operating-system page size. Every data
 file and manifest records it. A host using a different page size cannot open
@@ -420,11 +411,10 @@ Manifest {
     archive_seq:            u64,
     capture_seq:            u64,
     sync_covered_through:   u64,
-    recovery_kind:          u8,   // whole, disk-only, database
+    recovery_kind:          u8,   // whole, disk-only
     checkpoint_epoch:       u64,
     block_size:             u32,
     vset_config:            VsetConfig,
-    database_metadata:      DatabaseMetadata,
     vmstate_logical_length: u64,
     base:                   OptionalBaseRef,
     complete_list:          OptionalFileListRef,
@@ -437,8 +427,7 @@ Manifest {
 }
 ```
 
-`vset_config` describes the VM or database shape needed to interpret its block
-keys. `database_metadata` records database-file existence and visible lengths.
+`vset_config` describes the VM shape needed to interpret its block keys.
 `journal_seq` identifies the exact local record whose state is published.
 `archive_seq` independently identifies this particular metadata publication.
 The remaining names correspond to terms in the glossary.
@@ -544,10 +533,6 @@ manifest currently named by the head.
   one capture. The VM can continue from that exact state.
 - A **disk-only** VM manifest contains disks through the recorded guest sync,
   but no usable memory or VMM state. The VM starts normally from those disks.
-- A **database** manifest contains the main database, WAL, and rollback journal
-  through the recorded guest sync, including whether each file exists and its
-  visible length.
-
 A disk-only archive may still reference older memory files because a running
 VM or later compaction may need them. Those files do not make that recovery
 point resumable. The `recovery_kind` field alone decides which recovery action
@@ -566,8 +551,8 @@ Ordinary writes, copying dirty pages to local storage, guest sync, and local
 checkpoints do not write object-store manifests.
 
 `archive_seq` counts manifest publications. It increases even when compaction
-changes only the file layout. `capture_seq` identifies the saved guest or
-database state and therefore does not increase for compaction alone.
+changes only the file layout. `capture_seq` identifies the saved guest state
+and therefore does not increase for compaction alone.
 `journal_seq` also stays unchanged for compaction alone. Recovery never
 compares `archive_seq` with `journal_seq`; they count different things.
 
@@ -830,8 +815,7 @@ Recovery uses a saved state only if all of the following are true:
    durable storage;
 7. the state includes the newest guest sync that was acknowledged by any
    allowed recovery source; and
-8. the recovery kind explicitly permits VM resume, VM boot from disk, or
-   database open.
+8. the recovery kind explicitly permits VM resume or VM boot from disk.
 
 Takeover and migration still use the head CAS and writer fence. A new primary
 may reference read-only files uploaded by an older primary, but it can publish

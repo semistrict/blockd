@@ -75,6 +75,22 @@ pub struct BlockKey {
     pub block: u32,
 }
 
+/// Canonical page-sized BLX blocks for one logical VMM snapshot.
+pub fn vmm_snapshot_blocks(bytes: &[u8]) -> impl Iterator<Item = (BlockKey, Vec<u8>)> + '_ {
+    bytes.chunks(page_size()).enumerate().map(|(block, chunk)| {
+        let mut padded = vec![0; page_size()];
+        padded[..chunk.len()].copy_from_slice(chunk);
+        (
+            BlockKey {
+                space: BlockSpace::Vmm,
+                volume: 0,
+                block: u32::try_from(block).expect("VMM snapshot block fits u32"),
+            },
+            padded,
+        )
+    })
+}
+
 impl BlockKey {
     pub fn file_partition(self) -> (u32, u16) {
         (
@@ -95,11 +111,6 @@ impl BlockKey {
                 volume: page.volume.idx.0,
                 block: page.page.0,
             },
-            VsetKind::Database => Self {
-                space: BlockSpace::Data,
-                volume: page.volume.idx.0,
-                block: page.page.0,
-            },
         }
     }
 
@@ -107,7 +118,6 @@ impl BlockKey {
         let idx = match (kind, self.space) {
             (VsetKind::Compute, BlockSpace::Memory) if self.volume == 0 => 0,
             (VsetKind::Compute, BlockSpace::Data) => self.volume,
-            (VsetKind::Database, BlockSpace::Data) => self.volume,
             _ => return None,
         };
         Some(PageId {
@@ -126,8 +136,7 @@ impl BlockKey {
         match self.space {
             BlockSpace::Memory if self.volume == 0 => {}
             BlockSpace::Data => {}
-            BlockSpace::Vmm => return None,
-            BlockSpace::Memory => return None,
+            BlockSpace::Vmm | BlockSpace::Memory => return None,
         }
         Some(PageId {
             volume: VolumeId {
@@ -374,6 +383,34 @@ impl BlxBatchBuilder {
         }
     }
 
+    pub fn object_ids_fit(&self) -> bool {
+        let mut chunks = usize::from(!self.entries.is_empty());
+        let mut current_empty = true;
+        let mut estimated = HEADER_BYTES + TRAILER_BYTES;
+        let mut partition = None;
+        for entry in self.entries.values() {
+            if should_split(
+                current_empty,
+                estimated,
+                partition,
+                entry,
+                self.split_at_file_partitions,
+            ) {
+                chunks += 1;
+                estimated = HEADER_BYTES + TRAILER_BYTES;
+            }
+            current_empty = false;
+            partition = Some(entry.key().file_partition());
+            estimated += encoded_entry_upper_bound(entry) + FOOTER_ENTRY_BYTES;
+        }
+        chunks == 0
+            || self
+                .meta
+                .first_object_id
+                .checked_add(u64::try_from(chunks - 1).expect("chunk count fits u64"))
+                .is_some()
+    }
+
     pub fn finish(self) -> Vec<BlxObject> {
         if self.entries.is_empty() {
             return Vec::new();
@@ -384,18 +421,19 @@ impl BlxBatchBuilder {
         let mut partition = None;
         for entry in self.entries.into_values() {
             let entry_size = encoded_entry_upper_bound(&entry);
-            let footer_growth = FOOTER_ENTRY_BYTES;
             let entry_partition = entry.key().file_partition();
-            if !current.is_empty()
-                && ((self.split_at_file_partitions && partition != Some(entry_partition))
-                    || estimated + entry_size + footer_growth + FRAME_HEADER + FOOTER_PREFIX_BYTES
-                        > TARGET_FILE_BYTES)
-            {
+            if should_split(
+                current.is_empty(),
+                estimated,
+                partition,
+                &entry,
+                self.split_at_file_partitions,
+            ) {
                 chunks.push(std::mem::take(&mut current));
                 estimated = HEADER_BYTES + TRAILER_BYTES;
             }
             partition = Some(entry_partition);
-            estimated += entry_size + footer_growth;
+            estimated += entry_size + FOOTER_ENTRY_BYTES;
             current.push(entry);
         }
         if !current.is_empty() {
@@ -416,6 +454,23 @@ impl BlxBatchBuilder {
             })
             .collect()
     }
+}
+
+fn should_split(
+    current_empty: bool,
+    estimated: usize,
+    partition: Option<(u32, u16)>,
+    entry: &BlxEntry,
+    split_at_file_partitions: bool,
+) -> bool {
+    !current_empty
+        && ((split_at_file_partitions && partition != Some(entry.key().file_partition()))
+            || estimated
+                + encoded_entry_upper_bound(entry)
+                + FOOTER_ENTRY_BYTES
+                + FRAME_HEADER
+                + FOOTER_PREFIX_BYTES
+                > TARGET_FILE_BYTES)
 }
 
 fn encoded_entry_upper_bound(entry: &BlxEntry) -> usize {
@@ -955,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn block_keys_map_compute_and_database_volumes() {
+    fn block_keys_map_compute_volumes() {
         let page = |idx| PageId {
             volume: VolumeId {
                 vset: VsetId(7),
@@ -968,7 +1023,6 @@ mod tests {
             BlockSpace::Memory
         );
         assert_eq!(BlockKey::from_page(VsetKind::Compute, page(2)).volume, 2);
-        assert_eq!(BlockKey::from_page(VsetKind::Database, page(2)).volume, 2);
     }
 
     #[test]

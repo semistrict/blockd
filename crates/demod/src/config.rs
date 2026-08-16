@@ -68,8 +68,8 @@ pub struct DemodConfig {
 }
 
 impl DemodConfig {
-    pub fn load(path: &str) -> DemodConfig {
-        let text = std::fs::read_to_string(path).expect("config file");
+    pub async fn load(path: &str) -> DemodConfig {
+        let text = tokio::fs::read_to_string(path).await.expect("config file");
         Self::parse(&text)
     }
 

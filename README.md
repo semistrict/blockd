@@ -1,8 +1,8 @@
 # blockd
 
 Page-granular storage for Firecracker sandbox fleets. One daemon per host
-manages guest memory, durable disk state, and independently attachable SQLite
-vsets, with asynchronous archival to object storage.
+manages guest memory and durable disk state, with asynchronous archival to
+object storage.
 
 ## Build and test
 

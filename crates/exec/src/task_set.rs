@@ -1,4 +1,4 @@
-//! Owned groups of child actors.
+//! Owned groups of Tokio child actors.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -6,21 +6,15 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::rc::Rc;
 
-use crate::channel::{Receiver, UnboundedSender, unbounded};
-use crate::{TaskHandle, TaskId, spawn};
+use crate::channel::{UnboundedReceiver, unbounded};
+use crate::{TaskId, spawn};
 
-/// A cancellation tree node for dynamically spawned child actors.
-///
-/// Completed children are reaped without cancelling them. Dropping the set
-/// drops every remaining handle and therefore cancels the whole subtree.
 pub struct ActorCollection<E> {
-    actors: Rc<RefCell<BTreeMap<TaskId, TaskHandle<()>>>>,
-    completed_tx: UnboundedSender<(TaskId, Option<E>)>,
-    failures_rx: Receiver<E>,
-    reaper: TaskHandle<()>,
+    actors: Rc<RefCell<BTreeMap<TaskId, tokio::task::AbortHandle>>>,
+    failures_rx: UnboundedReceiver<E>,
+    failures_tx: crate::channel::UnboundedSender<E>,
 }
 
-/// A child collection whose actors cannot return an error.
 pub type TaskSet = ActorCollection<Infallible>;
 
 impl<E: 'static> Default for ActorCollection<E> {
@@ -31,56 +25,43 @@ impl<E: 'static> Default for ActorCollection<E> {
 
 impl<E: 'static> ActorCollection<E> {
     pub fn new() -> Self {
-        let actors = Rc::new(RefCell::new(BTreeMap::<TaskId, TaskHandle<()>>::new()));
-        let reaper_actors = Rc::clone(&actors);
-        let (completed_tx, mut completed_rx) = unbounded();
         let (failures_tx, failures_rx) = unbounded();
-        let reaper = spawn(async move {
-            while let Some((task, failure)) = completed_rx.recv().await {
-                if let Some(handle) = reaper_actors.borrow_mut().remove(&task) {
-                    handle.detach();
-                }
-                if let Some(failure) = failure {
-                    let _ = failures_tx.send(failure);
-                }
-            }
-        });
         Self {
-            actors,
-            completed_tx,
+            actors: Rc::new(RefCell::new(BTreeMap::new())),
             failures_rx,
-            reaper,
+            failures_tx,
         }
     }
 
     pub fn spawn(&mut self, future: impl Future<Output = ()> + 'static) -> TaskId {
-        let completed = self.completed_tx.clone();
-        let task_id = Rc::new(Cell::new(u64::MAX));
-        let child_id = Rc::clone(&task_id);
-        let handle = spawn(async move {
+        self.spawn_inner(async move {
             future.await;
-            let _ = completed.send((child_id.get(), None));
-        });
-        let id = handle.id();
-        task_id.set(id);
-        self.actors.borrow_mut().insert(id, handle);
-        id
+            None
+        })
     }
 
     pub fn spawn_result(
         &mut self,
         future: impl Future<Output = Result<(), E>> + 'static,
     ) -> TaskId {
-        let completed = self.completed_tx.clone();
+        self.spawn_inner(async move { future.await.err() })
+    }
+
+    fn spawn_inner(&mut self, future: impl Future<Output = Option<E>> + 'static) -> TaskId {
+        let actors = Rc::clone(&self.actors);
+        let failures = self.failures_tx.clone();
         let task_id = Rc::new(Cell::new(u64::MAX));
         let child_id = Rc::clone(&task_id);
         let handle = spawn(async move {
-            let failure = future.await.err();
-            let _ = completed.send((child_id.get(), failure));
+            let failure = future.await;
+            actors.borrow_mut().remove(&child_id.get());
+            if let Some(failure) = failure {
+                let _ = failures.send(failure);
+            }
         });
-        let id = handle.id();
+        let (id, abort) = handle.detach_abort_handle();
         task_id.set(id);
-        self.actors.borrow_mut().insert(id, handle);
+        self.actors.borrow_mut().insert(id, abort);
         id
     }
 
@@ -96,16 +77,20 @@ impl<E: 'static> ActorCollection<E> {
         self.actors.borrow().is_empty()
     }
 
-    /// Cancel one owned child while leaving the rest of the collection live.
     pub fn cancel(&mut self, task: TaskId) -> bool {
-        self.actors.borrow_mut().remove(&task).is_some()
+        let Some(abort) = self.actors.borrow_mut().remove(&task) else {
+            return false;
+        };
+        abort.abort();
+        true
     }
 }
 
 impl<E> Drop for ActorCollection<E> {
     fn drop(&mut self) {
-        self.reaper.cancel();
-        self.actors.borrow_mut().clear();
+        for (_, abort) in self.actors.borrow_mut().split_off(&0) {
+            abort.abort();
+        }
     }
 }
 
@@ -115,14 +100,19 @@ mod tests {
     use std::rc::Rc;
 
     use super::{ActorCollection, TaskSet};
-    use crate::{Executor, delay, yield_now};
+    use crate::{FaultConfig, delay, simulation_scope, yield_now};
 
-    #[test]
-    fn reaps_completed_children_and_cancels_live_children() {
+    async fn simulate<T>(seed: u64, future: impl Future<Output = T>) -> T {
+        tokio::task::LocalSet::new()
+            .run_until(simulation_scope(seed, FaultConfig::default(), future))
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reaps_completed_children_and_cancels_live_children() {
         let cancelled = Rc::new(Cell::new(false));
         let child_cancelled = Rc::clone(&cancelled);
-        let mut executor = Executor::simulation(1);
-        executor.block_on(async move {
+        simulate(1, async move {
             let mut children = TaskSet::new();
             children.spawn(async {});
             children.spawn(async move {
@@ -139,38 +129,38 @@ mod tests {
             assert_eq!(children.len(), 1);
             drop(children);
             yield_now().await;
-        });
+        })
+        .await;
         assert!(cancelled.get());
     }
 
-    #[test]
-    fn reaps_completed_children_while_parent_is_idle() {
-        let mut executor = Executor::simulation(1);
-        executor.block_on(async move {
+    #[tokio::test(start_paused = true)]
+    async fn reaps_completed_children_while_parent_is_idle() {
+        simulate(1, async move {
             let mut children = TaskSet::new();
             children.spawn(async {});
             delay(1).await;
             assert!(children.is_empty());
-        });
+        })
+        .await;
     }
 
-    #[test]
-    fn reports_child_failures_and_reaps_the_child() {
-        let mut executor = Executor::simulation(1);
-        executor.block_on(async move {
+    #[tokio::test(start_paused = true)]
+    async fn reports_child_failures_and_reaps_the_child() {
+        simulate(1, async move {
             let mut children = ActorCollection::<&'static str>::new();
             children.spawn_result(async { Err("failed") });
             assert_eq!(children.next_failure().await, Some("failed"));
             assert!(children.is_empty());
-        });
+        })
+        .await;
     }
 
-    #[test]
-    fn cancels_one_child_without_disturbing_its_sibling() {
+    #[tokio::test(start_paused = true)]
+    async fn cancels_one_child_without_disturbing_its_sibling() {
         let first_cancelled = Rc::new(Cell::new(false));
         let second_completed = Rc::new(Cell::new(false));
-        let mut executor = Executor::simulation(4);
-        executor.block_on({
+        simulate(4, {
             let first_cancelled = Rc::clone(&first_cancelled);
             let second_completed = Rc::clone(&second_completed);
             async move {
@@ -180,7 +170,6 @@ mod tests {
                         self.0.set(true);
                     }
                 }
-
                 let mut children = TaskSet::new();
                 let first = children.spawn(async move {
                     let _guard = MarkOnDrop(first_cancelled);
@@ -190,13 +179,35 @@ mod tests {
                     delay(1).await;
                     second_completed.set(true);
                 });
-                delay(1).await;
+                yield_now().await;
                 assert!(children.cancel(first));
                 assert!(!children.cancel(first));
                 delay(2).await;
+                assert!(children.is_empty());
             }
-        });
+        })
+        .await;
         assert!(first_cancelled.get());
         assert!(second_completed.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_completion_keeps_the_owned_handle_set_bounded() {
+        simulate(9, async move {
+            let mut children = TaskSet::new();
+            let (completed, mut completions) = crate::channel::unbounded();
+            for index in 0..10_000_u64 {
+                let completed = completed.clone();
+                children.spawn(async move {
+                    let _ = completed.send(index);
+                });
+                assert_eq!(completions.recv().await, Some(index));
+                yield_now().await;
+                assert!(children.len() <= 1, "completed handles accumulated");
+            }
+            yield_now().await;
+            assert!(children.is_empty());
+        })
+        .await;
     }
 }

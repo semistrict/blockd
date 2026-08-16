@@ -4,7 +4,7 @@
 //! or object store (R8.1). Byte layouts are pinned by tests; two encoders of
 //! the same state produce identical bytes.
 
-/// Hardware-accelerated CRC-32C (Castagnoli), as used by iSCSI/ext4/S3.
+/// Hardware-accelerated CRC-32C (Castagnoli), as used by iSCSI and ext4.
 pub fn crc32c(bytes: &[u8]) -> u32 {
     u32::try_from(crc_fast::checksum(
         crc_fast::CrcAlgorithm::Crc32Iscsi,
