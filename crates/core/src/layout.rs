@@ -24,11 +24,22 @@
 //! - `v/<vset:016x>/o/<fence:016x>-<object:016x>.blx` — the same immutable
 //!   BLX bytes used locally
 //! - `b/<base:016x>/…` — bases
+//! - `cluster/tls/public-keys/<host:04x>.member` — a node's current self-signed
+//!   TLS certificate and advertised peer endpoint; possession of write access
+//!   to this directory grants cluster membership
 
 use crate::types::{HostId, JournalSeq, SegId, VsetId};
 
 pub fn placement_key() -> String {
     "cluster/placement".to_owned()
+}
+
+pub fn peer_membership_prefix() -> String {
+    "cluster/tls/public-keys/".to_owned()
+}
+
+pub fn peer_membership_key(host: HostId) -> String {
+    format!("{}{:04x}.member", peer_membership_prefix(), host.0)
 }
 
 pub fn host_session_key(host: HostId) -> String {

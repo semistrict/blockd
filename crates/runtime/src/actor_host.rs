@@ -941,10 +941,7 @@ impl Runtime {
     ) -> (Self, BTreeMap<VsetId, Verdict>) {
         let mut hosts = BTreeMap::new();
         for (&vset, &vset_config) in vset_configs {
-            assert_peer_stash_transport(
-                vset_config,
-                config.peer.as_ref().is_some_and(|peer| peer.tls.is_some()),
-            );
+            assert_peer_stash_transport(vset_config, config.peer.is_some());
             hosts.insert(vset, VsetHost::new(vset_config));
         }
         let runtime = Self::start(hosts, config, store).await;
@@ -973,15 +970,21 @@ impl Runtime {
         };
         let shared = Arc::new(Shared::new(hosts, &config.daemon));
         let blobs = FileBlobs::new(&config.blob_dir);
+        let peer_store = Arc::clone(&store);
         let runtime_store = RuntimeStore::new(store);
         let actor_config = config.daemon.clone();
         let peer_input = inputs.peers.clone();
         let peers = match config.peer.clone() {
             Some(peer_config) => Some(
-                PeerNet::start(&peer_config, actor_config.host, move |from, message| {
-                    let lane = peer_lane(&message);
-                    let _ = peer_input.push(lane, (from, message));
-                })
+                PeerNet::start(
+                    &peer_config,
+                    actor_config.host,
+                    peer_store,
+                    move |from, message| {
+                        let lane = peer_lane(&message);
+                        let _ = peer_input.push(lane, (from, message));
+                    },
+                )
                 .await
                 .expect("peer listen"),
             ),

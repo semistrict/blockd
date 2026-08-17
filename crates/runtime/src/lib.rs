@@ -35,7 +35,7 @@ pub use loopstats::LoopStats;
 pub use metrics::{
     AtomicHistogram, FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS, LatencySeries,
 };
-pub use peer::{PeerConfig, PeerNet, PeerTlsConfig};
+pub use peer::{PeerConfig, PeerNet};
 pub use replica_recovery::{
     InstallReplicaRecoveryError, InstalledReplicaRecovery, install_replica_recovery,
 };

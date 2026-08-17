@@ -15,14 +15,11 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use base64::Engine;
     use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
     use blockd_core::journal::VsetConfig;
     use blockd_core::placement::PeerCandidate;
     use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
-    use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, PeerTlsConfig, Runtime, RuntimeConfig};
-    use rustls::RootCertStore;
-    use rustls::pki_types::CertificateDer;
+    use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, Runtime, RuntimeConfig};
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -39,11 +36,7 @@ mod linux {
         primary: bool,
         control: SocketAddr,
         peer_listen: SocketAddr,
-        peers: BTreeMap<HostId, SocketAddr>,
-        server_names: BTreeMap<HostId, String>,
-        identities: BTreeMap<HostId, Vec<PathBuf>>,
-        certificate: PathBuf,
-        private_key: PathBuf,
+        placement: Vec<PeerCandidate>,
         blob_dir: PathBuf,
         endpoint: String,
         metadata_endpoint: String,
@@ -64,38 +57,29 @@ mod linux {
             let (key, value) = line.split_once('=').expect("config key=value");
             values.insert(key.trim().to_owned(), value.trim().to_owned());
         }
+        assert!(
+            !values.keys().any(|key| key.starts_with("peer.")),
+            "peer endpoints are discovered from object storage"
+        );
         let get = |key: &str| values.get(key).unwrap_or_else(|| panic!("missing {key}"));
-        let mut peers = BTreeMap::new();
-        let mut server_names = BTreeMap::new();
-        let mut identities = BTreeMap::new();
+        let mut placement = Vec::new();
         for (key, value) in &values {
-            if let Some(id) = key.strip_prefix("peer.") {
-                peers.insert(
-                    HostId(id.parse().expect("peer id")),
-                    value.parse().expect("peer address"),
-                );
-            } else if let Some(id) = key.strip_prefix("server_name.") {
-                server_names.insert(
-                    HostId(id.parse().expect("server-name host id")),
-                    value.clone(),
-                );
-            } else if let Some(id) = key.strip_prefix("identity.") {
-                identities.insert(
-                    HostId(id.parse().expect("identity host id")),
-                    value.split(',').map(|path| path.trim().into()).collect(),
-                );
+            if let Some(id) = key.strip_prefix("placement.") {
+                placement.push(PeerCandidate {
+                    host: HostId(id.parse().expect("placement host id")),
+                    weight: 1,
+                    failure_domain: value.parse().expect("placement failure domain"),
+                    drained: false,
+                });
             }
         }
+        placement.sort_by_key(|candidate| candidate.host);
         Config {
             host: HostId(get("host").parse().expect("host")),
             primary: get("primary") == "true",
             control: get("control").parse().expect("control address"),
             peer_listen: get("peer_listen").parse().expect("peer listen"),
-            peers,
-            server_names,
-            identities,
-            certificate: get("certificate").into(),
-            private_key: get("private_key").into(),
+            placement,
             blob_dir: get("blob_dir").into(),
             endpoint: get("endpoint").clone(),
             metadata_endpoint: get("metadata_endpoint").clone(),
@@ -104,49 +88,12 @@ mod linux {
         }
     }
 
-    async fn pem(path: &Path) -> Vec<u8> {
-        let text = tokio::fs::read_to_string(path).await.expect("read PEM");
-        let body: String = text
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect();
-        base64::engine::general_purpose::STANDARD
-            .decode(body)
-            .expect("PEM base64")
-    }
-
-    async fn tls(config: &Config) -> PeerTlsConfig {
-        let mut roots = RootCertStore::empty();
-        let mut certificate_identities = BTreeMap::new();
-        for (&host, paths) in &config.identities {
-            for path in paths {
-                let certificate = pem(path).await;
-                roots
-                    .add(CertificateDer::from(certificate.clone()))
-                    .expect("trust anchor");
-                certificate_identities.insert(certificate, host);
-            }
-        }
-        PeerTlsConfig::from_der(
-            roots,
-            pem(&config.certificate).await,
-            &pem(&config.private_key).await,
-            config.server_names.clone(),
-            certificate_identities,
-        )
-    }
-
-    async fn runtime_config(config: &Config) -> RuntimeConfig {
-        let roster = config
-            .peers
-            .keys()
-            .map(|&host| PeerCandidate {
-                host,
-                weight: 1,
-                failure_domain: host.0 + 1,
-                drained: false,
-            })
-            .collect();
+    fn runtime_config(config: &Config) -> RuntimeConfig {
+        let roster = config.placement.clone();
+        let local_failure_domain = roster
+            .iter()
+            .find(|candidate| candidate.host == config.host)
+            .map_or(config.host.0 + 1, |candidate| candidate.failure_domain);
         RuntimeConfig {
             daemon: HostConfig {
                 archive: blockd_core::hostmeta::ArchivePolicy::default(),
@@ -159,7 +106,7 @@ mod linux {
                 wedge_ticks: 500,
                 replica_placement: Some(ReplicaPlacementConfig {
                     membership_epoch: 1,
-                    local_failure_domain: config.host.0 + 1,
+                    local_failure_domain,
                     roster,
                     authority: None,
                 }),
@@ -167,8 +114,6 @@ mod linux {
             blob_dir: config.blob_dir.clone(),
             peer: Some(PeerConfig {
                 listen: config.peer_listen,
-                peers: config.peers.clone(),
-                tls: Some(tls(config).await),
             }),
         }
     }
@@ -249,7 +194,6 @@ mod linux {
             std::process::exit(2)
         });
         let config = read_config(Path::new(&path)).await;
-        let runtime_config = runtime_config(&config).await;
         let existed = tokio::fs::try_exists(&config.blob_dir)
             .await
             .expect("inspect blob directory");
@@ -259,6 +203,7 @@ mod linux {
             endpoint: config.endpoint.clone(),
             metadata_endpoint: config.metadata_endpoint.clone(),
         }));
+        let runtime_config = runtime_config(&config);
         let runtime = Arc::new(if existed {
             let vsets = if config.primary {
                 BTreeMap::from([(VSET, VSET_CONFIG)])

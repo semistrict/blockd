@@ -192,7 +192,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
  "blockd-core",
  "blockd-runtime",
  "opentelemetry",
@@ -245,7 +244,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
  "blockd-core",
  "blockd-exec",
  "blockd-hostmem",

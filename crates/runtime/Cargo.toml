@@ -19,7 +19,6 @@ missing_panics_doc = "allow"
 
 [dependencies]
 async-trait.workspace = true
-base64 = "0.22.1"
 bytes = "1.11.1"
 blockd-core = { path = "../core" }
 blockd-exec = { path = "../exec" }
@@ -35,6 +34,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing.workspace = true
 reqwest = { workspace = true, features = ["hickory-dns", "http2", "rustls"] }
+rcgen = { version = "0.14.7", default-features = false, features = ["ring"] }
 rustix = { version = "0.38.44", features = ["fs"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
@@ -45,7 +45,6 @@ tokio-rustls = "0.26.4"
 # through the runtime's on-disk scan path.
 blockd-sim = { path = "../sim" }
 blockd-workload = { path = "../workload" }
-rcgen = { version = "0.14.7", default-features = false, features = ["ring"] }
 tempfile = "3.23.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]

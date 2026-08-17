@@ -152,8 +152,7 @@ resource "google_compute_instance" "host" {
 
   metadata = {
     blockd-host-id  = each.key
-    blockd-peer0-ip = local.hosts[0]
-    blockd-peer1-ip = local.hosts[1]
+    blockd-peer-ip  = each.value
     blockd-bucket   = google_storage_bucket.store.name
     blockd-repo     = var.repo
     blockd-repo-ref = var.repo_ref

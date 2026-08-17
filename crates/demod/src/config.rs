@@ -1,16 +1,13 @@
-//! Flat `key = value` configuration — the control plane's knowledge
-//! (host identity, roster, bucket, artifact paths) carried by a file.
+//! Flat `key = value` configuration — local identity, placement policy,
+//! bucket, and artifact paths carried by a file. Peer endpoints are discovered
+//! dynamically from object storage.
 //!
 //! ```text
 //! host = 0
 //! api = 10.0.0.2:7000
 //! peer_listen = 10.0.0.2:7001
-//! peer.0 = 10.0.0.2:7001
-//! peer.1 = 10.0.0.3:7001
-//! server_name.0 = host-0.internal
-//! identity.0 = /etc/blockd/host-0.crt
-//! certificate = /etc/blockd/host-0.crt
-//! private_key = /etc/blockd/host-0.key
+//! placement.0 = 1
+//! placement.1 = 2
 //! gcs_endpoint = https://storage.googleapis.com
 //! gcs_metadata = http://metadata.google.internal
 //! gcs_bucket = my-bucket
@@ -35,6 +32,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
 
 #[derive(Clone, Debug)]
@@ -42,11 +40,7 @@ pub struct DemodConfig {
     pub host: HostId,
     pub api: SocketAddr,
     pub peer_listen: SocketAddr,
-    pub peers: BTreeMap<HostId, SocketAddr>,
-    pub server_names: BTreeMap<HostId, String>,
-    pub identities: BTreeMap<HostId, Vec<PathBuf>>,
-    pub certificate: PathBuf,
-    pub private_key: PathBuf,
+    pub placement: Vec<PeerCandidate>,
     pub gcs_endpoint: String,
     pub gcs_metadata: String,
     pub gcs_bucket: String,
@@ -84,6 +78,10 @@ impl DemodConfig {
             let (key, value) = line.split_once('=').expect("key = value");
             kv.insert(key.trim().to_owned(), value.trim().to_owned());
         }
+        assert!(
+            !kv.keys().any(|key| key.starts_with("peer.")),
+            "peer endpoints are discovered from object storage"
+        );
         let get = |key: &str| -> String {
             kv.get(key)
                 .unwrap_or_else(|| panic!("config missing `{key}`"))
@@ -95,27 +93,18 @@ impl DemodConfig {
                 value.parse().unwrap_or_else(|_| panic!("invalid `{key}`"))
             })
         };
-        let mut peers = BTreeMap::new();
-        let mut server_names = BTreeMap::new();
-        let mut identities = BTreeMap::new();
+        let mut placement = Vec::new();
         for (key, value) in &kv {
-            if let Some(id) = key.strip_prefix("peer.") {
-                peers.insert(
-                    HostId(id.parse().expect("peer id")),
-                    value.parse().expect("peer addr"),
-                );
-            } else if let Some(id) = key.strip_prefix("server_name.") {
-                server_names.insert(
-                    HostId(id.parse().expect("server-name host id")),
-                    value.clone(),
-                );
-            } else if let Some(id) = key.strip_prefix("identity.") {
-                identities.insert(
-                    HostId(id.parse().expect("identity host id")),
-                    value.split(',').map(|path| path.trim().into()).collect(),
-                );
+            if let Some(id) = key.strip_prefix("placement.") {
+                placement.push(PeerCandidate {
+                    host: HostId(id.parse().expect("placement host id")),
+                    weight: 1,
+                    failure_domain: value.parse().expect("placement failure domain"),
+                    drained: false,
+                });
             }
         }
+        placement.sort_by_key(|candidate| candidate.host);
         let cache_pages =
             usize::try_from(parse_or("cache_pages", 4096)).expect("cache_pages fits this platform");
         let writeback_interval_ms = parse_or("writeback_interval_ms", 10);
@@ -154,11 +143,7 @@ impl DemodConfig {
             host: HostId(get("host").parse().expect("host id")),
             api: get("api").parse().expect("api addr"),
             peer_listen: get("peer_listen").parse().expect("peer_listen addr"),
-            peers,
-            server_names,
-            identities,
-            certificate: get("certificate").into(),
-            private_key: get("private_key").into(),
+            placement,
             gcs_endpoint: get("gcs_endpoint"),
             gcs_metadata: get("gcs_metadata"),
             gcs_bucket: get("gcs_bucket"),
@@ -189,11 +174,7 @@ mod tests {
 host = 2
 api = 127.0.0.1:7000
 peer_listen = 127.0.0.1:7001
-peer.1 = 127.0.0.1:7002
-server_name.1 = host-1.internal
-identity.1 = /tmp/host-1.crt
-certificate = /tmp/host-2.crt
-private_key = /tmp/host-2.key
+placement.1 = 2
 gcs_endpoint = http://127.0.0.1:7099
 gcs_metadata = http://127.0.0.1:7098
 gcs_bucket = test
@@ -217,6 +198,9 @@ fc_dir = /tmp/fc
         assert_eq!(defaults.disk_capacity_bytes, None);
         assert_eq!(defaults.disk_headroom_bytes, 0);
         assert_eq!(defaults.wedge_ticks, 500);
+        assert_eq!(defaults.placement.len(), 1);
+        assert_eq!(defaults.placement[0].host, HostId(1));
+        assert_eq!(defaults.placement[0].failure_domain, 2);
 
         let configured = DemodConfig::parse(&format!(
             "{REQUIRED}\ncache_pages = 8192\nwriteback_interval_ms = 25\nbackup_retry_ms = 250\narchive_interval_ms = 5000\narchive_lag_bytes = 123456\npeer_spool_capacity_bytes = 900000\npeer_spool_headroom_bytes = 100000\ndisk_capacity_bytes = 1000000\ndisk_headroom_bytes = 100000\nwedge_ticks = 40\n"
@@ -231,5 +215,11 @@ fc_dir = /tmp/fc
         assert_eq!(configured.disk_capacity_bytes, Some(1_000_000));
         assert_eq!(configured.disk_headroom_bytes, 100_000);
         assert_eq!(configured.wedge_ticks, 40);
+    }
+
+    #[test]
+    #[should_panic(expected = "peer endpoints are discovered from object storage")]
+    fn static_peer_endpoints_are_rejected() {
+        DemodConfig::parse(&format!("{REQUIRED}\npeer.9 = 127.0.0.1:9000\n"));
     }
 }

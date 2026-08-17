@@ -232,8 +232,12 @@ implementation decisions. Requirements take precedence when the two conflict.
   only on local monotonic clocks with bounded drift; nothing anywhere
   requires synchronized clocks across hosts.
 - **R6.5** The control plane's only obligations are liveness policy (when to
-  claim), placement preference, roster and certificates, and never reusing a
-  vset id.
+  claim), placement preference, and never reusing a vset id. Nodes generate
+  ephemeral TLS identities at startup and atomically publish their public
+  certificates and reachable endpoints in the cluster's object-store prefix,
+  then CAS-renew that record as a liveness heartbeat. Every node continuously
+  discovers and reconciles connections from live records in that directory;
+  write access to the prefix is the authority to join the roster.
 - **R6.6** The fenced per-vset head is also the durable authority for the one
   active stash assignment and any in-progress replacement. Health observations
   and deterministic virtual-node rankings are placement inputs, not authority.
@@ -339,9 +343,12 @@ implementation decisions. Requirements take precedence when the two conflict.
 ## R11 — Security and tenancy
 
 - **R11.1** All inter-host traffic is mutually authenticated and encrypted
-  (mTLS); host identities and certificates come from the control plane
-  (R6.5). A peer serves data only to authenticated members of its own
-  cluster.
+  (mTLS). Each host generates its certificate and private key in memory at
+  startup, publishes only the public certificate and reachable endpoint under
+  the cluster's object-store prefix, CAS-renews its record, and continuously
+  refreshes that directory as its trust set and discovery source (R6.5). A peer
+  serves data only to a certificate in a currently live record in its own
+  cluster; anyone able to write that directory is authorized to be a node.
 - **R11.2** Guests are adversarial. Nothing that crosses the guest boundary
   — fault patterns, page contents, sync requests, timing — may influence
   the daemon beyond that guest's own vset, and a guest can never read

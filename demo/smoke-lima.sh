@@ -41,8 +41,8 @@ for h in 0 1; do
 host = $h
 api = 127.0.0.1:710$h
 peer_listen = 127.0.0.1:700$((h + 1))
-peer.0 = 127.0.0.1:7001
-peer.1 = 127.0.0.1:7002
+placement.0 = 1
+placement.1 = 2
 gcs_endpoint = http://127.0.0.1:7099
 gcs_metadata = http://127.0.0.1:7099
 gcs_bucket = demo

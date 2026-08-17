@@ -1,18 +1,14 @@
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
 use blockd_core::types::millis;
 use blockd_runtime::fakegcs::{FakeGcs, FakeGcsServer};
-use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, PeerTlsConfig, RuntimeConfig};
-use rcgen::{CertifiedKey, generate_simple_self_signed};
-use rustls::RootCertStore;
-use rustls::pki_types::CertificateDer;
+use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, RuntimeConfig};
 
 #[allow(dead_code)]
 pub(crate) async fn local<F: Future>(future: F) -> F::Output {
@@ -70,17 +66,6 @@ pub(crate) fn base_daemon_config(host: u16) -> HostConfig {
 }
 
 #[allow(dead_code)]
-pub(crate) fn three_host_roster(
-    addresses: [SocketAddr; MAX_TEST_HOSTS],
-) -> BTreeMap<HostId, SocketAddr> {
-    addresses
-        .into_iter()
-        .enumerate()
-        .map(|(host, address)| (HostId(u16::try_from(host).expect("fits")), address))
-        .collect()
-}
-
-#[allow(dead_code)]
 pub(crate) fn three_host_runtime_config(
     host: u16,
     blob_dir: PathBuf,
@@ -108,79 +93,6 @@ pub(crate) fn three_host_runtime_config(
         blob_dir,
         peer: Some(PeerConfig {
             listen: addresses[usize::from(host)],
-            peers: three_host_roster(addresses),
-            tls: Some(peer_tls(usize::from(host), MAX_TEST_HOSTS)),
         }),
     }
-}
-
-struct Identity {
-    certificate: Vec<u8>,
-    private_key: Vec<u8>,
-}
-
-fn generate_set() -> Vec<Identity> {
-    (0..MAX_TEST_HOSTS)
-        .map(|host| {
-            let CertifiedKey { cert, signing_key } =
-                generate_simple_self_signed(vec![format!("host{host}.test")])
-                    .expect("generate test TLS identity");
-            Identity {
-                certificate: cert.der().to_vec(),
-                private_key: signing_key.serialize_der(),
-            }
-        })
-        .collect()
-}
-
-fn identity_sets() -> &'static [Vec<Identity>; 2] {
-    static SETS: OnceLock<[Vec<Identity>; 2]> = OnceLock::new();
-    SETS.get_or_init(|| [generate_set(), generate_set()])
-}
-
-#[allow(dead_code)] // Rotation-only test binaries use the configurable helper below.
-pub(crate) fn peer_tls(host: usize, host_count: usize) -> PeerTlsConfig {
-    rotating_peer_tls(host, host_count, false, true, false)
-}
-
-pub(crate) fn rotating_peer_tls(
-    host: usize,
-    host_count: usize,
-    active_new: bool,
-    trust_old: bool,
-    trust_new: bool,
-) -> PeerTlsConfig {
-    assert!(host < host_count && host_count <= MAX_TEST_HOSTS);
-    let sets = identity_sets();
-    let mut roots = RootCertStore::empty();
-    let mut identities = BTreeMap::new();
-    for (set, trusted) in [(&sets[0], trust_old), (&sets[1], trust_new)] {
-        if !trusted {
-            continue;
-        }
-        for (id, identity) in set.iter().take(host_count).enumerate() {
-            roots
-                .add(CertificateDer::from(identity.certificate.clone()))
-                .expect("test trust anchor");
-            identities.insert(
-                identity.certificate.clone(),
-                HostId(u16::try_from(id).expect("fits")),
-            );
-        }
-    }
-    let active = &sets[usize::from(active_new)][host];
-    PeerTlsConfig::from_der(
-        roots,
-        active.certificate.clone(),
-        &active.private_key,
-        (0..host_count)
-            .map(|id| {
-                (
-                    HostId(u16::try_from(id).expect("fits")),
-                    format!("host{id}.test"),
-                )
-            })
-            .collect(),
-        identities,
-    )
 }

@@ -32,15 +32,11 @@ async fn net(
     peers: BTreeMap<HostId, SocketAddr>,
 ) -> (Arc<PeerNet>, Receiver<(HostId, PeerMsg)>) {
     let (tx, rx) = channel();
-    let config = PeerConfig {
-        listen,
-        peers,
-        tls: None,
-    };
+    let config = PeerConfig { listen };
     // The net must know its own roster identity: sender state is seeded
     // for every OTHER roster member, and `connections()` reports exactly
     // those — a bogus self id would leak the host itself into the list.
-    let host = PeerNet::start(&config, self_id, move |from, msg| {
+    let host = PeerNet::start_plaintext(&config, self_id, peers, move |from, msg| {
         let _ = tx.send((from, msg));
     })
     .await

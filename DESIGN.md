@@ -92,9 +92,22 @@ head CAS activates it after a covering durable commit. Recovery inventories
 the head's active and transition peers plus the object store and accepts only a
 complete, verified closure. A stash never gains permission to run the guest.
 
-Peer traffic uses mutually authenticated TLS. The verified leaf certificate
-maps to a roster host ID; a frame claiming a different sender closes the
-connection.
+Peer traffic uses mutually authenticated TLS. Each node creates an ephemeral
+identity at startup and publishes one membership record containing its public
+certificate and reachable endpoint under `cluster/tls/public-keys/` in object
+storage. Nodes continuously refresh that directory as both their trust set and
+peer discovery source, making bucket write permission the authority to join
+the cluster. Each node CAS-renews its record as a heartbeat; observers age the
+seen object generation using only a local monotonic clock. They add, replace,
+and remove outbound connections as live records
+appear, change, and disappear; no configured peer endpoint roster exists. The verified
+leaf certificate maps to the host ID in its object name; a frame claiming a
+different sender closes the connection.
+Authorization is rechecked for every frame, so a membership refresh that
+removes a certificate also closes already-established traffic from that node.
+Brief object-store failures retain the last complete membership snapshot, but
+the trust set and outbound connections fail closed after a bounded monotonic
+staleness window and recover on the next successful refresh.
 
 The recovery drill inventories only peers named by the fenced head, verifies a
 complete closure in quarantine, claims ownership by head CAS, refences and

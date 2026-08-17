@@ -60,6 +60,19 @@ pub async fn receive_loop(
     mut stream: impl AsyncRead + Unpin,
     authenticated: Option<HostId>,
     decode: DecodePolicy,
+    deliver: impl FnMut(HostId, PeerMsg),
+) -> io::Result<()> {
+    receive_loop_while_authorized(&mut stream, authenticated, decode, |_| true, deliver).await
+}
+
+/// Receive verified messages while the transport identity remains authorized.
+/// Authorization is checked for every frame so a long-lived connection cannot
+/// retain access after its identity is revoked.
+pub async fn receive_loop_while_authorized(
+    mut stream: impl AsyncRead + Unpin,
+    authenticated: Option<HostId>,
+    decode: DecodePolicy,
+    mut authorized: impl FnMut(HostId) -> bool,
     mut deliver: impl FnMut(HostId, PeerMsg),
 ) -> io::Result<()> {
     loop {
@@ -74,6 +87,12 @@ pub async fn receive_loop(
                 decode_frame(&frame, authenticated)?
             }
         };
+        if !authorized(decoded.0) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer transport identity is no longer authorized",
+            ));
+        }
         deliver(decoded.0, decoded.1);
     }
 }
@@ -166,5 +185,46 @@ mod tests {
                 .map(|message| (HostId(3), message))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn receive_loop_closes_when_a_live_identity_is_revoked() {
+        let first = encode_peer(
+            HostId(3),
+            &PeerMsg::Released {
+                vset: VsetId(1),
+                release_fence: 2,
+            },
+        );
+        let second = encode_peer(
+            HostId(3),
+            &PeerMsg::Released {
+                vset: VsetId(1),
+                release_fence: 3,
+            },
+        );
+        let (mut writer, reader) = tokio::io::duplex(first.len() + second.len());
+        tokio::spawn(async move {
+            write_frame(&mut writer, &first).await.unwrap();
+            write_frame(&mut writer, &second).await.unwrap();
+        });
+
+        let mut checks = 0;
+        let mut delivered = Vec::new();
+        let error = receive_loop_while_authorized(
+            reader,
+            Some(HostId(3)),
+            DecodePolicy::Inline,
+            |_| {
+                checks += 1;
+                checks == 1
+            },
+            |_, message| delivered.push(message),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(delivered.len(), 1);
     }
 }

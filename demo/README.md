@@ -29,6 +29,11 @@ tofu -chdir=infra apply -var project=YOUR_PROJECT_ID
 ./demo/run.sh
 ```
 
+Run the GCP demo against a fresh deployment. Each daemon generates its TLS
+identity at first startup and publishes its public certificate and reachable
+endpoint to GCS. Nodes discover one another exclusively from those records;
+the demo does not configure a peer roster or accept certificate files.
+
 Each VM uses a separate XFS data disk mounted at
 `/var/opt/blockd/blobs`. Provisioning does not format the boot disk. Set
 `-var data_disk_size_gb=N` to change the data-disk size.

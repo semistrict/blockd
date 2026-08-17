@@ -6,24 +6,18 @@
 //! live-migrated over the peer transport.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
 use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts_async};
-use blockd_runtime::{
-    GcsConfig, GcsStore, ObjectStore, PeerConfig, PeerTlsConfig, Runtime, RuntimeConfig,
-};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, PeerConfig, Runtime, RuntimeConfig};
 
 use crate::config::DemodConfig;
 use crate::observability::Metrics;
@@ -93,52 +87,6 @@ pub struct Demod {
 }
 
 impl Demod {
-    async fn pem(path: &Path) -> Vec<u8> {
-        let text = tokio::fs::read_to_string(path).await.expect("read PEM");
-        let body: String = text
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect();
-        base64::engine::general_purpose::STANDARD
-            .decode(body)
-            .expect("PEM base64")
-    }
-
-    async fn peer_tls(cfg: &DemodConfig) -> PeerTlsConfig {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut roots = RootCertStore::empty();
-        let mut certificate_identities = BTreeMap::new();
-        for (&host, paths) in &cfg.identities {
-            for path in paths {
-                let certificate = Self::pem(path).await;
-                roots
-                    .add(CertificateDer::from(certificate.clone()))
-                    .expect("trust anchor");
-                certificate_identities.insert(certificate, host);
-            }
-        }
-        let certificate = CertificateDer::from(Self::pem(&cfg.certificate).await);
-        let private_key = Self::pem(&cfg.private_key).await;
-        let key = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key.clone()));
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
-            .build()
-            .expect("client verifier");
-        let server = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(vec![certificate.clone()], key())
-            .expect("server identity");
-        let client = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![certificate], key())
-            .expect("client identity");
-        PeerTlsConfig {
-            server: Arc::new(server),
-            client: Arc::new(client),
-            server_names: cfg.server_names.clone(),
-            certificate_identities,
-        }
-    }
-
     pub fn firecracker_fault_latency(
         &self,
     ) -> Vec<(&'static str, blockd_runtime::HistogramSnapshot)> {
@@ -161,21 +109,11 @@ impl Demod {
             endpoint: cfg.gcs_endpoint.clone(),
             metadata_endpoint: cfg.gcs_metadata.clone(),
         }));
-        let mut roster: Vec<PeerCandidate> = cfg
-            .peers
-            .keys()
-            .copied()
-            .chain(std::iter::once(cfg.host))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .map(|host| PeerCandidate {
-                host,
-                weight: 1,
-                failure_domain: host.0,
-                drained: false,
-            })
-            .collect();
-        roster.sort_by_key(|candidate| candidate.host);
+        let roster: Vec<PeerCandidate> = cfg.placement.clone();
+        let local_failure_domain = roster
+            .iter()
+            .find(|candidate| candidate.host == cfg.host)
+            .map_or(cfg.host.0, |candidate| candidate.failure_domain);
         let runtime_config = RuntimeConfig {
             daemon: HostConfig {
                 archive: blockd_core::hostmeta::ArchivePolicy {
@@ -193,7 +131,7 @@ impl Demod {
                 wedge_ticks: cfg.wedge_ticks,
                 replica_placement: Some(ReplicaPlacementConfig {
                     membership_epoch: 1,
-                    local_failure_domain: cfg.host.0,
+                    local_failure_domain,
                     roster,
                     authority: None,
                 }),
@@ -201,8 +139,6 @@ impl Demod {
             blob_dir: cfg.blob_dir.clone(),
             peer: Some(PeerConfig {
                 listen: cfg.peer_listen,
-                peers: cfg.peers.clone(),
-                tls: Some(Self::peer_tls(&cfg).await),
             }),
         };
         let rt = Runtime::new(&runtime_config, store.clone()).await;

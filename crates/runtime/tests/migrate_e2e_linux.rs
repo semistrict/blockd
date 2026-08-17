@@ -211,19 +211,8 @@ async fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
         .run_until(async {
             let addr_a = free_addr();
             let addr_b = free_addr();
-            let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
-                .into_iter()
-                .collect();
-            let peer_a = PeerConfig {
-                listen: addr_a,
-                peers: roster.clone(),
-                tls: Some(support::peer_tls(0, 2)),
-            };
-            let peer_b = PeerConfig {
-                listen: addr_b,
-                peers: roster,
-                tls: Some(support::peer_tls(1, 2)),
-            };
+            let peer_a = PeerConfig { listen: addr_a };
+            let peer_b = PeerConfig { listen: addr_b };
             let test_gcs = support::test_gcs("migrate").await;
             let store = test_gcs.store.clone();
             let a = Runtime::new(&runtime_config("host-a", 0, peer_a), store.clone()).await;

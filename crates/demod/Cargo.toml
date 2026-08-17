@@ -16,7 +16,6 @@ workspace = true
 blockd-core = { path = "../core" }
 blockd-runtime = { path = "../runtime" }
 async-trait.workspace = true
-base64 = "0.22.1"
 axum = { workspace = true, features = ["http1", "json", "tokio"] }
 opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry-http = { version = "0.32.0", default-features = false }

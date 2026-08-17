@@ -107,13 +107,10 @@ meta() {
     "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1"
 }
 HOST_ID=$(meta blockd-host-id)
-PEER0=$(meta blockd-peer0-ip)
-PEER1=$(meta blockd-peer1-ip)
+SELF_IP=$(meta blockd-peer-ip)
 BUCKET=$(meta blockd-bucket)
 REPO=$(meta blockd-repo)
 REPO_REF=$(meta blockd-repo-ref)
-SELF_IP=$([ "$HOST_ID" = 0 ] && echo "$PEER0" || echo "$PEER1")
-
 apt_update
 apt-get install -y \
   bc bison build-essential cpio curl flex git libelf-dev libseccomp-dev \
@@ -182,8 +179,8 @@ cat > /var/opt/blockd/demod.conf <<EOF
 host = $HOST_ID
 api = $SELF_IP:7000
 peer_listen = $SELF_IP:7001
-peer.0 = $PEER0:7001
-peer.1 = $PEER1:7001
+placement.0 = 1
+placement.1 = 2
 gcs_endpoint = https://storage.googleapis.com
 gcs_metadata = http://metadata.google.internal
 gcs_bucket = $BUCKET

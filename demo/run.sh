@@ -34,10 +34,19 @@ for host in "$HOST0" "$HOST1"; do
   done
 done
 
-say "reset: wipe the demo prefix and restart both daemons (reruns start clean)"
-gcloud storage rm -r "gs://$BUCKET/blockd" 2>/dev/null || true
-ssh0 'sudo systemctl restart blockd-demod'
-ssh1 'sudo systemctl restart blockd-demod'
+say "verify both nodes published startup-generated TLS membership records"
+CERT_PREFIX="gs://$BUCKET/blockd/cluster/tls/public-keys"
+for _ in $(seq 1 30); do
+  CERTS=$(gcloud storage ls "$CERT_PREFIX/*.member" 2>/dev/null || true)
+  [ "$(printf '%s\n' "$CERTS" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 2 ] && break
+  sleep 1
+done
+[ "$(printf '%s\n' "$CERTS" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 2 ] || {
+  echo "NODES DID NOT PUBLISH TWO TLS MEMBERSHIP RECORDS"
+  exit 1
+}
+show "startup-generated membership records:"
+printf '%s\n' "$CERTS" | sed 's/^/   /'
 
 say "open one SSH tunnel to both demo APIs (they are VPC-internal only)"
 gcloud compute ssh "$HOST0" --zone "$ZONE" --tunnel-through-iap -- -N \
