@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
 use opentelemetry::trace::TraceContextExt as _;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tracing::Instrument as _;
@@ -34,12 +35,17 @@ const MAX_BACKGROUND_CONCURRENCY: usize = 32;
 const MAX_OBSERVATION_CONCURRENCY: usize = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
+type LocalBackgroundFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+type LocalBackgroundTask = Box<dyn FnOnce() -> LocalBackgroundFuture + Send + 'static>;
+type LocalBackgroundSender = mpsc::UnboundedSender<LocalBackgroundTask>;
+
 #[derive(Clone)]
 struct ApiState {
     daemon: Arc<Demod>,
     operation_slots: Arc<Semaphore>,
     background_slots: Arc<Semaphore>,
     observation_slots: Arc<Semaphore>,
+    local_background: LocalBackgroundSender,
 }
 
 pub async fn serve(daemon: Arc<Demod>) {
@@ -50,6 +56,7 @@ pub async fn serve(daemon: Arc<Demod>) {
         operation_slots: Arc::new(Semaphore::new(MAX_OPERATION_CONCURRENCY)),
         background_slots: Arc::new(Semaphore::new(MAX_BACKGROUND_CONCURRENCY)),
         observation_slots: Arc::new(Semaphore::new(MAX_OBSERVATION_CONCURRENCY)),
+        local_background: start_local_background_dispatcher(),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(address)
@@ -69,6 +76,16 @@ pub async fn serve(daemon: Arc<Demod>) {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .expect("serve control API");
+}
+
+fn start_local_background_dispatcher() -> LocalBackgroundSender {
+    let (sender, mut receiver) = mpsc::unbounded_channel::<LocalBackgroundTask>();
+    tokio::task::spawn_local(async move {
+        while let Some(task) = receiver.recv().await {
+            tokio::task::spawn_local(task());
+        }
+    });
+    sender
 }
 
 async fn shutdown_signal() {
@@ -235,7 +252,7 @@ where
 
 async fn start_background<F, Fut>(state: &ApiState, operation: F) -> ApiResult<()>
 where
-    F: FnOnce(Arc<Demod>, tokio::sync::oneshot::Sender<()>) -> Fut + 'static,
+    F: FnOnce(Arc<Demod>, tokio::sync::oneshot::Sender<()>) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
     let permit = state
@@ -247,10 +264,15 @@ where
     let daemon = state.daemon.clone();
     let parent = tracing::Span::current();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    tokio::task::spawn_local(async move {
-        let _permit = permit;
-        operation(daemon, ready_tx).instrument(parent).await;
-    });
+    state
+        .local_background
+        .send(Box::new(move || {
+            Box::pin(async move {
+                let _permit = permit;
+                operation(daemon, ready_tx).instrument(parent).await;
+            })
+        }))
+        .map_err(|_| ApiError::internal("local background scheduler closed"))?;
     ready_rx
         .await
         .map_err(|_| ApiError::internal("background operation failed during startup"))
@@ -528,6 +550,30 @@ fn capacity_value(signal: blockd_runtime::CapacitySignal) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_background_work_can_be_submitted_from_a_runtime_task() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let dispatcher = start_local_background_dispatcher();
+                let (completed, completion) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    let queued = dispatcher.send(Box::new(move || {
+                        Box::pin(async move {
+                            let _ = completed.send(());
+                        })
+                    }));
+                    assert!(queued.is_ok());
+                })
+                .await
+                .expect("runtime task completed");
+                tokio::time::timeout(Duration::from_secs(1), completion)
+                    .await
+                    .expect("local background task ran")
+                    .expect("completion sender remained alive");
+            })
+            .await;
+    }
 
     #[test]
     fn header_extractor_is_case_insensitive() {
