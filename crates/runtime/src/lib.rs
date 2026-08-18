@@ -25,7 +25,6 @@ pub mod world;
 
 #[cfg(target_os = "linux")]
 pub use actor_host::{GuestAccess, GuestOperation, Runtime, RuntimeConfig};
-pub use blobscan::scan_blob_dir;
 pub use capacity::{
     CapacityController, CapacityInputs, CapacityReason, CapacitySignal, CapacityState,
 };

@@ -106,14 +106,14 @@ pub async fn write_frame(stream: &mut (impl AsyncWrite + Unpin), frame: &[u8]) -
 mod tests {
     use blockd_core::peer::encode_peer;
     use blockd_core::protocol::PeerMsg;
-    use blockd_core::types::{HostId, VsetId};
+    use blockd_core::types::{HostId, VolumeId};
 
     use super::*;
 
     #[tokio::test]
     async fn framing_round_trips_and_enforces_transport_identity() {
         let message = PeerMsg::Released {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             release_fence: 11,
         };
         let encoded = encode_peer(HostId(3), &message);
@@ -150,11 +150,11 @@ mod tests {
     async fn receive_loop_delivers_multiple_frames_through_the_shared_session() {
         let messages = [
             PeerMsg::Released {
-                vset: VsetId(1),
+                volume: VolumeId(1),
                 release_fence: 2,
             },
             PeerMsg::ReleasedAck {
-                vset: VsetId(1),
+                volume: VolumeId(1),
                 release_fence: 2,
             },
         ];
@@ -192,14 +192,14 @@ mod tests {
         let first = encode_peer(
             HostId(3),
             &PeerMsg::Released {
-                vset: VsetId(1),
+                volume: VolumeId(1),
                 release_fence: 2,
             },
         );
         let second = encode_peer(
             HostId(3),
             &PeerMsg::Released {
-                vset: VsetId(1),
+                volume: VolumeId(1),
                 release_fence: 3,
             },
         );

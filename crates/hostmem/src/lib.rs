@@ -13,7 +13,7 @@
 //!   touches, MINOR for evicted-PTE refaults — with `UFFDIO_CONTINUE`:
 //!   zero copy, the guest maps the very page the daemon wrote, and every
 //!   fault kind resolves through this one door.
-//! - **Prefetch** (R6.2) = the same two steps issued eagerly, before any
+//! - **Prefetch** = the same two steps issued eagerly, before any
 //!   fault.
 //! - **Shared bases** (R5.3) = many guest views mapping the same memfd
 //!   range; every view resolves to the one physical page.

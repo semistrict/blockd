@@ -1,22 +1,22 @@
 use crate::format::{Dec, DecodeError, Enc};
 use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
-use crate::types::{JournalSeq, SegId};
+use crate::types::{JournalSeq, ObjectId};
 
 pub(crate) fn encode_artifact(e: &mut Enc, artifact: ReplicaArtifact) {
     match artifact {
-        ReplicaArtifact::Segment { fence, seg } => {
+        ReplicaArtifact::Blx { fence, object } => {
             e.u8(0);
             e.u64(fence);
-            e.u64(seg.0);
+            e.u64(object.0);
         }
     }
 }
 
 pub(crate) fn decode_artifact(d: &mut Dec<'_>) -> Result<ReplicaArtifact, DecodeError> {
     match d.u8()? {
-        0 => Ok(ReplicaArtifact::Segment {
+        0 => Ok(ReplicaArtifact::Blx {
             fence: d.u64()?,
-            seg: SegId(d.u64()?),
+            object: ObjectId(d.u64()?),
         }),
         _ => Err(DecodeError),
     }

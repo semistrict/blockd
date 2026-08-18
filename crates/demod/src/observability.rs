@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
-use blockd_core::hostmeta::{Counters, DaemonStats, VsetOperations, VsetRole};
+use blockd_core::hostmeta::{Counters, DaemonStats, VolumeOperations, VolumeRole};
 use blockd_runtime::{
     CapacitySignal, CapacityState, FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS,
     LatencySeries,
@@ -236,8 +236,8 @@ pub struct MetricsSnapshot {
     pub capacity: CapacitySignal,
     pub loop_poll: Vec<(&'static str, u64, u64)>,
     pub loop_world: Vec<(&'static str, u64, u64)>,
-    pub loop_idle_ns: u64,
-    pub loop_occupancy: f64,
+    pub actor_idle_ns: u64,
+    pub actor_occupancy: f64,
     pub loop_queue_depths: (usize, usize),
     pub fault_latency: Vec<FaultLatency>,
     pub operation_latency: Vec<LatencySeries>,
@@ -566,8 +566,8 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
     );
     for (state, value) in [
         ("used", stats.local_blob_bytes),
-        ("segment_live", stats.live_segment_bytes),
-        ("segment_stored", stats.local_segment_bytes),
+        ("blx_live", stats.live_blx_bytes),
+        ("blx_stored", stats.local_blx_bytes),
         ("headroom", stats.disk_headroom_bytes),
     ] {
         append_sample(
@@ -583,121 +583,124 @@ fn append_daemon_state(out: &mut String, stats: &DaemonStats) {
 
     append_family(
         out,
-        "blockd_vset_state",
-        "Current vset lifecycle state.",
+        "blockd_volume_state",
+        "Current volume lifecycle state.",
         "gauge",
     );
     append_family(
         out,
-        "blockd_vset_pages",
-        "Current per-vset pages by operational state.",
+        "blockd_volume_pages",
+        "Current per-volume pages by operational state.",
         "gauge",
     );
     append_family(
         out,
-        "blockd_vset_pending",
-        "Current per-vset pending work.",
+        "blockd_volume_pending",
+        "Current per-volume pending work.",
         "gauge",
     );
     append_family(
         out,
-        "blockd_vset_archive_lag_captures",
+        "blockd_volume_archive_lag_captures",
         "Durable local captures not yet published.",
         "gauge",
     );
     append_family(
         out,
-        "blockd_vset_archive_lag_bytes",
-        "Durable local segment bytes not yet published.",
+        "blockd_volume_archive_lag_bytes",
+        "Durable local blx bytes not yet published.",
         "gauge",
     );
     append_family(
         out,
-        "blockd_vset_operation_in_progress",
-        "Whether per-vset background work is active.",
+        "blockd_volume_operation_in_progress",
+        "Whether per-volume background work is active.",
         "gauge",
     );
     append_family(
         out,
-        "blockd_vset_segment_bytes",
-        "Per-vset segment bytes by state.",
+        "blockd_volume_blx_bytes",
+        "Per-volume blx bytes by state.",
         "gauge",
     );
-    for vset in &stats.vsets {
-        let id = vset.vset.0;
-        let lifecycle = match vset.role {
-            VsetRole::Initializing => "initializing",
-            VsetRole::Serving => "serving",
-            VsetRole::Hydrating => "hydrating",
-            VsetRole::Outbound => "outbound",
+    for volume in &stats.volumes {
+        let id = volume.volume.0;
+        let lifecycle = match volume.role {
+            VolumeRole::Initializing => "initializing",
+            VolumeRole::Serving => "serving",
+            VolumeRole::Hydrating => "hydrating",
+            VolumeRole::Outbound => "outbound",
         };
         append_sample(
             out,
-            "blockd_vset_state",
-            &format!("vset_id=\"{id}\",state=\"{lifecycle}\""),
+            "blockd_volume_state",
+            &format!("volume_id=\"{id}\",state=\"{lifecycle}\""),
             1,
         );
         for (page_state, value) in [
-            ("dirty", vset.dirty_pages),
-            ("unstable", vset.unstable_pages),
-            ("hydration_remaining", vset.hydration_remaining_pages),
+            ("dirty", volume.dirty_pages),
+            ("unstable", volume.unstable_pages),
+            ("hydration_remaining", volume.hydration_remaining_pages),
         ] {
             append_sample(
                 out,
-                "blockd_vset_pages",
-                &format!("vset_id=\"{id}\",state=\"{page_state}\""),
+                "blockd_volume_pages",
+                &format!("volume_id=\"{id}\",state=\"{page_state}\""),
                 value,
             );
         }
         append_sample(
             out,
-            "blockd_vset_pending",
-            &format!("vset_id=\"{id}\",kind=\"sync\""),
-            vset.pending_syncs,
+            "blockd_volume_pending",
+            &format!("volume_id=\"{id}\",kind=\"sync\""),
+            volume.pending_syncs,
         );
-        if let Some(lag) = vset.archive_lag_captures {
+        if let Some(lag) = volume.archive_lag_captures {
             append_sample(
                 out,
-                "blockd_vset_archive_lag_captures",
-                &format!("vset_id=\"{id}\""),
+                "blockd_volume_archive_lag_captures",
+                &format!("volume_id=\"{id}\""),
                 lag,
             );
         }
-        if let Some(bytes) = vset.archive_lag_bytes {
+        if let Some(bytes) = volume.archive_lag_bytes {
             append_sample(
                 out,
-                "blockd_vset_archive_lag_bytes",
-                &format!("vset_id=\"{id}\""),
+                "blockd_volume_archive_lag_bytes",
+                &format!("volume_id=\"{id}\""),
                 bytes,
             );
         }
         for (operation, active) in [
-            ("capture", vset.operations.active(VsetOperations::CAPTURE)),
+            (
+                "capture",
+                volume.operations.active(VolumeOperations::CAPTURE),
+            ),
             (
                 "checkpoint",
-                vset.operations.active(VsetOperations::CHECKPOINT),
+                volume.operations.active(VolumeOperations::CHECKPOINT),
             ),
-            ("backup", vset.operations.active(VsetOperations::BACKUP)),
+            ("backup", volume.operations.active(VolumeOperations::BACKUP)),
             (
                 "hydration",
-                vset.operations.active(VsetOperations::HYDRATION),
+                volume.operations.active(VolumeOperations::HYDRATION),
             ),
         ] {
             append_sample(
                 out,
-                "blockd_vset_operation_in_progress",
-                &format!("vset_id=\"{id}\",operation=\"{operation}\""),
+                "blockd_volume_operation_in_progress",
+                &format!("volume_id=\"{id}\",operation=\"{operation}\""),
                 u8::from(active),
             );
         }
         for (state, value) in [
-            ("live", vset.live_segment_bytes),
-            ("stored", vset.local_segment_bytes),
+            ("live", volume.live_blx_bytes),
+            ("stored", volume.local_blx_bytes),
         ] {
             append_sample(
                 out,
-                "blockd_vset_segment_bytes",
-                &format!("vset_id=\"{id}\",state=\"{state}\""),
+                "blockd_volume_blx_bytes",
+                &format!("volume_id=\"{id}\",state=\"{state}\""),
                 value,
             );
         }
@@ -752,10 +755,8 @@ fn append_capacity_signal(out: &mut String, signal: CapacitySignal) {
         "Whether optional control-plane work should be scheduled on this host.",
         "gauge",
     );
-    for (work, allowed) in [
-        ("migration", signal.allow_migrations),
-        ("prefetch", signal.allow_prefetch),
-    ] {
+    {
+        let (work, allowed) = ("migration", signal.allow_migrations);
         append_sample(
             out,
             "blockd_capacity_optional_work_allowed",
@@ -768,15 +769,15 @@ fn append_capacity_signal(out: &mut String, signal: CapacitySignal) {
 fn append_archive_lag_age(out: &mut String, lag_age: &[(u64, f64)]) {
     append_family(
         out,
-        "blockd_vset_archive_lag_seconds",
+        "blockd_volume_archive_lag_seconds",
         "Continuous time with unpublished captures.",
         "gauge",
     );
-    for (vset, seconds) in lag_age {
+    for (volume, seconds) in lag_age {
         append_sample(
             out,
-            "blockd_vset_archive_lag_seconds",
-            &format!("vset_id=\"{vset}\""),
+            "blockd_volume_archive_lag_seconds",
+            &format!("volume_id=\"{volume}\""),
             seconds,
         );
     }
@@ -785,15 +786,15 @@ fn append_archive_lag_age(out: &mut String, lag_age: &[(u64, f64)]) {
 fn append_active_operation_age(out: &mut String, ages: &[(u64, &'static str, f64)]) {
     append_family(
         out,
-        "blockd_vset_operation_active_seconds",
+        "blockd_volume_operation_active_seconds",
         "Continuous time the current background operation has been active.",
         "gauge",
     );
-    for (vset, operation, seconds) in ages {
+    for (volume, operation, seconds) in ages {
         append_sample(
             out,
-            "blockd_vset_operation_active_seconds",
-            &format!("vset_id=\"{vset}\",operation=\"{operation}\""),
+            "blockd_volume_operation_active_seconds",
+            &format!("volume_id=\"{volume}\",operation=\"{operation}\""),
             seconds,
         );
     }
@@ -803,14 +804,14 @@ fn append_active_operation_age(out: &mut String, ages: &[(u64, &'static str, f64
 fn append_loop_metrics(out: &mut String, snapshot: &MetricsSnapshot) {
     append_family(
         out,
-        "blockd_event_loop_events_total",
+        "blockd_runtime_operations_total",
         "Actor polls and async world operations by kind.",
         "counter",
     );
     append_family(
         out,
-        "blockd_event_loop_seconds_total",
-        "Event-loop wall time by phase and kind.",
+        "blockd_runtime_operation_seconds_total",
+        "Cumulative actor-poll and async world-operation durations by kind.",
         "counter",
     );
     for (phase, rows) in [
@@ -820,51 +821,57 @@ fn append_loop_metrics(out: &mut String, snapshot: &MetricsSnapshot) {
         for (kind, count, ns) in rows {
             append_sample(
                 out,
-                "blockd_event_loop_events_total",
+                "blockd_runtime_operations_total",
                 &format!("phase=\"{phase}\",kind=\"{kind}\""),
                 count,
             );
             append_sample(
                 out,
-                "blockd_event_loop_seconds_total",
+                "blockd_runtime_operation_seconds_total",
                 &format!("phase=\"{phase}\",kind=\"{kind}\""),
                 *ns as f64 / 1_000_000_000.0,
             );
         }
     }
+    append_family(
+        out,
+        "blockd_actor_executor_idle_seconds_total",
+        "Cumulative time not spent polling protocol actors.",
+        "counter",
+    );
     append_sample(
         out,
-        "blockd_event_loop_seconds_total",
-        "phase=\"idle\",kind=\"all\"",
-        snapshot.loop_idle_ns as f64 / 1_000_000_000.0,
+        "blockd_actor_executor_idle_seconds_total",
+        "",
+        snapshot.actor_idle_ns as f64 / 1_000_000_000.0,
     );
     append_family(
         out,
-        "blockd_event_loop_occupancy_ratio",
-        "Cumulative fraction of observed loop time spent busy.",
+        "blockd_actor_executor_occupancy_ratio",
+        "Cumulative fraction of observed time spent polling protocol actors.",
         "gauge",
     );
     append_sample(
         out,
-        "blockd_event_loop_occupancy_ratio",
+        "blockd_actor_executor_occupancy_ratio",
         "",
-        snapshot.loop_occupancy,
+        snapshot.actor_occupancy,
     );
     append_family(
         out,
-        "blockd_event_loop_queue_depth",
+        "blockd_actor_executor_queue_depth",
         "Current queued events by priority lane.",
         "gauge",
     );
     append_sample(
         out,
-        "blockd_event_loop_queue_depth",
+        "blockd_actor_executor_queue_depth",
         "priority=\"critical\"",
         snapshot.loop_queue_depths.0,
     );
     append_sample(
         out,
-        "blockd_event_loop_queue_depth",
+        "blockd_actor_executor_queue_depth",
         "priority=\"background\"",
         snapshot.loop_queue_depths.1,
     );
@@ -880,27 +887,27 @@ fn append_fault_latency(out: &mut String, series: &[FaultLatency]) {
     );
     append_family(
         out,
-        "blockd_vset_page_faults_total",
-        "Per-vset page faults by final source.",
+        "blockd_volume_page_faults_total",
+        "Per-volume page faults by final source.",
         "counter",
     );
     append_family(
         out,
-        "blockd_vset_page_fault_duration_seconds_total",
-        "Per-vset cumulative page-fault service time by final source.",
+        "blockd_volume_page_fault_duration_seconds_total",
+        "Per-volume cumulative page-fault service time by final source.",
         "counter",
     );
     for item in series {
         append_sample(
             out,
-            "blockd_vset_page_faults_total",
-            &format!("vset_id=\"{}\",source=\"{}\"", item.vset.0, item.source),
+            "blockd_volume_page_faults_total",
+            &format!("volume_id=\"{}\",source=\"{}\"", item.volume.0, item.source),
             item.histogram.count,
         );
         append_sample(
             out,
-            "blockd_vset_page_fault_duration_seconds_total",
-            &format!("vset_id=\"{}\",source=\"{}\"", item.vset.0, item.source),
+            "blockd_volume_page_fault_duration_seconds_total",
+            &format!("volume_id=\"{}\",source=\"{}\"", item.volume.0, item.source),
             item.histogram.sum_ns as f64 / 1_000_000_000.0,
         );
     }
@@ -1010,28 +1017,26 @@ fn append_runtime_counters(out: &mut String, counters: &Counters) {
         guest_pages_dirtied => "Guest pages transitioning from clean to dirty.",
         faults_unservable => "Page faults that could not be served from any intact copy.",
         pressure_waits => "Guest operations delayed by cache pressure.",
-        pages_flushed => "Dirty pages flushed to durable segments.",
+        pages_flushed => "Dirty pages flushed to durable blx_files.",
         records_written => "Journal record copies written.",
         checkpoints_done => "Checkpoints completed.",
         syncs_acked => "Guest sync requests acknowledged.",
         guest_rejected => "Guest operations rejected by lifecycle guards.",
-        peer_rejected => "Peer messages rejected by protocol guards.",
         blobs_deleted => "Local blobs deleted after becoming unreachable.",
         manifests_published => "Backup manifests published to object storage.",
         store_retries => "Store operations deferred for retry after transient faults.",
-        fenced => "Vsets lost to a newer ownership claim.",
+        fenced => "Volumes lost to a newer ownership claim.",
         assignment_claims => "Successful object-store assignment claims.",
         assignment_claim_conflicts => "Assignment claims lost to another holder.",
-        nvme_reclaims => "Backed local segments reclaimed under capacity pressure.",
+        nvme_reclaims => "Backed local blx_files reclaimed under capacity pressure.",
         nvme_stalls => "Captures stalled by local disk capacity.",
-        prefetch_fills => "Pages prefetched after restore.",
         hydrate_fills => "Migration tail pages hydrated in the background.",
         peer_retries => "Peer fetches retried after no response.",
         cow_captures => "Snapshot pages captured on a concurrent guest write.",
         wedged_guests => "Guest-service liveness wedge detections.",
         wedged_hydration => "Hydration liveness wedge detections.",
         wedged_outbound => "Outbound migration liveness wedge detections.",
-        segs_compacted => "Mostly-dead segments compacted.",
+        blx_files_compacted => "Mostly-dead blx_files compacted.",
         pages_compacted => "Live pages rewritten by compaction.",
         replica_capacity_backpressure => "Passive writes held because host-wide spool hard capacity is exhausted.",
     }
@@ -1131,7 +1136,6 @@ mod tests {
             limiting_reason: Some(blockd_runtime::CapacityReason::BackupLag),
             admission_percent: 25,
             allow_migrations: false,
-            allow_prefetch: false,
         }
     }
 
@@ -1149,7 +1153,7 @@ mod tests {
         let custom_hash = custom.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        assert_eq!((custom.len(), custom_hash), (15_290, 0x5435_32e0_7411_814d));
+        assert_eq!((custom.len(), custom_hash), (15_243, 0x047b_802d_250b_66b1));
     }
 
     #[test]
@@ -1179,9 +1183,9 @@ mod tests {
             daemon: DaemonStats {
                 cache_capacity_pages: 100,
                 dirty_pages: 3,
-                vsets: vec![blockd_core::hostmeta::VsetStats {
-                    vset: blockd_core::types::VsetId(42),
-                    role: VsetRole::Hydrating,
+                volumes: vec![blockd_core::hostmeta::VolumeStats {
+                    volume: blockd_core::types::VolumeId(42),
+                    role: VolumeRole::Hydrating,
                     fence: 8,
                     dirty_pages: 3,
                     unstable_pages: 4,
@@ -1189,20 +1193,20 @@ mod tests {
                     hydration_remaining_pages: 9,
                     archive_lag_captures: Some(6),
                     archive_lag_bytes: Some(3072),
-                    operations: VsetOperations::default(),
-                    live_segment_bytes: 1024,
-                    local_segment_bytes: 2048,
+                    operations: VolumeOperations::default(),
+                    live_blx_bytes: 1024,
+                    local_blx_bytes: 2048,
                 }],
                 ..DaemonStats::default()
             },
             capacity: constrained_capacity(),
             loop_poll: vec![("ActorPoll", 2, 1_000)],
             loop_world: Vec::new(),
-            loop_idle_ns: 0,
-            loop_occupancy: 0.0,
+            actor_idle_ns: 0,
+            actor_occupancy: 0.0,
             loop_queue_depths: (0, 0),
             fault_latency: vec![FaultLatency {
-                vset: blockd_core::types::VsetId(42),
+                volume: blockd_core::types::VolumeId(42),
                 source: "local_nvme",
                 histogram: HistogramSnapshot {
                     buckets: vec![1; LATENCY_BUCKETS_NS.len()],
@@ -1236,18 +1240,20 @@ mod tests {
         assert!(text.contains("blockd_vms{state=\"running\"} 2"));
         assert!(text.contains("blockd_cache_pages{state=\"dirty\"} 3"));
         assert_capacity_metrics(&text);
-        assert!(text.contains("blockd_vset_archive_lag_captures{vset_id=\"42\"} 6"));
-        assert!(text.contains("blockd_vset_archive_lag_bytes{vset_id=\"42\"} 3072"));
-        assert!(text.contains("blockd_vset_archive_lag_seconds{vset_id=\"42\"} 12.5"));
+        assert!(text.contains("blockd_volume_archive_lag_captures{volume_id=\"42\"} 6"));
+        assert!(text.contains("blockd_volume_archive_lag_bytes{volume_id=\"42\"} 3072"));
+        assert!(text.contains("blockd_volume_archive_lag_seconds{volume_id=\"42\"} 12.5"));
         assert!(text.contains(
-            "blockd_vset_operation_active_seconds{vset_id=\"42\",operation=\"hydration\"} 8.25"
+            "blockd_volume_operation_active_seconds{volume_id=\"42\",operation=\"hydration\"} 8.25"
         ));
         assert!(
-            text.contains("blockd_vset_page_faults_total{vset_id=\"42\",source=\"local_nvme\"} 1")
+            text.contains(
+                "blockd_volume_page_faults_total{volume_id=\"42\",source=\"local_nvme\"} 1"
+            )
         );
         assert!(text.contains("blockd_page_fault_duration_seconds_count{source=\"local_nvme\"} 1"));
         assert!(
-            text.contains("blockd_event_loop_events_total{phase=\"poll\",kind=\"ActorPoll\"} 2")
+            text.contains("blockd_runtime_operations_total{phase=\"poll\",kind=\"ActorPoll\"} 2")
         );
         assert!(!text.contains("phase=\"effect\""));
         assert!(!text.contains("/vm/42/work"));
@@ -1262,7 +1268,7 @@ mod tests {
     fn fault_latency_encoding_is_byte_pinned() {
         let series = [
             FaultLatency {
-                vset: blockd_core::types::VsetId(42),
+                volume: blockd_core::types::VolumeId(42),
                 source: "local_nvme",
                 histogram: HistogramSnapshot {
                     buckets: vec![1; LATENCY_BUCKETS_NS.len()],
@@ -1272,7 +1278,7 @@ mod tests {
                 },
             },
             FaultLatency {
-                vset: blockd_core::types::VsetId(7),
+                volume: blockd_core::types::VolumeId(7),
                 source: "local_nvme",
                 histogram: HistogramSnapshot {
                     buckets: vec![2; LATENCY_BUCKETS_NS.len()],
@@ -1289,14 +1295,14 @@ mod tests {
             concat!(
                 "# HELP blockd_page_fault_duration_seconds End-to-end page-fault service time by final source.\n",
                 "# TYPE blockd_page_fault_duration_seconds histogram\n",
-                "# HELP blockd_vset_page_faults_total Per-vset page faults by final source.\n",
-                "# TYPE blockd_vset_page_faults_total counter\n",
-                "# HELP blockd_vset_page_fault_duration_seconds_total Per-vset cumulative page-fault service time by final source.\n",
-                "# TYPE blockd_vset_page_fault_duration_seconds_total counter\n",
-                "blockd_vset_page_faults_total{vset_id=\"42\",source=\"local_nvme\"} 1\n",
-                "blockd_vset_page_fault_duration_seconds_total{vset_id=\"42\",source=\"local_nvme\"} 1\n",
-                "blockd_vset_page_faults_total{vset_id=\"7\",source=\"local_nvme\"} 2\n",
-                "blockd_vset_page_fault_duration_seconds_total{vset_id=\"7\",source=\"local_nvme\"} 2\n",
+                "# HELP blockd_volume_page_faults_total Per-volume page faults by final source.\n",
+                "# TYPE blockd_volume_page_faults_total counter\n",
+                "# HELP blockd_volume_page_fault_duration_seconds_total Per-volume cumulative page-fault service time by final source.\n",
+                "# TYPE blockd_volume_page_fault_duration_seconds_total counter\n",
+                "blockd_volume_page_faults_total{volume_id=\"42\",source=\"local_nvme\"} 1\n",
+                "blockd_volume_page_fault_duration_seconds_total{volume_id=\"42\",source=\"local_nvme\"} 1\n",
+                "blockd_volume_page_faults_total{volume_id=\"7\",source=\"local_nvme\"} 2\n",
+                "blockd_volume_page_fault_duration_seconds_total{volume_id=\"7\",source=\"local_nvme\"} 2\n",
                 "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.00001\"} 3\n",
                 "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.000025\"} 3\n",
                 "blockd_page_fault_duration_seconds_bucket{source=\"local_nvme\",le=\"0.00005\"} 3\n",

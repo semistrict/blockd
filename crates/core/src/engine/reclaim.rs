@@ -1,15 +1,14 @@
 use std::collections::BTreeSet;
 
 use super::SharedHost;
-use crate::journal::JournalRecord;
 use crate::layout;
-use crate::types::{JournalSeq, SegId, VsetId};
+use crate::types::{ObjectId, VolumeId};
 use crate::world::{BlobError, Blobs};
 
-/// Drop local segment copies whose immutable bytes are already present in
+/// Drop local blx copies whose immutable bytes are already present in
 /// Store. Serving maps keep their locations and fault through to Store after
 /// the unlink, so this changes placement rather than logical state.
-pub async fn reclaim_backed_segments<W: Blobs>(
+pub async fn reclaim_backed_blx_files<W: Blobs>(
     state: SharedHost,
     world: &W,
 ) -> Result<(), BlobError> {
@@ -26,35 +25,33 @@ pub async fn reclaim_backed_segments<W: Blobs>(
             if !over_limit && !host.disk_reclaim_requested {
                 return Ok(());
             }
-            host.vsets.iter().find_map(|(&vset, vset_state)| {
-                vset_state
-                    .segment_blobs
+            host.volumes.iter().find_map(|(&volume, volume_state)| {
+                volume_state
+                    .blx_blobs
                     .iter()
-                    .find_map(|&(fence, segment, bytes)| {
-                        vset_state
-                            .backed_segments
-                            .contains(&(fence, segment))
-                            .then_some((vset, fence, segment, bytes))
+                    .find_map(|&(identity, bytes)| {
+                        volume_state
+                            .backed_blx_files
+                            .contains(&identity)
+                            .then_some((volume, identity, bytes))
                     })
             })
         };
-        let Some((vset, fence, segment, _bytes)) = candidate else {
+        let Some((volume, identity, _bytes)) = candidate else {
             return Ok(());
         };
-        let name = layout::segment_blob(vset, fence, segment);
+        let name = layout::blx_blob(volume, identity.writer_fence, ObjectId(identity.object_id));
         Blobs::delete(world, &name).await?;
         let mut host = state.borrow_mut();
         host.blob_sizes.remove(&name);
         host.disk_reclaim_requested = !host.disk_reclaim_target_met();
-        if let Some(vset_state) = host.vsets.get_mut(&vset) {
-            vset_state
-                .segment_blobs
-                .retain(|(stored_fence, stored_segment, _)| {
-                    (*stored_fence, *stored_segment) != (fence, segment)
-                });
-            vset_state.tombstone_segments.remove(&(fence, segment));
-            vset_state.vmm_segments.remove(&(fence, segment));
-            vset_state.segment_refs.remove(&(fence, segment));
+        if let Some(volume_state) = host.volumes.get_mut(&volume) {
+            volume_state
+                .blx_blobs
+                .retain(|(stored, _)| *stored != identity);
+            volume_state.tombstone_blx_files.remove(&identity);
+            volume_state.vmm_blx_files.remove(&identity);
+            volume_state.blx_refs.remove(&identity);
         }
         host.counters.nvme_reclaims += 1;
         host.counters.blobs_deleted += 1;
@@ -65,71 +62,44 @@ pub async fn reclaim_backed_segments<W: Blobs>(
 pub async fn cleanup_local<W: Blobs>(
     state: SharedHost,
     world: &W,
-    vset: VsetId,
+    volume: VolumeId,
     incarnation: u64,
 ) -> Result<(), BlobError> {
-    let (names, records_to_remove, segments_to_remove, pressure_reclaims) = {
+    let (names, records_to_remove, blx_to_remove, pressure_reclaims) = {
         let host = state.borrow();
-        let Some(vset_state) = host
-            .vsets
-            .get(&vset)
-            .filter(|vset| vset.incarnation == incarnation)
+        let Some(volume_state) = host
+            .volumes
+            .get(&volume)
+            .filter(|volume| volume.incarnation == incarnation)
         else {
             return Ok(());
         };
-        let mut keep_records = BTreeSet::new();
-        let mut keep_segments = BTreeSet::new();
-        if let Some(record) = &vset_state.best_record {
-            add_closure(
-                record,
-                &vset_state.record_segments,
-                &mut keep_records,
-                &mut keep_segments,
-            );
-        }
-        if let Some(record) = &vset_state.pinned {
-            add_closure(
-                record,
-                &vset_state.record_segments,
-                &mut keep_records,
-                &mut keep_segments,
-            );
-        }
-        if let Some(record) = &vset_state.peer_committed_record {
-            add_closure(
-                record,
-                &vset_state.record_segments,
-                &mut keep_records,
-                &mut keep_segments,
-            );
-        }
-        keep_segments.extend(
-            vset_state
-                .tombstone_segments
+        let (keep_records, mut keep_blx) = volume_state.retention_closure();
+        keep_blx.extend(
+            volume_state
+                .tombstone_blx_files
                 .iter()
-                .filter(|segment| !vset_state.backed_segments.contains(segment))
+                .filter(|blx| !volume_state.backed_blx_files.contains(blx))
                 .copied(),
         );
-        keep_segments.extend(vset_state.publishing_segments.iter().copied());
-        keep_segments.extend(vset_state.replicating_segments.iter().copied());
-        let records_to_remove = vset_state
+        keep_blx.extend(volume_state.publishing_blx_files.iter().copied());
+        keep_blx.extend(volume_state.replicating_blx_files.iter().copied());
+        let records_to_remove = volume_state
             .record_writes
             .iter()
             .filter_map(|(&seq, &(fence, _))| {
                 (!keep_records.contains(&(fence, seq))).then_some((fence, seq))
             })
             .collect::<Vec<_>>();
-        let segments_to_remove = vset_state
-            .segment_blobs
+        let blx_to_remove = volume_state
+            .blx_blobs
             .iter()
-            .filter_map(|&(fence, segment, _)| {
-                (!keep_segments.contains(&(fence, segment))).then_some((fence, segment))
-            })
+            .filter_map(|&(identity, _)| (!keep_blx.contains(&identity)).then_some(identity))
             .collect::<Vec<_>>();
         let pressure_reclaims = if host.disk_reclaim_requested {
-            segments_to_remove
+            blx_to_remove
                 .iter()
-                .filter(|candidate| vset_state.backed_segments.contains(candidate))
+                .filter(|candidate| volume_state.backed_blx_files.contains(candidate))
                 .count()
         } else {
             0
@@ -138,22 +108,15 @@ pub async fn cleanup_local<W: Blobs>(
             .iter()
             .flat_map(|&(fence, seq)| {
                 [
-                    layout::journal_blob(vset, fence, seq),
-                    layout::journal_mirror_blob(vset, fence, seq),
+                    layout::journal_blob(volume, fence, seq),
+                    layout::journal_mirror_blob(volume, fence, seq),
                 ]
             })
-            .chain(
-                segments_to_remove
-                    .iter()
-                    .map(|&(fence, segment)| layout::segment_blob(vset, fence, segment)),
-            )
+            .chain(blx_to_remove.iter().map(|identity| {
+                layout::blx_blob(volume, identity.writer_fence, ObjectId(identity.object_id))
+            }))
             .collect::<Vec<_>>();
-        (
-            names,
-            records_to_remove,
-            segments_to_remove,
-            pressure_reclaims,
-        )
+        (names, records_to_remove, blx_to_remove, pressure_reclaims)
     };
     if names.is_empty() {
         return Ok(());
@@ -161,30 +124,30 @@ pub async fn cleanup_local<W: Blobs>(
     Blobs::delete_many_durable(world, &names).await?;
     let mut host = state.borrow_mut();
     host.forget_blobs(&names);
-    let Some(vset_state) = host
-        .vsets
-        .get_mut(&vset)
-        .filter(|vset| vset.incarnation == incarnation)
+    let Some(volume_state) = host
+        .volumes
+        .get_mut(&volume)
+        .filter(|volume| volume.incarnation == incarnation)
     else {
         return Ok(());
     };
     for (_, seq) in records_to_remove {
-        vset_state.record_writes.remove(&seq);
-        vset_state.record_segments.remove(&seq);
+        volume_state.record_writes.remove(&seq);
+        volume_state.record_blx_files.remove(&seq);
     }
-    let segment_set = segments_to_remove.into_iter().collect::<BTreeSet<_>>();
-    vset_state
-        .segment_blobs
-        .retain(|(fence, segment, _)| !segment_set.contains(&(*fence, *segment)));
-    vset_state
-        .tombstone_segments
-        .retain(|segment| !segment_set.contains(segment));
-    vset_state
-        .vmm_segments
-        .retain(|segment| !segment_set.contains(segment));
-    vset_state
-        .segment_refs
-        .retain(|segment, _| !segment_set.contains(segment));
+    let blx_set = blx_to_remove.into_iter().collect::<BTreeSet<_>>();
+    volume_state
+        .blx_blobs
+        .retain(|(identity, _)| !blx_set.contains(identity));
+    volume_state
+        .tombstone_blx_files
+        .retain(|blx| !blx_set.contains(blx));
+    volume_state
+        .vmm_blx_files
+        .retain(|blx| !blx_set.contains(blx));
+    volume_state
+        .blx_refs
+        .retain(|blx, _| !blx_set.contains(blx));
     host.counters.blobs_deleted += names.len() as u64;
     if pressure_reclaims > 0 {
         host.disk_reclaim_requested = !host.disk_reclaim_target_met();
@@ -194,27 +157,4 @@ pub async fn cleanup_local<W: Blobs>(
             .saturating_add(u64::try_from(pressure_reclaims).expect("reclaim count fits u64"));
     }
     Ok(())
-}
-
-fn add_closure(
-    record: &JournalRecord,
-    record_segments: &std::collections::BTreeMap<JournalSeq, BTreeSet<(u64, SegId)>>,
-    records: &mut BTreeSet<(u64, JournalSeq)>,
-    segments: &mut BTreeSet<(u64, SegId)>,
-) {
-    records.insert((record.fence, record.seq));
-    segments.extend(record.files.iter().filter_map(|file| {
-        (file.identity.namespace_kind == crate::blx::NamespaceKind::Vset)
-            .then_some((file.identity.writer_fence, SegId(file.identity.object_id)))
-    }));
-    if let Some(written) = record_segments.get(&record.seq) {
-        segments.extend(written);
-    }
-    segments.extend(
-        record
-            .overlay
-            .values()
-            .filter(|(_, location)| location.base == 0)
-            .map(|(_, location)| (location.fence, location.seg)),
-    );
 }

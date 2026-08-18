@@ -465,8 +465,8 @@ fn metrics_text(state: &Arc<Demod>) -> String {
         capacity: state.rt.capacity_signal(),
         loop_poll: loop_stats.poll_totals(),
         loop_world: loop_stats.world_totals(),
-        loop_idle_ns: loop_stats.idle_ns(),
-        loop_occupancy: loop_stats.occupancy(),
+        actor_idle_ns: loop_stats.actor_idle_ns(),
+        actor_occupancy: loop_stats.actor_occupancy(),
         loop_queue_depths: state.rt.loop_queue_depths(),
         fault_latency: state.rt.fault_latency(),
         operation_latency: state.rt.operation_latency(),
@@ -480,13 +480,13 @@ fn metrics_text(state: &Arc<Demod>) -> String {
             .rt
             .backup_lag_age()
             .into_iter()
-            .map(|(vset, age)| (vset.0, age.as_secs_f64()))
+            .map(|(volume, age)| (volume.0, age.as_secs_f64()))
             .collect(),
         active_operation_age: state
             .rt
             .active_operation_age()
             .into_iter()
-            .map(|(vset, operation, age)| (vset.0, operation, age.as_secs_f64()))
+            .map(|(volume, operation, age)| (volume.0, operation, age.as_secs_f64()))
             .collect(),
     };
     state.metrics.encode(&snapshot)
@@ -520,7 +520,7 @@ fn status_value(state: &Arc<Demod>) -> Value {
             "syncs_acked": counters.syncs_acked,
             "manifests_published": counters.manifests_published,
             "hydrate_fills": counters.hydrate_fills,
-            "segs_compacted": counters.segs_compacted,
+            "blx_files_compacted": counters.blx_files_compacted,
         },
         "store": {
             "puts": store.puts.load(Ordering::SeqCst),
@@ -543,7 +543,6 @@ fn capacity_value(signal: blockd_runtime::CapacitySignal) -> Value {
         "limiting_reason": signal.limiting_reason.map(blockd_runtime::CapacityReason::as_str),
         "admission_percent": signal.admission_percent,
         "allow_migrations": signal.allow_migrations,
-        "allow_prefetch": signal.allow_prefetch,
     })
 }
 
@@ -598,7 +597,6 @@ mod tests {
             limiting_reason: Some(blockd_runtime::CapacityReason::DiskHeadroom),
             admission_percent: 0,
             allow_migrations: false,
-            allow_prefetch: false,
         });
         assert_eq!(
             value,
@@ -607,7 +605,6 @@ mod tests {
                 "limiting_reason": "disk_headroom",
                 "admission_percent": 0,
                 "allow_migrations": false,
-                "allow_prefetch": false,
             })
         );
     }

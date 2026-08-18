@@ -2,7 +2,7 @@
 //! corruption.
 
 use blockd_core::hostmeta::HostConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::types::{micros, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::rng::Ppm;
@@ -137,7 +137,7 @@ fn repeated_checkpoints_accrue_no_storage_debt() {
 #[test]
 fn one_rotated_record_copy_recovers_from_its_intact_mirror() {
     let mut config = base_config();
-    config.vset_count = 1;
+    config.volume_count = 1;
     config.horizon = millis(500);
     config.faults.rot_records_at = vec![(millis(250), false)];
     config.faults.crash_at = vec![millis(300)];
@@ -156,8 +156,8 @@ fn pressure_slows_guests_but_never_kills() {
     // writeback-driven eviction; everyone still progresses; nobody dies.
     let mut config = base_config();
     config.host.cache_pages = 8;
-    config.vset_count = 4;
-    config.vset.pages_per_volume = 32;
+    config.volume_count = 4;
+    config.volume.pages = 32;
     let report = run(6, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
@@ -193,11 +193,11 @@ fn non_capacity_write_failure_fail_stops_the_host() {
 
 #[test]
 fn bit_rot_never_serves_corrupt_bytes() {
-    // R8.1: damaged segments must never serve bytes. Random damage may land
+    // R8.1: damaged BLX files must never serve bytes. Random damage may land
     // on obsolete data, but any unservable read must fail its guest loudly.
     let mut config = base_config();
     config.horizon = secs(3);
-    // Small cache: evictions force refaults, so damaged segments are read.
+    // Small cache: evictions force refaults, so damaged BLX files are read.
     config.host.cache_pages = 24;
     config.faults = FaultPlan {
         crash_mean_interval: 0,
@@ -223,7 +223,7 @@ fn bit_rot_never_serves_corrupt_bytes() {
 #[test]
 fn rot_on_either_record_copy_never_rolls_back_acked_syncs() {
     let mut config = base_config();
-    config.vset_count = 1;
+    config.volume_count = 1;
     config.horizon = secs(3);
     // Crash 50µs behind each flip — inside the window where the rotted
     // record is still the newest, before another record covers its syncs.
@@ -261,14 +261,14 @@ fn full_chaos_stays_consistent() {
 }
 
 #[test]
-fn scale_run_hosts_many_overcommitted_vsets() {
-    // R1.3, proportionally scaled: one host, 100 concurrently live vsets,
-    // memory overcommitted ~4x (100 vsets x 48 pages of working set
+fn scale_run_hosts_many_overcommitted_volumes() {
+    // R1.3, proportionally scaled: one host, 100 concurrently live volumes,
+    // memory overcommitted ~4x (100 volumes x 48 pages of working set
     // against a 1200-page cache). Thin provisioning + writeback-driven
     // eviction keep every guest progressing (R2.4/R2.5): nobody dies,
     // nothing corrupts, pressure only slows.
     let mut config = base_config();
-    config.vset_count = 100;
+    config.volume_count = 100;
     config.host.cache_pages = 1200;
     config.horizon = secs(1);
     let report = run(17, config);
@@ -289,7 +289,7 @@ fn scale_run_hosts_many_overcommitted_vsets() {
 /// committed regression seed corpus. Every seed that ever exposed a bug
 /// belongs in this list, forever.
 /// The step-cost bound (design flaw 2): one writeback tick starts a
-/// bounded, rotating share of the fleet's captures — never every vset at
+/// bounded, rotating share of the fleet's captures — never every volume at
 /// once — and each capture reads at most one drain batch in any step (a
 /// larger set arms an incremental drain and reads NOTHING in the tick).
 /// Wall time cannot pass inside a sim step; counted work units can, and
@@ -298,12 +298,12 @@ fn scale_run_hosts_many_overcommitted_vsets() {
 #[test]
 fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
     let mut config = base_config();
-    config.vset_count = 64;
+    config.volume_count = 64;
     config.horizon = secs(3);
-    config.vset.pages_per_volume = 24;
+    config.volume.pages = 24;
     let report = run(5, config);
     assert_clean(&report);
-    // 8 rotation slots × the 64-page synchronous-capture ceiling; a vset's
+    // 8 rotation slots × the 64-page synchronous-capture ceiling; a volume's
     // full 72-page set never lands in one step at all.
     let step_ceiling: u64 = 8 * 64;
     assert!(
@@ -319,7 +319,7 @@ fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
     );
 }
 
-/// 2a-full, the residual after the tick stagger: ONE vset with a huge
+/// 2a-full, the residual after the tick stagger: ONE volume with a huge
 /// dirty set must not cost O(dirty) inside any single step. The capture
 /// arms the whole set behind write protection in one cheap read-free
 /// step, drains a bounded batch per continuation step, and a guest write
@@ -330,9 +330,9 @@ fn writeback_work_per_step_stays_bounded_at_fleet_scale() {
 #[test]
 fn huge_dirty_sets_capture_incrementally_with_copy_on_fault() {
     let mut config = base_config();
-    config.vset_count = 1;
+    config.volume_count = 1;
     config.host.cache_pages = 4096;
-    config.vset.pages_per_volume = 600; // 3 volumes × 600 pages
+    config.volume.pages = 600;
     config.horizon = secs(2);
     // A hot writer: the dirty set between writeback ticks dwarfs one
     // drain batch, and writes keep landing while the drain runs. No
@@ -374,18 +374,18 @@ fn chaos_seed_corpus_stays_consistent() {
     }
 }
 
-/// Journal metadata must stay bounded as a large vset fills. Page locations
+/// Journal metadata must stay bounded as a large volume fills. Page locations
 /// are rebuilt from BLX footers and are never persisted as a separate map.
 #[test]
-fn large_vsets_keep_journal_metadata_bounded() {
+fn large_volumes_keep_journal_metadata_bounded() {
     let config = HarnessConfig {
         host: HostConfig {
             // A warm cache: the test measures metadata cost, not thrash.
             cache_pages: 32_768,
             ..base_config().host
         },
-        vset_count: 1,
-        vset: VsetConfig::compute(2, 8_000),
+        volume_count: 1,
+        volume: VolumeConfig::data(8_000),
         think: (micros(5), micros(25)),
         horizon: secs(1),
         checkpoint_interval: Some(millis(300)),
@@ -396,7 +396,7 @@ fn large_vsets_keep_journal_metadata_bounded() {
     let report = run(41, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);
-    // Enough pages and records to expose metadata that scales with vset size.
+    // Enough pages and records to expose metadata that scales with volume size.
     assert!(
         report.counters.pages_flushed > 6_000,
         "workload too small to expose metadata growth: {} pages flushed",
@@ -418,21 +418,21 @@ fn large_vsets_keep_journal_metadata_bounded() {
     // count. Rewriting a full page map on every capture exceeds this budget.
     let budget = 900 * report.counters.pages_flushed + 16_384 * report.counters.records_written;
     assert!(
-        report.map_bytes_written < budget,
+        report.journal_bytes_written < budget,
         "journal metadata cost {} bytes ({} flushed pages, {} records; budget {budget}) — \
          rewriting a page map per capture",
-        report.map_bytes_written,
+        report.journal_bytes_written,
         report.counters.pages_flushed,
         report.counters.records_written,
     );
 }
 
 /// R2.7/R4.5: disk space tracks LIVE data, not write history. The workload
-/// is the pathological shape for write-once segments: a small hot set
+/// is the pathological shape for write-once BLX files: a small hot set
 /// churns every interval (its old entries die immediately) while cold
-/// pages arrive once and survive — so every segment ends up mostly dead
+/// pages arrive once and survive — so every blx ends up mostly dead
 /// but pinned by its few cold survivors. Without compaction the device
-/// accumulates one mostly-dead segment per capture, unbounded in the
+/// accumulates one mostly-dead blx per capture, unbounded in the
 /// horizon; with it, dead bytes are bounded by a constant factor of live.
 #[test]
 fn steady_overwrites_dont_amplify_disk_space() {
@@ -441,13 +441,13 @@ fn steady_overwrites_dont_amplify_disk_space() {
             cache_pages: 8_192,
             ..base_config().host
         },
-        vset_count: 1,
-        vset: VsetConfig::compute(2, 4_096),
+        volume_count: 1,
+        volume: VolumeConfig::data(4_096),
         think: (micros(10), micros(50)),
         horizon: secs(2),
         checkpoint_interval: None,
         // Writeback-shaped (syncs rare), 90% of picks in a 32-page hot
-        // set: each capture's segment is mostly hot pages that the next
+        // set: each capture's blx is mostly hot pages that the next
         // capture supersedes, plus a few cold survivors that pin it.
         sync_share: Some(Ppm(1_000)),
         hot_pages: Some((Ppm::percent(90), 32)),
@@ -464,39 +464,38 @@ fn steady_overwrites_dont_amplify_disk_space() {
         report.counters.records_written
     );
     assert!(
-        report.counters.pages_flushed > 9_000,
+        report.counters.pages_flushed > 4_500,
         "only {} pages flushed — not enough churn to expose amplification",
         report.counters.pages_flushed
     );
-    // The structural bound compaction buys: every surviving segment is
+    // The structural bound compaction buys: every surviving blx is
     // majority-live, so disk ≤ 2 × live plus the not-yet-compacted tail.
-    // History (≈7 MB of segment writes per simulated second) must NOT
-    // accumulate — without compaction this run ends at 20.6 MB and grows
-    // linearly with the horizon.
+    // History (≈3.5 MB of blx writes per simulated second) must NOT
+    // accumulate — without compaction it grows linearly with the horizon.
     assert!(
-        report.seg_bytes_end
-            < 2 * report.seg_live_bytes_end + 1_500_000 * page_size() as u64 / 4096,
-        "{} segment bytes on disk for {} live — space amplifying with history",
-        report.seg_bytes_end,
-        report.seg_live_bytes_end
+        report.blx_bytes_end
+            < 2 * report.blx_live_bytes_end + 1_500_000 * page_size() as u64 / 4096,
+        "{} blx bytes on disk for {} live — space amplifying with history",
+        report.blx_bytes_end,
+        report.blx_live_bytes_end
     );
     // And the daemon's live accounting can't be excusing the bound: the
-    // whole vset is 3 volumes × 4096 pages at ≤ ~700 compressed-framed
-    // bytes each ≈ 8.6 MB ceiling, and the measured end state sits well
-    // under it (live 4.7 MB, disk 7.2 MB at seed 43).
+    // volume is 4096 pages at ≤ ~700 compressed-framed bytes each. The
+    // absolute ceilings below are deliberately conservative; the tighter
+    // live-relative bound above is the regression guard.
     assert!(
-        report.seg_live_bytes_end < 5_500_000 * page_size() as u64 / 4096,
+        report.blx_live_bytes_end < 5_500_000 * page_size() as u64 / 4096,
         "{} live bytes — accounting inflated past the working set",
-        report.seg_live_bytes_end
+        report.blx_live_bytes_end
     );
     assert!(
-        report.seg_bytes_end < 9_000_000 * page_size() as u64 / 4096,
-        "{} segment bytes on disk at end",
-        report.seg_bytes_end
+        report.blx_bytes_end < 9_000_000 * page_size() as u64 / 4096,
+        "{} blx bytes on disk at end",
+        report.blx_bytes_end
     );
     // Compaction did the reclaiming, not luck.
     assert!(
-        report.counters.segs_compacted > 0,
-        "no segment was ever compacted"
+        report.counters.blx_files_compacted > 0,
+        "no blx was ever compacted"
     );
 }

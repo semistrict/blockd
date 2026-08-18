@@ -9,24 +9,26 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::layout;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig};
-use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};
+use blockd_workload::{
+    Backend, Capability, LogicalPage, Operation, VerifyScope, VolumeShape, WorkloadModel,
+};
+use futures_util::future::join_all;
 
 mod support;
 
-const VSET: VsetId = VsetId(1);
+fn volume_id(index: u8) -> VolumeId {
+    VolumeId(u64::from(index))
+}
 
-fn pid(idx: u8, page: u32) -> PageId {
+fn pid(index: u8, page: u32) -> PageId {
     PageId {
-        volume: VolumeId {
-            vset: VSET,
-            idx: VolumeIdx(idx),
-        },
+        volume: volume_id(index),
         page: PageNo(page),
     }
 }
@@ -77,18 +79,18 @@ fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
 struct MigrationBackend<'a> {
     hosts: [&'a Runtime; 2],
     current: usize,
-    config: VsetConfig,
+    shape: VolumeShape,
     pause: Duration,
     migrations: u64,
     verified_model: Option<WorkloadModel>,
 }
 
 impl<'a> MigrationBackend<'a> {
-    fn new(a: &'a Runtime, b: &'a Runtime, config: VsetConfig) -> Self {
+    fn new(a: &'a Runtime, b: &'a Runtime, shape: VolumeShape) -> Self {
         Self {
             hosts: [a, b],
             current: 0,
-            config,
+            shape,
             pause: Duration::ZERO,
             migrations: 0,
             verified_model: None,
@@ -104,7 +106,8 @@ impl<'a> MigrationBackend<'a> {
     }
 
     async fn verify_page(&self, page: LogicalPage, expected: u64) -> Result<(), String> {
-        let bytes = self.runtime().guest_read(VSET, Self::page_id(page)).await;
+        let volume = volume_id(page.volume);
+        let bytes = self.runtime().guest_read(volume, Self::page_id(page)).await;
         let actual = u64::from_le_bytes(bytes[0..8].try_into().expect("sized"));
         if actual != expected {
             return Err(format!(
@@ -145,15 +148,22 @@ impl Backend for MigrationBackend<'_> {
         model: &WorkloadModel,
     ) -> Result<(), Self::Error> {
         match operation {
-            Operation::Create => self.hosts[0].create_vset(VSET, self.config).await,
+            Operation::Create => {
+                for index in 1..=self.shape.disk_volumes {
+                    self.hosts[0]
+                        .create_volume(volume_id(index), VolumeConfig::data(self.shape.pages))
+                        .await;
+                }
+            }
             Operation::Read { page } => self.verify_page(page, model.expected(page)).await?,
             Operation::Write { page, value } => {
+                let volume = volume_id(page.volume);
                 self.runtime()
-                    .guest_write(VSET, Self::page_id(page), value)
+                    .guest_write(volume, Self::page_id(page), value)
                     .await;
             }
             Operation::Sync { volume } => {
-                if !self.runtime().guest_sync(VSET, VolumeIdx(volume)).await {
+                if !self.runtime().guest_sync(volume_id(volume)).await {
                     return Err(format!("sync rejected for volume {volume}"));
                 }
             }
@@ -165,15 +175,26 @@ impl Backend for MigrationBackend<'_> {
                         self.current
                     ));
                 }
-                self.hosts[destination].expect_migration(VSET, self.config);
                 let started = Instant::now();
-                self.hosts[self.current]
-                    .migrate_out(VSET, HostId(to_host))
-                    .await;
-                let verdict = self.hosts[destination].wait_migrated_in(VSET).await;
+                for index in 1..=self.shape.disk_volumes {
+                    self.hosts[destination]
+                        .expect_migration(volume_id(index), VolumeConfig::data(self.shape.pages));
+                }
+                join_all((1..=self.shape.disk_volumes).map(|index| {
+                    self.hosts[self.current].migrate_out(volume_id(index), HostId(to_host))
+                }))
+                .await;
+                let verdicts = join_all(
+                    (1..=self.shape.disk_volumes)
+                        .map(|index| self.hosts[destination].wait_migrated_in(volume_id(index))),
+                )
+                .await;
                 self.pause = started.elapsed();
-                if !matches!(verdict, Verdict::Resume { .. }) {
-                    return Err(format!("migration verdict was {verdict:?}"));
+                if verdicts
+                    .iter()
+                    .any(|verdict| !matches!(verdict, Verdict::ColdBoot))
+                {
+                    return Err(format!("migration verdicts were {verdicts:?}"));
                 }
                 self.current = destination;
                 self.migrations += 1;
@@ -212,13 +233,13 @@ fn primary_files_under(base: &std::path::Path, dir: &std::path::Path) -> usize {
         .sum()
 }
 
-/// A worked vset moves from host A to host B over TCP: verdict
+/// A worked volume moves from host A to host B over TCP: verdict
 /// resumes on B, the same workload continues there, EVERY disk byte
 /// verifies on B (demand fetches over the wire), hydration drains the
 /// tail, and the source releases and reclaims all primary-local blobs. The
 /// former source may immediately hold a passive spool for the new primary.
 #[tokio::test(flavor = "current_thread")]
-async fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
+async fn migration_moves_a_worked_volume_between_real_runtimes_over_tcp() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let addr_a = free_addr();
@@ -231,8 +252,7 @@ async fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
             let b = Runtime::new(&runtime_config("host-b", 1, peer_b), store.clone()).await;
 
             let spec = blockd_workload::load("migration").expect("migration workload");
-            let vc = VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
-            let mut backend = MigrationBackend::new(&a, &b, vc);
+            let mut backend = MigrationBackend::new(&a, &b, spec.shape);
             let outcome = blockd_workload::run(&spec, &mut backend)
                 .await
                 .expect("migration workload");
@@ -282,7 +302,12 @@ async fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
                 let peer_faults = b
                     .fault_latency()
                     .into_iter()
-                    .filter(|series| series.vset == VSET && series.source == "peer")
+                    .filter(|series| {
+                        (1..=backend.shape.disk_volumes)
+                            .map(volume_id)
+                            .any(|volume| series.volume == volume)
+                            && series.source == "peer"
+                    })
                     .map(|series| series.histogram.count)
                     .sum::<u64>();
                 if b.counters().hydrate_fills + peer_faults > 0 {

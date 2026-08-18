@@ -1,5 +1,5 @@
 //! Replica preparation profile. It measures the expensive validation/sealing
-//! work that formerly occupied the peer I/O callback against the bounded
+//! work that formerly occupied the replication path against the bounded
 //! queue submission now performed there.
 
 #![allow(
@@ -12,20 +12,18 @@ use std::sync::mpsc::{channel, sync_channel};
 use std::time::Instant;
 
 use blockd_core::format::crc32c;
+use blockd_core::page_file::PageBatchBuilder;
 use blockd_core::protocol::ReplicaArtifact;
 use blockd_core::replica_spool::seal_verified_replica_artifact;
-use blockd_core::segment::SegmentBatchBuilder;
-use blockd_core::types::{
-    Gen, HostId, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,
-};
+use blockd_core::types::{Gen, HostId, ObjectId, PageId, PageNo, VolumeId, page_size};
 
-fn artifact_bytes() -> (VsetId, ReplicaArtifact, Vec<u8>) {
+fn artifact_bytes() -> (VolumeId, ReplicaArtifact, Vec<u8>) {
     const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    let vset = VsetId(7);
+    let volume = VolumeId(7);
     let fence = 11;
-    let seg = SegId(13);
-    let artifact = ReplicaArtifact::Segment { fence, seg };
-    let mut builder = SegmentBatchBuilder::new(vset, fence, seg);
+    let object = ObjectId(13);
+    let artifact = ReplicaArtifact::Blx { fence, object };
+    let mut builder = PageBatchBuilder::new(volume, fence, object);
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut raw = vec![0u8; page_size()];
     let pages = TARGET_BYTES.div_ceil(page_size());
@@ -38,10 +36,7 @@ fn artifact_bytes() -> (VsetId, ReplicaArtifact, Vec<u8>) {
         }
         builder.add(
             PageId {
-                volume: VolumeId {
-                    vset,
-                    idx: VolumeIdx(1),
-                },
+                volume,
                 page: PageNo(u32::try_from(page_no).expect("profile page count fits")),
             },
             Gen(u64::try_from(page_no).expect("fits") + 1),
@@ -49,12 +44,12 @@ fn artifact_bytes() -> (VsetId, ReplicaArtifact, Vec<u8>) {
         );
     }
     let (_, bytes, _) = builder.finish().pop().expect("profile object");
-    (vset, artifact, bytes)
+    (volume, artifact, bytes)
 }
 
-fn prepare(vset: VsetId, artifact: ReplicaArtifact, checksum: u32, bytes: &[u8]) -> Vec<u8> {
+fn prepare(volume: VolumeId, artifact: ReplicaArtifact, checksum: u32, bytes: &[u8]) -> Vec<u8> {
     assert_eq!(crc32c(bytes), checksum);
-    seal_verified_replica_artifact(HostId(3), vset, 5, artifact, checksum, bytes)
+    seal_verified_replica_artifact(HostId(3), volume, 5, artifact, checksum, bytes)
         .expect("valid benchmark artifact")
 }
 
@@ -62,13 +57,13 @@ fn prepare(vset: VsetId, artifact: ReplicaArtifact, checksum: u32, bytes: &[u8])
 #[ignore = "performance profile; run explicitly in release mode"]
 fn profile_replica_preparation_queue() {
     const SAMPLES: usize = 5;
-    let (vset, artifact, bytes) = artifact_bytes();
+    let (volume, artifact, bytes) = artifact_bytes();
     let checksum = crc32c(&bytes);
 
     let mut inline_samples = Vec::new();
     for _ in 0..SAMPLES {
         let started = Instant::now();
-        let frame = prepare(vset, artifact, checksum, &bytes);
+        let frame = prepare(volume, artifact, checksum, &bytes);
         inline_samples.push(started.elapsed());
         assert!(frame.len() > bytes.len());
     }
@@ -78,7 +73,7 @@ fn profile_replica_preparation_queue() {
     let worker = std::thread::spawn(move || {
         for _ in 0..SAMPLES {
             let bytes = rx.recv().expect("profile job");
-            done.send(prepare(vset, artifact, checksum, &bytes))
+            done.send(prepare(volume, artifact, checksum, &bytes))
                 .expect("profile receiver");
         }
     });

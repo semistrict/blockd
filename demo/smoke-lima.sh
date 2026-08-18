@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The whole demo story on one machine (Lima/aarch64): a fake GCS store,
-# two demod hosts, real Firecracker microVMs, live vset migration over
-# TCP, forks sharing one memory copy, and a backed vset surviving host
+# two demod hosts, real Firecracker microVMs, live volume migration over
+# TCP, forks sharing one memory copy, and a backed volume surviving host
 # death via the store alone. GCP runs the same script shape against the
 # real bucket (demo/run.sh).
 set -euo pipefail
@@ -65,11 +65,11 @@ R=$(post "$API0/vm")
 VM=$(field "$R" id)
 show "vm $VM running"
 
-say "guest work, mirrored into its blockd vset (3 bursts, each synced)"
+say "guest work, mirrored into its blockd volume (3 bursts, each synced)"
 R=$(post "$API0/vm/$VM/work?bursts=3")
 show "burst $(field "$R" burst), guest sum $(field "$R" guest_sum)"
 R=$(post "$API0/vm/$VM/verify")
-show "vset verifies: ok=$(field "$R" ok) at burst $(field "$R" burst)"
+show "volume verifies: ok=$(field "$R" ok) at burst $(field "$R" burst)"
 
 say "fork: snapshot the live VM, start 3 forks sharing ONE memory copy"
 R=$(post "$API0/vm/$VM/fork?n=3")
@@ -78,10 +78,10 @@ show "forks: $R"
 show "kernel accounting: sum(Pss) $PSS < sum(Rss) $RSS -> pages are shared"
 [ "$PSS" -lt "$RSS" ] || { echo "FORKS NOT SHARING"; exit 1; }
 
-say "live-migrate VM $VM: vset over TCP, microVM via the store"
+say "live-migrate VM $VM: volume over TCP, microVM via the store"
 post "$API1/vm/$VM/expect" >/dev/null
 R=$(post "$API0/vm/$VM/migrate?to=1")
-show "source: snapshot+publish $(field "$R" snapshot_ms)ms, vset handoff $(field "$R" handoff_ms)ms"
+show "source: snapshot+publish $(field "$R" snapshot_ms)ms, volume handoff $(field "$R" handoff_ms)ms"
 for _ in $(seq 1 100); do
   S=$(get "$API1/status")
   grep -q "\"id\":$VM,\"state\":\"running\"" <<<"$S" && break
@@ -89,7 +89,7 @@ for _ in $(seq 1 100); do
 done
 grep -q "\"id\":$VM,\"state\":\"running\"" <<<"$S" || { echo "MIGRATION NEVER LANDED"; exit 1; }
 R=$(post "$API1/vm/$VM/verify")
-show "vset verifies ON HOST 1: ok=$(field "$R" ok) at burst $(field "$R" burst)"
+show "volume verifies ON HOST 1: ok=$(field "$R" ok) at burst $(field "$R" burst)"
 R=$(post "$API1/vm/$VM/work?bursts=1")
 show "and keeps working there: burst $(field "$R" burst)"
 
@@ -105,7 +105,7 @@ pkill -9 -f "$WORK/h0/scratch" 2>/dev/null || true
 R=$(post "$API1/vm/$BVM/restore")
 show "host 1 restored vm $BVM from the bucket: verdict $(field "$R" verdict)"
 R=$(post "$API1/vm/$BVM/verify")
-show "vset verifies after restore: ok=$(field "$R" ok) at burst $(field "$R" burst)"
+show "volume verifies after restore: ok=$(field "$R" ok) at burst $(field "$R" burst)"
 [ "$(field "$R" ok)" = "true" ] || { echo "RESTORE VERIFY FAILED"; exit 1; }
 
 say "final status (host 1)"

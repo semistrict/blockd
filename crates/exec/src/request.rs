@@ -75,6 +75,13 @@ impl<T, R> Request<T, R> {
 }
 
 impl<R> Reply<R> {
+    /// Wait until the caller drops its response.
+    pub async fn closed(&mut self) {
+        if let Some(sender) = self.sender.as_mut() {
+            sender.closed().await;
+        }
+    }
+
     /// Resolve the request once. A returned value means the caller cancelled.
     pub fn send(&mut self, value: R) -> Result<(), R> {
         let Some(sender) = self.sender.take() else {

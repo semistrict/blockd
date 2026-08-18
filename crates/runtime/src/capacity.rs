@@ -45,7 +45,7 @@ pub enum CapacityReason {
     BackupLag,
     PeerSpoolCapacity,
     StashReplacement,
-    EventLoopOccupancy,
+    ActorExecutorOccupancy,
 }
 
 impl CapacityReason {
@@ -58,7 +58,7 @@ impl CapacityReason {
             Self::BackupLag => "backup_lag",
             Self::PeerSpoolCapacity => "peer_spool_capacity",
             Self::StashReplacement => "stash_replacement",
-            Self::EventLoopOccupancy => "event_loop_occupancy",
+            Self::ActorExecutorOccupancy => "actor_executor_occupancy",
         }
     }
 }
@@ -71,7 +71,6 @@ pub struct CapacitySignal {
     pub admission_percent: u8,
     /// Optional work which should not compete with recovery or foreground I/O.
     pub allow_migrations: bool,
-    pub allow_prefetch: bool,
 }
 
 impl Default for CapacitySignal {
@@ -88,21 +87,18 @@ impl CapacitySignal {
                 limiting_reason: None,
                 admission_percent: 100,
                 allow_migrations: true,
-                allow_prefetch: true,
             },
             CapacityState::Constrained => Self {
                 state,
                 limiting_reason,
                 admission_percent: CONSTRAINED_ADMISSION_PERCENT,
                 allow_migrations: false,
-                allow_prefetch: false,
             },
             CapacityState::Critical => Self {
                 state,
                 limiting_reason,
                 admission_percent: 0,
                 allow_migrations: false,
-                allow_prefetch: false,
             },
         }
     }
@@ -120,8 +116,8 @@ pub struct CapacityInputs {
     pub disk_capacity_bytes: Option<u64>,
     pub disk_headroom_bytes: u64,
     pub local_io_in_flight: u64,
-    pub loop_busy_ns: u64,
-    pub loop_idle_ns: u64,
+    pub actor_busy_ns: u64,
+    pub actor_idle_ns: u64,
     pub critical_queue_depth: usize,
     pub background_queue_depth: usize,
     pub oldest_backup_lag: Duration,
@@ -135,8 +131,8 @@ pub struct CapacityInputs {
 pub struct CapacityController {
     signal: CapacitySignal,
     recovery_streak: u8,
-    previous_loop_busy_ns: u64,
-    previous_loop_idle_ns: u64,
+    previous_actor_busy_ns: u64,
+    previous_actor_idle_ns: u64,
 }
 
 impl CapacityController {
@@ -147,16 +143,16 @@ impl CapacityController {
     /// Incorporate one periodic sample. Higher pressure takes effect at once;
     /// lower pressure must persist and then recovers by one state at a time.
     pub fn observe(&mut self, inputs: CapacityInputs) -> CapacitySignal {
-        let loop_busy_ns = inputs
-            .loop_busy_ns
-            .saturating_sub(self.previous_loop_busy_ns);
-        let loop_idle_ns = inputs
-            .loop_idle_ns
-            .saturating_sub(self.previous_loop_idle_ns);
-        self.previous_loop_busy_ns = inputs.loop_busy_ns;
-        self.previous_loop_idle_ns = inputs.loop_idle_ns;
+        let actor_busy_ns = inputs
+            .actor_busy_ns
+            .saturating_sub(self.previous_actor_busy_ns);
+        let actor_idle_ns = inputs
+            .actor_idle_ns
+            .saturating_sub(self.previous_actor_idle_ns);
+        self.previous_actor_busy_ns = inputs.actor_busy_ns;
+        self.previous_actor_idle_ns = inputs.actor_idle_ns;
 
-        let observed = classify(inputs, loop_busy_ns, loop_idle_ns);
+        let observed = classify(inputs, actor_busy_ns, actor_idle_ns);
         match observed.state.cmp(&self.signal.state) {
             std::cmp::Ordering::Greater => {
                 self.signal = CapacitySignal::for_state(observed.state, observed.reason);
@@ -199,7 +195,7 @@ impl Observation {
     }
 }
 
-fn classify(inputs: CapacityInputs, loop_busy_ns: u64, loop_idle_ns: u64) -> Observation {
+fn classify(inputs: CapacityInputs, actor_busy_ns: u64, actor_idle_ns: u64) -> Observation {
     let mut observed = Observation::default();
 
     let cache = ratio_level(
@@ -265,8 +261,8 @@ fn classify(inputs: CapacityInputs, loop_busy_ns: u64, loop_idle_ns: u64) -> Obs
         observed.consider(CapacityState::Constrained, CapacityReason::StashReplacement);
     }
 
-    let loop_total_ns = loop_busy_ns.saturating_add(loop_idle_ns);
-    let loop_level = ratio_level(loop_busy_ns.into(), loop_total_ns.into(), 80, 95);
+    let actor_total_ns = actor_busy_ns.saturating_add(actor_idle_ns);
+    let actor_level = ratio_level(actor_busy_ns.into(), actor_total_ns.into(), 80, 95);
     let queue_level = if inputs.critical_queue_depth >= 64 || inputs.background_queue_depth >= 256 {
         CapacityState::Critical
     } else if inputs.critical_queue_depth >= 16 || inputs.background_queue_depth >= 64 {
@@ -275,8 +271,8 @@ fn classify(inputs: CapacityInputs, loop_busy_ns: u64, loop_idle_ns: u64) -> Obs
         CapacityState::Normal
     };
     observed.consider(
-        loop_level.max(queue_level),
-        CapacityReason::EventLoopOccupancy,
+        actor_level.max(queue_level),
+        CapacityReason::ActorExecutorOccupancy,
     );
 
     observed
@@ -365,7 +361,6 @@ mod tests {
         assert_eq!(signal.limiting_reason, Some(CapacityReason::DirtyBacklog));
         assert_eq!(signal.admission_percent, 0);
         assert!(!signal.allow_migrations);
-        assert!(!signal.allow_prefetch);
     }
 
     #[test]
@@ -402,11 +397,11 @@ mod tests {
             ),
             (
                 CapacityInputs {
-                    loop_busy_ns: 80,
-                    loop_idle_ns: 20,
+                    actor_busy_ns: 80,
+                    actor_idle_ns: 20,
                     ..CapacityInputs::default()
                 },
-                CapacityReason::EventLoopOccupancy,
+                CapacityReason::ActorExecutorOccupancy,
             ),
         ];
         for (input, reason) in cases {

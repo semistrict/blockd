@@ -4,7 +4,7 @@
   "name": "peer-attrition",
   "description": "Lose the active stash peer long enough to force fenced replacement and residue recovery.",
   "kind": "cluster",
-  "topology": { "vset_count": 1 },
+  "topology": { "volume_count": 1 },
   "workload": { "horizon": "2s" },
   "nemeses": {
     "restart_delay": { "min": "700ms", "max": "800ms" },

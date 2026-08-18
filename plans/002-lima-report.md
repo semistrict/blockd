@@ -7,10 +7,10 @@ fault-worker parallelism the first optimization.** The retained Lima baseline
 does show useful overlap between the actor, fault worker, and guest/runtime
 threads, but the curve stops improving after four cores while the primary actor
 remains about 88% occupied. The largest growing user-space hotspot is a 1 kHz
-observability publication that scans per-vset segment state twice.
+observability publication that scans per-volume BLX state twice.
 
 The next focused implementation/evaluation should make observability snapshots
-incremental or substantially less frequent, and remove the duplicate segment
+incremental or substantially less frequent, and remove the duplicate BLX
 scan. It should then rerun this exact baseline before considering more fault
 workers. Scheduler wakeups and the serial fault queue remain secondary
 candidates: at eight cores, mean fill queue wait is still about 94 us versus
@@ -34,7 +34,7 @@ work on a suitable host.
 - Hardware cycles, instructions, branch, cache, LLC, memory-controller, and
   NUMA PMU events were not exposed by Lima. Software task-clock, scheduler,
   fault, pressure, block, and stack sampling were available.
-- 64 total star-lineage vsets: one idle seed root and 63 active descendants.
+- 64 total star-lineage volumes: one idle seed root and 63 active descendants.
 - The root owns a deterministic 16,384-page (64 MiB) hot set that is
   checkpointed and retained before forking. Descendants first-touch the same
   retained pages and diverge on writes. The measured root is disabled so its
@@ -43,7 +43,7 @@ work on a suitable host.
   80% reads / 20% writes, no pacing, fixed seed, cache headroom large enough to
   avoid intentional eviction.
 - Three counter-only 30-second repetitions at 1, 2, 4, and 8 allowed cores.
-  Matching stack samples used 20-second phases. A separate 256-vset control used
+  Matching stack samples used 20-second phases. A separate 256-volume control used
   one idle root plus 255 active descendants on all eight cores.
 
 The shared-base smoke gate produced 1,272 shared fills and about 21,600
@@ -122,11 +122,11 @@ expose hardware counters, and `arch_counter_get_cntpct` is partly a
 virtualization/sampling clock cost, so runtime counters and scaling results are
 authoritative.
 
-| Symbol | 1 core / 64 vsets | 8 cores / 64 vsets | 8 cores / 256 vsets |
+| Symbol | 1 core / 64 volumes | 8 cores / 64 volumes | 8 cores / 256 volumes |
 |---|---:|---:|---:|
 | `try_to_wake_up` | 9.53% | 18.46% | 15.65% |
 | `finish_task_switch` | 17.22% | 15.29% | 8.96% |
-| `VsetState::live_segment_bytes` | 6.99% | 7.66% | 11.54% |
+| `VolumeState::live_segment_bytes` | 6.99% | 7.66% | 11.54% |
 | `HostState::seg_space` | 4.60% | 5.00% | 10.80% |
 | `HostState::stats` | 0.94% | 1.68% | 2.69% |
 | `eventfd_write` | 4.79% | 2.52% | 2.05% |
@@ -136,13 +136,13 @@ authoritative.
 The runtime publishes observability at
 `writeback_interval.clamp(1, 1_000_000)` nanoseconds, at most a 1 ms period.
 Every publication calls `HostState::stats`; that calls
-`VsetState::live_segment_bytes` once per vset and then calls `seg_space`, which
-scans the same per-vset segment locations again. At 256 vsets, those three
+`VolumeState::live_segment_bytes` once per volume and then calls `seg_space`, which
+scans the same per-volume BLX locations again. At 256 volumes, those three
 symbols rise from 14.34% to 25.03% of sampled CPU. That fleet-size response is
 much stronger evidence than the flat eight-core curve alone.
 
-The 256-vset retained control reached a median 3,712 ops/s, only 1.69x the
-64-vset eight-core result for 4x as many active descendants. Median p50 worsened
+The 256-volume retained control reached a median 3,712 ops/s, only 1.69x the
+64-volume eight-core result for 4x as many active descendants. Median p50 worsened
 from 25 ms to 100 ms and p99 from 100 ms to 250 ms; mean fill queue wait roughly
 doubled from 94 us to 187 us, while the actor remained about 88% occupied and
 the process used only about 2.0 CPU cores.
@@ -181,14 +181,14 @@ Other limits:
 - The runtime/UFFD tier is not a real-VM capacity claim.
 - No hardware cache, bandwidth, cycles, instructions, or NUMA counter claims
   can be made from this VM.
-- The 64-vset independent-root control was noisy and ordered; it is retained as
+- The 64-volume independent-root control was noisy and ordered; it is retained as
   exploratory evidence only, not a controlled provenance conclusion.
 
 ## Reproduction and artifacts
 
 The authoritative ignored artifact package is
 `artifacts/lima-shared-base-baseline-2026-08-17-structured/`. It contains the
-three-repetition core matrix, measured-phase CPU confirmation, 64- and 256-vset
+three-repetition core matrix, measured-phase CPU confirmation, 64- and 256-volume
 hotspot profiles, both instrumentation orderings, the shared-base smoke gate,
 machine metadata, raw runtime snapshots, `perf stat`, stack samples, pressure,
 disk, NUMA, and memory observations.
@@ -201,7 +201,7 @@ BLOCKD_PROFILE_SEED_SHARED_HOTSET=1 \
 BLOCKD_PROFILE_MEASURE_ROOTS=0 \
 BLOCKD_PROFILE_PAGES_PER_VOLUME=16384 \
 BLOCKD_PROFILE_HOT_PAGES=16384 \
-BLOCKD_PROFILE_CACHE_PAGES_PER_VSET=16384 \
+BLOCKD_PROFILE_CACHE_PAGES_PER_VOLUME=16384 \
 BLOCKD_PROFILE_COUNTS=64 \
 BLOCKD_PROFILE_PROVENANCES=star \
 BLOCKD_PROFILE_REPETITIONS=3 \
@@ -211,6 +211,6 @@ BLOCKD_PROFILE_STACKS_FIRST=0 \
 scripts/run-large-host-matrix.sh ARTIFACT_ROOT runtime
 ```
 
-The 256-vset control changes `BLOCKD_PROFILE_COUNTS=256` and
+The 256-volume control changes `BLOCKD_PROFILE_COUNTS=256` and
 `BLOCKD_PROFILE_CPU_LISTS=0-7`. Endpoint stack profiles use
 `BLOCKD_PROFILE_STACKS=1` with `scripts/run-large-host-profile.sh`.

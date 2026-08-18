@@ -11,9 +11,9 @@
 use std::fmt;
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
-use blockd_core::types::{HostId, VsetId};
+use blockd_core::types::{HostId, VolumeId};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -38,10 +38,6 @@ const DOCUMENTS: &[(&str, &str)] = &[
     ),
     ("peer-links", include_str!("../scenarios/peer-links.json")),
     ("peer-rare", include_str!("../scenarios/peer-rare.json")),
-    (
-        "placement-fear",
-        include_str!("../scenarios/placement-fear.json"),
-    ),
     ("explore", include_str!("../scenarios/explore.json")),
     (
         "cold-restore-outage",
@@ -58,10 +54,6 @@ const DOCUMENTS: &[(&str, &str)] = &[
     (
         "hot-compaction",
         include_str!("../scenarios/hot-compaction.json"),
-    ),
-    (
-        "resume-set-rot",
-        include_str!("../scenarios/resume-set-rot.json"),
     ),
     (
         "peer-commit-crashes",
@@ -97,7 +89,6 @@ pub const SWEEP_SCENARIOS: &[&str] = &[
     "nvme-pressure-backed",
     "migration-release-blackout",
     "hot-compaction",
-    "resume-set-rot",
     "peer-commit-crashes",
     "peer-transfer-crashes",
     "peer-transition-before-cas",
@@ -156,7 +147,6 @@ pub enum CoverageMetric {
     WedgeHydration,
     WedgeOutbound,
     Release,
-    PrefetchFill,
     ParkedEnd,
     HydratingEnd,
     SpaceAmplificationPpm,
@@ -259,17 +249,17 @@ impl Scenario {
                 "daemon.disk-headroom-bytes must be smaller than disk capacity",
             ));
         }
-        let disk_volumes = r.u8(&topology.disk_volumes, "topology.disk-volumes")?;
-        let pages_per_volume = r.u32(&topology.pages_per_volume, "topology.pages-per-volume")?;
-        if pages_per_volume == 0 {
-            return Err(ScenarioError::new(
-                "topology.pages-per-volume must be positive",
-            ));
+        let volume_pages = r.u32(&topology.pages, "topology.pages")?;
+        if volume_pages == 0 {
+            return Err(ScenarioError::new("topology.pages must be positive"));
         }
-        let vset_config = VsetConfig::compute(disk_volumes, pages_per_volume);
-        let vset_count = r.u16(&topology.vset_count, "topology.vset-count")?;
-        if vset_count == 0 {
-            return Err(ScenarioError::new("topology.vset-count must be positive"));
+        let volume_config = match topology.volume_kind {
+            VolumeKindSpec::Memory => VolumeConfig::memory(volume_pages),
+            VolumeKindSpec::Data => VolumeConfig::data(volume_pages),
+        };
+        let volume_count = r.u16(&topology.volume_count, "topology.volume-count")?;
+        if volume_count == 0 {
+            return Err(ScenarioError::new("topology.volume-count must be positive"));
         }
         let horizon = r.duration(&workload.horizon, "workload.horizon")?;
         let think = r.duration_range(&workload.think, "workload.think")?;
@@ -289,9 +279,9 @@ impl Scenario {
             .map(|hot| {
                 let share = r.ppm(&hot.share_ppm, "workload.hot-pages.share-ppm")?;
                 let pages = r.u32(&hot.pages, "workload.hot-pages.pages")?;
-                if pages == 0 || pages >= pages_per_volume {
+                if pages == 0 || pages >= volume_pages {
                     return Err(ScenarioError::new(
-                        "hot page count must be within 1..pages-per-volume",
+                        "hot page count must be within 1..volume pages",
                     ));
                 }
                 Ok((share, pages))
@@ -365,8 +355,8 @@ impl Scenario {
             },
             bdev,
             store,
-            vset_count,
-            vset_config,
+            volume_count,
+            volume_config,
             horizon,
             think,
             checkpoint_interval,
@@ -438,8 +428,8 @@ impl Scenario {
             passive_disk_capacity: None,
             blobs: common.bdev,
             store: common.store,
-            vset_count: common.vset_count,
-            vset: common.vset_config,
+            volume_count: common.volume_count,
+            volume: common.volume_config,
             horizon: common.horizon,
             think: common.think,
             checkpoint_interval: common.checkpoint_interval,
@@ -492,8 +482,8 @@ impl Scenario {
             daemon: common.daemon,
             bdev: common.bdev,
             store: common.store,
-            vset_count: common.vset_count,
-            vset_config: common.vset_config,
+            volume_count: common.volume_count,
+            volume_config: common.volume_config,
             horizon: common.horizon,
             think: common.think,
             checkpoint_interval: common.checkpoint_interval,
@@ -520,11 +510,6 @@ impl Scenario {
                 .store_outage
                 .as_ref()
                 .map(|window| r.window(window, "nemeses.store-outage"))
-                .transpose()?,
-            rot_resume_set_at: nemeses
-                .rot_resume_set_at
-                .as_ref()
-                .map(|v| r.duration(v, "nemeses.rot-resume-set-at"))
                 .transpose()?,
             drop_peer: nemeses
                 .drop_peer
@@ -564,15 +549,15 @@ impl Scenario {
             .migrate_at
             .as_ref()
             .map(|migrate| {
-                let vset = r.count(&migrate.vset, "nemeses.migrate-at.vset")?;
-                if vset == 0 || vset > u64::from(config.vset_count) {
+                let volume = r.count(&migrate.volume, "nemeses.migrate-at.volume")?;
+                if volume == 0 || volume > u64::from(config.volume_count) {
                     return Err(ScenarioError::new(
-                        "nemeses.migrate-at.vset is outside the configured vsets",
+                        "nemeses.migrate-at.volume is outside the configured volumes",
                     ));
                 }
                 Ok((
                     r.duration(&migrate.at, "nemeses.migrate-at.at")?,
-                    VsetId(vset),
+                    VolumeId(volume),
                     resolve_host(&config, r, &migrate.to, "nemeses.migrate-at.to")?,
                 ))
             })
@@ -812,10 +797,17 @@ struct ObjectStoreSpec {
 #[serde(deny_unknown_fields)]
 struct TopologySpec {
     hosts: Option<CountSpec>,
-    vset_count: CountSpec,
-    disk_volumes: CountSpec,
-    pages_per_volume: CountSpec,
+    volume_count: CountSpec,
+    volume_kind: VolumeKindSpec,
+    pages: CountSpec,
     replica_placement: Option<PlacementSpec>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum VolumeKindSpec {
+    Memory,
+    Data,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -892,7 +884,6 @@ struct NemesisSpec {
     fault_points: Vec<FaultPointSpec>,
     rot_records: Vec<RotRecordSpec>,
     crash_at: Vec<DurationSpec>,
-    rot_resume_set_at: Option<DurationSpec>,
     drop_peer: Option<DropPeerSpec>,
     race_restore: bool,
     migrate_at: Option<MigrateAtSpec>,
@@ -947,7 +938,6 @@ pub enum FaultPointSpec {
     CrashPeerAfterCommitBeforeAck,
     CrashPrimaryAfterAckBeforeSyncOk,
     CrashPrimaryAfterSyncOk,
-    CrashPrimaryAfterHeadBeforeRelease,
     CrashPrimaryBeforeTransitionCas,
     CrashPrimaryAfterSeedBeforeActiveCas,
     CrashPrimaryAfterActiveCasBeforeCommit,
@@ -970,9 +960,6 @@ impl FaultPointSpec {
             Self::CrashPeerAfterCommitBeforeAck => FaultPoint::CrashPeerAfterCommitBeforeAck,
             Self::CrashPrimaryAfterAckBeforeSyncOk => FaultPoint::CrashPrimaryAfterAckBeforeSyncOk,
             Self::CrashPrimaryAfterSyncOk => FaultPoint::CrashPrimaryAfterSyncOk,
-            Self::CrashPrimaryAfterHeadBeforeRelease => {
-                FaultPoint::CrashPrimaryAfterHeadBeforeRelease
-            }
             Self::CrashPrimaryBeforeTransitionCas => FaultPoint::CrashPrimaryBeforeTransitionCas,
             Self::CrashPrimaryAfterSeedBeforeActiveCas => {
                 FaultPoint::CrashPrimaryAfterSeedBeforeActiveCas
@@ -1023,6 +1010,12 @@ enum PeerKindSpec {
     ReplicaStatusReply,
     ReplicaRelease,
     ReplicaReleaseAck,
+    VnodeAdopt,
+    VnodeAdoptAck,
+    VnodeFetchClosure,
+    VnodeClosure,
+    VnodeCommit,
+    VnodeCommitAck,
 }
 
 impl From<PeerKindSpec> for PeerKind {
@@ -1042,6 +1035,12 @@ impl From<PeerKindSpec> for PeerKind {
             PeerKindSpec::ReplicaStatusReply => Self::ReplicaStatusReply,
             PeerKindSpec::ReplicaRelease => Self::ReplicaRelease,
             PeerKindSpec::ReplicaReleaseAck => Self::ReplicaReleaseAck,
+            PeerKindSpec::VnodeAdopt => Self::VnodeAdopt,
+            PeerKindSpec::VnodeAdoptAck => Self::VnodeAdoptAck,
+            PeerKindSpec::VnodeFetchClosure => Self::VnodeFetchClosure,
+            PeerKindSpec::VnodeClosure => Self::VnodeClosure,
+            PeerKindSpec::VnodeCommit => Self::VnodeCommit,
+            PeerKindSpec::VnodeCommitAck => Self::VnodeCommitAck,
         }
     }
 }
@@ -1050,7 +1049,7 @@ impl From<PeerKindSpec> for PeerKind {
 #[serde(deny_unknown_fields)]
 struct MigrateAtSpec {
     at: DurationSpec,
-    vset: CountSpec,
+    volume: CountSpec,
     to: HostSelector,
 }
 
@@ -1193,11 +1192,6 @@ impl Realizer {
         Ok(Ppm(value))
     }
 
-    fn u8(&self, value: &CountSpec, path: &str) -> Result<u8, ScenarioError> {
-        u8::try_from(self.count(value, path)?)
-            .map_err(|_| ScenarioError::new(format!("{path}: value does not fit u8")))
-    }
-
     fn u16(&self, value: &CountSpec, path: &str) -> Result<u16, ScenarioError> {
         u16::try_from(self.count(value, path)?)
             .map_err(|_| ScenarioError::new(format!("{path}: value does not fit u16")))
@@ -1253,7 +1247,7 @@ fn resolve_host(
                 placement.membership_epoch,
                 config.daemon.host,
                 placement.local_failure_domain,
-                VsetId(1),
+                VolumeId(1),
                 &placement.roster,
             )
             .get(rank)
@@ -1274,8 +1268,8 @@ struct Common {
     daemon: HostConfig,
     bdev: BlobDevConfig,
     store: StoreConfig,
-    vset_count: u16,
-    vset_config: VsetConfig,
+    volume_count: u16,
+    volume_config: VolumeConfig,
     horizon: u64,
     think: (u64, u64),
     checkpoint_interval: Option<u64>,
@@ -1328,9 +1322,9 @@ mod tests {
         };
         assert_eq!(format!("{first:#?}"), format!("{replay:#?}"));
         assert!((3..=5).contains(&first.hosts));
-        assert!((3..=6).contains(&first.vset_count));
+        assert!((3..=6).contains(&first.volume_count));
         assert!((64..=512).contains(&first.daemon.cache_pages));
-        assert!((8..=24).contains(&first.vset_config.pages_per_volume));
+        assert!((8..=24).contains(&first.volume_config.pages));
         let RealizedScenario::Cluster(other) = scenario.realize(92).expect("other realization")
         else {
             panic!("cluster scenario expected");
@@ -1383,7 +1377,6 @@ mod tests {
             ("peer-attrition", 117),
             ("peer-links", 119),
             ("peer-rare", 127),
-            ("placement-fear", 149),
         ];
         for (name, seed) in cluster {
             let RealizedScenario::Cluster(config) = load(name)

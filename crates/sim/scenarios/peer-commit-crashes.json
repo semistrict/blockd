@@ -4,7 +4,7 @@
   "name": "peer-commit-crashes",
   "description": "Crash peer-stash commit, acknowledgement, primary publication, and release boundaries.",
   "kind": "cluster",
-  "topology": { "vset_count": 1 },
+  "topology": { "volume_count": 1 },
   "workload": { "horizon": "6s" },
   "nemeses": {
     "restart_delay": { "min": "10ms", "max": "20ms" },
@@ -12,15 +12,13 @@
     "fault_points": [
       "crash-peer-after-commit-before-ack",
       "crash-primary-after-ack-before-sync-ok",
-      "crash-primary-after-sync-ok",
-      "crash-primary-after-head-before-release"
+      "crash-primary-after-sync-ok"
     ]
   },
   "coverage": [
     { "metric": "peer-fault", "fault_point": "crash-peer-after-commit-before-ack", "label": "peer crash after commit" },
     { "metric": "peer-fault", "fault_point": "crash-primary-after-ack-before-sync-ok", "label": "primary crash after ack" },
-    { "metric": "peer-fault", "fault_point": "crash-primary-after-sync-ok", "label": "primary crash after sync reply" },
-    { "metric": "peer-fault", "fault_point": "crash-primary-after-head-before-release", "label": "primary crash before release" }
+    { "metric": "peer-fault", "fault_point": "crash-primary-after-sync-ok", "label": "primary crash after sync reply" }
   ],
   "outcomes": [
     { "metric": "guest-death", "label": "guest deaths", "max": 0 }

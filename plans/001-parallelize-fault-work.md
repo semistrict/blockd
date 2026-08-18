@@ -31,18 +31,18 @@
 
 ## Why this matters
 
-The protocol core intentionally owns host-wide cache, fork-lineage, and vset
+The protocol core intentionally owns host-wide cache, fork-lineage, and volume
 state on one current-thread actor tree. That decision should remain unchanged:
 forks share base residency and physical memory mappings, and pressure policy
 needs one authoritative cache view. However, production currently sends as many
 as 64 concurrent core fault actors into a world-side worker that executes only
 one blocking mapping or userfaultfd operation at a time. The Linux interference
-profile records severe noisy-neighbor collapse at 48 busy vsets.
+profile records severe noisy-neighbor collapse at 48 busy volumes.
 
 This plan removes that narrower serialization point. It keeps `HostState`,
 `Cache`, `ProductionWorld`, and the actor tree local and non-`Send`; only
-thread-safe `Arc<VsetHost>` mapping/kernel operations execute concurrently.
-Ordering remains FIFO for each vset, write-protect calls spanning several vsets
+thread-safe `Arc<VolumeHost>` mapping/kernel operations execute concurrently.
+Ordering remains FIFO for each volume, write-protect calls spanning several volumes
 complete only after every subgroup completes, and graceful shutdown retains a
 prefix-draining barrier.
 
@@ -55,7 +55,7 @@ prefix-draining barrier.
   `LocalSet` and sends network, blocking, and timer work through Tokio services.
 - `crates/core/src/world.rs:9-12` requires guest-memory operations to be applied
   in call order per page. This is the minimum ordering contract. The new worker
-  may provide the stronger and simpler guarantee of FIFO ordering per vset.
+  may provide the stronger and simpler guarantee of FIFO ordering per volume.
 - `crates/core/src/world.rs:25-26` states that dropping a world-method future
   cancels only the wait; already-submitted I/O may still land. Do not attempt to
   make blocking syscalls cancellable in this plan.
@@ -79,7 +79,7 @@ enum FaultWork {
     Fill { /* one page */ },
     Unprotect { /* one page */ },
     Evict { /* one page */ },
-    WriteProtect { /* groups from several vsets */ },
+    WriteProtect { /* groups from several volumes */ },
     Barrier { /* graceful shutdown */ },
 }
 
@@ -103,11 +103,11 @@ write-protect syscall funnels through the single loop above.
 `crates/runtime/src/actor_host.rs:624-747` establishes the top-level call
 shapes:
 
-- `arm_write_protect` groups pages by `VsetId`, submits one multi-vset
+- `arm_write_protect` groups pages by `VolumeId`, submits one multi-volume
   `WriteProtect`, and awaits one aggregate reply.
 - `fill`, `unprotect`, and `evict` each target exactly one page and therefore one
-  vset.
-- `fill_shared` clones immutable source bytes and targets one `VsetHost`; the
+  volume.
+- `fill_shared` clones immutable source bytes and targets one `VolumeHost`; the
   actor-owned base-residency decision has already happened before this method.
 
 `crates/runtime/src/actor_host.rs:1035-1049` uses `FaultWork::Barrier` during
@@ -117,9 +117,9 @@ has completed. Work submitted after it must not delay that reply.
 ### Existing performance evidence
 
 `crates/runtime/tests/loop_interference_linux.rs:189-225` exercises real
-userfaultfd and disk I/O at 0, 4, 16, and 48 noisy vsets. Its current comment
+userfaultfd and disk I/O at 0, 4, 16, and 48 noisy volumes. Its current comment
 records about 56 probe operations in three seconds and about 50 ms per operation
-at 48 noisy vsets. The test only verifies that traffic flowed; it does not prove
+at 48 noisy volumes. The test only verifies that traffic flowed; it does not prove
 that production fault work overlapped.
 
 ### Applicable repository conventions
@@ -128,7 +128,7 @@ that production fault work overlapped.
   collections because deterministic ordering is a project convention.
 - Keep blocking syscalls behind `tokio::task::spawn_blocking`; see
   `crates/runtime/src/world.rs:34-63`.
-- Fixed per-host worker tasks are acceptable. Per-vset permanent tasks are not:
+- Fixed per-host worker tasks are acceptable. Per-volume permanent tasks are not:
   `REQUIREMENTS.md:R1.3` requires 10,000 mostly idle live guests to have small
   fixed overhead.
 - Tests must assert intended behavior. Do not add a test that passes merely
@@ -141,7 +141,7 @@ that production fault work overlapped.
 |---------|---------|---------------------|
 | Confirm Linux | `test "$(uname -s)" = Linux` | exit 0 |
 | Focused unit tests | `cargo test -p blockd-runtime --lib fault_work -- --nocapture` | all matching tests pass; at least four tests run |
-| Interference profile | `cargo test --release -p blockd-runtime --test loop_interference_linux -- --test-threads=1 --nocapture` | one profile test passes and prints rows for 0, 4, 16, and 48 noisy vsets |
+| Interference profile | `cargo test --release -p blockd-runtime --test loop_interference_linux -- --test-threads=1 --nocapture` | one profile test passes and prints rows for 0, 4, 16, and 48 noisy volumes |
 | Multicore profile | `scripts/run-fault-multicore-profile.sh artifacts/fault-multicore` | serial-control and parallel rows are recorded for each usable core count |
 | Runtime tests | `cargo test -p blockd-runtime` | all tests pass |
 | Portable workspace | `cargo test --workspace` | all tests pass on the current platform |
@@ -172,7 +172,7 @@ claim this plan is complete; use the STOP condition below.
   and unsafe `Send`/`Sync` implementations are not part of this change.
 - `crates/sim/**` — simulation has no production blocking worker and must not
   gain one.
-- Any sharding of `HostState`, `Cache`, vsets, fork lineages, or shared-memory
+- Any sharding of `HostState`, `Cache`, volumes, fork lineages, or shared-memory
   backing files.
 - Any dependency, configuration-format, wire-format, or storage-format change.
 
@@ -193,12 +193,12 @@ Implement a bounded, fair, keyed dispatcher inside
 2. A fixed `FAULT_WORK_CONCURRENCY` limits active blocking jobs. Start with 8,
    matching the existing bounded file and part-fetch worker counts. Do not make
    it configurable in this plan.
-3. At most one job for a given `VsetId` is active. Jobs for that vset execute in
-   submission order. Jobs for distinct vsets may overlap up to the global
+3. At most one job for a given `VolumeId` is active. Jobs for that volume execute in
+   submission order. Jobs for distinct volumes may overlap up to the global
    limit.
-4. No permanent per-vset worker or queue task exists. Queue state is created
+4. No permanent per-volume worker or queue task exists. Queue state is created
    only while work is pending and removed after the key becomes idle.
-5. `WriteProtect` is split into one job per vset. Its one caller reply is sent
+5. `WriteProtect` is split into one job per volume. Its one caller reply is sent
    only after every subgroup completes; any subgroup error makes the aggregate
    result an error.
 6. When the dispatcher receives `Barrier`, it temporarily stops admitting
@@ -212,7 +212,7 @@ Implement a bounded, fair, keyed dispatcher inside
 8. Dropping the runtime may still detach an already-running blocking syscall,
    matching the existing world contract. Graceful `Runtime::shutdown` must
    drain through the barrier.
-9. Queue selection is round-robin across ready vset keys. A continuously busy
+9. Queue selection is round-robin across ready volume keys. A continuously busy
    key may not keep another ready key from starting.
 
 Use a private structure equivalent to the repository's existing keyed-queue
@@ -220,14 +220,14 @@ pattern in `crates/core/src/engine/keyed_queue.rs`, but keep it local to
 `actor_host.rs` so this change does not expose or relocate core internals. It
 should maintain:
 
-- `BTreeMap<VsetId, VecDeque<QueuedFaultJob>>` for pending FIFO queues;
-- `VecDeque<VsetId>` for fair ready-key rotation;
-- `BTreeSet<VsetId>` for active keys;
+- `BTreeMap<VolumeId, VecDeque<QueuedFaultJob>>` for pending FIFO queues;
+- `VecDeque<VolumeId>` for fair ready-key rotation;
+- `BTreeSet<VolumeId>` for active keys;
 - a total active count bounded by `FAULT_WORK_CONCURRENCY`;
 - local write-protect batch state keyed by a monotonically allocated internal
   identifier.
 
-Refactor the blocking function so it accepts one per-vset job and returns
+Refactor the blocking function so it accepts one per-volume job and returns
 `Result<(), ()>`. Reply routing belongs to the dispatcher, not to the blocking
 function. This keeps aggregation, failures, and barriers on the local task.
 
@@ -243,7 +243,7 @@ comparison only; do not encode the current collapse as an accepted test result.
 
 **Verify**:
 `cargo test --release -p blockd-runtime --test loop_interference_linux -- --test-threads=1 --nocapture`
-→ exits 0 and prints one row each for 0, 4, 16, and 48 noisy vsets.
+→ exits 0 and prints one row each for 0, 4, 16, and 48 noisy volumes.
 
 ### Step 2: Add intended-behavior scheduler tests first
 
@@ -252,50 +252,50 @@ In the existing `#[cfg(test)]` module of
 when a blocking job begins and wait on a test-controlled release primitive.
 Use bounded timeouts so failures report instead of hanging CI. Add these tests:
 
-1. `fault_work_overlaps_distinct_vsets`: two jobs with different `VsetId`s both
+1. `fault_work_overlaps_distinct_volumes`: two jobs with different `VolumeId`s both
    reach their blocking section before either is released. This must fail under
    the original one-at-a-time loop and pass under the target dispatcher.
-2. `fault_work_serializes_one_vset`: the second job for one `VsetId` cannot
-   enter until the first completes, while a job for a different vset can enter.
+2. `fault_work_serializes_one_volume`: the second job for one `VolumeId` cannot
+   enter until the first completes, while a job for a different volume can enter.
 3. `fault_work_barrier_drains_only_its_prefix`: a blocked job submitted before
    the barrier delays the barrier; a blocked job submitted after the barrier
    does not delay the barrier reply and begins only after barrier admission
    resumes.
-4. `fault_work_batch_waits_for_every_vset_and_combines_errors`: a synthetic
-   multi-vset batch does not reply early and returns `Err(())` when any subgroup
+4. `fault_work_batch_waits_for_every_volume_and_combines_errors`: a synthetic
+   multi-volume batch does not reply early and returns `Err(())` when any subgroup
    fails.
 5. `fault_work_join_failure_does_not_strand_dispatch`: a deliberately panicking
    test job yields an error reply, later independent work completes, and a
    subsequent barrier completes.
 6. `fault_work_reaps_idle_keys`: after jobs finish, no pending or active
-   per-vset queue state remains.
+   per-volume queue state remains.
 
 Test-only variants must be under `#[cfg(test)]`; production callers must not be
 able to construct them. These tests encode the intended correct behavior and
 must not be weakened to observe the current bug.
 
 **Verify before implementation**:
-`cargo test -p blockd-runtime --lib fault_work_overlaps_distinct_vsets -- --nocapture`
+`cargo test -p blockd-runtime --lib fault_work_overlaps_distinct_volumes -- --nocapture`
 → fails because the second independent job cannot enter. Do not commit a green
 test that accepts serialization.
 
 ### Step 3: Make every production job explicitly keyed
 
-Refactor `FaultWork` into an ingress request and a smaller per-vset blocking
+Refactor `FaultWork` into an ingress request and a smaller per-volume blocking
 job shape.
 
 - `Fill`, `Unprotect`, and `Evict` derive their key from
-  `page.volume.vset`.
-- Change the internal `WriteProtect` groups from `(Arc<VsetHost>, Vec<usize>)`
-  to `(VsetId, Arc<VsetHost>, Vec<usize>)`; the grouping map in
-  `arm_write_protect` already has the vset ID.
+  `page.volume.volume`.
+- Change the internal `WriteProtect` groups from `(Arc<VolumeHost>, Vec<usize>)`
+  to `(VolumeId, Arc<VolumeHost>, Vec<usize>)`; the grouping map in
+  `arm_write_protect` already has the volume ID.
 - `Barrier` remains an ingress-only control request and never becomes a
   blocking job.
 - Keep the exact existing syscall bodies for fill, unprotect, evict, and
   write-protect. Only move reply handling out of `execute_fault_work` and have
   the blocking job return `Result<(), ()>`.
 
-Do not key by a hash, pointer value, or page number. FIFO by `VsetId` is a
+Do not key by a hash, pointer value, or page number. FIFO by `VolumeId` is a
 deliberately stronger guarantee than the per-page world contract and avoids
 ordering bugs among fill, write-protect, unprotect, and eviction for one guest.
 The separate `ShmemServer` sharing domain does not traverse this queue.
@@ -303,7 +303,7 @@ The separate `ShmemServer` sharing domain does not traverse this queue.
 **Verify**:
 `cargo check -p blockd-runtime --tests`
 → exits 0 on Linux; every `FaultWork` construction has an explicit derivable
-vset key, and no public API changed.
+volume key, and no public API changed.
 
 ### Step 4: Implement the bounded fair dispatcher
 
@@ -318,7 +318,7 @@ selects between new ingress and blocking-job completions.
 - Route a direct job result to its original `Injector<Result<(), ()>>`.
 - Update a write-protect batch's remaining count and accumulated failure; send
   its original reply exactly once when remaining reaches zero.
-- If a write-protect request has no compute-vset groups, reply `Ok(())`
+- If a write-protect request has no compute-volume groups, reply `Ok(())`
   immediately.
 - On a barrier, stop polling the ingress receiver until pending and active work
   are both empty, send the barrier reply, then resume ingress.
@@ -333,8 +333,8 @@ configuration field or modify `DaemonStats` wire/storage representations.
 
 **Verify**:
 `cargo test -p blockd-runtime --lib fault_work -- --nocapture`
-→ all six new tests pass, at least two different-vset jobs are observed active
-at once, same-vset FIFO holds, batch and barrier tests finish, and idle-key state
+→ all six new tests pass, at least two different-volume jobs are observed active
+at once, same-volume FIFO holds, batch and barrier tests finish, and idle-key state
 is empty.
 
 ### Step 5: Turn the interference profile into a concurrency regression gate
@@ -345,7 +345,7 @@ Update `crates/runtime/tests/loop_interference_linux.rs`:
 - Record the runtime's maximum world-side fault-work concurrency in
   `PhaseResult` and print it with each profile row.
 - Keep the existing traffic-shape assertions.
-- For every phase with at least two noisy vsets, assert that maximum
+- For every phase with at least two noisy volumes, assert that maximum
   world-side fault-work concurrency is at least 2. This is a
   machine-independent functional property and directly prevents restoration
   of the one-at-a-time worker.
@@ -355,13 +355,13 @@ Update `crates/runtime/tests/loop_interference_linux.rs`:
 
 Run the release profile on the same host and build profile used for Step 1.
 Compare the four rows. Include the before/after table in the handoff. Treat
-worse 16- or 48-vset probe throughput or tail latency as an investigation
+worse 16- or 48-volume probe throughput or tail latency as an investigation
 signal, not something to hide by weakening assertions.
 
 **Verify**:
 `cargo test --release -p blockd-runtime --test loop_interference_linux -- --test-threads=1 --nocapture`
 → exits 0, prints all four rows plus maximum fault-work concurrency, and the 4,
-16, and 48 noisy-vset phases report a maximum of at least 2.
+16, and 48 noisy-volume phases report a maximum of at least 2.
 
 ### Step 6: Verify kernel ordering and shutdown behavior
 
@@ -389,7 +389,7 @@ to make a hang pass.
 
 Confirm that only the two in-scope source files and the plan status changed.
 Confirm there are no new `Arc<Mutex<HostState>>`, `tokio::spawn` calls in core,
-per-vset permanent tasks, or configuration fields.
+per-volume permanent tasks, or configuration fields.
 
 **Verify**:
 
@@ -417,13 +417,13 @@ without widening the runtime's public API.
 
 The profile must contain two workloads:
 
-1. **Independent fill throughput**: create enough distinct compute vsets and
+1. **Independent fill throughput**: create enough distinct compute volumes and
    missing pages to keep all selected workers busy. Submit real per-page fill
-   jobs spread round-robin across vsets. Report completed fills, elapsed time,
+   jobs spread round-robin across volumes. Report completed fills, elapsed time,
    fills/second, and observed maximum in-flight jobs.
-2. **Mixed fault work**: across distinct vsets, execute a repeatable mixture of
+2. **Mixed fault work**: across distinct volumes, execute a repeatable mixture of
    fill, write-protect, unprotect, and eviction operations. Preserve valid
-   operation order within each vset. Report total operations/second and counts
+   operation order within each volume. Report total operations/second and counts
    by operation. This catches a design that scales byte copies but serializes
    the relevant ioctls.
 
@@ -467,11 +467,11 @@ baseline.
 | 8 | 1 | serial control | models the old global worker on a larger host |
 | 8 | 8 | production-width candidate | best or plateaued throughput, never required to scale linearly |
 
-The profiles are expected to improve independent-vset throughput with 2 and 4
+The profiles are expected to improve independent-volume throughput with 2 and 4
 workers. Eight workers may plateau because page copies, userfaultfd ioctls,
 memory bandwidth, or the kernel become limiting. Do not require linear scaling
 and do not encode a machine-specific throughput threshold. Correctness
-assertions must still require all submitted jobs to complete, per-vset order to
+assertions must still require all submitted jobs to complete, per-volume order to
 hold, and observed maximum in-flight jobs to reach at least 2 in every parallel
 candidate.
 
@@ -508,10 +508,10 @@ After every Step 8 verification succeeds, update Plan 001 in
 Add all six scheduler tests named in Step 2 to the existing Linux-only test
 module in `crates/runtime/src/actor_host.rs`. They must cover:
 
-- independent-vset overlap;
-- same-vset FIFO ordering;
+- independent-volume overlap;
+- same-volume FIFO ordering;
 - fair progress for a second key;
-- multi-vset write-protect aggregation and failure;
+- multi-volume write-protect aggregation and failure;
 - barrier prefix semantics;
 - blocking-task panic/join failure;
 - cleanup of idle keyed state.
@@ -552,26 +552,26 @@ All items must hold:
 
 - [ ] `HostState`, `Cache`, `ProductionWorld`, and `shared_pages` remain local
       and non-`Send`.
-- [ ] No vset, cache, fork-lineage, or memory-backing sharding was introduced.
+- [ ] No volume, cache, fork-lineage, or memory-backing sharding was introduced.
 - [ ] At most `FAULT_WORK_CONCURRENCY` blocking jobs run concurrently.
-- [ ] At most one job per `VsetId` is active, with FIFO order.
-- [ ] Distinct vsets demonstrably overlap in the focused test.
-- [ ] Multi-vset write protection replies once, after all subgroups, and
+- [ ] At most one job per `VolumeId` is active, with FIFO order.
+- [ ] Distinct volumes demonstrably overlap in the focused test.
+- [ ] Multi-volume write protection replies once, after all subgroups, and
       combines errors.
 - [ ] A blocking-task panic cannot strand a direct caller, aggregate, or
       graceful shutdown barrier.
 - [ ] Barrier semantics drain the accepted prefix without waiting for later
       requests.
-- [ ] Idle vsets retain no worker task or keyed queue entry.
+- [ ] Idle volumes retain no worker task or keyed queue entry.
 - [ ] The Linux profile reports maximum fault-work concurrency of at least 2
-      under multi-vset load.
+      under multi-volume load.
 - [ ] The before/after release-profile table is included in the handoff.
 - [ ] The multicore artifact contains same-core serial controls and parallel
       candidates for every supported core count through 8.
 - [ ] Real independent-fill throughput improves at 2 and 4 cores versus the
       same-core one-worker controls, or the plan is reported blocked rather
       than claimed complete.
-- [ ] The mixed workload completes with correct per-vset operation order and
+- [ ] The mixed workload completes with correct per-volume operation order and
       demonstrates more than one active worker in parallel candidates.
 - [ ] The Linux kernel suite, runtime suite, workspace suite, and lint all pass.
 - [ ] No source file outside the explicit scope changed.
@@ -582,9 +582,9 @@ All items must hold:
 Stop and report; do not improvise if any condition occurs:
 
 - Either in-scope source file has semantically drifted from the excerpts above.
-- The target production path now lets two `VsetHost` values reference the same
+- The target production path now lets two `VolumeHost` values reference the same
   mutable `HostRegion` backing, or the Firecracker `ShmemServer` path has been
-  routed through `FaultWork`. `VsetId` is then no longer a sufficient ordering
+  routed through `FaultWork`. `VolumeId` is then no longer a sufficient ordering
   key; the design must be revised around an explicit backing-domain identity.
 - Correct ordering requires holding a `RefCell` borrow or mutex guard across an
   `.await`.
@@ -595,7 +595,7 @@ Stop and report; do not improvise if any condition occurs:
 - Any focused scheduler test remains flaky or relies on sleep timing rather
   than synchronization.
 - The Linux kernel suite hangs or fails twice after one reasonable correction.
-- Release-profile maximum concurrency stays at 1 under multi-vset load.
+- Release-profile maximum concurrency stays at 1 under multi-volume load.
 - The 2-core or 4-core real-fill candidate fails to outperform its same-core
   one-worker control in two clean, pinned runs. The serialized worker was then
   not the expected multicore limiter; retain the measurements and investigate
@@ -607,7 +607,7 @@ Stop and report; do not improvise if any condition occurs:
   limitation and rerun on a suitable Linux host; do not claim multicore
   validation.
 - The new implementation worsens both probe throughput and p99 latency at 16
-  or 48 noisy vsets on the same host/build profile. Report the measurements and
+  or 48 noisy volumes on the same host/build profile. Report the measurements and
   investigate before landing.
 
 ## Maintenance notes
@@ -616,16 +616,16 @@ Stop and report; do not improvise if any condition occurs:
   exactly one terminal path: direct reply, aggregate reply, barrier reply, or
   receiver closure that wakes the waiter with an error.
 - Reviewers should also trace FIFO ordering for `Fill -> WriteProtect`,
-  `WriteProtect -> Unprotect`, and `Evict -> Fill` on one vset.
+  `WriteProtect -> Unprotect`, and `Evict -> Fill` on one volume.
 - `FAULT_WORK_CONCURRENCY = 8` is an initial bounded production value, not a
   universal optimum. A future configuration change requires its own measured
   plan and must account for Tokio blocking-pool saturation.
 - Preserve the same-core one-worker rows in performance artifacts. Comparing a
   parallel run on a larger CPU set only against a one-core run confounds CPU
   availability with dispatcher behavior.
-- If production later unifies `VsetHost` regions across forks, add an explicit
+- If production later unifies `VolumeHost` regions across forks, add an explicit
   stable backing-domain identifier and key ordering by that domain (and page
-  where safe), rather than by vset or pointer address.
+  where safe), rather than by volume or pointer address.
 - If the local actor loop remains saturated after this plan, profile poll cost
   and batching next. Do not jump directly to sharding the host cache; preserve
   the shared-residency invariant and quantify the remaining on-loop work first.

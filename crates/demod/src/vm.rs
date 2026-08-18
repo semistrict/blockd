@@ -1,6 +1,6 @@
 //! VM orchestration: real Firecracker microVMs restored from store-held
 //! snapshots (one fill server per snapshot prefix, forks share one copy),
-//! each paired with a daemon-managed vset that carries its durable state
+//! each paired with a daemon-managed volume that carries its durable state
 //! — checkpointed continuously, replicated to a passive peer, published to
 //! the store, and
 //! live-migrated over the peer transport.
@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, millis};
 use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts_async};
 use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, PeerConfig, Runtime, RuntimeConfig};
 
@@ -26,8 +26,8 @@ pub const MEM_MIB: u32 = 128;
 pub const PART_BYTES: u64 = 8 * 1024 * 1024;
 /// Pages the guest fills per work burst (matching the fc-guest arena).
 pub const GUEST_FILL_PAGES: u32 = 512;
-/// The paired vset: one memory volume + one 256-page disk volume.
-pub const VSET_PAGES: u32 = 256;
+/// Pages in each independently managed mirrored data volume.
+pub const VOLUME_PAGES: u32 = 256;
 /// Data words the mirror writes per burst (page 0 is the burst counter).
 pub const MIRROR_PAGES: u32 = 63;
 
@@ -40,16 +40,13 @@ pub struct MigrationTimings {
     pub overlap_ms: u128,
 }
 
-fn vset_config() -> VsetConfig {
-    VsetConfig::compute(1, VSET_PAGES)
+fn volume_config() -> VolumeConfig {
+    VolumeConfig::data(VOLUME_PAGES)
 }
 
-fn disk_page(vset: VsetId, page: u32) -> PageId {
+fn disk_page(volume: VolumeId, page: u32) -> PageId {
     PageId {
-        volume: VolumeId {
-            vset,
-            idx: VolumeIdx(1),
-        },
+        volume: volume,
         page: PageNo(page),
     }
 }
@@ -298,14 +295,14 @@ impl Demod {
         vm
     }
 
-    /// Start a fresh VM from the base snapshot with its paired vset.
+    /// Start a fresh VM from the base snapshot with its paired volume.
     #[tracing::instrument(skip(self), fields(vm_id = tracing::field::Empty))]
     pub async fn start_vm(&self) -> u64 {
         let id = self.next_vm.fetch_add(1, Ordering::SeqCst);
         tracing::Span::current().record("vm_id", id);
         let mut fc = self.boot_from(id, "base").await;
         fc.cmd("ping", "PONG").await;
-        self.rt.create_vset(VsetId(id), vset_config()).await;
+        self.rt.create_volume(VolumeId(id), volume_config()).await;
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
@@ -326,16 +323,16 @@ impl Demod {
     }
 
     /// One work burst: the guest computes over fresh memory, and the
-    /// burst is mirrored into the vset — counter plus data pages — with a
+    /// burst is mirrored into the volume — counter plus data pages — with a
     /// sync making it a durable consistency point.
     #[tracing::instrument(skip(self), fields(vm_id = id, burst_count = bursts))]
     pub async fn work(&self, id: u64, bursts: u64) -> (u64, String) {
-        let vset = VsetId(id);
+        let volume = VolumeId(id);
         let fc = self.fc_of(id);
         let mut sum = String::new();
         let mut burst = 0;
         for _ in 0..bursts {
-            let counter = self.rt.guest_read(vset, disk_page(vset, 0)).await;
+            let counter = self.rt.guest_read(volume, disk_page(volume, 0)).await;
             burst = u64::from_le_bytes(counter[0..8].try_into().expect("sized")) + 1;
             let seed = id * 31 + burst;
             {
@@ -346,26 +343,32 @@ impl Demod {
             }
             for page in 1..=MIRROR_PAGES {
                 self.rt
-                    .guest_write(vset, disk_page(vset, page), mirror_value(id, burst, page))
+                    .guest_write(
+                        volume,
+                        disk_page(volume, page),
+                        mirror_value(id, burst, page),
+                    )
                     .await;
             }
-            self.rt.guest_write(vset, disk_page(vset, 0), burst).await;
-            assert!(self.rt.guest_sync(vset, VolumeIdx(1)).await, "sync failed");
+            self.rt
+                .guest_write(volume, disk_page(volume, 0), burst)
+                .await;
+            assert!(self.rt.guest_sync(volume).await, "sync failed");
         }
         (burst, sum)
     }
 
-    /// Verify the vset against the self-describing model: page 0 names
+    /// Verify the volume against the self-describing model: page 0 names
     /// the burst, every data page must match it. Returns (burst,
     /// mismatches).
     #[tracing::instrument(skip(self), fields(vm_id = id))]
     pub async fn verify(&self, id: u64) -> (u64, u32) {
-        let vset = VsetId(id);
-        let counter = self.rt.guest_read(vset, disk_page(vset, 0)).await;
+        let volume = VolumeId(id);
+        let counter = self.rt.guest_read(volume, disk_page(volume, 0)).await;
         let burst = u64::from_le_bytes(counter[0..8].try_into().expect("sized"));
         let mut mismatches = 0;
         for page in 1..=MIRROR_PAGES {
-            let bytes = self.rt.guest_read(vset, disk_page(vset, page)).await;
+            let bytes = self.rt.guest_read(volume, disk_page(volume, page)).await;
             let got = u64::from_le_bytes(bytes[0..8].try_into().expect("sized"));
             let want = if burst == 0 {
                 0
@@ -411,7 +414,9 @@ impl Demod {
             let (rss, pss) = rss_pss_of_pid(fc.pid()).await;
             rss_sum += rss;
             pss_sum += pss;
-            self.rt.create_vset(VsetId(fork_id), vset_config()).await;
+            self.rt
+                .create_volume(VolumeId(fork_id), volume_config())
+                .await;
             self.vms.lock().expect("lock").insert(
                 fork_id,
                 Vm {
@@ -444,14 +449,14 @@ impl Demod {
         (ids, rss_sum, pss_sum, resident)
     }
 
-    /// Destination side of a migration: accept the vset (guest memory
+    /// Destination side of a migration: accept the volume (guest memory
     /// pre-created), then — once the handoff lands — restore the microVM
     /// from the snapshot the source published.
     #[tracing::instrument(skip(self, ready), fields(vm_id = id))]
     pub async fn expect(self: &Arc<Demod>, id: u64, ready: impl FnOnce()) {
         let prefix = format!("vm{id}/mig");
         let previous_snapshot = self.snapshot_generation(&prefix).await;
-        self.rt.expect_migration(VsetId(id), vset_config());
+        self.rt.expect_migration(VolumeId(id), volume_config());
         self.vms.lock().expect("lock").insert(
             id,
             Vm {
@@ -462,9 +467,9 @@ impl Demod {
         );
         ready();
         {
-            let verdict = self.rt.wait_migrated_in(VsetId(id)).await;
+            let verdict = self.rt.wait_migrated_in(VolumeId(id)).await;
             assert!(
-                matches!(verdict, Verdict::Resume { .. }),
+                matches!(verdict, Verdict::ColdBoot),
                 "migration verdict {verdict:?}"
             );
             self.wait_snapshot_after(&prefix, previous_snapshot).await;
@@ -480,7 +485,7 @@ impl Demod {
     }
 
     /// Source side: pause + snapshot the microVM, publish it, kill it,
-    /// and live-migrate the vset over TCP. Snapshot publication and the vset
+    /// and live-migrate the volume over TCP. Snapshot publication and the volume
     /// handoff overlap; the returned timings expose the saved serial time.
     #[tracing::instrument(skip(self), fields(vm_id = id, destination_host = to))]
     pub async fn migrate(&self, id: u64, to: u16) -> MigrationTimings {
@@ -504,7 +509,7 @@ impl Demod {
         };
         let handoff = async {
             let handoff_started = Instant::now();
-            self.rt.migrate_out(VsetId(id), HostId(to)).await;
+            self.rt.migrate_out(VolumeId(id), HostId(to)).await;
             handoff_started.elapsed().as_millis()
         };
         let (publish_ms, handoff_ms) = tokio::join!(publish, handoff);
@@ -541,11 +546,11 @@ impl Demod {
         }
     }
 
-    /// After the owning host died: restore a vset from the store
+    /// After the owning host died: restore a volume from the store
     /// alone (R6.1) and give it a fresh microVM from the base image.
     #[tracing::instrument(skip(self), fields(vm_id = id))]
     pub async fn restore(&self, id: u64) -> String {
-        let verdict = self.rt.restore_vset(VsetId(id), vset_config()).await;
+        let verdict = self.rt.restore_volume(VolumeId(id), volume_config()).await;
         let mut fc = self.boot_from(id, "base").await;
         fc.cmd("ping", "PONG").await;
         self.vms.lock().expect("lock").insert(

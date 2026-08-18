@@ -253,7 +253,7 @@ async fn profile_cold_restore_from_fake_gcs() {
     gcs.fake.latency_ms.store(56, Ordering::SeqCst);
     let store = gcs.store.clone();
 
-    // Backup: the snapshot memory as segment objects (R4.6-sized parts).
+    // Backup: the snapshot memory as blx objects (R4.6-sized parts).
     let t = Instant::now();
     let parts = upload_mem_parts_async(
         store.clone(),

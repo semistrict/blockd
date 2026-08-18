@@ -6,16 +6,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use blockd_core::head::HeadRecord;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::layout;
-use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{PageId, PageNo, VolumeId};
 use blockd_runtime::fakegcs::{FakeGcs, Fault};
 use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, Runtime};
 use tokio::process::Command;
 
 mod support;
 
-const VSET: VsetId = VsetId(1);
+const VOLUME: VolumeId = VolumeId(1);
 
 fn store(endpoint: &str, prefix: &str) -> Arc<GcsStore> {
     Arc::new(GcsStore::new(GcsConfig {
@@ -58,33 +58,29 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
             for runtime in [&a, &b, &c] {
                 support::wait_for_peer_membership(runtime, 2).await;
             }
-            let vset_config = VsetConfig {
-                kind: blockd_core::journal::VsetKind::Compute,
-                disk_volumes: 1,
-                pages_per_volume: 8,
+            let volume_config = VolumeConfig {
+                kind: blockd_core::journal::VolumeKind::Data,
+                pages: 8,
             };
-            a.create_vset(VSET, vset_config).await;
+            a.create_volume(VOLUME, volume_config).await;
             let (_, head_bytes) = store(&endpoint, &prefix)
-                .get(layout::head_key(VSET))
+                .get(layout::head_key(VOLUME))
                 .await
                 .expect("head read")
                 .expect("head");
-            let head = HeadRecord::decode(VSET, &head_bytes).expect("head decode");
+            let head = HeadRecord::decode(VOLUME, &head_bytes).expect("head decode");
             let active = head.stash.expect("assignment").active_peer;
             fake.faults
                 .lock()
                 .expect("fault lock")
                 .extend(std::iter::repeat_n(Fault::Status(503), 5_000));
             let page = PageId {
-                volume: VolumeId {
-                    vset: VSET,
-                    idx: VolumeIdx(1),
-                },
+                volume: VOLUME,
                 page: PageNo(3),
             };
             let value = 0xA500_0000_0000_0000 | u64::try_from(iteration).expect("fits");
-            a.guest_write(VSET, page, value).await;
-            assert!(a.guest_sync(VSET, VolumeIdx(1)).await);
+            a.guest_write(VOLUME, page, value).await;
+            assert!(a.guest_sync(VOLUME).await);
             drop(a);
             drop(b);
             drop(c);
@@ -104,7 +100,7 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
                 prefix.as_str(),
                 "--source",
                 "0",
-                "--vset",
+                "--volume",
                 "1",
                 "--residue-root",
                 peer_root.to_str().expect("path"),
@@ -150,12 +146,12 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
             let (recovered, verdicts) = Runtime::recover(
                 &configs[0],
                 store(&endpoint, &prefix),
-                &BTreeMap::from([(VSET, vset_config)]),
+                &BTreeMap::from([(VOLUME, volume_config)]),
             )
             .await;
             assert!(verdicts.is_empty());
-            let _ = recovered.wait_recovered(VSET).await;
-            let bytes = recovered.guest_read(VSET, page).await;
+            let _ = recovered.wait_recovered(VOLUME).await;
+            let bytes = recovered.guest_read(VOLUME, page).await;
             assert_eq!(
                 u64::from_ne_bytes(bytes[..8].try_into().expect("word")),
                 value

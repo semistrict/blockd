@@ -101,7 +101,7 @@ impl PeerTransport {
             return false;
         };
         if self.faults.targeted_drop.is_some_and(|(kind, begin, end)| {
-            kind == peer_tag(message) && (begin..end).contains(&now())
+            kind == message.tag() && (begin..end).contains(&now())
         }) {
             self.stats
                 .targeted_drops
@@ -230,7 +230,7 @@ async fn listener_loop(
         let stats = Rc::clone(&stats);
         tokio::task::spawn_local(async move {
             let _ = receive_loop(stream, None, DecodePolicy::Inline, move |from, message| {
-                if peer_tag(&message) == 6 {
+                if matches!(message, PeerMsg::Released { .. }) {
                     stats.released.set(stats.released.get().saturating_add(1));
                 }
                 let _ = incoming.send((from, message));
@@ -244,37 +244,12 @@ fn odds((numerator, denominator): (u64, u64)) -> bool {
     numerator != 0 && denominator != 0 && random_u64() % denominator < numerator
 }
 
-fn peer_tag(message: &PeerMsg) -> u8 {
-    match message {
-        PeerMsg::MigrateOffer { .. } => 0,
-        PeerMsg::MigrateAccept { .. } => 1,
-        PeerMsg::FetchRange { .. } => 2,
-        PeerMsg::Page { .. } => 3,
-        PeerMsg::Released { .. } => 6,
-        PeerMsg::ReleasedAck { .. } => 7,
-        PeerMsg::ReplicaPut { .. } => 8,
-        PeerMsg::ReplicaPutAck { .. } => 9,
-        PeerMsg::ReplicaCommit { .. } => 10,
-        PeerMsg::ReplicaCommitAck { .. } => 11,
-        PeerMsg::ReplicaStatus { .. } => 13,
-        PeerMsg::ReplicaStatusReply { .. } => 14,
-        PeerMsg::ReplicaRelease { .. } => 16,
-        PeerMsg::ReplicaReleaseAck { .. } => 17,
-        PeerMsg::VnodeAdopt { .. } => 18,
-        PeerMsg::VnodeAdoptAck { .. } => 19,
-        PeerMsg::VnodeFetchClosure { .. } => 20,
-        PeerMsg::VnodeClosure { .. } => 21,
-        PeerMsg::VnodeCommit { .. } => 22,
-        PeerMsg::VnodeCommitAck { .. } => 23,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use blockd_core::types::VsetId;
+    use blockd_core::types::VolumeId;
 
     use super::*;
 
@@ -321,7 +296,7 @@ mod tests {
                 )
                 .await?;
                 let message = PeerMsg::Released {
-                    vset: VsetId(7),
+                    volume: VolumeId(7),
                     release_fence: 11,
                 };
                 for _ in 0..10 {
@@ -338,7 +313,7 @@ mod tests {
             Some((
                 HostId(0),
                 PeerMsg::Released {
-                    vset: VsetId(7),
+                    volume: VolumeId(7),
                     release_fence: 11,
                 }
             ))

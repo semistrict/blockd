@@ -9,8 +9,8 @@ mod support;
 
 use std::path::PathBuf;
 
-use blockd_core::journal::VsetConfig;
-use blockd_core::types::{VsetId, micros, millis};
+use blockd_core::journal::VolumeConfig;
+use blockd_core::types::{VolumeId, micros, millis};
 use blockd_runtime::{Runtime, RuntimeConfig};
 use blockd_workload::{load, run};
 use runtime_workload::{RuntimeDataBackend, RuntimeLifecycleBackend};
@@ -46,7 +46,7 @@ async fn checked_in_steady_io_matches_the_real_runtime() {
             }
             let spec = load("steady-io").expect("checked-in workload");
             {
-                let mut backend = RuntimeDataBackend::new(&runtimes[0], VsetId(1));
+                let mut backend = RuntimeDataBackend::new(&runtimes[0], VolumeId(1));
                 let outcome = run(&spec, &mut backend)
                     .await
                     .expect("real runtime workload");
@@ -74,9 +74,8 @@ async fn checked_in_checkpoint_recovery_matches_deterministic_simulation() {
         .run_until(async {
             let spec = load("checkpoint-recovery").expect("checked-in workload");
             let mut sim_config = blockd_sim::presets::single_host_base();
-            sim_config.vset_count = 1;
-            sim_config.vset =
-                VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
+            sim_config.volume_count = 1;
+            sim_config.volume = VolumeConfig::data(spec.shape.pages);
             sim_config.horizon = millis(10_000);
             sim_config.think = (micros(1), micros(2));
             sim_config.checkpoint_interval = None;
@@ -98,7 +97,7 @@ async fn checked_in_checkpoint_recovery_matches_deterministic_simulation() {
                 Runtime::new(&passive_b, store.clone()).await,
                 Runtime::new(&passive_c, store.clone()).await,
             ];
-            let mut backend = RuntimeLifecycleBackend::new(primary, store, passives, VsetId(1));
+            let mut backend = RuntimeLifecycleBackend::new(primary, store, passives, VolumeId(1));
             let actual = run(&spec, &mut backend)
                 .await
                 .expect("real runtime workload");

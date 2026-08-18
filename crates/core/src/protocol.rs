@@ -4,8 +4,8 @@
 
 use std::fmt;
 
-use crate::journal::VsetConfig;
-use crate::types::{Epoch, HostId, SegId, VsetId};
+use crate::journal::VolumeConfig;
+use crate::types::{Epoch, HostId, ObjectId, VolumeId};
 
 /// Largest object accepted by the durable-store seam, including framing
 /// overhead for payloads whose unframed contract is 64 MiB.
@@ -43,10 +43,12 @@ pub enum StoreFault {
 /// Typed identity of an immutable artifact placed in a passive peer spool.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ReplicaArtifact {
-    Segment { fence: u64, seg: SegId },
+    Blx { fence: u64, object: ObjectId },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Field order is the durability significance order; derived ordering is used
+/// to compare replication frontiers throughout the engine.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct ReplicaCommitInfo {
     pub writer_fence: u64,
     pub seq: crate::types::JournalSeq,
@@ -62,7 +64,7 @@ pub enum PeerMsg {
     /// bytes. The sender has already made its outbound handoff durable
     /// (R7.2: durable on both sides before either acts).
     MigrateOffer {
-        vset: VsetId,
+        volume: VolumeId,
         record: Vec<u8>,
         /// Canonical VMM bytes when they fit in the offer. A recovered source
         /// may omit them; the destination then fetches the verified BLX ranges.
@@ -72,19 +74,19 @@ pub enum PeerMsg {
     /// guest is resuming. The source now serves fetches and never runs the
     /// guest again.
     MigrateAccept {
-        vset: VsetId,
+        volume: VolumeId,
         /// The source fence from the exact offered record being accepted.
         offer_fence: u64,
     },
     /// Demand fetch of one page entry from a peer (the peer tier of R2.3).
     FetchRange {
         io: PeerRequestId,
-        vset: VsetId,
+        volume: VolumeId,
         /// Present when the requester is the primary reading its committed
         /// copy from the assigned passive. Absent for migration-source reads.
         replica_assignment_epoch: Option<u64>,
         fence: u64,
-        seg: SegId,
+        object: ObjectId,
         offset: u32,
         len: u32,
     },
@@ -95,28 +97,28 @@ pub enum PeerMsg {
         bytes: Option<Vec<u8>>,
     },
     /// The destination holds every byte it needs: the source may reclaim
-    /// the vset's local state.
+    /// the volume's local state.
     Released {
-        vset: VsetId,
+        volume: VolumeId,
         release_fence: u64,
     },
     /// The source's acknowledgment of `Released` (which is retried until
     /// acked; a source that already reclaimed still acks).
     ReleasedAck {
-        vset: VsetId,
+        volume: VolumeId,
         release_fence: u64,
     },
     /// Store one immutable artifact on the assigned passive peer. An
     /// identical retry re-acks without another append.
     ReplicaPut {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         artifact: ReplicaArtifact,
         checksum: u32,
         bytes: Vec<u8>,
     },
     ReplicaPutAck {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         artifact: ReplicaArtifact,
         checksum: u32,
@@ -124,33 +126,33 @@ pub enum PeerMsg {
     /// Commit one exact recovery record after every required artifact is
     /// stable on this peer or already truthfully known in the store.
     ReplicaCommit {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         info: ReplicaCommitInfo,
         required: Vec<ReplicaArtifact>,
         record: Vec<u8>,
     },
     ReplicaCommitAck {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         info: ReplicaCommitInfo,
     },
     ReplicaStatus {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
     },
     ReplicaStatusReply {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         committed: Option<ReplicaCommitInfo>,
     },
     ReplicaRelease {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         through: ReplicaCommitInfo,
     },
     ReplicaReleaseAck {
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         through: ReplicaCommitInfo,
     },
@@ -177,7 +179,7 @@ pub enum PeerMsg {
     VnodeCommit {
         io: PeerRequestId,
         proof: crate::authority::AuthorityProof,
-        vset: VsetId,
+        volume: VolumeId,
         sequence: u64,
         bytes: Vec<u8>,
     },
@@ -187,18 +189,46 @@ pub enum PeerMsg {
     },
 }
 
+impl PeerMsg {
+    /// Stable wire discriminant shared by encoders and transport fault models.
+    pub const fn tag(&self) -> u8 {
+        match self {
+            Self::MigrateOffer { .. } => 0,
+            Self::MigrateAccept { .. } => 1,
+            Self::FetchRange { .. } => 2,
+            Self::Page { .. } => 3,
+            Self::Released { .. } => 6,
+            Self::ReleasedAck { .. } => 7,
+            Self::ReplicaPut { .. } => 8,
+            Self::ReplicaPutAck { .. } => 9,
+            Self::ReplicaCommit { .. } => 10,
+            Self::ReplicaCommitAck { .. } => 11,
+            Self::ReplicaStatus { .. } => 12,
+            Self::ReplicaStatusReply { .. } => 13,
+            Self::ReplicaRelease { .. } => 15,
+            Self::ReplicaReleaseAck { .. } => 16,
+            Self::VnodeAdopt { .. } => 18,
+            Self::VnodeAdoptAck { .. } => 19,
+            Self::VnodeFetchClosure { .. } => 20,
+            Self::VnodeClosure { .. } => 21,
+            Self::VnodeCommit { .. } => 22,
+            Self::VnodeCommitAck { .. } => 23,
+        }
+    }
+}
+
 /// In-process administrative call. Completion is routed by its owned reply
 /// promise; only checkpoint retains a request identity for durable retry
 /// idempotency.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdminCall {
-    CreateVset {
-        vset: VsetId,
-        config: VsetConfig,
+    CreateVolume {
+        volume: VolumeId,
+        config: VolumeConfig,
         from_base: Option<u64>,
     },
     KeepBase {
-        vset: VsetId,
+        volume: VolumeId,
         base: u64,
     },
     DeleteBase {
@@ -206,13 +236,13 @@ pub enum AdminCall {
     },
     Checkpoint {
         retry: ReqId,
-        vset: VsetId,
+        volume: VolumeId,
     },
-    RestoreVset {
-        vset: VsetId,
+    RestoreVolume {
+        volume: VolumeId,
     },
     MigrateOut {
-        vset: VsetId,
+        volume: VolumeId,
         to: HostId,
     },
 }
@@ -220,13 +250,13 @@ pub enum AdminCall {
 /// Successful completion of an in-process administrative operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdminSuccess {
-    VsetCreated { vset: VsetId },
-    CheckpointDone { vset: VsetId, epoch: Epoch },
-    VsetRestored { vset: VsetId, verdict: Verdict },
+    VolumeCreated { volume: VolumeId },
+    CheckpointDone { volume: VolumeId, epoch: Epoch },
+    VolumeRestored { volume: VolumeId, verdict: Verdict },
     BaseKept { base: u64 },
     BaseDeleted { base: u64 },
-    VsetForked { vset: VsetId, verdict: Verdict },
-    MigratedOut { vset: VsetId },
+    VolumeForked { volume: VolumeId, verdict: Verdict },
+    MigratedOut { volume: VolumeId },
 }
 
 pub type AdminResult = Result<AdminSuccess, AdminError>;
@@ -242,14 +272,14 @@ pub enum AdminError {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdminEvent {
-    /// A backed-up vset finished local recovery and this host retained
+    /// A backed-up volume finished local recovery and this host retained
     /// authority with local state at least as new as the backup.
-    VsetRecovered { vset: VsetId, verdict: Verdict },
+    VolumeRecovered { volume: VolumeId, verdict: Verdict },
     /// An inbound migration is live on this host, per the verdict.
-    VsetMigratedIn { vset: VsetId, verdict: Verdict },
+    VolumeMigratedIn { volume: VolumeId, verdict: Verdict },
 }
 
-/// Recovery verdict for one vset (R8.2: explicit, per vset).
+/// Recovery verdict for one volume (R8.2: explicit, per volume).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
     /// Newest usable recovery point is a whole checkpoint: resume — memory,

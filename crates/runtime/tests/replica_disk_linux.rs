@@ -14,35 +14,30 @@ use std::time::{Duration, Instant};
 
 use blockd_core::engine::{HostState, recover_local};
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::{JournalRecord, RecordKind, VsetConfig};
+use blockd_core::journal::{JournalRecord, RecordKind, VolumeConfig};
 use blockd_core::layout;
+use blockd_core::page_file::PageBatchBuilder;
 use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
 use blockd_core::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use blockd_core::replica_spool::{seal_replica_artifact, seal_replica_commit};
-use blockd_core::segment::SegmentBatchBuilder;
-use blockd_core::types::{
-    Gen, HostId, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId, page_size,
-};
+use blockd_core::types::{Gen, HostId, JournalSeq, ObjectId, PageId, PageNo, VolumeId, page_size};
 use blockd_exec::ProductionContext;
 use blockd_runtime::world::FileBlobs;
 use tokio::process::Command;
 
-const VSET: VsetId = VsetId(7);
+const VOLUME: VolumeId = VolumeId(7);
 
 fn fixture() -> (Vec<u8>, Vec<u8>) {
     let page = PageId {
-        volume: VolumeId {
-            vset: VSET,
-            idx: VolumeIdx(1),
-        },
+        volume: VOLUME,
         page: PageNo(2),
     };
-    let mut builder = SegmentBatchBuilder::new(VSET, 4, SegId(9));
+    let mut builder = PageBatchBuilder::new(VOLUME, 4, ObjectId(9));
     builder.add(page, Gen(3), &vec![0xA5; page_size()]);
-    let (_, segment, locs) = builder.finish().pop().expect("fixture object");
-    let artifact = ReplicaArtifact::Segment {
+    let (_, blx, locs) = builder.finish().pop().expect("fixture object");
+    let artifact = ReplicaArtifact::Blx {
         fence: 4,
-        seg: SegId(9),
+        object: ObjectId(9),
     };
     let info = ReplicaCommitInfo {
         writer_fence: 4,
@@ -50,10 +45,9 @@ fn fixture() -> (Vec<u8>, Vec<u8>) {
         sync_covered_through: 12,
     };
     let record = JournalRecord {
-        config: VsetConfig {
-            kind: blockd_core::journal::VsetKind::Compute,
-            disk_volumes: 1,
-            pages_per_volume: 8,
+        config: VolumeConfig {
+            kind: blockd_core::journal::VolumeKind::Data,
+            pages: 8,
         },
         seq: info.seq,
         fence: info.writer_fence,
@@ -62,13 +56,13 @@ fn fixture() -> (Vec<u8>, Vec<u8>) {
         sync_covered_through: info.sync_covered_through,
         post_state_checksum: 0,
         files: Vec::new(),
-        overlay: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
+        runtime_page_index: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
         migrated_from: None,
     }
-    .encode(VSET);
+    .encode(VOLUME);
     (
-        seal_replica_artifact(HostId(0), VSET, 1, artifact, &segment).expect("artifact"),
-        seal_replica_commit(HostId(0), VSET, 1, info, &[artifact], &record).expect("commit"),
+        seal_replica_artifact(HostId(0), VOLUME, 1, artifact, &blx).expect("artifact"),
+        seal_replica_commit(HostId(0), VOLUME, 1, info, &[artifact], &record).expect("commit"),
     )
 }
 
@@ -91,7 +85,7 @@ fn replica_kill_child() {
         return;
     };
     let (artifact, commit) = fixture();
-    let name = layout::replica_spool_blob(HostId(0), VSET, 1);
+    let name = layout::replica_spool_blob(HostId(0), VOLUME, 1);
     let path = root.join(name);
     let parent = path.parent().expect("parent");
     std::fs::create_dir_all(parent).expect("create spool directory");
@@ -140,7 +134,7 @@ async fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
             let status = child.wait().await.expect("reap append helper");
             assert!(!status.success(), "helper must die abruptly");
 
-            let name = layout::replica_spool_blob(HostId(0), VSET, 1);
+            let name = layout::replica_spool_blob(HostId(0), VOLUME, 1);
             let path = root.join(&name);
             let bytes = std::fs::read(&path).expect("surviving spool");
             let (artifact, _) = fixture();
@@ -165,7 +159,7 @@ async fn abrupt_process_kill_leaves_only_a_truncatable_tail() {
                     drained: false,
                 },
             ];
-            let target = rank_stash_candidates(6, HostId(0), 1, VSET, &roster)[0];
+            let target = rank_stash_candidates(6, HostId(0), 1, VOLUME, &roster)[0];
             let target_domain = roster
                 .iter()
                 .find(|candidate| candidate.host == target)

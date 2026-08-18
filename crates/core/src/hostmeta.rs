@@ -1,5 +1,5 @@
 use crate::placement::PeerCandidate;
-use crate::types::{HostId, VsetId};
+use crate::types::{HostId, VolumeId};
 
 #[derive(Clone, Debug)]
 pub struct HostConfig {
@@ -63,7 +63,6 @@ pub struct Counters {
     pub checkpoints_done: u64,
     pub syncs_acked: u64,
     pub guest_rejected: u64,
-    pub peer_rejected: u64,
     pub blobs_deleted: u64,
     pub manifests_published: u64,
     pub store_retries: u64,
@@ -72,14 +71,13 @@ pub struct Counters {
     pub assignment_claim_conflicts: u64,
     pub nvme_reclaims: u64,
     pub nvme_stalls: u64,
-    pub prefetch_fills: u64,
     pub hydrate_fills: u64,
     pub peer_retries: u64,
     pub cow_captures: u64,
     pub wedged_guests: u64,
     pub wedged_hydration: u64,
     pub wedged_outbound: u64,
-    pub segs_compacted: u64,
+    pub blx_files_compacted: u64,
     pub pages_compacted: u64,
     pub replica_bytes: u64,
     pub replica_rejected: u64,
@@ -89,7 +87,6 @@ pub struct Counters {
     pub replica_logical_bytes: u64,
     pub replica_nonactive_bytes: u64,
     pub replica_replacement_bytes: u64,
-    pub replica_cleanup_rewrite_bytes: u64,
     pub replica_artifact_flushes: u64,
     pub replica_commit_flushes: u64,
     pub replica_rotations: u64,
@@ -103,8 +100,8 @@ pub struct Counters {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplicaVsetMetrics {
-    pub vset: VsetId,
+pub struct ReplicaVolumeMetrics {
+    pub volume: VolumeId,
     pub active_peer: Option<HostId>,
     pub transition_peer: Option<HostId>,
     pub assignment_epoch: Option<u64>,
@@ -121,7 +118,7 @@ pub struct ReplicaVsetMetrics {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplicaSpoolMetrics {
     pub source: HostId,
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub assignment_epoch: u64,
     pub stored_bytes: u64,
     pub host_capacity_bytes: u64,
@@ -132,9 +129,9 @@ pub struct ReplicaSpoolMetrics {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VsetStats {
-    pub vset: VsetId,
-    pub role: VsetRole,
+pub struct VolumeStats {
+    pub volume: VolumeId,
+    pub role: VolumeRole,
     pub fence: u64,
     pub dirty_pages: usize,
     pub unstable_pages: usize,
@@ -142,13 +139,13 @@ pub struct VsetStats {
     pub hydration_remaining_pages: usize,
     pub archive_lag_captures: Option<u64>,
     pub archive_lag_bytes: Option<u64>,
-    pub operations: VsetOperations,
-    pub live_segment_bytes: u64,
-    pub local_segment_bytes: u64,
+    pub operations: VolumeOperations,
+    pub live_blx_bytes: u64,
+    pub local_blx_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VsetRole {
+pub enum VolumeRole {
     Initializing,
     Serving,
     Hydrating,
@@ -156,9 +153,9 @@ pub enum VsetRole {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct VsetOperations(pub(crate) u8);
+pub struct VolumeOperations(pub(crate) u8);
 
-impl VsetOperations {
+impl VolumeOperations {
     pub const CAPTURE: u8 = 1;
     pub const CHECKPOINT: u8 = 2;
     pub const BACKUP: u8 = 4;
@@ -181,7 +178,7 @@ pub struct DaemonStats {
     pub local_blob_bytes: u64,
     pub disk_capacity_bytes: Option<u64>,
     pub disk_headroom_bytes: u64,
-    pub live_segment_bytes: u64,
-    pub local_segment_bytes: u64,
-    pub vsets: Vec<VsetStats>,
+    pub live_blx_bytes: u64,
+    pub local_blx_bytes: u64,
+    pub volumes: Vec<VolumeStats>,
 }

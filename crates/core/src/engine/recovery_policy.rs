@@ -6,7 +6,8 @@ use crate::types::Epoch;
 pub fn record_verdict(record: &JournalRecord) -> Verdict {
     match record.kind {
         RecordKind::Checkpoint { epoch, vmstate, .. }
-            if record.capture_seq >= record.sync_covered_through =>
+            if record.config.kind == crate::journal::VolumeKind::Memory
+                && record.capture_seq >= record.sync_covered_through =>
         {
             Verdict::Resume { epoch, vmstate }
         }
@@ -20,7 +21,9 @@ pub fn recovery_metadata(record: &JournalRecord) -> (RecoveryKind, Epoch, u64) {
             epoch,
             vmstate_logical_length,
             ..
-        } if matches!(record_verdict(record), Verdict::Resume { .. }) => {
+        } if record.config.kind == crate::journal::VolumeKind::Memory
+            && matches!(record_verdict(record), Verdict::Resume { .. }) =>
+        {
             (RecoveryKind::Whole, epoch, vmstate_logical_length)
         }
         RecordKind::Checkpoint { .. } | RecordKind::Commit => (RecoveryKind::DiskOnly, Epoch(0), 0),

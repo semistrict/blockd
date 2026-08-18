@@ -6,12 +6,13 @@
   "kind": "cluster",
   "topology": {
     "hosts": 2,
-    "vset_count": 1
+    "volume_count": 1,
+    "volume_kind": "memory"
   },
   "nemeses": {
     "kill_hosts": [],
     "race_restore": false,
-    "migrate_at": { "at": "1500ms", "vset": 1, "to": 1 },
+    "migrate_at": { "at": "1500ms", "volume": 1, "to": 1 },
     "drop_peer": {
       "kind": "released",
       "window": { "start": "1500ms", "end": "3100ms" }
@@ -27,6 +28,6 @@
   "outcomes": [
     { "metric": "guest-death", "label": "guest deaths", "max": 0 },
     { "metric": "parked-end", "label": "parked fills at drain", "max": 0 },
-    { "metric": "hydrating-end", "label": "hydrating vsets at drain", "max": 0 }
+    { "metric": "hydrating-end", "label": "hydrating volumes at drain", "max": 0 }
   ]
 }

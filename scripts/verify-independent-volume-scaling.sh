@@ -28,9 +28,20 @@ while IFS= read -r summary; do
         echo "missing manifest beside summary: $summary" >&2
         exit 1
     fi
+    if ! jq -e '
+        (.available_parallelism | type == "number" and . > 0 and floor == .)
+        and (.operations_per_second | type == "number" and . >= 0)
+        and (.process_cpu.average_cores | type == "number" and . >= 0)
+        and (.operation_latency.p50_upper_ns | type == "number" and . >= 0)
+        and (.operation_latency.p99_upper_ns | type == "number" and . >= 0)
+        and (.errors | type == "number" and . >= 0 and floor == .)
+    ' "$summary" >/dev/null; then
+        echo "invalid or missing numeric metric in summary: $summary" >&2
+        exit 1
+    fi
     current_signature=$(jq -c '{
-        vset_count,
-        active_vset_count,
+        volume_count,
+        active_volume_count,
         topology: .fork_provenance.topology,
         roots: .fork_provenance.roots,
         runtime_shards,
@@ -38,7 +49,7 @@ while IFS= read -r summary; do
         refault_each_access,
         pages_per_volume,
         hot_pages,
-        cache_pages_per_vset,
+        cache_pages_per_volume,
         write_ppm,
         duration_secs,
         latency_sample_rate
@@ -130,7 +141,7 @@ for cores in 1 2 4 8; do
 done
 
 if (( failed != 0 )); then
-    echo "independent-vset scaling gate failed" >&2
+    echo "independent-volume scaling gate failed" >&2
     exit 1
 fi
-echo "independent-vset scaling gate passed"
+echo "independent-volume scaling gate passed"

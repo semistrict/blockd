@@ -11,13 +11,13 @@ use std::time::{Duration, Instant};
 
 use blockd_core::engine::{HostFatal, HostState, host_actor_with_state};
 use blockd_core::hostmeta::{
-    Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVsetMetrics, VsetOperations,
+    Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVolumeMetrics, VolumeOperations,
 };
-use blockd_core::journal::{VsetConfig, VsetKind};
+use blockd_core::journal::{VolumeConfig, VolumeKind};
 use blockd_core::protocol::{
     AdminCall, AdminEvent, AdminResult, AdminSuccess, PeerMsg, ReqId, Verdict,
 };
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId};
 use blockd_core::world::{
     AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem,
     GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store, StoreError,
@@ -43,7 +43,7 @@ pub struct RuntimeConfig {
     pub peer: Option<PeerConfig>,
 }
 
-fn assert_peer_stash_transport(config: VsetConfig, authenticated: bool) {
+fn assert_peer_stash_transport(config: VolumeConfig, authenticated: bool) {
     let _ = config;
     assert!(
         authenticated,
@@ -51,8 +51,9 @@ fn assert_peer_stash_transport(config: VsetConfig, authenticated: bool) {
     );
 }
 
-struct VsetHost {
-    config: VsetConfig,
+struct VolumeHost {
+    volume: VolumeId,
+    config: VolumeConfig,
     region: Arc<HostRegion>,
     view: Arc<GuestView>,
     uffd: Option<Arc<Uffd>>,
@@ -84,13 +85,12 @@ struct CtlState {
     pause_waiter: Option<Injector<u64>>,
 }
 
-impl VsetHost {
-    fn new(config: VsetConfig) -> Arc<Self> {
-        let pages = (usize::from(config.disk_volumes) + 1)
-            * usize::try_from(config.pages_per_volume).expect("page count fits");
+impl VolumeHost {
+    fn new(volume: VolumeId, config: VolumeConfig) -> Arc<Self> {
+        let pages = usize::try_from(config.pages).expect("page count fits");
         let region = Arc::new(HostRegion::new(pages).expect("guest region"));
         let view = Arc::new(GuestView::map(&region, 0, pages).expect("guest view"));
-        let uffd = (config.kind == VsetKind::Compute).then(|| {
+        let uffd = Some({
             let (uffd, features) = Uffd::new(
                 UffdFeatures::PAGEFAULT_FLAG_WP
                     | UffdFeatures::MINOR_SHMEM
@@ -106,6 +106,7 @@ impl VsetHost {
             Arc::new(uffd)
         });
         Arc::new(Self {
+            volume,
             config,
             region,
             view,
@@ -116,21 +117,44 @@ impl VsetHost {
     }
 
     fn page_index(&self, page: PageId) -> usize {
-        usize::from(page.volume.idx.0)
-            * usize::try_from(self.config.pages_per_volume).expect("page count fits")
-            + usize::try_from(page.page.0).expect("page index fits")
+        usize::try_from(page.page.0).expect("page index fits")
     }
 
-    fn page_of_addr(&self, vset: VsetId, addr: usize) -> PageId {
+    fn page_of_addr(&self, addr: usize) -> PageId {
         let index = (addr - self.view.addr_of(0)) / page_size();
-        let per = usize::try_from(self.config.pages_per_volume).expect("page count fits");
         PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(u8::try_from(index / per).expect("volume index fits")),
-            },
-            page: PageNo(u32::try_from(index % per).expect("page number fits")),
+            volume: self.volume,
+            page: PageNo(u32::try_from(index).expect("page number fits")),
         }
+    }
+
+    async fn op_start(&self) {
+        loop {
+            let notified = self.ctl.ready.notified();
+            {
+                let mut state = self.ctl.state.lock().expect("guest control lock");
+                if !state.pause_requested && !state.paused && !state.in_op {
+                    state.in_op = true;
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn op_end(&self) {
+        let mut state = self.ctl.state.lock().expect("guest control lock");
+        state.in_op = false;
+        state.applied = state.applied.saturating_add(1);
+        if state.pause_requested && !state.paused {
+            state.paused = true;
+            let applied = state.applied;
+            if let Some(waiter) = state.pause_waiter.take() {
+                let _ = waiter.push(Lane::Critical, applied);
+            }
+        }
+        drop(state);
+        self.ctl.ready.notify_waiters();
     }
 }
 
@@ -317,13 +341,13 @@ impl FaultWorkStats {
 }
 
 struct Shared {
-    vsets: Mutex<BTreeMap<VsetId, Arc<VsetHost>>>,
+    volumes: Mutex<BTreeMap<VolumeId, Arc<VolumeHost>>>,
     admin_events: Mutex<VecDeque<AdminEvent>>,
     admin_event_ready: tokio::sync::Notify,
     incidents: Mutex<Vec<String>>,
     counters: Mutex<Counters>,
     daemon_stats: Mutex<DaemonStats>,
-    replica_metrics: Mutex<Vec<ReplicaVsetMetrics>>,
+    replica_metrics: Mutex<Vec<ReplicaVolumeMetrics>>,
     replica_spool_metrics: Mutex<Vec<ReplicaSpoolMetrics>>,
     capacity: Mutex<CapacityController>,
     stats: LoopStats,
@@ -332,20 +356,20 @@ struct Shared {
     operation_latency: [[AtomicHistogram; OPERATION_OUTCOMES.len()]; OPERATION_NAMES.len()],
     local_io_latency: [[AtomicHistogram; LOCAL_IO_OUTCOMES.len()]; LOCAL_IO_NAMES.len()],
     local_io_in_flight: [AtomicU64; LOCAL_IO_NAMES.len()],
-    pause_expected: Mutex<BTreeMap<VsetId, VecDeque<usize>>>,
-    pause_in_flight: Mutex<BTreeMap<VsetId, (usize, Instant)>>,
+    pause_expected: Mutex<BTreeMap<VolumeId, VecDeque<usize>>>,
+    pause_in_flight: Mutex<BTreeMap<VolumeId, (usize, Instant)>>,
     pause_latency: [AtomicHistogram; PAUSE_NAMES.len()],
     fault_work_stats: FaultWorkStats,
-    backup_lag_started: Mutex<BTreeMap<VsetId, Instant>>,
-    operation_started: Mutex<BTreeMap<(VsetId, u8), Instant>>,
+    backup_lag_started: Mutex<BTreeMap<VolumeId, Instant>>,
+    operation_started: Mutex<BTreeMap<(VolumeId, u8), Instant>>,
     next_req: AtomicU64,
 }
 
 impl Shared {
-    fn new(vsets: BTreeMap<VsetId, Arc<VsetHost>>, config: &HostConfig) -> Self {
+    fn new(volumes: BTreeMap<VolumeId, Arc<VolumeHost>>, config: &HostConfig) -> Self {
         let state = HostState::new(config.clone());
         Self {
-            vsets: Mutex::new(vsets),
+            volumes: Mutex::new(volumes),
             admin_events: Mutex::new(VecDeque::new()),
             admin_event_ready: tokio::sync::Notify::new(),
             incidents: Mutex::new(Vec::new()),
@@ -413,8 +437,8 @@ impl FaultReaderStats {
 
 struct PendingGuestPause {
     shared: Arc<Shared>,
-    host: Arc<VsetHost>,
-    vset: VsetId,
+    host: Arc<VolumeHost>,
+    volume: VolumeId,
     generation: u64,
     active: bool,
 }
@@ -438,31 +462,31 @@ impl Drop for PendingGuestPause {
         state.paused = false;
         state.pause_waiter = None;
         drop(state);
-        complete_pause(&self.shared, self.vset);
+        self.shared.complete_pause(self.volume);
         self.host.ctl.ready.notify_waiters();
     }
 }
 
 enum FaultWork {
     Fill {
-        host: Arc<VsetHost>,
+        host: Arc<VolumeHost>,
         page: PageId,
         bytes: Option<Vec<u8>>,
         writable: bool,
         reply: Injector<Result<(), ()>>,
     },
     Unprotect {
-        host: Arc<VsetHost>,
+        host: Arc<VolumeHost>,
         page: PageId,
         reply: Injector<Result<(), ()>>,
     },
     Evict {
-        host: Arc<VsetHost>,
+        host: Arc<VolumeHost>,
         page: PageId,
         reply: Injector<Result<(), ()>>,
     },
     WriteProtect {
-        hosts: Vec<(VsetId, Arc<VsetHost>, Vec<usize>)>,
+        hosts: Vec<(VolumeId, Arc<VolumeHost>, Vec<usize>)>,
         reply: Injector<Result<(), ()>>,
     },
     Barrier {
@@ -470,8 +494,8 @@ enum FaultWork {
     },
     #[cfg(test)]
     Test {
-        vset: VsetId,
-        entered: std::sync::mpsc::Sender<VsetId>,
+        volume: VolumeId,
+        entered: std::sync::mpsc::Sender<VolumeId>,
         release: Arc<TestFaultWorkGate>,
         result: Result<(), ()>,
         panics: bool,
@@ -483,27 +507,27 @@ const FAULT_WORK_CONCURRENCY: usize = 8;
 
 enum BlockingFaultWork {
     Fill {
-        host: Arc<VsetHost>,
+        host: Arc<VolumeHost>,
         page: PageId,
         bytes: Option<Vec<u8>>,
         writable: bool,
     },
     Unprotect {
-        host: Arc<VsetHost>,
+        host: Arc<VolumeHost>,
         page: PageId,
     },
     Evict {
-        host: Arc<VsetHost>,
+        host: Arc<VolumeHost>,
         page: PageId,
     },
     WriteProtect {
-        host: Arc<VsetHost>,
+        host: Arc<VolumeHost>,
         indices: Vec<usize>,
     },
     #[cfg(test)]
     Test {
-        vset: VsetId,
-        entered: std::sync::mpsc::Sender<VsetId>,
+        volume: VolumeId,
+        entered: std::sync::mpsc::Sender<VolumeId>,
         release: Arc<TestFaultWorkGate>,
         result: Result<(), ()>,
         panics: bool,
@@ -552,7 +576,7 @@ struct QueuedFaultWork {
 
 struct CompletedFaultWork {
     worker: usize,
-    vset: VsetId,
+    volume: VolumeId,
     operation: usize,
     reply: FaultWorkReply,
     result: Result<(), ()>,
@@ -568,43 +592,75 @@ struct FaultWorkBatch {
 
 #[derive(Default)]
 struct FaultWorkQueue {
-    queues: BTreeMap<VsetId, VecDeque<QueuedFaultWork>>,
-    ready: VecDeque<VsetId>,
-    active: BTreeSet<VsetId>,
+    queues: BTreeMap<VolumeId, VecDeque<QueuedFaultWork>>,
+    ready: VecDeque<VolumeId>,
+    active: BTreeSet<VolumeId>,
+}
+
+struct FaultWorkDispatcher<'a> {
+    workers: &'a [std::sync::mpsc::Sender<(VolumeId, QueuedFaultWork)>],
+    shared: Arc<Shared>,
+    queue: FaultWorkQueue,
+    idle_workers: VecDeque<usize>,
+    batches: BTreeMap<u64, FaultWorkBatch>,
+    next_batch: u64,
+    barrier: Option<tokio::sync::oneshot::Sender<()>>,
+    incoming_closed: bool,
+}
+
+impl<'a> FaultWorkDispatcher<'a> {
+    fn new(
+        workers: &'a [std::sync::mpsc::Sender<(VolumeId, QueuedFaultWork)>],
+        shared: Arc<Shared>,
+    ) -> Self {
+        Self {
+            workers,
+            shared,
+            queue: FaultWorkQueue::default(),
+            idle_workers: (0..workers.len()).collect(),
+            batches: BTreeMap::new(),
+            next_batch: 1,
+            barrier: None,
+            incoming_closed: false,
+        }
+    }
 }
 
 impl FaultWorkQueue {
-    fn push(&mut self, vset: VsetId, work: QueuedFaultWork) {
-        let queue = self.queues.entry(vset).or_default();
-        if queue.is_empty() && !self.active.contains(&vset) {
-            self.ready.push_back(vset);
+    fn push(&mut self, volume: VolumeId, work: QueuedFaultWork) {
+        let queue = self.queues.entry(volume).or_default();
+        if queue.is_empty() && !self.active.contains(&volume) {
+            self.ready.push_back(volume);
         }
         queue.push_back(work);
     }
 
-    fn start_next(&mut self) -> Option<(VsetId, QueuedFaultWork)> {
+    fn start_next(&mut self) -> Option<(VolumeId, QueuedFaultWork)> {
         if self.active.len() >= FAULT_WORK_CONCURRENCY {
             return None;
         }
-        let vset = self.ready.pop_front()?;
-        assert!(self.active.insert(vset), "fault-work vset already active");
+        let volume = self.ready.pop_front()?;
+        assert!(
+            self.active.insert(volume),
+            "fault-work volume already active"
+        );
         let work = self
             .queues
-            .get_mut(&vset)
+            .get_mut(&volume)
             .and_then(VecDeque::pop_front)
-            .expect("ready fault-work vset has pending work");
-        Some((vset, work))
+            .expect("ready fault-work volume has pending work");
+        Some((volume, work))
     }
 
-    fn complete(&mut self, vset: VsetId) {
+    fn complete(&mut self, volume: VolumeId) {
         assert!(
-            self.active.remove(&vset),
-            "completed fault-work vset was not active"
+            self.active.remove(&volume),
+            "completed fault-work volume was not active"
         );
-        if self.queues.get(&vset).is_some_and(VecDeque::is_empty) {
-            self.queues.remove(&vset);
+        if self.queues.get(&volume).is_some_and(VecDeque::is_empty) {
+            self.queues.remove(&volume);
         } else {
-            self.ready.push_back(vset);
+            self.ready.push_back(volume);
         }
     }
 
@@ -644,13 +700,13 @@ fn fault_work_loop(work: tokio::sync::mpsc::UnboundedReceiver<FaultWork>, shared
     let mut worker_senders = Vec::with_capacity(FAULT_WORK_CONCURRENCY);
     let mut workers = Vec::with_capacity(FAULT_WORK_CONCURRENCY);
     for worker in 0..FAULT_WORK_CONCURRENCY {
-        let (sender, receiver) = std::sync::mpsc::channel::<(VsetId, QueuedFaultWork)>();
+        let (sender, receiver) = std::sync::mpsc::channel::<(VolumeId, QueuedFaultWork)>();
         let completed = completed.clone();
         workers.push(
             std::thread::Builder::new()
                 .name(format!("blockd-fault-syscall-{worker}"))
                 .spawn(move || {
-                    while let Ok((vset, queued)) = receiver.recv() {
+                    while let Ok((volume, queued)) = receiver.recv() {
                         let started = Instant::now();
                         let executed =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -661,7 +717,7 @@ fn fault_work_loop(work: tokio::sync::mpsc::UnboundedReceiver<FaultWork>, shared
                         if completed
                             .send(CompletedFaultWork {
                                 worker,
-                                vset,
+                                volume,
                                 operation: queued.operation,
                                 reply: queued.reply,
                                 result,
@@ -683,266 +739,228 @@ fn fault_work_loop(work: tokio::sync::mpsc::UnboundedReceiver<FaultWork>, shared
         .enable_all()
         .build()
         .expect("fault-work runtime");
-    runtime.block_on(fault_work_dispatch(
-        work,
-        completed_rx,
-        &worker_senders,
-        shared,
-    ));
+    runtime.block_on(FaultWorkDispatcher::new(&worker_senders, shared).run(work, completed_rx));
     drop(worker_senders);
     for worker in workers {
         worker.join().expect("fault syscall worker joined");
     }
 }
 
-fn queue_fault_work(
-    queue: &mut FaultWorkQueue,
-    vset: VsetId,
-    operation: usize,
-    queued: Instant,
-    work: BlockingFaultWork,
-    reply: FaultWorkReply,
-) {
-    queue.push(
-        vset,
-        QueuedFaultWork {
-            operation,
-            queued,
-            work,
-            reply,
-        },
-    );
-}
-
-fn admit_write_protect(
-    hosts: Vec<(VsetId, Arc<VsetHost>, Vec<usize>)>,
-    reply: Injector<Result<(), ()>>,
-    operation: usize,
-    queued: Instant,
-    queue: &mut FaultWorkQueue,
-    batches: &mut BTreeMap<u64, FaultWorkBatch>,
-    next_batch: &mut u64,
-) {
-    let batch = *next_batch;
-    *next_batch = next_batch.wrapping_add(1);
-    batches.insert(
-        batch,
-        FaultWorkBatch {
-            remaining: hosts.len(),
-            failed: false,
-            reply,
-        },
-    );
-    for (vset, host, indices) in hosts {
-        queue_fault_work(
-            queue,
-            vset,
-            operation,
-            queued,
-            BlockingFaultWork::WriteProtect { host, indices },
-            FaultWorkReply::Batch(batch),
+impl FaultWorkDispatcher<'_> {
+    fn queue(
+        &mut self,
+        volume: VolumeId,
+        operation: usize,
+        queued: Instant,
+        work: BlockingFaultWork,
+        reply: FaultWorkReply,
+    ) {
+        self.queue.push(
+            volume,
+            QueuedFaultWork {
+                operation,
+                queued,
+                work,
+                reply,
+            },
         );
     }
-}
 
-fn admit_fault_work(
-    item: FaultWork,
-    shared: &Shared,
-    queue: &mut FaultWorkQueue,
-    batches: &mut BTreeMap<u64, FaultWorkBatch>,
-    next_batch: &mut u64,
-    barrier: &mut Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    let operation = item.operation();
-    let queued = shared.fault_work_stats.dequeue(operation);
-    shared.fault_work_stats.observe(
-        operation,
-        0,
-        queued.map_or(Duration::ZERO, |started| started.elapsed()),
-    );
-    let queued = Instant::now();
-    match item {
-        FaultWork::Fill {
-            host,
-            page,
-            bytes,
-            writable,
-            reply,
-        } => queue_fault_work(
-            queue,
-            page.volume.vset,
+    fn admit_write_protect(
+        &mut self,
+        hosts: Vec<(VolumeId, Arc<VolumeHost>, Vec<usize>)>,
+        reply: Injector<Result<(), ()>>,
+        operation: usize,
+        queued: Instant,
+    ) {
+        let batch = self.next_batch;
+        self.next_batch = self.next_batch.wrapping_add(1);
+        self.batches.insert(
+            batch,
+            FaultWorkBatch {
+                remaining: hosts.len(),
+                failed: false,
+                reply,
+            },
+        );
+        for (volume, host, indices) in hosts {
+            self.queue(
+                volume,
+                operation,
+                queued,
+                BlockingFaultWork::WriteProtect { host, indices },
+                FaultWorkReply::Batch(batch),
+            );
+        }
+    }
+
+    fn admit(&mut self, item: FaultWork) {
+        let operation = item.operation();
+        let queued = self.shared.fault_work_stats.dequeue(operation);
+        self.shared.fault_work_stats.observe(
             operation,
-            queued,
-            BlockingFaultWork::Fill {
+            0,
+            queued.map_or(Duration::ZERO, |started| started.elapsed()),
+        );
+        let queued = Instant::now();
+        match item {
+            FaultWork::Fill {
                 host,
                 page,
                 bytes,
                 writable,
-            },
-            FaultWorkReply::Direct(reply),
-        ),
-        FaultWork::Unprotect { host, page, reply } => queue_fault_work(
-            queue,
-            page.volume.vset,
-            operation,
-            queued,
-            BlockingFaultWork::Unprotect { host, page },
-            FaultWorkReply::Direct(reply),
-        ),
-        FaultWork::Evict { host, page, reply } => queue_fault_work(
-            queue,
-            page.volume.vset,
-            operation,
-            queued,
-            BlockingFaultWork::Evict { host, page },
-            FaultWorkReply::Direct(reply),
-        ),
-        FaultWork::WriteProtect { hosts, reply } => {
-            if hosts.is_empty() {
-                shared
+                reply,
+            } => self.queue(
+                page.volume,
+                operation,
+                queued,
+                BlockingFaultWork::Fill {
+                    host,
+                    page,
+                    bytes,
+                    writable,
+                },
+                FaultWorkReply::Direct(reply),
+            ),
+            FaultWork::Unprotect { host, page, reply } => self.queue(
+                page.volume,
+                operation,
+                queued,
+                BlockingFaultWork::Unprotect { host, page },
+                FaultWorkReply::Direct(reply),
+            ),
+            FaultWork::Evict { host, page, reply } => self.queue(
+                page.volume,
+                operation,
+                queued,
+                BlockingFaultWork::Evict { host, page },
+                FaultWorkReply::Direct(reply),
+            ),
+            FaultWork::WriteProtect { hosts, reply } => {
+                if hosts.is_empty() {
+                    self.shared
+                        .fault_work_stats
+                        .observe(operation, 1, Duration::ZERO);
+                    self.shared
+                        .fault_work_stats
+                        .observe(operation, 2, Duration::ZERO);
+                    let _ = reply.push(Lane::Critical, Ok(()));
+                    return;
+                }
+                self.admit_write_protect(hosts, reply, operation, queued);
+            }
+            FaultWork::Barrier { done } => {
+                self.shared
                     .fault_work_stats
                     .observe(operation, 1, Duration::ZERO);
-                shared
+                self.shared
                     .fault_work_stats
                     .observe(operation, 2, Duration::ZERO);
-                let _ = reply.push(Lane::Critical, Ok(()));
-                return;
+                self.barrier = Some(done);
             }
-            admit_write_protect(hosts, reply, operation, queued, queue, batches, next_batch);
-        }
-        FaultWork::Barrier { done } => {
-            shared
-                .fault_work_stats
-                .observe(operation, 1, Duration::ZERO);
-            shared
-                .fault_work_stats
-                .observe(operation, 2, Duration::ZERO);
-            *barrier = Some(done);
-        }
-        #[cfg(test)]
-        FaultWork::Test {
-            vset,
-            entered,
-            release,
-            result,
-            panics,
-            reply,
-        } => queue_fault_work(
-            queue,
-            vset,
-            operation,
-            queued,
-            BlockingFaultWork::Test {
-                vset,
+            #[cfg(test)]
+            FaultWork::Test {
+                volume,
                 entered,
                 release,
                 result,
                 panics,
-            },
-            FaultWorkReply::Direct(reply),
-        ),
-    }
-}
-
-fn finish_fault_work(
-    completed: CompletedFaultWork,
-    shared: &Shared,
-    queue: &mut FaultWorkQueue,
-    batches: &mut BTreeMap<u64, FaultWorkBatch>,
-    idle_workers: &mut VecDeque<usize>,
-) {
-    idle_workers.push_back(completed.worker);
-    if completed.panicked {
-        shared
-            .fault_work_stats
-            .join_failures
-            .fetch_add(1, Ordering::Relaxed);
-    }
-    shared
-        .fault_work_stats
-        .observe(completed.operation, 2, completed.elapsed);
-    shared.fault_work_stats.complete();
-    queue.complete(completed.vset);
-    match completed.reply {
-        FaultWorkReply::Direct(reply) => {
-            let _ = reply.push(Lane::Critical, completed.result);
-        }
-        FaultWorkReply::Batch(batch) => {
-            let state = batches.get_mut(&batch).expect("active fault-work batch");
-            state.failed |= completed.result.is_err();
-            state.remaining -= 1;
-            if state.remaining == 0 {
-                let state = batches.remove(&batch).expect("completed fault-work batch");
-                let _ = state
-                    .reply
-                    .push(Lane::Critical, if state.failed { Err(()) } else { Ok(()) });
-            }
+                reply,
+            } => self.queue(
+                volume,
+                operation,
+                queued,
+                BlockingFaultWork::Test {
+                    volume,
+                    entered,
+                    release,
+                    result,
+                    panics,
+                },
+                FaultWorkReply::Direct(reply),
+            ),
         }
     }
-}
 
-async fn fault_work_dispatch(
-    mut incoming: tokio::sync::mpsc::UnboundedReceiver<FaultWork>,
-    mut completed: tokio::sync::mpsc::UnboundedReceiver<CompletedFaultWork>,
-    workers: &[std::sync::mpsc::Sender<(VsetId, QueuedFaultWork)>],
-    shared: Arc<Shared>,
-) {
-    let mut queue = FaultWorkQueue::default();
-    let mut idle_workers = (0..workers.len()).collect::<VecDeque<_>>();
-    let mut batches = BTreeMap::<u64, FaultWorkBatch>::new();
-    let mut next_batch = 1u64;
-    let mut barrier: Option<tokio::sync::oneshot::Sender<()>> = None;
-    let mut incoming_closed = false;
-
-    loop {
-        while let Some(worker) = idle_workers.pop_front() {
-            let Some((vset, queued)) = queue.start_next() else {
-                idle_workers.push_front(worker);
-                break;
-            };
-            shared
+    fn finish(&mut self, completed: CompletedFaultWork) {
+        self.idle_workers.push_back(completed.worker);
+        if completed.panicked {
+            self.shared
                 .fault_work_stats
-                .observe(queued.operation, 1, queued.queued.elapsed());
-            workers[worker]
-                .send((vset, queued))
-                .expect("fault syscall worker alive");
-            shared.fault_work_stats.start();
+                .join_failures
+                .fetch_add(1, Ordering::Relaxed);
         }
-
-        if queue.is_idle() {
-            if let Some(done) = barrier.take() {
-                let _ = done.send(());
-                continue;
+        self.shared
+            .fault_work_stats
+            .observe(completed.operation, 2, completed.elapsed);
+        self.shared.fault_work_stats.complete();
+        self.queue.complete(completed.volume);
+        match completed.reply {
+            FaultWorkReply::Direct(reply) => {
+                let _ = reply.push(Lane::Critical, completed.result);
             }
-            if incoming_closed {
-                break;
+            FaultWorkReply::Batch(batch) => {
+                let state = self
+                    .batches
+                    .get_mut(&batch)
+                    .expect("active fault-work batch");
+                state.failed |= completed.result.is_err();
+                state.remaining -= 1;
+                if state.remaining == 0 {
+                    let state = self
+                        .batches
+                        .remove(&batch)
+                        .expect("completed fault-work batch");
+                    let _ = state
+                        .reply
+                        .push(Lane::Critical, if state.failed { Err(()) } else { Ok(()) });
+                }
             }
         }
+    }
 
-        tokio::select! {
-            biased;
-            result = completed.recv(), if idle_workers.len() != workers.len() => {
-                finish_fault_work(
-                    result.expect("active fault syscall worker"),
-                    &shared,
-                    &mut queue,
-                    &mut batches,
-                    &mut idle_workers,
-                );
-            }
-            item = incoming.recv(), if barrier.is_none() && !incoming_closed => {
-                let Some(item) = item else {
-                    incoming_closed = true;
-                    continue;
+    async fn run(
+        mut self,
+        mut incoming: tokio::sync::mpsc::UnboundedReceiver<FaultWork>,
+        mut completed: tokio::sync::mpsc::UnboundedReceiver<CompletedFaultWork>,
+    ) {
+        loop {
+            while let Some(worker) = self.idle_workers.pop_front() {
+                let Some((volume, queued)) = self.queue.start_next() else {
+                    self.idle_workers.push_front(worker);
+                    break;
                 };
-                admit_fault_work(
-                    item,
-                    &shared,
-                    &mut queue,
-                    &mut batches,
-                    &mut next_batch,
-                    &mut barrier,
-                );
+                self.shared
+                    .fault_work_stats
+                    .observe(queued.operation, 1, queued.queued.elapsed());
+                self.workers[worker]
+                    .send((volume, queued))
+                    .expect("fault syscall worker alive");
+                self.shared.fault_work_stats.start();
+            }
+
+            if self.queue.is_idle() {
+                if let Some(done) = self.barrier.take() {
+                    let _ = done.send(());
+                    continue;
+                }
+                if self.incoming_closed {
+                    break;
+                }
+            }
+
+            tokio::select! {
+                biased;
+                result = completed.recv(), if self.idle_workers.len() != self.workers.len() => {
+                    self.finish(result.expect("active fault syscall worker"));
+                }
+                item = incoming.recv(), if self.barrier.is_none() && !self.incoming_closed => {
+                    let Some(item) = item else {
+                        self.incoming_closed = true;
+                        continue;
+                    };
+                    self.admit(item);
+                }
             }
         }
     }
@@ -995,13 +1013,13 @@ fn execute_fault_work(work: BlockingFaultWork) -> Result<(), ()> {
         }
         #[cfg(test)]
         BlockingFaultWork::Test {
-            vset,
+            volume,
             entered,
             release,
             result,
             panics,
         } => {
-            entered.send(vset).expect("test observes fault work");
+            entered.send(volume).expect("test observes fault work");
             release.wait();
             assert!(!panics, "synthetic fault-work panic");
             result
@@ -1029,7 +1047,7 @@ fn for_each_contiguous_run(indices: &mut Vec<usize>, mut visit: impl FnMut(usize
     visit(start, end - start + 1);
 }
 
-type SharedPageKey = (u64, u64, blockd_core::types::SegId, u32);
+type SharedPageKey = (u64, u64, blockd_core::types::ObjectId, u32);
 
 struct ProductionWorld {
     blobs: FileBlobs,
@@ -1046,8 +1064,8 @@ struct ProductionWorld {
 }
 
 impl ProductionWorld {
-    fn host(&self, vset: VsetId) -> Arc<VsetHost> {
-        self.shared.vsets.lock().expect("vset lock")[&vset].clone()
+    fn host(&self, volume: VolumeId) -> Arc<VolumeHost> {
+        self.shared.volumes.lock().expect("volume lock")[&volume].clone()
     }
 
     fn enqueue_fault_work(&self, item: FaultWork) -> Result<(), GuestMemoryError> {
@@ -1255,26 +1273,26 @@ impl Peers for ProductionWorld {
 
 impl GuestMem for ProductionWorld {
     async fn read_page(&self, page: PageId) -> Vec<u8> {
-        let host = self.host(page.volume.vset);
+        let host = self.host(page.volume);
         host.region.read_page(host.page_index(page))
     }
 
     async fn arm_write_protect(&self, pages: &[PageId]) -> Result<(), GuestMemoryError> {
         let hosts = {
-            let mut by_vset = BTreeMap::<VsetId, Vec<usize>>::new();
-            let vsets = self.shared.vsets.lock().expect("vset lock");
+            let mut by_volume = BTreeMap::<VolumeId, Vec<usize>>::new();
+            let volumes = self.shared.volumes.lock().expect("volume lock");
             for &page in pages {
-                let host = &vsets[&page.volume.vset];
-                if host.config.kind == VsetKind::Compute {
-                    by_vset
-                        .entry(page.volume.vset)
+                let host = &volumes[&page.volume];
+                if host.config.kind == VolumeKind::Data {
+                    by_volume
+                        .entry(page.volume)
                         .or_default()
                         .push(host.page_index(page));
                 }
             }
-            by_vset
+            by_volume
                 .into_iter()
-                .map(|(vset, pages)| (vset, Arc::clone(&vsets[&vset]), pages))
+                .map(|(volume, pages)| (volume, Arc::clone(&volumes[&volume]), pages))
                 .collect()
         };
         let (reply, response) = injector();
@@ -1290,7 +1308,7 @@ impl GuestMem for ProductionWorld {
         writable: bool,
         source: FillSource,
     ) -> Result<(), GuestMemoryError> {
-        let host = self.host(page.volume.vset);
+        let host = self.host(page.volume);
         let (reply, response) = injector();
         self.enqueue_fault_work(FaultWork::Fill {
             host: Arc::clone(&host),
@@ -1300,14 +1318,15 @@ impl GuestMem for ProductionWorld {
             reply,
         })?;
         self.fault_response(&response, world_kind::FILL).await?;
-        complete_fault(&self.shared, Some(&host), page, source.into(), "served");
+        self.shared
+            .complete_fault(Some(&host), page, source.into(), "served");
         Ok(())
     }
 
     async fn fill_shared(
         &self,
         page: PageId,
-        share: (u64, u64, blockd_core::types::SegId, u32),
+        share: (u64, u64, blockd_core::types::ObjectId, u32),
         bytes: Option<Vec<u8>>,
         writable: bool,
     ) -> Result<(), GuestMemoryError> {
@@ -1320,7 +1339,7 @@ impl GuestMem for ProductionWorld {
             .get(&share)
             .cloned()
             .expect("shared base page admitted before reuse");
-        let host = self.host(page.volume.vset);
+        let host = self.host(page.volume);
         let (reply, response) = injector();
         self.enqueue_fault_work(FaultWork::Fill {
             host: Arc::clone(&host),
@@ -1331,18 +1350,13 @@ impl GuestMem for ProductionWorld {
         })?;
         self.fault_response(&response, world_kind::FILL_SHARED)
             .await?;
-        complete_fault(
-            &self.shared,
-            Some(&host),
-            page,
-            FaultSource::Shared,
-            "served",
-        );
+        self.shared
+            .complete_fault(Some(&host), page, FaultSource::Shared, "served");
         Ok(())
     }
 
     async fn remap(&self, page: PageId, writable: bool) -> Result<(), GuestMemoryError> {
-        let host = self.host(page.volume.vset);
+        let host = self.host(page.volume);
         let (reply, response) = injector();
         self.enqueue_fault_work(FaultWork::Fill {
             host: Arc::clone(&host),
@@ -1352,25 +1366,21 @@ impl GuestMem for ProductionWorld {
             reply,
         })?;
         self.fault_response(&response, world_kind::FILL).await?;
-        complete_fault(
-            &self.shared,
-            Some(&host),
-            page,
-            FaultSource::Local,
-            "served",
-        );
+        self.shared
+            .complete_fault(Some(&host), page, FaultSource::Local, "served");
         Ok(())
     }
 
     async fn fail(&self, page: PageId) -> Result<(), GuestMemoryError> {
         self.shared.stats.record_world(world_kind::FILL_FAILED, 0);
-        complete_fault(&self.shared, None, page, FaultSource::Unservable, "failed");
+        self.shared
+            .complete_fault(None, page, FaultSource::Unservable, "failed");
         tracing::error!(?page, "fatal unservable guest page");
         Err(GuestMemoryError::Unservable)
     }
 
     async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError> {
-        let host = self.host(page.volume.vset);
+        let host = self.host(page.volume);
         let (reply, response) = injector();
         self.enqueue_fault_work(FaultWork::Unprotect {
             host: Arc::clone(&host),
@@ -1379,30 +1389,29 @@ impl GuestMem for ProductionWorld {
         })?;
         self.fault_response(&response, world_kind::UNPROTECT)
             .await?;
-        complete_fault(
-            &self.shared,
-            Some(&host),
-            page,
-            FaultSource::WriteProtect,
-            "served",
-        );
+        self.shared
+            .complete_fault(Some(&host), page, FaultSource::WriteProtect, "served");
         Ok(())
     }
 
     async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError> {
-        let host = self.host(page.volume.vset);
+        let host = self.host(page.volume);
         let (reply, response) = injector();
         self.enqueue_fault_work(FaultWork::Evict { host, page, reply })?;
         self.fault_response(&response, world_kind::EVICT).await
     }
 
-    async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
+    async fn install_vmstate(
+        &self,
+        volume: VolumeId,
+        bytes: Vec<u8>,
+    ) -> Result<(), GuestMemoryError> {
         let raw: [u8; 8] = bytes
             .get(..8)
             .ok_or(GuestMemoryError::Unservable)?
             .try_into()
             .map_err(|_| GuestMemoryError::Unservable)?;
-        self.host(vset)
+        self.host(volume)
             .ctl
             .state
             .lock()
@@ -1411,10 +1420,10 @@ impl GuestMem for ProductionWorld {
         Ok(())
     }
 
-    async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError> {
+    async fn pause(&self, volume: VolumeId) -> Result<GuestPause, GuestMemoryError> {
         let started = Instant::now();
-        begin_pause(&self.shared, vset);
-        let host = self.host(vset);
+        self.shared.begin_pause(volume);
+        let host = self.host(volume);
         let (generation, response) = {
             let mut state = host.ctl.state.lock().expect("guest control lock");
             state.pause_generation = state
@@ -1436,7 +1445,7 @@ impl GuestMem for ProductionWorld {
         let pending = PendingGuestPause {
             shared: Arc::clone(&self.shared),
             host: Arc::clone(&host),
-            vset,
+            volume,
             generation,
             active: true,
         };
@@ -1458,10 +1467,10 @@ impl GuestMem for ProductionWorld {
 
     async fn resume(
         &self,
-        vset: VsetId,
+        volume: VolumeId,
         pause: Option<GuestPause>,
     ) -> Result<(), GuestMemoryError> {
-        let host = self.host(vset);
+        let host = self.host(volume);
         let mut state = host.ctl.state.lock().expect("guest control lock");
         if pause.is_some_and(|pause| pause.generation != state.pause_generation) {
             return Ok(());
@@ -1469,14 +1478,18 @@ impl GuestMem for ProductionWorld {
         state.pause_requested = false;
         state.paused = false;
         drop(state);
-        complete_pause(&self.shared, vset);
+        self.shared.complete_pause(volume);
         host.ctl.ready.notify_waiters();
         self.shared.stats.record_world(world_kind::RESUME_GUEST, 0);
         Ok(())
     }
 
-    async fn commit_pause(&self, vset: VsetId, pause: GuestPause) -> Result<(), GuestMemoryError> {
-        let host = self.host(vset);
+    async fn commit_pause(
+        &self,
+        volume: VolumeId,
+        pause: GuestPause,
+    ) -> Result<(), GuestMemoryError> {
+        let host = self.host(volume);
         let mut state = host.ctl.state.lock().expect("guest control lock");
         if pause.generation != state.pause_generation {
             return Ok(());
@@ -1484,7 +1497,7 @@ impl GuestMem for ProductionWorld {
         state.pause_requested = false;
         state.pause_waiter = None;
         drop(state);
-        complete_pause(&self.shared, vset);
+        self.shared.complete_pause(volume);
         Ok(())
     }
 
@@ -1500,13 +1513,13 @@ impl GuestMem for ProductionWorld {
         self.sync_rx.recv().await
     }
 
-    async fn fence(&self, vset: VsetId) -> Result<(), GuestMemoryError> {
+    async fn fence(&self, volume: VolumeId) -> Result<(), GuestMemoryError> {
         self.shared
             .incidents
             .lock()
             .expect("incident lock")
-            .push(format!("fenced: {vset:?}"));
-        self.shared.stats.record_world(world_kind::VSET_FENCED, 0);
+            .push(format!("fenced: {volume:?}"));
+        self.shared.stats.record_world(world_kind::VOLUME_FENCED, 0);
         Ok(())
     }
 }
@@ -1576,22 +1589,22 @@ pub struct Runtime {
     authenticated_peers: bool,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     actor_task: Option<std::thread::JoinHandle<()>>,
-    fault_readers: Mutex<BTreeMap<VsetId, tokio::task::JoinHandle<()>>>,
+    fault_readers: Mutex<BTreeMap<VolumeId, tokio::task::JoinHandle<()>>>,
     fault_worker: Option<std::thread::JoinHandle<()>>,
 }
 
-/// A persistent guest thread's access to one compute vset.
+/// A persistent guest thread's access to one compute volume.
 ///
 /// Real VM vCPU threads touch their mappings directly and block in the kernel
 /// while userfaultfd work is serviced. Keeping this handle on a dedicated
 /// thread avoids a fresh executor handoff for every memory access.
 #[derive(Clone)]
 pub struct GuestAccess {
-    host: Arc<VsetHost>,
+    host: Arc<VolumeHost>,
 }
 
 pub struct GuestOperation {
-    host: Arc<VsetHost>,
+    host: Arc<VolumeHost>,
 }
 
 impl GuestAccess {
@@ -1608,7 +1621,7 @@ impl GuestAccess {
     }
 
     pub async fn begin(&self) -> GuestOperation {
-        Runtime::op_start(&self.host).await;
+        self.host.op_start().await;
         GuestOperation {
             host: Arc::clone(&self.host),
         }
@@ -1635,7 +1648,7 @@ impl GuestOperation {
 
 impl Drop for GuestOperation {
     fn drop(&mut self) {
-        Runtime::op_end(&self.host);
+        self.host.op_end();
     }
 }
 
@@ -1649,12 +1662,12 @@ impl Runtime {
     pub async fn recover(
         config: &RuntimeConfig,
         store: Arc<dyn ObjectStore>,
-        vset_configs: &BTreeMap<VsetId, VsetConfig>,
-    ) -> (Self, BTreeMap<VsetId, Verdict>) {
+        volume_configs: &BTreeMap<VolumeId, VolumeConfig>,
+    ) -> (Self, BTreeMap<VolumeId, Verdict>) {
         let mut hosts = BTreeMap::new();
-        for (&vset, &vset_config) in vset_configs {
-            assert_peer_stash_transport(vset_config, config.peer.is_some());
-            hosts.insert(vset, VsetHost::new(vset_config));
+        for (&volume, &volume_config) in volume_configs {
+            assert_peer_stash_transport(volume_config, config.peer.is_some());
+            hosts.insert(volume, VolumeHost::new(volume, volume_config));
         }
         let runtime = Self::start(hosts, config, store).await;
         (runtime, BTreeMap::new())
@@ -1662,7 +1675,7 @@ impl Runtime {
 
     #[allow(clippy::too_many_lines)]
     async fn start(
-        hosts: BTreeMap<VsetId, Arc<VsetHost>>,
+        hosts: BTreeMap<VolumeId, Arc<VolumeHost>>,
         config: &RuntimeConfig,
         store: Arc<dyn ObjectStore>,
     ) -> Self {
@@ -1752,8 +1765,7 @@ impl Runtime {
                             let observation_inputs = actor_inputs.clone();
                             let mut observation = blockd_exec::spawn(async move {
                                 loop {
-                                    publish_observability(
-                                        &observation_shared,
+                                    observation_shared.publish_observability(
                                         &observation_state,
                                         &observation_inputs,
                                     );
@@ -1776,7 +1788,7 @@ impl Runtime {
                             {
                                 let _ = drain.await;
                             }
-                            publish_observability(&actor_shared, &state, &actor_inputs);
+                            actor_shared.publish_observability(&state, &actor_inputs);
                         })
                         .await;
                 }));
@@ -1796,16 +1808,14 @@ impl Runtime {
         };
         let hosts = runtime
             .shared
-            .vsets
+            .volumes
             .lock()
-            .expect("vset lock")
+            .expect("volume lock")
             .iter()
-            .map(|(&vset, host)| (vset, Arc::clone(host)))
+            .map(|(&volume, host)| (volume, Arc::clone(host)))
             .collect::<Vec<_>>();
-        for (vset, host) in hosts {
-            if host.config.kind == VsetKind::Compute {
-                runtime.spawn_fault_reader(vset, host);
-            }
+        for (volume, host) in hosts {
+            runtime.spawn_fault_reader(volume, host);
         }
         runtime
     }
@@ -1848,24 +1858,24 @@ impl Runtime {
         self.shared.capacity.lock().expect("capacity lock").signal()
     }
 
-    pub fn backup_lag_age(&self) -> Vec<(VsetId, Duration)> {
+    pub fn backup_lag_age(&self) -> Vec<(VolumeId, Duration)> {
         self.shared
             .backup_lag_started
             .lock()
             .expect("lag lock")
             .iter()
-            .map(|(&vset, started)| (vset, started.elapsed()))
+            .map(|(&volume, started)| (volume, started.elapsed()))
             .collect()
     }
 
-    pub fn active_operation_age(&self) -> Vec<(VsetId, &'static str, Duration)> {
+    pub fn active_operation_age(&self) -> Vec<(VolumeId, &'static str, Duration)> {
         self.shared
             .operation_started
             .lock()
             .expect("operation lock")
             .iter()
-            .map(|(&(vset, operation), started)| {
-                (vset, operation_name(operation), started.elapsed())
+            .map(|(&(volume, operation), started)| {
+                (volume, operation_name(operation), started.elapsed())
             })
             .collect()
     }
@@ -1876,16 +1886,16 @@ impl Runtime {
             .daemon_stats
             .lock()
             .expect("stats lock")
-            .vsets
+            .volumes
             .iter()
-            .map(|stats| stats.vset)
+            .map(|stats| stats.volume)
             .collect::<BTreeSet<_>>();
-        let vsets = self.shared.vsets.lock().expect("vset lock");
+        let volumes = self.shared.volumes.lock().expect("volume lock");
         let mut snapshots = Vec::new();
-        for (&vset, host) in vsets.iter().filter(|(vset, _)| active.contains(vset)) {
+        for (&volume, host) in volumes.iter().filter(|(volume, _)| active.contains(volume)) {
             for source in FaultSource::ALL {
                 snapshots.push(FaultLatency {
-                    vset,
+                    volume,
                     source: source.name(),
                     histogram: host.fault_latency[source.index()].snapshot(),
                 });
@@ -1943,13 +1953,13 @@ impl Runtime {
     }
 
     #[allow(clippy::too_many_lines)] // readiness, error, tracing, and injection are one loop
-    fn spawn_fault_reader(&self, vset: VsetId, host: Arc<VsetHost>) {
+    fn spawn_fault_reader(&self, volume: VolumeId, host: Arc<VolumeHost>) {
         let faults = self.inputs.faults.clone();
         let shared = Arc::clone(&self.shared);
         let uffd = host
             .uffd
             .as_ref()
-            .expect("compute vset has userfaultfd")
+            .expect("compute volume has userfaultfd")
             .clone();
         uffd.set_nonblocking(true).expect("nonblocking userfaultfd");
         shared
@@ -1974,7 +1984,7 @@ impl Runtime {
                             .lock()
                             .expect("incident lock")
                             .push(format!(
-                                "fault reader readiness failed for {vset:?}: {error}"
+                                "fault reader readiness failed for {volume:?}: {error}"
                             ));
                         return;
                     }
@@ -1991,7 +2001,7 @@ impl Runtime {
                                 .incidents
                                 .lock()
                                 .expect("incident lock")
-                                .push(format!("fault reader failed for {vset:?}: {error}"));
+                                .push(format!("fault reader failed for {volume:?}: {error}"));
                             return;
                         }
                         Err(_) => break,
@@ -2001,11 +2011,10 @@ impl Runtime {
                         Ordering::Relaxed,
                     );
                     for event in events {
-                        let page = host.page_of_addr(vset, event.address & !(page_size() - 1));
+                        let page = host.page_of_addr(event.address & !(page_size() - 1));
                         let span = tracing::debug_span!(
                             "page.fault",
-                            vset_id = vset.0,
-                            volume = page.volume.idx.0,
+                            volume_id = volume.0,
                             page = page.page.0,
                             write = event.write,
                             wp = event.wp,
@@ -2054,7 +2063,7 @@ impl Runtime {
             .fault_readers
             .lock()
             .expect("fault reader lock")
-            .insert(vset, task)
+            .insert(volume, task)
         {
             previous.abort();
         }
@@ -2100,52 +2109,55 @@ impl Runtime {
         .expect("admin event within 30 seconds")
     }
 
-    pub async fn create_vset(&self, vset: VsetId, config: VsetConfig) {
+    pub async fn create_volume(&self, volume: VolumeId, config: VolumeConfig) {
         let started = Instant::now();
-        self.install_vset_host(vset, config);
+        self.install_volume_host(volume, config);
         let created = match self
-            .admin_request(AdminCall::CreateVset {
-                vset,
+            .admin_request(AdminCall::CreateVolume {
+                volume,
                 config,
                 from_base: None,
             })
             .await
         {
-            Ok(AdminSuccess::VsetCreated { vset: found }) if found == vset => true,
+            Ok(AdminSuccess::VolumeCreated { volume: found }) if found == volume => true,
             Err(_) => false,
             result => panic!("unexpected create result: {result:?}"),
         };
         self.observe_operation(0, created, started.elapsed());
-        assert!(created, "vset creation failed");
+        assert!(created, "volume creation failed");
     }
 
-    pub async fn keep_base(&self, vset: VsetId, base: u64) {
-        match self.admin_request(AdminCall::KeepBase { vset, base }).await {
+    pub async fn keep_base(&self, volume: VolumeId, base: u64) {
+        match self
+            .admin_request(AdminCall::KeepBase { volume, base })
+            .await
+        {
             Ok(AdminSuccess::BaseKept { base: found }) if found == base => {}
             result => panic!("base retention failed: {result:?}"),
         }
     }
 
-    pub async fn fork_vset(&self, vset: VsetId, config: VsetConfig, base: u64) -> Verdict {
+    pub async fn fork_volume(&self, volume: VolumeId, config: VolumeConfig, base: u64) -> Verdict {
         let started = Instant::now();
-        self.install_vset_host(vset, config);
+        self.install_volume_host(volume, config);
         let result = match self
-            .admin_request(AdminCall::CreateVset {
-                vset,
+            .admin_request(AdminCall::CreateVolume {
+                volume,
                 config,
                 from_base: Some(base),
             })
             .await
         {
-            Ok(AdminSuccess::VsetForked {
-                vset: found,
+            Ok(AdminSuccess::VolumeForked {
+                volume: found,
                 verdict,
-            }) if found == vset => Some(verdict),
+            }) if found == volume => Some(verdict),
             Err(_) => None,
             result => panic!("unexpected fork result: {result:?}"),
         };
         self.observe_operation(5, result.is_some(), started.elapsed());
-        result.expect("vset fork failed")
+        result.expect("volume fork failed")
     }
 
     pub async fn delete_base(&self, base: u64) {
@@ -2155,12 +2167,15 @@ impl Runtime {
         }
     }
 
-    pub async fn checkpoint(&self, vset: VsetId) -> u64 {
+    pub async fn checkpoint(&self, volume: VolumeId) -> u64 {
         let started = Instant::now();
         let req = self.req();
-        self.expect_pause(vset, 0);
+        let pauses_guest = self.host(volume).config.kind == VolumeKind::Memory;
+        if pauses_guest {
+            self.expect_pause(volume, 0);
+        }
         let result = match self
-            .admin_request(AdminCall::Checkpoint { retry: req, vset })
+            .admin_request(AdminCall::Checkpoint { retry: req, volume })
             .await
         {
             Ok(AdminSuccess::CheckpointDone { epoch, .. }) => Some(epoch.0),
@@ -2168,17 +2183,20 @@ impl Runtime {
             result => panic!("unexpected checkpoint result: {result:?}"),
         };
         self.observe_operation(1, result.is_some(), started.elapsed());
-        if result.is_none() {
-            self.cancel_expected_pause(vset, 0);
+        if pauses_guest && result.is_none() {
+            self.cancel_expected_pause(volume, 0);
         }
         result.expect("checkpoint failed")
     }
 
-    pub async fn restore_vset(&self, vset: VsetId, config: VsetConfig) -> Verdict {
+    pub async fn restore_volume(&self, volume: VolumeId, config: VolumeConfig) -> Verdict {
         let started = Instant::now();
-        self.install_vset_host(vset, config);
-        let result = match self.admin_request(AdminCall::RestoreVset { vset }).await {
-            Ok(AdminSuccess::VsetRestored { verdict, .. }) => Some(verdict),
+        self.install_volume_host(volume, config);
+        let result = match self
+            .admin_request(AdminCall::RestoreVolume { volume })
+            .await
+        {
+            Ok(AdminSuccess::VolumeRestored { verdict, .. }) => Some(verdict),
             Err(_) => None,
             result => panic!("unexpected restore result: {result:?}"),
         };
@@ -2186,57 +2204,63 @@ impl Runtime {
         result.expect("restore failed")
     }
 
-    pub async fn wait_recovered(&self, vset: VsetId) -> Verdict {
+    pub async fn wait_recovered(&self, volume: VolumeId) -> Verdict {
         self.wait_admin_event(|event| match event {
-            AdminEvent::VsetRecovered {
-                vset: found,
+            AdminEvent::VolumeRecovered {
+                volume: found,
                 verdict,
-            } if *found == vset => Some(*verdict),
+            } if *found == volume => Some(*verdict),
             _ => None,
         })
         .await
     }
 
-    pub fn expect_migration(&self, vset: VsetId, config: VsetConfig) {
-        self.install_vset_host(vset, config);
+    pub fn expect_migration(&self, volume: VolumeId, config: VolumeConfig) {
+        self.install_volume_host(volume, config);
     }
 
-    fn install_vset_host(&self, vset: VsetId, config: VsetConfig) {
+    fn install_volume_host(&self, volume: VolumeId, config: VolumeConfig) {
         assert_peer_stash_transport(config, self.authenticated_peers);
-        let host = VsetHost::new(config);
+        let host = VolumeHost::new(volume, config);
         self.shared
-            .vsets
+            .volumes
             .lock()
-            .expect("vset lock")
-            .insert(vset, Arc::clone(&host));
-        if config.kind == VsetKind::Compute {
-            self.spawn_fault_reader(vset, host);
-        }
+            .expect("volume lock")
+            .insert(volume, Arc::clone(&host));
+        self.spawn_fault_reader(volume, host);
     }
 
-    pub async fn migrate_out(&self, vset: VsetId, to: HostId) {
+    pub async fn migrate_out(&self, volume: VolumeId, to: HostId) {
         let started = Instant::now();
-        self.expect_pause(vset, 1);
-        let migrated = match self.admin_request(AdminCall::MigrateOut { vset, to }).await {
+        let pauses_guest = self.host(volume).config.kind == VolumeKind::Memory;
+        if pauses_guest {
+            self.expect_pause(volume, 1);
+        }
+        let migrated = match self
+            .admin_request(AdminCall::MigrateOut { volume, to })
+            .await
+        {
             Ok(AdminSuccess::MigratedOut { .. }) => true,
             Err(_) => false,
             result => panic!("unexpected migration result: {result:?}"),
         };
         self.observe_operation(3, migrated, started.elapsed());
-        if migrated {
-            complete_pause(&self.shared, vset);
-        } else {
-            self.cancel_expected_pause(vset, 1);
+        if pauses_guest {
+            if migrated {
+                self.shared.complete_pause(volume);
+            } else {
+                self.cancel_expected_pause(volume, 1);
+            }
         }
         assert!(migrated, "migrate out failed");
     }
 
-    pub async fn wait_migrated_in(&self, vset: VsetId) -> Verdict {
+    pub async fn wait_migrated_in(&self, volume: VolumeId) -> Verdict {
         self.wait_admin_event(|event| match event {
-            AdminEvent::VsetMigratedIn {
-                vset: found,
+            AdminEvent::VolumeMigratedIn {
+                volume: found,
                 verdict,
-            } if *found == vset => Some(*verdict),
+            } if *found == volume => Some(*verdict),
             _ => None,
         })
         .await
@@ -2246,7 +2270,7 @@ impl Runtime {
         *self.shared.counters.lock().expect("counter lock")
     }
 
-    pub fn replica_metrics(&self) -> Vec<ReplicaVsetMetrics> {
+    pub fn replica_metrics(&self) -> Vec<ReplicaVolumeMetrics> {
         self.shared
             .replica_metrics
             .lock()
@@ -2278,77 +2302,45 @@ impl Runtime {
         ))
     }
 
-    fn host(&self, vset: VsetId) -> Arc<VsetHost> {
-        self.shared.vsets.lock().expect("vset lock")[&vset].clone()
+    fn host(&self, volume: VolumeId) -> Arc<VolumeHost> {
+        self.shared.volumes.lock().expect("volume lock")[&volume].clone()
     }
 
-    pub fn guest_access(&self, vset: VsetId) -> GuestAccess {
+    pub fn guest_access(&self, volume: VolumeId) -> GuestAccess {
         GuestAccess {
-            host: self.host(vset),
+            host: self.host(volume),
         }
     }
 
-    async fn op_start(host: &VsetHost) {
-        loop {
-            let notified = host.ctl.ready.notified();
-            {
-                let mut state = host.ctl.state.lock().expect("guest control lock");
-                if !state.pause_requested && !state.paused && !state.in_op {
-                    state.in_op = true;
-                    return;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    fn op_end(host: &VsetHost) {
-        let mut state = host.ctl.state.lock().expect("guest control lock");
-        state.in_op = false;
-        state.applied = state.applied.saturating_add(1);
-        if state.pause_requested && !state.paused {
-            state.paused = true;
-            let applied = state.applied;
-            if let Some(waiter) = state.pause_waiter.take() {
-                let _ = waiter.push(Lane::Critical, applied);
-            }
-        }
-        drop(state);
-        host.ctl.ready.notify_waiters();
-    }
-
-    pub async fn guest_write(&self, vset: VsetId, page: PageId, value: u64) {
-        let host = self.host(vset);
-        Self::op_start(&host).await;
+    pub async fn guest_write(&self, volume: VolumeId, page: PageId, value: u64) {
+        let host = self.host(volume);
+        host.op_start().await;
         tokio::task::spawn_blocking(move || {
             host.view.write_word(host.page_index(page), value);
-            Self::op_end(&host);
+            host.op_end();
         })
         .await
         .expect("guest write worker");
     }
 
-    pub async fn guest_read(&self, vset: VsetId, page: PageId) -> Vec<u8> {
-        let host = self.host(vset);
-        Self::op_start(&host).await;
+    pub async fn guest_read(&self, volume: VolumeId, page: PageId) -> Vec<u8> {
+        let host = self.host(volume);
+        host.op_start().await;
         tokio::task::spawn_blocking(move || {
             let bytes = host.view.read_page(host.page_index(page));
-            Self::op_end(&host);
+            host.op_end();
             bytes
         })
         .await
         .expect("guest read worker")
     }
 
-    pub async fn guest_sync(&self, vset: VsetId, volume: VolumeIdx) -> bool {
+    pub async fn guest_sync(&self, volume: VolumeId) -> bool {
         let started = Instant::now();
-        let host = self.host(vset);
-        Self::op_start(&host).await;
+        let host = self.host(volume);
+        host.op_start().await;
         let req = self.req();
-        let (request, reply) = request(GuestSync {
-            req,
-            volume: VolumeId { vset, idx: volume },
-        });
+        let (request, reply) = request(GuestSync { req, volume });
         self.inputs
             .syncs
             .push(Lane::Critical, request)
@@ -2357,13 +2349,13 @@ impl Runtime {
             .await
             .expect("sync reply within 30 seconds")
             .expect("actor host alive");
-        Self::op_end(&host);
+        host.op_end();
         self.observe_operation(4, ok, started.elapsed());
         ok
     }
 
-    pub fn guest_applied(&self, vset: VsetId) -> u64 {
-        self.host(vset)
+    pub fn guest_applied(&self, volume: VolumeId) -> u64 {
+        self.host(volume)
             .ctl
             .state
             .lock()
@@ -2371,8 +2363,8 @@ impl Runtime {
             .applied
     }
 
-    pub fn guest_resident_bytes(&self, vset: VsetId) -> usize {
-        self.host(vset)
+    pub fn guest_resident_bytes(&self, volume: VolumeId) -> usize {
+        self.host(volume)
             .region
             .resident_bytes()
             .expect("resident byte query")
@@ -2382,19 +2374,19 @@ impl Runtime {
         self.shared.operation_latency[operation][usize::from(!success)].observe(elapsed);
     }
 
-    fn expect_pause(&self, vset: VsetId, operation: usize) {
+    fn expect_pause(&self, volume: VolumeId, operation: usize) {
         self.shared
             .pause_expected
             .lock()
             .expect("pause lock")
-            .entry(vset)
+            .entry(volume)
             .or_default()
             .push_back(operation);
     }
 
-    fn cancel_expected_pause(&self, vset: VsetId, operation: usize) {
+    fn cancel_expected_pause(&self, volume: VolumeId, operation: usize) {
         let mut expected = self.shared.pause_expected.lock().expect("pause lock");
-        if let Some(queue) = expected.get_mut(&vset)
+        if let Some(queue) = expected.get_mut(&volume)
             && let Some(position) = queue.iter().position(|candidate| *candidate == operation)
         {
             queue.remove(position);
@@ -2466,194 +2458,193 @@ fn elapsed_ns(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn complete_fault(
-    shared: &Shared,
-    host: Option<&VsetHost>,
-    page: PageId,
-    source: FaultSource,
-    outcome: &'static str,
-) {
-    let fault = {
-        let mut pending = shared.fault_in_flight.lock().expect("fault lock");
-        let fault = pending.get_mut(&page).and_then(VecDeque::pop_front);
-        if pending.get(&page).is_some_and(VecDeque::is_empty) {
-            pending.remove(&page);
+impl Shared {
+    fn complete_fault(
+        &self,
+        host: Option<&VolumeHost>,
+        page: PageId,
+        source: FaultSource,
+        outcome: &'static str,
+    ) {
+        let fault = {
+            let mut pending = self.fault_in_flight.lock().expect("fault lock");
+            let fault = pending.get_mut(&page).and_then(VecDeque::pop_front);
+            if pending.get(&page).is_some_and(VecDeque::is_empty) {
+                pending.remove(&page);
+            }
+            fault
+        };
+        let Some(fault) = fault else {
+            return;
+        };
+        let elapsed = fault.started.elapsed();
+        if let Some(host) = host {
+            host.fault_latency[source.index()].observe(elapsed);
         }
+        fault.span.record("source", source.name());
+        fault.span.record("outcome", outcome);
         fault
-    };
-    let Some(fault) = fault else {
-        return;
-    };
-    let elapsed = fault.started.elapsed();
-    if let Some(host) = host {
-        host.fault_latency[source.index()].observe(elapsed);
+            .span
+            .record("duration_ms", elapsed.as_secs_f64() * 1000.0);
     }
-    fault.span.record("source", source.name());
-    fault.span.record("outcome", outcome);
-    fault
-        .span
-        .record("duration_ms", elapsed.as_secs_f64() * 1000.0);
-}
 
-fn complete_pause(shared: &Shared, vset: VsetId) {
-    if let Some((operation, started)) = shared
-        .pause_in_flight
-        .lock()
-        .expect("pause lock")
-        .remove(&vset)
-    {
-        shared.pause_latency[operation].observe(started.elapsed());
-    }
-}
-
-fn begin_pause(shared: &Shared, vset: VsetId) {
-    let operation = shared
-        .pause_expected
-        .lock()
-        .expect("pause lock")
-        .get_mut(&vset)
-        .and_then(VecDeque::pop_front);
-    if let Some(operation) = operation {
-        shared
+    fn complete_pause(&self, volume: VolumeId) {
+        if let Some((operation, started)) = self
             .pause_in_flight
             .lock()
             .expect("pause lock")
-            .insert(vset, (operation, Instant::now()));
+            .remove(&volume)
+        {
+            self.pause_latency[operation].observe(started.elapsed());
+        }
+    }
+
+    fn begin_pause(&self, volume: VolumeId) {
+        let operation = self
+            .pause_expected
+            .lock()
+            .expect("pause lock")
+            .get_mut(&volume)
+            .and_then(VecDeque::pop_front);
+        if let Some(operation) = operation {
+            self.pause_in_flight
+                .lock()
+                .expect("pause lock")
+                .insert(volume, (operation, Instant::now()));
+        }
     }
 }
 
 const BACKGROUND_OPERATIONS: [u8; 4] = [
-    VsetOperations::CAPTURE,
-    VsetOperations::CHECKPOINT,
-    VsetOperations::BACKUP,
-    VsetOperations::HYDRATION,
+    VolumeOperations::CAPTURE,
+    VolumeOperations::CHECKPOINT,
+    VolumeOperations::BACKUP,
+    VolumeOperations::HYDRATION,
 ];
 
 fn operation_name(operation: u8) -> &'static str {
     match operation {
-        VsetOperations::CAPTURE => "capture",
-        VsetOperations::CHECKPOINT => "checkpoint",
-        VsetOperations::BACKUP => "backup",
-        VsetOperations::HYDRATION => "hydration",
+        VolumeOperations::CAPTURE => "capture",
+        VolumeOperations::CHECKPOINT => "checkpoint",
+        VolumeOperations::BACKUP => "backup",
+        VolumeOperations::HYDRATION => "hydration",
         _ => unreachable!("known background operation"),
     }
 }
 
-fn publish_observability(shared: &Shared, state: &Rc<RefCell<HostState>>, inputs: &Inputs) {
-    let state = state.borrow();
-    let daemon = state.stats();
-    *shared.counters.lock().expect("counter lock") = state.counters;
-    *shared.daemon_stats.lock().expect("stats lock") = daemon.clone();
-    *shared.replica_metrics.lock().expect("replica metric lock") = state.replica_metrics();
-    *shared
-        .replica_spool_metrics
-        .lock()
-        .expect("replica spool metric lock") = state.replica_spool_metrics();
-    drop(state);
-    update_backup_lag(shared, &daemon);
-    update_active_operations(shared, &daemon);
-    update_capacity_signal(shared, &daemon, inputs);
-}
-
-fn update_backup_lag(shared: &Shared, stats: &DaemonStats) {
-    let now = Instant::now();
-    let lagging = stats
-        .vsets
-        .iter()
-        .filter(|vset| vset.archive_lag_captures.is_some_and(|lag| lag > 0))
-        .map(|vset| vset.vset)
-        .collect::<BTreeSet<_>>();
-    let mut started = shared.backup_lag_started.lock().expect("lag lock");
-    started.retain(|vset, _| lagging.contains(vset));
-    for vset in lagging {
-        started.entry(vset).or_insert(now);
+impl Shared {
+    fn publish_observability(&self, state: &Rc<RefCell<HostState>>, inputs: &Inputs) {
+        let state = state.borrow();
+        let daemon = state.stats();
+        *self.counters.lock().expect("counter lock") = state.counters;
+        *self.daemon_stats.lock().expect("stats lock") = daemon.clone();
+        *self.replica_metrics.lock().expect("replica metric lock") = state.replica_metrics();
+        *self
+            .replica_spool_metrics
+            .lock()
+            .expect("replica spool metric lock") = state.replica_spool_metrics();
+        drop(state);
+        self.update_backup_lag(&daemon);
+        self.update_active_operations(&daemon);
+        self.update_capacity_signal(&daemon, inputs);
     }
-}
 
-fn update_active_operations(shared: &Shared, stats: &DaemonStats) {
-    let now = Instant::now();
-    let active = stats
-        .vsets
-        .iter()
-        .flat_map(|vset| {
-            BACKGROUND_OPERATIONS
-                .into_iter()
-                .filter(move |operation| vset.operations.active(*operation))
-                .map(move |operation| (vset.vset, operation))
-        })
-        .collect::<BTreeSet<_>>();
-    let mut started = shared.operation_started.lock().expect("operation lock");
-    started.retain(|operation, _| active.contains(operation));
-    for operation in active {
-        started.entry(operation).or_insert(now);
+    fn update_backup_lag(&self, stats: &DaemonStats) {
+        let now = Instant::now();
+        let lagging = stats
+            .volumes
+            .iter()
+            .filter(|volume| volume.archive_lag_captures.is_some_and(|lag| lag > 0))
+            .map(|volume| volume.volume)
+            .collect::<BTreeSet<_>>();
+        let mut started = self.backup_lag_started.lock().expect("lag lock");
+        started.retain(|volume, _| lagging.contains(volume));
+        for volume in lagging {
+            started.entry(volume).or_insert(now);
+        }
     }
-}
 
-fn update_capacity_signal(shared: &Shared, daemon: &DaemonStats, actor_inputs: &Inputs) {
-    let local_io_in_flight = shared
-        .local_io_in_flight
-        .iter()
-        .map(|value| value.load(Ordering::Relaxed))
-        .sum();
-    let oldest_backup_lag = shared
-        .backup_lag_started
-        .lock()
-        .expect("lag lock")
-        .values()
-        .map(Instant::elapsed)
-        .max()
-        .unwrap_or_default();
-    let replica_metrics = shared.replica_metrics.lock().expect("replica metric lock");
-    let stash_missing = replica_metrics
-        .iter()
-        .any(|metric| metric.assignment_epoch.is_none() || metric.active_peer.is_none());
-    let stash_replacement_active = replica_metrics
-        .iter()
-        .any(|metric| metric.transition_peer.is_some());
-    drop(replica_metrics);
-    let spool_metrics = shared
-        .replica_spool_metrics
-        .lock()
-        .expect("replica spool metric lock");
-    let (peer_spool_used_bytes, peer_spool_capacity_bytes) = spool_metrics
-        .iter()
-        .filter(|metric| metric.host_capacity_bytes > 0)
-        .max_by(|left, right| {
-            (u128::from(left.stored_bytes) * u128::from(right.host_capacity_bytes))
-                .cmp(&(u128::from(right.stored_bytes) * u128::from(left.host_capacity_bytes)))
-        })
-        .map_or((0, 0), |metric| {
-            (metric.stored_bytes, metric.host_capacity_bytes)
-        });
-    drop(spool_metrics);
-    let (critical_queue_depth, background_queue_depth) = actor_inputs.depths();
-    let inputs = CapacityInputs {
-        cache_capacity_pages: daemon.cache_capacity_pages,
-        cache_used_pages: daemon
-            .resident_pages
-            .saturating_add(daemon.shared_resident_pages)
-            .saturating_add(daemon.reserved_pages),
-        dirty_pages: daemon.dirty_pages,
-        pressure_waiting_faults: daemon.pressure_waiting_faults,
-        disk_used_bytes: daemon.local_blob_bytes,
-        disk_capacity_bytes: daemon.disk_capacity_bytes,
-        disk_headroom_bytes: daemon.disk_headroom_bytes,
-        local_io_in_flight,
-        loop_busy_ns: shared.stats.busy_ns(),
-        loop_idle_ns: shared.stats.idle_ns(),
-        critical_queue_depth,
-        background_queue_depth,
-        oldest_backup_lag,
-        peer_spool_used_bytes,
-        peer_spool_capacity_bytes,
-        stash_missing,
-        stash_replacement_active,
-    };
-    shared
-        .capacity
-        .lock()
-        .expect("capacity lock")
-        .observe(inputs);
+    fn update_active_operations(&self, stats: &DaemonStats) {
+        let now = Instant::now();
+        let active = stats
+            .volumes
+            .iter()
+            .flat_map(|volume| {
+                BACKGROUND_OPERATIONS
+                    .into_iter()
+                    .filter(move |operation| volume.operations.active(*operation))
+                    .map(move |operation| (volume.volume, operation))
+            })
+            .collect::<BTreeSet<_>>();
+        let mut started = self.operation_started.lock().expect("operation lock");
+        started.retain(|operation, _| active.contains(operation));
+        for operation in active {
+            started.entry(operation).or_insert(now);
+        }
+    }
+
+    fn update_capacity_signal(&self, daemon: &DaemonStats, actor_inputs: &Inputs) {
+        let local_io_in_flight = self
+            .local_io_in_flight
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .sum();
+        let oldest_backup_lag = self
+            .backup_lag_started
+            .lock()
+            .expect("lag lock")
+            .values()
+            .map(Instant::elapsed)
+            .max()
+            .unwrap_or_default();
+        let replica_metrics = self.replica_metrics.lock().expect("replica metric lock");
+        let stash_missing = replica_metrics
+            .iter()
+            .any(|metric| metric.assignment_epoch.is_none() || metric.active_peer.is_none());
+        let stash_replacement_active = replica_metrics
+            .iter()
+            .any(|metric| metric.transition_peer.is_some());
+        drop(replica_metrics);
+        let spool_metrics = self
+            .replica_spool_metrics
+            .lock()
+            .expect("replica spool metric lock");
+        let (peer_spool_used_bytes, peer_spool_capacity_bytes) = spool_metrics
+            .iter()
+            .filter(|metric| metric.host_capacity_bytes > 0)
+            .max_by(|left, right| {
+                (u128::from(left.stored_bytes) * u128::from(right.host_capacity_bytes))
+                    .cmp(&(u128::from(right.stored_bytes) * u128::from(left.host_capacity_bytes)))
+            })
+            .map_or((0, 0), |metric| {
+                (metric.stored_bytes, metric.host_capacity_bytes)
+            });
+        drop(spool_metrics);
+        let (critical_queue_depth, background_queue_depth) = actor_inputs.depths();
+        let inputs = CapacityInputs {
+            cache_capacity_pages: daemon.cache_capacity_pages,
+            cache_used_pages: daemon
+                .resident_pages
+                .saturating_add(daemon.shared_resident_pages)
+                .saturating_add(daemon.reserved_pages),
+            dirty_pages: daemon.dirty_pages,
+            pressure_waiting_faults: daemon.pressure_waiting_faults,
+            disk_used_bytes: daemon.local_blob_bytes,
+            disk_capacity_bytes: daemon.disk_capacity_bytes,
+            disk_headroom_bytes: daemon.disk_headroom_bytes,
+            local_io_in_flight,
+            actor_busy_ns: self.stats.actor_busy_ns(),
+            actor_idle_ns: self.stats.actor_idle_ns(),
+            critical_queue_depth,
+            background_queue_depth,
+            oldest_backup_lag,
+            peer_spool_used_bytes,
+            peer_spool_capacity_bytes,
+            stash_missing,
+            stash_replacement_active,
+        };
+        self.capacity.lock().expect("capacity lock").observe(inputs);
+    }
 }
 
 #[cfg(test)]
@@ -2675,8 +2666,8 @@ mod tests {
     fn enqueue_test_fault_work(
         sender: &tokio::sync::mpsc::UnboundedSender<FaultWork>,
         shared: &Shared,
-        vset: VsetId,
-        entered: std::sync::mpsc::Sender<VsetId>,
+        volume: VolumeId,
+        entered: std::sync::mpsc::Sender<VolumeId>,
         release: Arc<TestFaultWorkGate>,
     ) -> Injected<Result<(), ()>> {
         let (reply, response) = injector();
@@ -2684,7 +2675,7 @@ mod tests {
             sender,
             &shared.fault_work_stats,
             FaultWork::Test {
-                vset,
+                volume,
                 entered,
                 release,
                 result: Ok(()),
@@ -2752,26 +2743,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fault_work_overlaps_distinct_vsets() {
+    async fn fault_work_overlaps_distinct_volumes() {
         let (sender, shared, worker) = start_test_fault_worker();
         let (entered, observed) = std::sync::mpsc::channel();
         let release = Arc::new(TestFaultWorkGate::closed());
         let first = enqueue_test_fault_work(
             &sender,
             &shared,
-            VsetId(1),
+            VolumeId(1),
             entered.clone(),
             Arc::clone(&release),
         );
         let second =
-            enqueue_test_fault_work(&sender, &shared, VsetId(2), entered, Arc::clone(&release));
+            enqueue_test_fault_work(&sender, &shared, VolumeId(2), entered, Arc::clone(&release));
 
         let first_entered = observed
             .recv_timeout(Duration::from_secs(1))
-            .expect("first independent vset entered");
+            .expect("first independent volume entered");
         let second_entered = observed
             .recv_timeout(Duration::from_secs(1))
-            .expect("second independent vset overlapped");
+            .expect("second independent volume overlapped");
         assert_ne!(first_entered, second_entered);
         release.release();
         assert_eq!(first.recv().await, Some(Ok(())));
@@ -2784,7 +2775,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fault_work_serializes_each_vset() {
+    async fn fault_work_serializes_each_volume() {
         let (sender, shared, worker) = start_test_fault_worker();
         let (entered, observed) = std::sync::mpsc::channel();
         let first_release = Arc::new(TestFaultWorkGate::closed());
@@ -2792,26 +2783,32 @@ mod tests {
         let first = enqueue_test_fault_work(
             &sender,
             &shared,
-            VsetId(1),
+            VolumeId(1),
             entered.clone(),
             Arc::clone(&first_release),
         );
         let second = enqueue_test_fault_work(
             &sender,
             &shared,
-            VsetId(1),
+            VolumeId(1),
             entered,
             Arc::clone(&second_release),
         );
 
-        assert_eq!(observed.recv_timeout(Duration::from_secs(1)), Ok(VsetId(1)));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)),
+            Ok(VolumeId(1))
+        );
         assert!(
             observed.recv_timeout(Duration::from_millis(50)).is_err(),
-            "same-vset successor entered before its predecessor completed"
+            "same-volume successor entered before its predecessor completed"
         );
         first_release.release();
         assert_eq!(first.recv().await, Some(Ok(())));
-        assert_eq!(observed.recv_timeout(Duration::from_secs(1)), Ok(VsetId(1)));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)),
+            Ok(VolumeId(1))
+        );
         second_release.release();
         assert_eq!(second.recv().await, Some(Ok(())));
         drop(sender);
@@ -2827,7 +2824,7 @@ mod tests {
         let first = enqueue_test_fault_work(
             &sender,
             &shared,
-            VsetId(1),
+            VolumeId(1),
             entered.clone(),
             Arc::clone(&first_release),
         );
@@ -2841,12 +2838,15 @@ mod tests {
         let second = enqueue_test_fault_work(
             &sender,
             &shared,
-            VsetId(2),
+            VolumeId(2),
             entered,
             Arc::clone(&second_release),
         );
 
-        assert_eq!(observed.recv_timeout(Duration::from_secs(1)), Ok(VsetId(1)));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)),
+            Ok(VolumeId(1))
+        );
         assert!(
             observed.recv_timeout(Duration::from_millis(50)).is_err(),
             "post-barrier work entered while the prefix was draining"
@@ -2854,7 +2854,10 @@ mod tests {
         first_release.release();
         assert_eq!(first.recv().await, Some(Ok(())));
         completed.await.expect("barrier completed after prefix");
-        assert_eq!(observed.recv_timeout(Duration::from_secs(1)), Ok(VsetId(2)));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)),
+            Ok(VolumeId(2))
+        );
         second_release.release();
         assert_eq!(second.recv().await, Some(Ok(())));
         drop(sender);
@@ -2862,7 +2865,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fault_work_panic_does_not_strand_the_vset() {
+    async fn fault_work_panic_does_not_strand_the_volume() {
         let (sender, shared, worker) = start_test_fault_worker();
         let (entered, observed) = std::sync::mpsc::channel();
         let release = Arc::new(TestFaultWorkGate::closed());
@@ -2872,7 +2875,7 @@ mod tests {
             &sender,
             &shared.fault_work_stats,
             FaultWork::Test {
-                vset: VsetId(1),
+                volume: VolumeId(1),
                 entered: entered.clone(),
                 release: Arc::clone(&release),
                 result: Ok(()),
@@ -2882,12 +2885,18 @@ mod tests {
         )
         .expect("fault worker alive");
         let successor =
-            enqueue_test_fault_work(&sender, &shared, VsetId(1), entered, Arc::clone(&release));
+            enqueue_test_fault_work(&sender, &shared, VolumeId(1), entered, Arc::clone(&release));
 
         assert_eq!(panic_response.recv().await, Some(Err(())));
         assert_eq!(successor.recv().await, Some(Ok(())));
-        assert_eq!(observed.recv_timeout(Duration::from_secs(1)), Ok(VsetId(1)));
-        assert_eq!(observed.recv_timeout(Duration::from_secs(1)), Ok(VsetId(1)));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)),
+            Ok(VolumeId(1))
+        );
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(1)),
+            Ok(VolumeId(1))
+        );
         let metrics = shared.fault_work_stats.snapshot();
         assert_eq!(metrics.active, 0);
         assert_eq!(metrics.join_failures, 1);
@@ -2896,14 +2905,14 @@ mod tests {
     }
 
     #[test]
-    fn persistent_guest_access_serializes_each_vset() {
+    fn persistent_guest_access_serializes_each_volume() {
         let guest = GuestAccess {
-            host: VsetHost::new(VsetConfig::compute(1, 1)),
+            host: VolumeHost::new(VolumeId(1), VolumeConfig::data(1)),
         };
         let operation = guest.try_begin().expect("first operation starts");
         assert!(
             guest.try_begin().is_none(),
-            "a second operation entered the non-thread-safe vset"
+            "a second operation entered the non-thread-safe volume"
         );
         drop(operation);
         assert!(guest.try_begin().is_some());
@@ -2952,53 +2961,53 @@ mod tests {
     #[test]
     fn successful_migration_completes_pause_once() {
         let shared = Shared::new(BTreeMap::new(), &test_host_config());
-        let vset = VsetId(7);
+        let volume = VolumeId(7);
         shared
             .pause_expected
             .lock()
             .expect("pause lock")
-            .entry(vset)
+            .entry(volume)
             .or_default()
             .push_back(1);
 
-        begin_pause(&shared, vset);
+        shared.begin_pause(volume);
         assert!(
             shared
                 .pause_in_flight
                 .lock()
                 .expect("pause lock")
-                .contains_key(&vset)
+                .contains_key(&volume)
         );
 
-        complete_pause(&shared, vset);
-        complete_pause(&shared, vset);
+        shared.complete_pause(volume);
+        shared.complete_pause(volume);
 
         assert!(
             !shared
                 .pause_in_flight
                 .lock()
                 .expect("pause lock")
-                .contains_key(&vset)
+                .contains_key(&volume)
         );
         assert_eq!(shared.pause_latency[1].snapshot().count, 1);
     }
 
     #[test]
     fn cancelled_pending_pause_releases_guest_control() {
-        let vset = VsetId(8);
-        let host = VsetHost::new(VsetConfig::compute(1, 1));
+        let volume = VolumeId(8);
+        let host = VolumeHost::new(volume, VolumeConfig::data(1));
         let shared = Arc::new(Shared::new(
-            BTreeMap::from([(vset, Arc::clone(&host))]),
+            BTreeMap::from([(volume, Arc::clone(&host))]),
             &test_host_config(),
         ));
         shared
             .pause_expected
             .lock()
             .expect("pause lock")
-            .entry(vset)
+            .entry(volume)
             .or_default()
             .push_back(0);
-        begin_pause(&shared, vset);
+        shared.begin_pause(volume);
         {
             let mut state = host.ctl.state.lock().expect("guest control lock");
             state.pause_generation = 1;
@@ -3009,7 +3018,7 @@ mod tests {
         drop(PendingGuestPause {
             shared: Arc::clone(&shared),
             host: Arc::clone(&host),
-            vset,
+            volume,
             generation: 1,
             active: true,
         });
@@ -3023,7 +3032,7 @@ mod tests {
                 .pause_in_flight
                 .lock()
                 .expect("pause lock")
-                .contains_key(&vset)
+                .contains_key(&volume)
         );
     }
 }

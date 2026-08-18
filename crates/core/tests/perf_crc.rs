@@ -1,4 +1,4 @@
-//! CRC-32C throughput profile for the artifact-sized buffers used by segments
+//! CRC-32C throughput profile for the artifact-sized buffers used by BLX files
 //! and replica transfer. The comparison implementation is the bytewise table
 //! loop that preceded `crc-fast`; correctness is asserted, timings are printed.
 

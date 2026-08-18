@@ -58,7 +58,6 @@ struct Coverage {
     wedged_hydration: u64,
     wedged_outbound: u64,
     releases: u64,
-    prefetch_fills: u64,
     parked_end: u64,
     hydrating_end: u64,
     space_amplification_ppm: u64,
@@ -92,7 +91,6 @@ impl Coverage {
         self.wedged_hydration += other.wedged_hydration;
         self.wedged_outbound += other.wedged_outbound;
         self.releases += other.releases;
-        self.prefetch_fills += other.prefetch_fills;
         self.parked_end += other.parked_end;
         self.hydrating_end += other.hydrating_end;
         self.space_amplification_ppm = self
@@ -136,7 +134,6 @@ impl Coverage {
             CoverageMetric::WedgeHydration => self.wedged_hydration,
             CoverageMetric::WedgeOutbound => self.wedged_outbound,
             CoverageMetric::Release => self.releases,
-            CoverageMetric::PrefetchFill => self.prefetch_fills,
             CoverageMetric::ParkedEnd => self.parked_end,
             CoverageMetric::HydratingEnd => self.hydrating_end,
             CoverageMetric::SpaceAmplificationPpm => self.space_amplification_ppm,
@@ -220,7 +217,7 @@ fn run_one(scenario: &Scenario, seed: u64) -> Outcome {
                 pages_flushed: report.counters.pages_flushed,
                 guest_deaths: report.guest_deaths,
                 parked_end: u64::try_from(report.parked_end).expect("parked count fits u64"),
-                space_amplification_ppm: ratio_ppm(report.seg_bytes_end, report.seg_live_bytes_end),
+                space_amplification_ppm: ratio_ppm(report.blx_bytes_end, report.blx_live_bytes_end),
                 ..Coverage::default()
             };
             let mut violations = report.violations.clone();
@@ -260,7 +257,6 @@ fn run_one(scenario: &Scenario, seed: u64) -> Outcome {
                 wedged_hydration: report.wedged_hydration,
                 wedged_outbound: report.wedged_outbound,
                 releases: report.releases,
-                prefetch_fills: report.prefetch_fills,
                 parked_end: u64::try_from(report.parked_end).expect("parked count fits u64"),
                 hydrating_end: u64::try_from(report.hydrating_end)
                     .expect("hydrating count fits u64"),

@@ -22,8 +22,8 @@ const DOCUMENTS: &[(&str, &str)] = &[
         include_str!("../specs/memory-snapshot.json"),
     ),
     (
-        "decider-throughput",
-        include_str!("../specs/decider-throughput.json"),
+        "actor-throughput",
+        include_str!("../specs/actor-throughput.json"),
     ),
 ];
 
@@ -46,7 +46,7 @@ impl std::error::Error for WorkloadError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum VolumeSet {
+pub enum VolumeSelection {
     Memory,
     Disk,
     All,
@@ -62,9 +62,9 @@ pub enum VerifyScope {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VsetShape {
+pub struct VolumeShape {
     pub disk_volumes: u8,
-    pub pages_per_volume: u32,
+    pub pages: u32,
     pub backed_up: bool,
 }
 
@@ -78,7 +78,7 @@ pub struct HotSet {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessPattern {
-    pub volumes: VolumeSet,
+    pub volumes: VolumeSelection,
     pub hot: Option<HotSet>,
 }
 
@@ -112,7 +112,7 @@ pub struct WorkloadSpec {
     pub schema: u32,
     pub name: String,
     pub seed: u64,
-    pub shape: VsetShape,
+    pub shape: VolumeShape,
     pub phases: Vec<Phase>,
 }
 
@@ -127,9 +127,9 @@ impl WorkloadSpec {
         if self.name.is_empty() {
             return Err(WorkloadError::new("workload name must not be empty"));
         }
-        if self.shape.disk_volumes == 0 || self.shape.pages_per_volume == 0 {
+        if self.shape.disk_volumes == 0 || self.shape.pages == 0 {
             return Err(WorkloadError::new(format!(
-                "workload {}: vset shape must contain disk volumes and pages",
+                "workload {}: volume shape must contain disk volumes and pages",
                 self.name
             )));
         }
@@ -174,9 +174,8 @@ impl WorkloadSpec {
                     if let Some(hot) = access.hot
                         && (hot.share_ppm > 1_000_000
                             || hot.pages == 0
-                            || hot.pages > self.shape.pages_per_volume
-                            || (hot.share_ppm < 1_000_000
-                                && hot.pages == self.shape.pages_per_volume))
+                            || hot.pages > self.shape.pages
+                            || (hot.share_ppm < 1_000_000 && hot.pages == self.shape.pages))
                     {
                         return Err(WorkloadError::new(format!(
                             "workload {}: run {index} has an invalid hot set",
@@ -297,12 +296,12 @@ impl Program {
 
     fn logical_page(&mut self, access: AccessPattern) -> LogicalPage {
         let volume = match access.volumes {
-            VolumeSet::Memory => 0,
-            VolumeSet::Disk => {
+            VolumeSelection::Memory => 0,
+            VolumeSelection::Disk => {
                 u8::try_from(self.rng.below(u64::from(self.spec.shape.disk_volumes)) + 1)
                     .expect("disk volume fits u8")
             }
-            VolumeSet::All => {
+            VolumeSelection::All => {
                 u8::try_from(self.rng.below(u64::from(self.spec.shape.disk_volumes) + 1))
                     .expect("volume fits u8")
             }
@@ -313,13 +312,10 @@ impl Program {
             }
             Some(hot) => {
                 hot.pages
-                    + u32::try_from(
-                        self.rng
-                            .below(u64::from(self.spec.shape.pages_per_volume - hot.pages)),
-                    )
-                    .expect("page fits u32")
+                    + u32::try_from(self.rng.below(u64::from(self.spec.shape.pages - hot.pages)))
+                        .expect("page fits u32")
             }
-            None => u32::try_from(self.rng.below(u64::from(self.spec.shape.pages_per_volume)))
+            None => u32::try_from(self.rng.below(u64::from(self.spec.shape.pages)))
                 .expect("page fits u32"),
         };
         LogicalPage { volume, page }
@@ -421,7 +417,7 @@ impl Lcg {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkloadModel {
-    shape: VsetShape,
+    shape: VolumeShape,
     pages: BTreeMap<LogicalPage, u64>,
     completed: u64,
     reads: u64,
@@ -436,7 +432,7 @@ pub struct WorkloadModel {
 }
 
 impl WorkloadModel {
-    pub fn new(shape: VsetShape) -> Self {
+    pub fn new(shape: VolumeShape) -> Self {
         Self {
             shape,
             pages: BTreeMap::new(),
@@ -453,7 +449,7 @@ impl WorkloadModel {
         }
     }
 
-    pub fn shape(&self) -> VsetShape {
+    pub fn shape(&self) -> VolumeShape {
         self.shape
     }
 
@@ -468,7 +464,7 @@ impl WorkloadModel {
             VerifyScope::All => 0..=self.shape.disk_volumes,
         };
         volumes.flat_map(move |volume| {
-            (0..self.shape.pages_per_volume).map(move |page| {
+            (0..self.shape.pages).map(move |page| {
                 let logical = LogicalPage { volume, page };
                 (logical, self.expected(logical))
             })

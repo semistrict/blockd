@@ -718,12 +718,13 @@ mod tests {
     fn layout_keys_pass_encoding_unchanged() {
         for key in [
             "v/000000000badcafe/head",
-            "v/000000000badcafe/rs",
-            "v/000000000badcafe/m/0000000000000002-000000000000001f",
-            "v/000000000badcafe/s/0000000000000002-0000000000000003",
-            "v/000000000badcafe/l/0000000000000002-0000000000000007",
-            "b/000000000badcafe/rec",
-            "b/000000000badcafe/l/0000000000000002-0000000000000007",
+            "v/000000000badcafe/m/0000000000000002-000000000000001f.manifest",
+            "v/000000000badcafe/f/0000000000000002-0000000000000007.files",
+            "v/000000000badcafe/o/0000000000000002-0000000000000003.blx",
+            "v/000000000badcafe/p/0000000000000002-000000000000001f",
+            "b/000000000badcafe/root",
+            "b/000000000badcafe/m/0000000000000007.manifest",
+            "cluster/tls/public-keys/0002.member",
         ] {
             assert_eq!(encode_key(key), key);
         }

@@ -62,11 +62,6 @@ impl Pcg64 {
         self.below(1_000_000) < u64::from(probability.0)
     }
 
-    pub fn pick<'a, T>(&mut self, values: &'a [T]) -> &'a T {
-        assert!(!values.is_empty(), "pick from empty slice");
-        &values[usize::try_from(self.below(values.len() as u64)).expect("index fits usize")]
-    }
-
     #[must_use]
     pub fn fork(&mut self, stream: u64) -> Self {
         Self::new(self.next_u64(), stream)

@@ -8,9 +8,7 @@
 //!
 //! - Pages live in **generations** — coarse age buckets between `min_seq`
 //!   and `max_seq`, at most [`MAX_NR_GENS`] wide, exactly the kernel's
-//!   shape. Fault-ins join the youngest generation; readahead (resume-set
-//!   prefetch, R6.2) joins the oldest, just as the kernel places
-//!   speculative page-cache reads.
+//!   shape. Fault-ins join the youngest generation.
 //! - **Aging** advances `max_seq` and promotes pages the accessed-bit
 //!   harvest ([`crate::world::GuestMem::harvest_accessed`]) reports touched —
 //!   the mirror of the kernel walking page tables for young bits; blockd's
@@ -33,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
-use crate::types::{PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId};
+use crate::types::{ObjectId, PageId, PageNo, VolumeId};
 
 /// Generations resident pages spread across, as in the kernel's MGLRU.
 pub const MAX_NR_GENS: u64 = 4;
@@ -59,22 +57,16 @@ impl Entry {
 }
 
 /// Identity of a shared base page: its immutable location.
-pub type BaseKey = (u64, u64, SegId, u32);
+pub type BaseKey = (u64, u64, ObjectId, u32);
 
-/// Every `PageId` a vset can own — `PageId` orders by vset first, so all
-/// per-vset queries are range scans, never host-wide walks.
-fn vset_range(vset: VsetId) -> RangeInclusive<PageId> {
+/// Every `PageId` a volume can own — `PageId` orders by volume first, so all
+/// per-volume queries are range scans, never host-wide walks.
+fn volume_range(volume: VolumeId) -> RangeInclusive<PageId> {
     PageId {
-        volume: VolumeId {
-            vset,
-            idx: VolumeIdx(0),
-        },
+        volume,
         page: PageNo(0),
     }..=PageId {
-        volume: VolumeId {
-            vset,
-            idx: VolumeIdx(u8::MAX),
-        },
+        volume,
         page: PageNo(u32::MAX),
     }
 }
@@ -84,7 +76,7 @@ pub struct Cache {
     /// Slots promised to in-flight fills but not yet installed.
     reserved: usize,
     entries: BTreeMap<PageId, Entry>,
-    /// Dirty pages, indexed for per-vset range queries: the writeback
+    /// Dirty pages, indexed for per-volume range queries: the writeback
     /// trigger and capture must never scan the whole host cache.
     dirty: BTreeSet<PageId>,
     /// Pages whose newest content is not yet durable — dirty or mid-flush
@@ -148,18 +140,6 @@ impl Cache {
         self.entries.get(&page).is_some_and(|e| e.dirty)
     }
 
-    /// Remove one resident page regardless of dirty state.
-    pub fn remove_page(&mut self, page: PageId) -> bool {
-        let Some(entry) = self.entries.remove(&page) else {
-            return false;
-        };
-        self.unlink(page, &entry);
-        self.count_remove(entry.class, entry.generation);
-        self.dirty.remove(&page);
-        self.unstable.remove(&page);
-        true
-    }
-
     pub fn resident_count(&self) -> usize {
         self.entries.len()
     }
@@ -182,13 +162,6 @@ impl Cache {
     /// Host-wide pages whose newest content is not durable yet.
     pub fn unstable_count(&self) -> usize {
         self.unstable.len()
-    }
-
-    pub fn resident_pages_of(&self, vset: VsetId) -> Vec<PageId> {
-        self.entries
-            .range(vset_range(vset))
-            .map(|(&page, _)| page)
-            .collect()
     }
 
     fn unlink(&mut self, page: PageId, entry: &Entry) {
@@ -279,16 +252,6 @@ impl Cache {
     /// effect). `None` means genuine pressure (R2.5): every resident page is
     /// dirty or mid-flush, so the caller must wait for writeback — never
     /// kill.
-    /// Reserve a slot only if free capacity exists — prefetch (R6.2) must
-    /// never evict live pages to make room for guesses.
-    pub fn reserve_if_free(&mut self) -> bool {
-        if self.entries.len() + self.base_resident.len() + self.reserved < self.capacity {
-            self.reserved += 1;
-            return true;
-        }
-        false
-    }
-
     pub fn reserve_slot(&mut self) -> Option<Option<PageId>> {
         if self.entries.len() + self.base_resident.len() + self.reserved < self.capacity {
             self.reserved += 1;
@@ -307,14 +270,6 @@ impl Cache {
     /// access was a write.
     pub fn fill_slot(&mut self, page: PageId, dirty: bool, memory: bool) {
         self.fill_slot_in(page, dirty, self.max_seq, memory);
-    }
-
-    /// Install a readahead page (resume-set prefetch, R6.2): it joins the
-    /// OLDEST generation, exactly where the kernel puts speculative
-    /// page-cache reads — a guess that is never used ages out first.
-    pub fn fill_slot_cold(&mut self, page: PageId, memory: bool) {
-        let class = u8::from(memory);
-        self.fill_slot_in(page, false, self.min_seq[usize::from(class)], memory);
     }
 
     fn fill_slot_in(&mut self, page: PageId, dirty: bool, generation: u64, memory: bool) {
@@ -391,33 +346,33 @@ impl Cache {
         self.link(page, &entry);
     }
 
-    /// Resident pages of one vset whose current content is not yet durable:
+    /// Resident pages of one volume whose current content is not yet durable:
     /// dirty, or still mid-flush. A capture must persist exactly these — a
     /// mid-flush page's durable location still holds *stale* content, so
     /// referencing it would capture a state that never existed.
-    pub fn unstable_pages_of(&self, vset: VsetId) -> Vec<PageId> {
-        self.unstable.range(vset_range(vset)).copied().collect()
+    pub fn unstable_pages_of(&self, volume: VolumeId) -> Vec<PageId> {
+        self.unstable.range(volume_range(volume)).copied().collect()
     }
 
-    /// Dirty pages of one vset (these get re-write-protected at capture).
-    pub fn dirty_pages_of(&self, vset: VsetId) -> Vec<PageId> {
-        self.dirty.range(vset_range(vset)).copied().collect()
+    /// Dirty pages of one volume (these get re-write-protected at capture).
+    pub fn dirty_pages_of(&self, volume: VolumeId) -> Vec<PageId> {
+        self.dirty.range(volume_range(volume)).copied().collect()
     }
 
-    /// Does the vset have resident dirty pages? (Writeback trigger — pages
+    /// Does the volume have resident dirty pages? (Writeback trigger — pages
     /// merely mid-flush are already on their way and need no new capture.)
-    pub fn has_dirty_of(&self, vset: VsetId) -> bool {
-        self.dirty.range(vset_range(vset)).next().is_some()
+    pub fn has_dirty_of(&self, volume: VolumeId) -> bool {
+        self.dirty.range(volume_range(volume)).next().is_some()
     }
 
-    /// Drop every resident page of one vset. A removed vset (fenced,
+    /// Drop every resident page of one volume. A removed volume (fenced,
     /// released, failed creation) must leave nothing behind: a stale entry
     /// would satisfy `is_resident` for a later incarnation of the same
-    /// vset on this host and vouch for bytes the host no longer maps.
-    pub fn purge_vset(&mut self, vset: VsetId) -> Vec<PageId> {
+    /// volume on this host and vouch for bytes the host no longer maps.
+    pub fn purge_volume(&mut self, volume: VolumeId) -> Vec<PageId> {
         let pages: Vec<PageId> = self
             .entries
-            .range(vset_range(vset))
+            .range(volume_range(volume))
             .map(|(p, _)| *p)
             .collect();
         for page in &pages {
@@ -434,14 +389,11 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PageNo, VolumeId, VolumeIdx, VsetId};
+    use crate::types::{PageNo, VolumeId};
 
     fn page(idx: u8, n: u32) -> PageId {
         PageId {
-            volume: VolumeId {
-                vset: VsetId(1),
-                idx: VolumeIdx(idx),
-            },
+            volume: VolumeId(u64::from(idx) + 1),
             page: PageNo(n),
         }
     }
@@ -493,28 +445,6 @@ mod tests {
         assert_eq!(cache.reserve_slot(), Some(Some(page(1, 1))));
     }
 
-    /// R2.6 readahead placement: prefetched pages join the OLDEST
-    /// generation — an unused guess ages out before any demand fill,
-    /// regardless of insertion order.
-    #[test]
-    fn readahead_ages_out_before_demand_fills() {
-        let mut cache = Cache::new(3);
-        assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 0), false, false); // A: demand, gen 0
-        cache.age(Vec::new); // opens gen 1; A stays old
-        assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(page(1, 1), false, false); // B: demand, gen 1
-        assert!(cache.reserve_if_free());
-        cache.fill_slot_cold(page(1, 2), false); // C: readahead → gen 0
-        // Oldest generation drains first: A then C — the prefetched C dies
-        // before B even though C arrived last.
-        assert_eq!(cache.reserve_slot(), Some(Some(page(1, 0))));
-        cache.fill_slot(page(1, 3), false, false);
-        assert_eq!(cache.reserve_slot(), Some(Some(page(1, 2))));
-        cache.fill_slot(page(1, 4), false, false);
-        assert_eq!(cache.reserve_slot(), Some(Some(page(1, 1))));
-    }
-
     /// The generation span is bounded by [`MAX_NR_GENS`], like the
     /// kernel's: aging cannot run away from an undrained oldest gen.
     #[test]
@@ -528,65 +458,56 @@ mod tests {
         assert_eq!(cache.gen_span(), MAX_NR_GENS);
     }
 
-    fn vpage(vset: u64, idx: u8, n: u32) -> PageId {
+    fn vpage(volume: u64, n: u32) -> PageId {
         PageId {
-            volume: VolumeId {
-                vset: VsetId(vset),
-                idx: VolumeIdx(idx),
-            },
+            volume: VolumeId(volume),
             page: PageNo(n),
         }
     }
 
-    /// The per-vset queries are range scans over dedicated indexes; they
-    /// must see exactly one vset's pages, track every dirty/flush
+    /// The per-volume queries are range scans over dedicated indexes; they
+    /// must see exactly one volume's pages, track every dirty/flush
     /// transition, and purge cleanly — never by walking the host cache.
     #[test]
-    fn per_vset_queries_track_dirty_and_flush_transitions_exactly() {
+    fn per_volume_queries_track_dirty_and_flush_transitions_exactly() {
         let mut cache = Cache::new(8);
         for page in [
-            vpage(1, 0, u32::MAX), // dirty, extreme page number
-            vpage(2, 0, 0),        // dirty, neighbor vset's smallest key
-            vpage(2, u8::MAX, 7),  // dirty, extreme volume index
+            vpage(1, u32::MAX), // dirty, extreme page number
+            vpage(2, 0),        // dirty, neighbor volume's smallest key
+            vpage(2, 7),        // dirty, another page in that volume
         ] {
             assert_eq!(cache.reserve_slot(), Some(None));
-            cache.fill_slot(page, true, page.volume.idx.is_memory());
+            cache.fill_slot(page, true, false);
         }
         assert_eq!(cache.reserve_slot(), Some(None));
-        cache.fill_slot(vpage(2, 1, 3), false, false); // clean
-        assert_eq!(cache.dirty_pages_of(VsetId(1)), vec![vpage(1, 0, u32::MAX)]);
+        cache.fill_slot(vpage(2, 3), false, false); // clean
+        assert_eq!(cache.dirty_pages_of(VolumeId(1)), vec![vpage(1, u32::MAX)]);
         assert_eq!(
-            cache.dirty_pages_of(VsetId(2)),
-            vec![vpage(2, 0, 0), vpage(2, u8::MAX, 7)]
+            cache.dirty_pages_of(VolumeId(2)),
+            vec![vpage(2, 0), vpage(2, 7)]
         );
-        assert!(!cache.has_dirty_of(VsetId(3)));
+        assert!(!cache.has_dirty_of(VolumeId(3)));
 
-        // A capture flushes vset 2's memory page: no longer dirty, still
+        // A capture flushes volume 2's first page: no longer dirty, still
         // unstable until the flush completes.
-        cache.begin_flush(vpage(2, 0, 0));
-        assert_eq!(cache.dirty_pages_of(VsetId(2)), vec![vpage(2, u8::MAX, 7)]);
+        cache.begin_flush(vpage(2, 0));
+        assert_eq!(cache.dirty_pages_of(VolumeId(2)), vec![vpage(2, 7)]);
         assert_eq!(
-            cache.unstable_pages_of(VsetId(2)),
-            vec![vpage(2, 0, 0), vpage(2, u8::MAX, 7)]
+            cache.unstable_pages_of(VolumeId(2)),
+            vec![vpage(2, 0), vpage(2, 7)]
         );
-        cache.end_flush(vpage(2, 0, 0));
-        assert_eq!(
-            cache.unstable_pages_of(VsetId(2)),
-            vec![vpage(2, u8::MAX, 7)]
-        );
+        cache.end_flush(vpage(2, 0));
+        assert_eq!(cache.unstable_pages_of(VolumeId(2)), vec![vpage(2, 7)]);
 
-        // Purging vset 2 clears its indexes and leaves vset 1 untouched.
-        let purged = cache.purge_vset(VsetId(2));
+        // Purging volume 2 clears its indexes and leaves volume 1 untouched.
+        let purged = cache.purge_volume(VolumeId(2));
+        assert_eq!(purged, vec![vpage(2, 0), vpage(2, 3), vpage(2, 7)]);
+        assert!(!cache.has_dirty_of(VolumeId(2)));
+        assert_eq!(cache.unstable_pages_of(VolumeId(2)), Vec::<PageId>::new());
+        assert!(cache.has_dirty_of(VolumeId(1)));
         assert_eq!(
-            purged,
-            vec![vpage(2, 0, 0), vpage(2, 1, 3), vpage(2, u8::MAX, 7)]
-        );
-        assert!(!cache.has_dirty_of(VsetId(2)));
-        assert_eq!(cache.unstable_pages_of(VsetId(2)), Vec::<PageId>::new());
-        assert!(cache.has_dirty_of(VsetId(1)));
-        assert_eq!(
-            cache.unstable_pages_of(VsetId(1)),
-            vec![vpage(1, 0, u32::MAX)]
+            cache.unstable_pages_of(VolumeId(1)),
+            vec![vpage(1, u32::MAX)]
         );
     }
 

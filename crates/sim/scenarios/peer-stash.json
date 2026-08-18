@@ -5,7 +5,7 @@
   "description": "Peer-stashed durability under lossy links and a prolonged object-store outage.",
   "kind": "cluster",
   "topology": {
-    "vset_count": 3,
+    "volume_count": 3,
     "replica_placement": {
       "mode": "weighted-hosts",
       "membership_epoch": 1,

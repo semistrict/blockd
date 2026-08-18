@@ -22,9 +22,8 @@ pub use fault::{FaultConfig, FaultPoint};
 pub use request::{Reply, Request, Response, TryRecvError, request};
 pub use runtime::{
     Cancelled, Delay, ProductionContext, SimulationContext, TaskHandle, TaskId, advance_to,
-    current_poll, delay, fault_point, now, observe, random_u64, run_ready,
-    set_simulation_fault_config, simulation_fault_hits, simulation_polls, simulation_scope,
-    simulation_trace_hash, spawn, yield_now,
+    current_poll, delay, fault_point, now, observe, random_between, random_hit, random_u64,
+    run_ready, simulation_polls, simulation_scope, simulation_trace_hash, spawn, yield_now,
 };
 pub use select::{Either, OneOf3, Timeout, join2, select2, select3, timeout};
-pub use task_set::{ActorCollection, TaskSet};
+pub use task_set::TaskSet;

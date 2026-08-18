@@ -67,8 +67,7 @@ pub struct PutCounters {
 pub enum StoreObjectKind {
     Head = 0,
     Manifest = 1,
-    Segment = 2,
-    ResumeSet = 4,
+    Blx = 2,
     Base = 5,
     Other = 6,
 }

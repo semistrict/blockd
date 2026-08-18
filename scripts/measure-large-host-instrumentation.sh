@@ -2,12 +2,12 @@
 set -euo pipefail
 
 if [[ $# -lt 3 || $# -gt 4 ]]; then
-    echo "usage: $0 ARTIFACT_ROOT VSET_COUNT PROVENANCE [DURATION_SECS]" >&2
+    echo "usage: $0 ARTIFACT_ROOT VOLUME_COUNT PROVENANCE [DURATION_SECS]" >&2
     exit 2
 fi
 
 artifact_root=$1
-vset_count=$2
+volume_count=$2
 provenance=$3
 duration_secs=${4:-300}
 repetitions=${BLOCKD_PROFILE_INSTRUMENTATION_REPETITIONS:-10}
@@ -38,8 +38,8 @@ for command in awk jq; do
 done
 
 mkdir "$artifact_root"
-printf 'vset_count\t%s\nprovenance\t%s\nduration_secs\t%s\nrepetitions\t%s\ndetailed_first\t%s\n' \
-    "$vset_count" "$provenance" "$duration_secs" "$repetitions" "$first" \
+printf 'volume_count\t%s\nprovenance\t%s\nduration_secs\t%s\nrepetitions\t%s\ndetailed_first\t%s\n' \
+    "$volume_count" "$provenance" "$duration_secs" "$repetitions" "$first" \
     >"$artifact_root/config.tsv"
 printf 'order\tpair\tdetailed_profile_metrics\tartifact\n' >"$artifact_root/index.tsv"
 
@@ -47,13 +47,13 @@ provenance_tag=${provenance//:/-}
 for ((order = 1; order <= repetitions; order++)); do
     detailed=$(((order - 1 + first) % 2))
     pair=$(((order + 1) / 2))
-    run_dir=$artifact_root/v${vset_count}-${provenance_tag}-detail${detailed}-n${order}
+    run_dir=$artifact_root/v${volume_count}-${provenance_tag}-detail${detailed}-n${order}
     printf '%s\t%s\t%s\t%s\n' "$order" "$pair" "$detailed" "$run_dir" \
         >>"$artifact_root/index.tsv"
     BLOCKD_PROFILE_DETAILED_METRICS=$detailed \
     BLOCKD_PROFILE_STACKS=0 \
         scripts/run-large-host-profile.sh \
-        "$run_dir" "$vset_count" "$provenance" "$duration_secs" runtime
+        "$run_dir" "$volume_count" "$provenance" "$duration_secs" runtime
 done
 
 results=$artifact_root/results.tsv

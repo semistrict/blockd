@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use crate::format::{
     Dec, DecodeError, Enc, FRAME_HEADER, checksum64, crc32c, open_frame, seal_frame,
 };
-use crate::journal::VsetKind;
-use crate::types::{Gen, PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
+use crate::journal::VolumeKind;
+use crate::types::{Gen, PageId, PageNo, VolumeId, page_size};
 
 pub const MAGIC_HEADER: u32 = u32::from_le_bytes(*b"BLXH");
 pub const MAGIC_ENTRY: u32 = u32::from_le_bytes(*b"BLXE");
@@ -35,14 +35,14 @@ pub fn compaction_object_id_start(slot: u64) -> Option<u64> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum NamespaceKind {
-    Vset = 0,
+    Volume = 0,
     ImportedBase = 1,
 }
 
 impl NamespaceKind {
-    fn decode(value: u8) -> Result<Self, DecodeError> {
+    pub(crate) fn decode(value: u8) -> Result<Self, DecodeError> {
         match value {
-            0 => Ok(Self::Vset),
+            0 => Ok(Self::Volume),
             1 => Ok(Self::ImportedBase),
             _ => Err(DecodeError),
         }
@@ -71,7 +71,6 @@ impl BlockSpace {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockKey {
     pub space: BlockSpace,
-    pub volume: u8,
     pub block: u32,
 }
 
@@ -83,7 +82,6 @@ pub fn vmm_snapshot_blocks(bytes: &[u8]) -> impl Iterator<Item = (BlockKey, Vec<
         (
             BlockKey {
                 space: BlockSpace::Vmm,
-                volume: 0,
                 block: u32::try_from(block).expect("VMM snapshot block fits u32"),
             },
             padded,
@@ -99,75 +97,61 @@ impl BlockKey {
         )
     }
 
-    pub fn from_page(kind: VsetKind, page: PageId) -> Self {
+    pub fn from_page(kind: VolumeKind, page: PageId) -> Self {
         match kind {
-            VsetKind::Compute if page.volume.idx.0 == 0 => Self {
+            VolumeKind::Memory => Self {
                 space: BlockSpace::Memory,
-                volume: 0,
                 block: page.page.0,
             },
-            VsetKind::Compute => Self {
+            VolumeKind::Data => Self {
                 space: BlockSpace::Data,
-                volume: page.volume.idx.0,
                 block: page.page.0,
             },
         }
     }
 
-    pub fn to_page(self, kind: VsetKind, vset: VsetId) -> Option<PageId> {
-        let idx = match (kind, self.space) {
-            (VsetKind::Compute, BlockSpace::Memory) if self.volume == 0 => 0,
-            (VsetKind::Compute, BlockSpace::Data) => self.volume,
+    pub fn to_page(self, kind: VolumeKind, volume: VolumeId) -> Option<PageId> {
+        match (kind, self.space) {
+            (VolumeKind::Memory, BlockSpace::Memory) | (VolumeKind::Data, BlockSpace::Data) => {}
             _ => return None,
-        };
+        }
         Some(PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(idx),
-            },
+            volume,
             page: PageNo(self.block),
         })
     }
 
-    /// Convert a stored page key without needing the manifest's vset kind.
+    /// Convert a stored page key without needing the manifest's volume kind.
     /// Memory and data occupy distinct spaces, while the volume number is the
     /// same number used by the live page identifier.
-    pub fn to_page_id(self, vset: VsetId) -> Option<PageId> {
+    pub fn to_page_id(self, volume: VolumeId) -> Option<PageId> {
         match self.space {
-            BlockSpace::Memory if self.volume == 0 => {}
-            BlockSpace::Data => {}
-            BlockSpace::Vmm | BlockSpace::Memory => return None,
+            BlockSpace::Memory | BlockSpace::Data => {}
+            BlockSpace::Vmm => return None,
         }
         Some(PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(self.volume),
-            },
+            volume,
             page: PageNo(self.block),
         })
     }
 
-    fn encode(self, e: &mut Enc) {
+    pub(crate) fn encode(self, e: &mut Enc) {
         e.u8(self.space as u8);
-        e.u8(self.volume);
+        e.u8(0);
         e.u16(0);
         e.u32(self.block);
     }
 
-    fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
+    pub(crate) fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
         let key = Self {
             space: BlockSpace::decode(d.u8()?)?,
-            volume: d.u8()?,
             block: {
-                if d.u16()? != 0 {
+                if d.u8()? != 0 || d.u16()? != 0 {
                     return Err(DecodeError);
                 }
                 d.u32()?
             },
         };
-        if key.space == BlockSpace::Memory && key.volume != 0 {
-            return Err(DecodeError);
-        }
         Ok(key)
     }
 
@@ -175,7 +159,7 @@ impl BlockKey {
         match self.space {
             BlockSpace::Memory => 0,
             BlockSpace::Vmm => 1,
-            BlockSpace::Data => u16::from(self.volume) + 2,
+            BlockSpace::Data => 2,
         }
     }
 }
@@ -572,44 +556,46 @@ fn encode_header(header: BlxHeader) -> Vec<u8> {
     seal_frame(MAGIC_HEADER, &e.finish())
 }
 
-pub fn open_header(bytes: &[u8]) -> Result<(BlxHeader, usize), DecodeError> {
-    if bytes.len() < HEADER_BYTES {
-        return Err(DecodeError);
+impl BlxHeader {
+    pub fn open(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
+        if bytes.len() < HEADER_BYTES {
+            return Err(DecodeError);
+        }
+        let end = HEADER_BYTES;
+        let payload = open_frame(MAGIC_HEADER, &bytes[..end])?;
+        let mut d = Dec::new(payload);
+        if d.u16()? != HEADER_VERSION {
+            return Err(DecodeError);
+        }
+        let header = Self {
+            block_size: d.u32()?,
+            namespace_kind: NamespaceKind::decode(d.u8()?)?,
+            namespace_id: d.u64()?,
+            writer_fence: d.u64()?,
+            object_id: d.u64()?,
+            min_seq: d.u64()?,
+            max_seq: d.u64()?,
+            batch_id: d.u64()?,
+            chunk_index: d.u32()?,
+            chunk_count: d.u32()?,
+            entry_count: d.u32()?,
+            first_key: BlockKey::decode(&mut d)?,
+            last_key: BlockKey::decode(&mut d)?,
+            pre_state_checksum: d.u64()?,
+            post_state_checksum: d.u64()?,
+        };
+        d.finish()?;
+        if header.block_size != u32::try_from(page_size()).expect("page size fits u32")
+            || header.min_seq > header.max_seq
+            || header.chunk_count == 0
+            || header.chunk_index >= header.chunk_count
+            || header.entry_count == 0
+            || header.first_key > header.last_key
+        {
+            return Err(DecodeError);
+        }
+        Ok((header, end))
     }
-    let end = HEADER_BYTES;
-    let payload = open_frame(MAGIC_HEADER, &bytes[..end])?;
-    let mut d = Dec::new(payload);
-    if d.u16()? != HEADER_VERSION {
-        return Err(DecodeError);
-    }
-    let header = BlxHeader {
-        block_size: d.u32()?,
-        namespace_kind: NamespaceKind::decode(d.u8()?)?,
-        namespace_id: d.u64()?,
-        writer_fence: d.u64()?,
-        object_id: d.u64()?,
-        min_seq: d.u64()?,
-        max_seq: d.u64()?,
-        batch_id: d.u64()?,
-        chunk_index: d.u32()?,
-        chunk_count: d.u32()?,
-        entry_count: d.u32()?,
-        first_key: BlockKey::decode(&mut d)?,
-        last_key: BlockKey::decode(&mut d)?,
-        pre_state_checksum: d.u64()?,
-        post_state_checksum: d.u64()?,
-    };
-    d.finish()?;
-    if header.block_size != u32::try_from(page_size()).expect("page size fits u32")
-        || header.min_seq > header.max_seq
-        || header.chunk_count == 0
-        || header.chunk_index >= header.chunk_count
-        || header.entry_count == 0
-        || header.first_key > header.last_key
-    {
-        return Err(DecodeError);
-    }
-    Ok((header, end))
 }
 
 fn encode_entry(entry: &BlxEntry) -> Vec<u8> {
@@ -626,32 +612,34 @@ fn encode_entry(entry: &BlxEntry) -> Vec<u8> {
     seal_frame(MAGIC_ENTRY, &e.finish())
 }
 
-pub fn open_entry(bytes: &[u8]) -> Result<BlxEntry, DecodeError> {
-    let payload = open_frame(MAGIC_ENTRY, bytes)?;
-    let mut d = Dec::new(payload);
-    let kind = EntryKind::decode(d.u8()?)?;
-    let key = BlockKey::decode(&mut d)?;
-    let generation = Gen(d.u64()?);
-    let entry = match kind {
-        EntryKind::Data => {
-            let raw_len = usize::try_from(d.u32()?).expect("u32 fits usize");
-            let stored_len = usize::try_from(d.u32()?).expect("u32 fits usize");
-            if raw_len != page_size() {
-                return Err(DecodeError);
+impl BlxEntry {
+    pub fn open(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let payload = open_frame(MAGIC_ENTRY, bytes)?;
+        let mut d = Dec::new(payload);
+        let kind = EntryKind::decode(d.u8()?)?;
+        let key = BlockKey::decode(&mut d)?;
+        let generation = Gen(d.u64()?);
+        let entry = match kind {
+            EntryKind::Data => {
+                let raw_len = usize::try_from(d.u32()?).expect("u32 fits usize");
+                let stored_len = usize::try_from(d.u32()?).expect("u32 fits usize");
+                if raw_len != page_size() {
+                    return Err(DecodeError);
+                }
+                let compressed = d.bytes(stored_len)?;
+                let bytes =
+                    lz4_flex::block::decompress(compressed, raw_len).map_err(|_| DecodeError)?;
+                Self::Data {
+                    key,
+                    generation,
+                    bytes,
+                }
             }
-            let compressed = d.bytes(stored_len)?;
-            let bytes =
-                lz4_flex::block::decompress(compressed, raw_len).map_err(|_| DecodeError)?;
-            BlxEntry::Data {
-                key,
-                generation,
-                bytes,
-            }
-        }
-        EntryKind::Tombstone => BlxEntry::Tombstone { key, generation },
-    };
-    d.finish()?;
-    Ok(entry)
+            EntryKind::Tombstone => Self::Tombstone { key, generation },
+        };
+        d.finish()?;
+        Ok(entry)
+    }
 }
 
 fn encode_footer(footer: &BlxFooter) -> Vec<u8> {
@@ -670,43 +658,45 @@ fn encode_footer(footer: &BlxFooter) -> Vec<u8> {
     seal_frame(MAGIC_FOOTER, &e.finish())
 }
 
-pub fn open_footer(bytes: &[u8]) -> Result<BlxFooter, DecodeError> {
-    let payload = open_frame(MAGIC_FOOTER, bytes)?;
-    let mut d = Dec::new(payload);
-    if d.u16()? != 1 {
-        return Err(DecodeError);
-    }
-    let count = usize::try_from(d.u32()?).expect("u32 fits usize");
-    if d.remaining() != count.checked_mul(FOOTER_ENTRY_BYTES).ok_or(DecodeError)? {
-        return Err(DecodeError);
-    }
-    let mut entries = Vec::with_capacity(count);
-    let mut previous = None;
-    for _ in 0..count {
-        let entry = FooterEntry {
-            key: BlockKey::decode(&mut d)?,
-            offset: d.u32()?,
-            length: d.u32()?,
-            generation: Gen(d.u64()?),
-            kind: EntryKind::decode(d.u8()?)?,
-            value_checksum: {
-                let reserved = d.bytes(7)?;
-                if reserved != [0; 7] {
-                    return Err(DecodeError);
-                }
-                d.u64()?
-            },
-        };
-        if (entry.kind == EntryKind::Tombstone && entry.value_checksum != 0)
-            || previous.is_some_and(|key| key >= entry.key)
-        {
+impl BlxFooter {
+    pub fn open(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let payload = open_frame(MAGIC_FOOTER, bytes)?;
+        let mut d = Dec::new(payload);
+        if d.u16()? != 1 {
             return Err(DecodeError);
         }
-        previous = Some(entry.key);
-        entries.push(entry);
+        let count = usize::try_from(d.u32()?).expect("u32 fits usize");
+        if d.remaining() != count.checked_mul(FOOTER_ENTRY_BYTES).ok_or(DecodeError)? {
+            return Err(DecodeError);
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut previous = None;
+        for _ in 0..count {
+            let entry = FooterEntry {
+                key: BlockKey::decode(&mut d)?,
+                offset: d.u32()?,
+                length: d.u32()?,
+                generation: Gen(d.u64()?),
+                kind: EntryKind::decode(d.u8()?)?,
+                value_checksum: {
+                    let reserved = d.bytes(7)?;
+                    if reserved != [0; 7] {
+                        return Err(DecodeError);
+                    }
+                    d.u64()?
+                },
+            };
+            if (entry.kind == EntryKind::Tombstone && entry.value_checksum != 0)
+                || previous.is_some_and(|key| key >= entry.key)
+            {
+                return Err(DecodeError);
+            }
+            previous = Some(entry.key);
+            entries.push(entry);
+        }
+        d.finish()?;
+        Ok(Self { entries })
     }
-    d.finish()?;
-    Ok(BlxFooter { entries })
 }
 
 fn encode_trailer(footer_offset: u32, footer_length: u32) -> [u8; TRAILER_BYTES] {
@@ -738,59 +728,61 @@ pub fn open_trailer(bytes: &[u8]) -> Result<(u32, u32), DecodeError> {
     Ok((offset, length))
 }
 
-pub fn scan_object(bytes: &[u8]) -> Result<(BlxHeader, BlxFooter), DecodeError> {
-    let (header, header_end) = open_header(bytes)?;
-    if bytes.len() < header_end + TRAILER_BYTES {
-        return Err(DecodeError);
-    }
-    let (footer_offset, footer_length) = open_trailer(&bytes[bytes.len() - TRAILER_BYTES..])?;
-    let footer_offset = usize::try_from(footer_offset).expect("u32 fits usize");
-    let footer_length = usize::try_from(footer_length).expect("u32 fits usize");
-    let footer_end = footer_offset
-        .checked_add(footer_length)
-        .ok_or(DecodeError)?;
-    if footer_offset < header_end || footer_end + TRAILER_BYTES != bytes.len() {
-        return Err(DecodeError);
-    }
-    let footer = open_footer(&bytes[footer_offset..footer_end])?;
-    if footer.entries.len() != usize::try_from(header.entry_count).expect("u32 fits usize")
-        || footer.entries.first().map(|entry| entry.key) != Some(header.first_key)
-        || footer.entries.last().map(|entry| entry.key) != Some(header.last_key)
-    {
-        return Err(DecodeError);
-    }
-    let mut expected_offset = header_end;
-    for footer_entry in &footer.entries {
-        let offset = usize::try_from(footer_entry.offset).expect("u32 fits usize");
-        let length = usize::try_from(footer_entry.length).expect("u32 fits usize");
-        let end = offset.checked_add(length).ok_or(DecodeError)?;
-        if offset != expected_offset || end > footer_offset {
+impl BlxObject {
+    pub fn scan(bytes: &[u8]) -> Result<(BlxHeader, BlxFooter), DecodeError> {
+        let (header, header_end) = BlxHeader::open(bytes)?;
+        if bytes.len() < header_end + TRAILER_BYTES {
             return Err(DecodeError);
         }
-        let entry = open_entry(&bytes[offset..end])?;
-        let value_checksum = match &entry {
-            BlxEntry::Data { bytes, .. } => checksum64(bytes),
-            BlxEntry::Tombstone { .. } => 0,
-        };
-        if (
-            entry.key(),
-            entry.generation(),
-            entry.kind(),
-            value_checksum,
-        ) != (
-            footer_entry.key,
-            footer_entry.generation,
-            footer_entry.kind,
-            footer_entry.value_checksum,
-        ) {
+        let (footer_offset, footer_length) = open_trailer(&bytes[bytes.len() - TRAILER_BYTES..])?;
+        let footer_offset = usize::try_from(footer_offset).expect("u32 fits usize");
+        let footer_length = usize::try_from(footer_length).expect("u32 fits usize");
+        let footer_end = footer_offset
+            .checked_add(footer_length)
+            .ok_or(DecodeError)?;
+        if footer_offset < header_end || footer_end + TRAILER_BYTES != bytes.len() {
             return Err(DecodeError);
         }
-        expected_offset = end;
+        let footer = BlxFooter::open(&bytes[footer_offset..footer_end])?;
+        if footer.entries.len() != usize::try_from(header.entry_count).expect("u32 fits usize")
+            || footer.entries.first().map(|entry| entry.key) != Some(header.first_key)
+            || footer.entries.last().map(|entry| entry.key) != Some(header.last_key)
+        {
+            return Err(DecodeError);
+        }
+        let mut expected_offset = header_end;
+        for footer_entry in &footer.entries {
+            let offset = usize::try_from(footer_entry.offset).expect("u32 fits usize");
+            let length = usize::try_from(footer_entry.length).expect("u32 fits usize");
+            let end = offset.checked_add(length).ok_or(DecodeError)?;
+            if offset != expected_offset || end > footer_offset {
+                return Err(DecodeError);
+            }
+            let entry = BlxEntry::open(&bytes[offset..end])?;
+            let value_checksum = match &entry {
+                BlxEntry::Data { bytes, .. } => checksum64(bytes),
+                BlxEntry::Tombstone { .. } => 0,
+            };
+            if (
+                entry.key(),
+                entry.generation(),
+                entry.kind(),
+                value_checksum,
+            ) != (
+                footer_entry.key,
+                footer_entry.generation,
+                footer_entry.kind,
+                footer_entry.value_checksum,
+            ) {
+                return Err(DecodeError);
+            }
+            expected_offset = end;
+        }
+        if expected_offset != footer_offset {
+            return Err(DecodeError);
+        }
+        Ok((header, footer))
     }
-    if expected_offset != footer_offset {
-        return Err(DecodeError);
-    }
-    Ok((header, footer))
 }
 
 /// One visible data block's layout-independent contribution to the state
@@ -819,21 +811,23 @@ pub fn replace_state_block(
 }
 
 /// Open a complete object and retain the verified index and reference fields.
-pub fn open_object(bytes: &[u8]) -> Result<BlxObject, DecodeError> {
-    let (header, footer) = scan_object(bytes)?;
-    let (footer_offset, footer_length) = open_trailer(
-        bytes
-            .get(bytes.len().checked_sub(TRAILER_BYTES).ok_or(DecodeError)?..)
-            .ok_or(DecodeError)?,
-    )?;
-    Ok(BlxObject {
-        header,
-        footer,
-        footer_offset,
-        footer_length,
-        checksum: checksum64(bytes),
-        bytes: bytes.to_vec(),
-    })
+impl BlxObject {
+    pub fn open(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (header, footer) = Self::scan(bytes)?;
+        let (footer_offset, footer_length) = open_trailer(
+            bytes
+                .get(bytes.len().checked_sub(TRAILER_BYTES).ok_or(DecodeError)?..)
+                .ok_or(DecodeError)?,
+        )?;
+        Ok(Self {
+            header,
+            footer,
+            footer_offset,
+            footer_length,
+            checksum: checksum64(bytes),
+            bytes: bytes.to_vec(),
+        })
+    }
 }
 
 /// Merge complete input objects into a new batch. The newest generation for
@@ -846,13 +840,13 @@ pub struct BlxCompactor {
 
 impl BlxCompactor {
     pub fn add_object(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
-        let (_, footer) = scan_object(bytes)?;
+        let (_, footer) = BlxObject::scan(bytes)?;
         for indexed in footer.entries {
             let start = usize::try_from(indexed.offset).expect("u32 fits usize");
             let end = start
                 .checked_add(usize::try_from(indexed.length).expect("u32 fits usize"))
                 .ok_or(DecodeError)?;
-            let entry = open_entry(bytes.get(start..end).ok_or(DecodeError)?)?;
+            let entry = BlxEntry::open(bytes.get(start..end).ok_or(DecodeError)?)?;
             if self
                 .newest
                 .get(&entry.key())
@@ -901,7 +895,7 @@ mod tests {
 
     fn meta() -> BatchMeta {
         BatchMeta {
-            namespace_kind: NamespaceKind::Vset,
+            namespace_kind: NamespaceKind::Volume,
             namespace_id: 7,
             writer_fence: 12,
             first_object_id: 30,
@@ -925,7 +919,6 @@ mod tests {
     fn key(block: u32) -> BlockKey {
         BlockKey {
             space: BlockSpace::Memory,
-            volume: 0,
             block,
         }
     }
@@ -936,22 +929,18 @@ mod tests {
         for key in [
             BlockKey {
                 space: BlockSpace::Memory,
-                volume: 0,
                 block: 0,
             },
             BlockKey {
                 space: BlockSpace::Data,
-                volume: 1,
                 block: 0,
             },
             BlockKey {
                 space: BlockSpace::Vmm,
-                volume: 0,
                 block: 0,
             },
             BlockKey {
                 space: BlockSpace::Memory,
-                volume: 0,
                 block: blocks_per_file_partition(),
             },
         ] {
@@ -973,11 +962,11 @@ mod tests {
         let objects = builder.finish();
         assert_eq!(objects.len(), 1);
         let object = &objects[0];
-        let (header, footer) = scan_object(&object.bytes).expect("valid BLX object");
+        let (header, footer) = BlxObject::scan(&object.bytes).expect("valid BLX object");
         assert_eq!(header, object.header);
         assert_eq!(footer, object.footer);
         let found = footer.find(key(2)).expect("indexed block");
-        let entry = open_entry(
+        let entry = BlxEntry::open(
             &object.bytes[found.offset as usize..(found.offset + found.length) as usize],
         )
         .expect("entry");
@@ -1003,26 +992,26 @@ mod tests {
         let bytes = builder.finish().pop().expect("object").bytes;
         for keep in 0..bytes.len() {
             assert!(
-                scan_object(&bytes[..keep]).is_err(),
+                BlxObject::scan(&bytes[..keep]).is_err(),
                 "accepted {keep} bytes"
             );
         }
     }
 
     #[test]
-    fn block_keys_map_compute_volumes() {
-        let page = |idx| PageId {
-            volume: VolumeId {
-                vset: VsetId(7),
-                idx: VolumeIdx(idx),
-            },
+    fn block_keys_distinguish_memory_and_data_volumes() {
+        let page = |_kind| PageId {
+            volume: VolumeId(7),
             page: PageNo(3),
         };
         assert_eq!(
-            BlockKey::from_page(VsetKind::Compute, page(0)).space,
+            BlockKey::from_page(VolumeKind::Memory, page(0)).space,
             BlockSpace::Memory
         );
-        assert_eq!(BlockKey::from_page(VsetKind::Compute, page(2)).volume, 2);
+        assert_eq!(
+            BlockKey::from_page(VolumeKind::Data, page(2)).space,
+            BlockSpace::Data
+        );
     }
 
     #[test]
@@ -1043,7 +1032,7 @@ mod tests {
         output_meta.batch_id = 7;
         let compacted = compact_objects(output_meta, &[first[0].clone(), later[0].clone()], true)
             .expect("compact");
-        let (_, footer) = scan_object(&compacted[0].bytes).expect("output");
+        let (_, footer) = BlxObject::scan(&compacted[0].bytes).expect("output");
         assert_eq!(footer.find(key(1)).expect("key 1").generation, Gen(3));
         assert_eq!(
             footer.find(key(2)).expect("key 2").kind,

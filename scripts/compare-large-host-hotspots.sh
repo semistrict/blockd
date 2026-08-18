@@ -25,8 +25,8 @@ for command in awk jq mktemp sort; do
     fi
 done
 
-echo "base: $(jq -c '{profile,vset_count,topology:.fork_provenance.topology,roots:.fork_provenance.roots,max_generation:.fork_provenance.max_generation,cpu_list,available_parallelism}' "$base_manifest")"
-echo "comparison: $(jq -c '{profile,vset_count,topology:.fork_provenance.topology,roots:.fork_provenance.roots,max_generation:.fork_provenance.max_generation,cpu_list,available_parallelism}' "$comparison_manifest")"
+echo "base: $(jq -c '{profile,volume_count,topology:.fork_provenance.topology,roots:.fork_provenance.roots,max_generation:.fork_provenance.max_generation,cpu_list,available_parallelism}' "$base_manifest")"
+echo "comparison: $(jq -c '{profile,volume_count,topology:.fork_provenance.topology,roots:.fork_provenance.roots,max_generation:.fork_provenance.max_generation,cpu_list,available_parallelism}' "$comparison_manifest")"
 
 rows=$(mktemp)
 trap 'rm -f "$rows"' EXIT

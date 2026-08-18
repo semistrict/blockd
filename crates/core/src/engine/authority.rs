@@ -21,6 +21,70 @@ pub struct VersionedSession {
     pub record: HostSessionRecord,
 }
 
+impl VersionedSession {
+    async fn replace<W: Store>(
+        self,
+        world: &W,
+        record: HostSessionRecord,
+    ) -> Result<Self, AuthorityError> {
+        let store_version = Store::put_cas(
+            world,
+            layout::host_session_key(record.host()),
+            Some(self.store_version),
+            record.encode(),
+        )
+        .await
+        .map_err(map_store_error)?;
+        Ok(Self {
+            store_version,
+            record,
+        })
+    }
+
+    async fn defend<W: Store>(
+        self,
+        world: &W,
+        session: u64,
+        nonce: u64,
+    ) -> Result<Self, AuthorityError> {
+        let defended = self
+            .record
+            .defend(session, nonce)
+            .map_err(|_| AuthorityError::Invalid)?;
+        self.replace(world, defended).await
+    }
+
+    async fn challenge<W: Store>(
+        self,
+        world: &W,
+        challenger: HostId,
+        nonce: u64,
+        challenged_at: u64,
+    ) -> Result<Self, AuthorityError> {
+        let next = self
+            .record
+            .challenge(challenger, nonce, challenged_at)
+            .map_err(|_| AuthorityError::Fenced)?;
+        self.replace(world, next).await
+    }
+
+    async fn revoke<W: Store>(self, world: &W, nonce: u64) -> Result<Self, AuthorityError> {
+        let revoked = self
+            .record
+            .revoke(nonce)
+            .map_err(|_| AuthorityError::Invalid)?;
+        self.replace(world, revoked).await
+    }
+
+    async fn activate<W: Store>(self, world: &W, session: u64) -> Result<Self, AuthorityError> {
+        let active = self
+            .record
+            .activate(session)
+            .map_err(|_| AuthorityError::Invalid)?;
+        self.replace(world, active).await
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollSession {
     Active(VersionedSession),
@@ -122,24 +186,9 @@ pub async fn poll_or_defend_host_session<W: Store>(
             session: found_session,
             nonce,
             ..
-        } if found == host && found_session == session => {
-            let defended = observed
-                .record
-                .defend(session, nonce)
-                .map_err(|_| AuthorityError::Invalid)?;
-            let store_version = Store::put_cas(
-                world,
-                layout::host_session_key(host),
-                Some(observed.store_version),
-                defended.encode(),
-            )
-            .await
-            .map_err(map_store_error)?;
-            Ok(PollSession::Defended(VersionedSession {
-                store_version,
-                record: defended,
-            }))
-        }
+        } if found == host && found_session == session => Ok(PollSession::Defended(
+            observed.defend(world, session, nonce).await?,
+        )),
         _ => Err(AuthorityError::Fenced),
     }
 }
@@ -157,22 +206,9 @@ pub async fn challenge_host_session<W: Store>(
     if matches!(observed.record, HostSessionRecord::Challenge { .. }) {
         return Ok(observed);
     }
-    let challenge_record = observed
-        .record
-        .challenge(challenger, nonce, challenged_at)
-        .map_err(|_| AuthorityError::Fenced)?;
-    let store_version = Store::put_cas(
-        world,
-        layout::host_session_key(host),
-        Some(observed.store_version),
-        challenge_record.encode(),
-    )
-    .await
-    .map_err(map_store_error)?;
-    Ok(VersionedSession {
-        store_version,
-        record: challenge_record,
-    })
+    observed
+        .challenge(world, challenger, nonce, challenged_at)
+        .await
 }
 
 pub async fn revoke_host_session<W: Store>(
@@ -180,23 +216,7 @@ pub async fn revoke_host_session<W: Store>(
     challenged: VersionedSession,
     nonce: u64,
 ) -> Result<VersionedSession, AuthorityError> {
-    let revoked = challenged
-        .record
-        .revoke(nonce)
-        .map_err(|_| AuthorityError::Invalid)?;
-    let host = revoked.host();
-    let store_version = Store::put_cas(
-        world,
-        layout::host_session_key(host),
-        Some(challenged.store_version),
-        revoked.encode(),
-    )
-    .await
-    .map_err(map_store_error)?;
-    Ok(VersionedSession {
-        store_version,
-        record: revoked,
-    })
+    challenged.revoke(world, nonce).await
 }
 
 pub async fn activate_host_session<W: Store>(
@@ -204,23 +224,7 @@ pub async fn activate_host_session<W: Store>(
     revoked: VersionedSession,
     session: u64,
 ) -> Result<VersionedSession, AuthorityError> {
-    let active = revoked
-        .record
-        .activate(session)
-        .map_err(|_| AuthorityError::Invalid)?;
-    let host = active.host();
-    let store_version = Store::put_cas(
-        world,
-        layout::host_session_key(host),
-        Some(revoked.store_version),
-        active.encode(),
-    )
-    .await
-    .map_err(map_store_error)?;
-    Ok(VersionedSession {
-        store_version,
-        record: active,
-    })
+    revoked.activate(world, session).await
 }
 
 pub async fn verify_authority_proof<W: Store>(

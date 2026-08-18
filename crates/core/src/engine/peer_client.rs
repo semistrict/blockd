@@ -8,16 +8,46 @@ use std::task::{Context, Poll};
 use blockd_exec::channel::{Closed, OneReceiver, OneSender, oneshot};
 use blockd_exec::{FaultPoint, fault_point, timeout};
 
+use crate::page_file::PageFileLoc;
 use crate::protocol::{PeerMsg, PeerRequestId, ReplicaArtifact, ReplicaCommitInfo};
-use crate::segment::PageLoc;
-use crate::types::{HostId, JournalSeq, VsetId};
+use crate::types::{HostId, JournalSeq, VolumeId};
 use crate::world::Peers;
 use crate::{authority::AuthorityProof, vnode_member::ProtectedClosureRef};
 
-type ReplicaStatusKey = (HostId, VsetId, u64);
-type ReplicaPutKey = (HostId, VsetId, u64, ReplicaArtifact, u32);
-type ReplicaCommitKey = (HostId, VsetId, u64, u64, JournalSeq, u64);
-type MigrationKey = (VsetId, HostId, u64);
+type ReplicaStatusKey = (HostId, VolumeId, u64);
+type ReplicaPutKey = (HostId, VolumeId, u64, ReplicaArtifact, u32);
+type ReplicaCommitKey = (HostId, VolumeId, u64, u64, JournalSeq, u64);
+type MigrationKey = (VolumeId, HostId, u64);
+
+struct PendingKeys;
+
+impl PendingKeys {
+    const fn put(
+        target: HostId,
+        volume: VolumeId,
+        assignment_epoch: u64,
+        artifact: ReplicaArtifact,
+        checksum: u32,
+    ) -> ReplicaPutKey {
+        (target, volume, assignment_epoch, artifact, checksum)
+    }
+
+    const fn commit(
+        target: HostId,
+        volume: VolumeId,
+        assignment_epoch: u64,
+        info: ReplicaCommitInfo,
+    ) -> ReplicaCommitKey {
+        (
+            target,
+            volume,
+            assignment_epoch,
+            info.writer_fence,
+            info.seq,
+            info.sync_covered_through,
+        )
+    }
+}
 struct Pending {
     expected: HostId,
     reply: PendingReply,
@@ -127,20 +157,46 @@ impl<T> Drop for PeerReply<T> {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct PeerClient {
     broker: Rc<RefCell<Broker>>,
+    retry: u64,
+    page_retry: u64,
+    migration_retry: u64,
+}
+
+impl Default for PeerClient {
+    fn default() -> Self {
+        Self::new(1)
+    }
 }
 
 impl PeerClient {
+    pub(super) fn new(retry: u64) -> Self {
+        Self {
+            broker: Rc::new(RefCell::new(Broker::default())),
+            retry,
+            page_retry: retry,
+            migration_retry: retry,
+        }
+    }
+
+    pub(super) fn for_host(retry: u64) -> Self {
+        Self {
+            broker: Rc::new(RefCell::new(Broker::default())),
+            retry,
+            page_retry: 50_000_000,
+            migration_retry: 5_000_000,
+        }
+    }
+
     pub async fn fetch_page<W: Peers>(
         &self,
         world: &W,
         source: HostId,
-        vset: VsetId,
-        location: PageLoc,
+        volume: VolumeId,
+        location: PageFileLoc,
         replica_assignment_epoch: Option<u64>,
-        retry: u64,
     ) -> Option<Vec<u8>> {
         loop {
             let (io, receive) = self.register_page(source);
@@ -149,16 +205,16 @@ impl PeerClient {
                 source,
                 PeerMsg::FetchRange {
                     io,
-                    vset,
+                    volume,
                     replica_assignment_epoch,
                     fence: location.fence,
-                    seg: location.seg,
+                    object: location.object,
                     offset: location.offset,
                     len: location.len,
                 },
             )
             .await;
-            if let Ok(Ok(bytes)) = timeout(retry, receive).await {
+            if let Ok(Ok(bytes)) = timeout(self.page_retry, receive).await {
                 return bytes;
             }
         }
@@ -169,13 +225,12 @@ impl PeerClient {
         &self,
         world: &W,
         target: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         offer_fence: u64,
         record: Vec<u8>,
         vmstate: Option<Vec<u8>>,
-        retry: u64,
     ) -> bool {
-        let key = (vset, target, offer_fence);
+        let key = (volume, target, offer_fence);
         self.broker.borrow_mut().active_migrations.insert(key);
         let _call = MigrationCall {
             broker: Rc::downgrade(&self.broker),
@@ -184,42 +239,41 @@ impl PeerClient {
         if self.broker.borrow_mut().accepted_migrations.remove(&key) {
             return true;
         }
-        let receive = self.migration(vset, target, offer_fence);
+        let receive = self.migration(volume, target, offer_fence);
         Peers::send(
             world,
             target,
             PeerMsg::MigrateOffer {
-                vset,
+                volume,
                 record,
                 vmstate,
             },
         )
         .await;
-        matches!(timeout(retry, receive).await, Ok(Ok(())))
+        matches!(timeout(self.migration_retry, receive).await, Ok(Ok(())))
     }
 
     pub async fn replica_status<W: Peers>(
         &self,
         world: &W,
         target: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
-        retry: u64,
     ) -> Result<(Option<ReplicaCommitInfo>, u8), PeerRpcError> {
         let mut attempts = 0_u8;
         loop {
             attempts = attempts.saturating_add(1);
-            let receive = self.status(target, vset, assignment_epoch);
+            let receive = self.status(target, volume, assignment_epoch);
             Peers::send(
                 world,
                 target,
                 PeerMsg::ReplicaStatus {
-                    vset,
+                    volume,
                     assignment_epoch,
                 },
             )
             .await;
-            if let Ok(Ok(committed)) = timeout(retry, receive).await {
+            if let Ok(Ok(committed)) = timeout(self.retry, receive).await {
                 return Ok((committed, attempts));
             }
             if fault_point(FaultPoint::ReplicaRetryTimer) || attempts >= 3 {
@@ -233,22 +287,24 @@ impl PeerClient {
         &self,
         world: &W,
         target: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         artifact: ReplicaArtifact,
         checksum: u32,
         bytes: Vec<u8>,
-        retry: u64,
     ) -> Result<u8, PeerRpcError> {
         let mut attempts = 0_u8;
         loop {
             attempts = attempts.saturating_add(1);
-            let receive = self.put(target, (target, vset, assignment_epoch, artifact, checksum));
+            let receive = self.put(
+                target,
+                PendingKeys::put(target, volume, assignment_epoch, artifact, checksum),
+            );
             Peers::send(
                 world,
                 target,
                 PeerMsg::ReplicaPut {
-                    vset,
+                    volume,
                     assignment_epoch,
                     artifact,
                     checksum,
@@ -256,7 +312,7 @@ impl PeerClient {
                 },
             )
             .await;
-            if let Ok(Ok(())) = timeout(retry, receive).await {
+            if let Ok(Ok(())) = timeout(self.retry, receive).await {
                 return Ok(attempts);
             }
             if fault_point(FaultPoint::ReplicaRetryTimer) || attempts >= 3 {
@@ -270,22 +326,24 @@ impl PeerClient {
         &self,
         world: &W,
         target: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         info: ReplicaCommitInfo,
         required: Vec<ReplicaArtifact>,
         record: Vec<u8>,
-        retry: u64,
     ) -> Result<u8, PeerRpcError> {
         let mut attempts = 0_u8;
         loop {
             attempts = attempts.saturating_add(1);
-            let receive = self.commit(target, commit_key(target, vset, assignment_epoch, info));
+            let receive = self.commit(
+                target,
+                PendingKeys::commit(target, volume, assignment_epoch, info),
+            );
             Peers::send(
                 world,
                 target,
                 PeerMsg::ReplicaCommit {
-                    vset,
+                    volume,
                     assignment_epoch,
                     info,
                     required: required.clone(),
@@ -293,7 +351,7 @@ impl PeerClient {
                 },
             )
             .await;
-            if let Ok(Ok(())) = timeout(retry, receive).await {
+            if let Ok(Ok(())) = timeout(self.retry, receive).await {
                 return Ok(attempts);
             }
             if fault_point(FaultPoint::ReplicaRetryTimer) || attempts >= 3 {
@@ -307,14 +365,13 @@ impl PeerClient {
         world: &W,
         target: HostId,
         proof: AuthorityProof,
-        retry: u64,
     ) -> Result<Vec<ProtectedClosureRef>, PeerRpcError> {
         let mut attempts = 0_u8;
         loop {
             attempts = attempts.saturating_add(1);
             let (io, receive) = self.register_adoption(target);
             Peers::send(world, target, PeerMsg::VnodeAdopt { io, proof }).await;
-            if let Ok(Ok((received, closures))) = timeout(retry, receive).await
+            if let Ok(Ok((received, closures))) = timeout(self.retry, receive).await
                 && received == proof
             {
                 return Ok(closures);
@@ -362,7 +419,6 @@ impl PeerClient {
         target: HostId,
         vnode: crate::authority::VnodeId,
         closure: ProtectedClosureRef,
-        retry: u64,
     ) -> Option<Vec<u8>> {
         for _ in 0..3 {
             let request = self.broker.borrow_mut().allocate_request();
@@ -382,7 +438,7 @@ impl PeerClient {
                 },
             )
             .await;
-            if let Ok(Ok(Some(bytes))) = timeout(retry, receive).await {
+            if let Ok(Ok(Some(bytes))) = timeout(self.retry, receive).await {
                 return Some(bytes);
             }
         }
@@ -408,10 +464,9 @@ impl PeerClient {
         world: &W,
         target: HostId,
         proof: AuthorityProof,
-        vset: VsetId,
+        volume: VolumeId,
         sequence: u64,
         bytes: Vec<u8>,
-        retry: u64,
     ) -> Option<ProtectedClosureRef> {
         for _ in 0..3 {
             let request = self.broker.borrow_mut().allocate_request();
@@ -427,13 +482,13 @@ impl PeerClient {
                 PeerMsg::VnodeCommit {
                     io: request,
                     proof,
-                    vset,
+                    volume,
                     sequence,
                     bytes: bytes.clone(),
                 },
             )
             .await;
-            if let Ok(Ok(closure)) = timeout(retry, receive).await {
+            if let Ok(Ok(closure)) = timeout(self.retry, receive).await {
                 return Some(closure);
             }
         }
@@ -472,8 +527,8 @@ impl PeerClient {
         );
     }
 
-    fn migration(&self, vset: VsetId, target: HostId, offer_fence: u64) -> PeerReply<()> {
-        let key = (vset, target, offer_fence);
+    fn migration(&self, volume: VolumeId, target: HostId, offer_fence: u64) -> PeerReply<()> {
+        let key = (volume, target, offer_fence);
         self.pending(
             target,
             PendingKey::Migration(key),
@@ -482,8 +537,8 @@ impl PeerClient {
         )
     }
 
-    pub fn resolve_migration(&self, vset: VsetId, from: HostId, offer_fence: u64) {
-        let key = (vset, from, offer_fence);
+    pub fn resolve_migration(&self, volume: VolumeId, from: HostId, offer_fence: u64) {
+        let key = (volume, from, offer_fence);
         let mut broker = self.broker.borrow_mut();
         if broker.active_migrations.contains(&key)
             && !broker.resolve(PendingKey::Migration(key), from, PendingValue::Unit)
@@ -495,27 +550,27 @@ impl PeerClient {
     pub(super) fn status(
         &self,
         target: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
     ) -> PeerReply<Option<ReplicaCommitInfo>> {
         // Status is a monotonic durable attestation within an authenticated
-        // (host, vset, assignment epoch). A late reply may understate progress
+        // (host, volume, assignment epoch). A late reply may understate progress
         // and cause redundant transfer, but cannot overstate durable progress
         // or satisfy another assignment, so retries intentionally share this
         // semantic key.
-        let key = (target, vset, assignment_epoch);
+        let key = (target, volume, assignment_epoch);
         self.pending(target, PendingKey::Status(key), true, PendingReply::Status)
     }
 
     pub fn resolve_status(
         &self,
         from: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         committed: Option<ReplicaCommitInfo>,
     ) {
         self.broker.borrow_mut().resolve(
-            PendingKey::Status((from, vset, assignment_epoch)),
+            PendingKey::Status((from, volume, assignment_epoch)),
             from,
             PendingValue::Status(committed),
         );
@@ -525,20 +580,43 @@ impl PeerClient {
         self.pending(target, PendingKey::Put(key), true, PendingReply::Unit)
     }
 
-    pub fn resolve_put(&self, from: HostId, key: ReplicaPutKey) {
-        self.broker
-            .borrow_mut()
-            .resolve(PendingKey::Put(key), from, PendingValue::Unit);
+    pub fn resolve_put(
+        &self,
+        from: HostId,
+        volume: VolumeId,
+        assignment_epoch: u64,
+        artifact: ReplicaArtifact,
+        checksum: u32,
+    ) {
+        self.broker.borrow_mut().resolve(
+            PendingKey::Put(PendingKeys::put(
+                from,
+                volume,
+                assignment_epoch,
+                artifact,
+                checksum,
+            )),
+            from,
+            PendingValue::Unit,
+        );
     }
 
     fn commit(&self, target: HostId, key: ReplicaCommitKey) -> PeerReply<()> {
         self.pending(target, PendingKey::Commit(key), true, PendingReply::Unit)
     }
 
-    pub fn resolve_commit(&self, from: HostId, key: ReplicaCommitKey) {
-        self.broker
-            .borrow_mut()
-            .resolve(PendingKey::Commit(key), from, PendingValue::Unit);
+    pub fn resolve_commit(
+        &self,
+        from: HostId,
+        volume: VolumeId,
+        assignment_epoch: u64,
+        info: ReplicaCommitInfo,
+    ) {
+        self.broker.borrow_mut().resolve(
+            PendingKey::Commit(PendingKeys::commit(from, volume, assignment_epoch, info)),
+            from,
+            PendingValue::Unit,
+        );
     }
 
     fn pending<T>(
@@ -630,22 +708,6 @@ impl Broker {
     }
 }
 
-fn commit_key(
-    target: HostId,
-    vset: VsetId,
-    assignment_epoch: u64,
-    info: ReplicaCommitInfo,
-) -> ReplicaCommitKey {
-    (
-        target,
-        vset,
-        assignment_epoch,
-        info.writer_fence,
-        info.seq,
-        info.sync_covered_through,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -675,17 +737,17 @@ mod tests {
             self.sends.set(sends);
             if matches!(self.mode, ReplyMode::AcceptMigrationOnSecondOffer)
                 && sends == 2
-                && let PeerMsg::MigrateOffer { vset, .. } = message
+                && let PeerMsg::MigrateOffer { volume, .. } = message
             {
                 self.client
-                    .resolve_migration(vset, to, CURRENT_MIGRATION_FENCE);
+                    .resolve_migration(volume, to, CURRENT_MIGRATION_FENCE);
                 self.client
-                    .resolve_migration(vset, to, CURRENT_MIGRATION_FENCE);
+                    .resolve_migration(volume, to, CURRENT_MIGRATION_FENCE);
             } else if matches!(self.mode, ReplyMode::DeliverStaleMigrationAccept)
-                && let PeerMsg::MigrateOffer { vset, .. } = message
+                && let PeerMsg::MigrateOffer { volume, .. } = message
             {
                 self.client
-                    .resolve_migration(vset, to, CURRENT_MIGRATION_FENCE - 1);
+                    .resolve_migration(volume, to, CURRENT_MIGRATION_FENCE - 1);
             }
         }
 
@@ -712,19 +774,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stale_waiter_cleanup_cannot_remove_a_newer_retry() {
         let client = PeerClient::default();
-        let stale = client.status(HostId(2), VsetId(7), 11);
-        let current = client.status(HostId(2), VsetId(7), 11);
+        let stale = client.status(HostId(2), VolumeId(7), 11);
+        let current = client.status(HostId(2), VolumeId(7), 11);
 
         drop(stale);
-        client.resolve_status(HostId(3), VsetId(7), 11, None);
+        client.resolve_status(HostId(3), VolumeId(7), 11, None);
         assert!(
             client
                 .broker
                 .borrow()
                 .pending
-                .contains_key(&PendingKey::Status((HostId(2), VsetId(7), 11)))
+                .contains_key(&PendingKey::Status((HostId(2), VolumeId(7), 11)))
         );
-        client.resolve_status(HostId(2), VsetId(7), 11, None);
+        client.resolve_status(HostId(2), VolumeId(7), 11, None);
 
         assert_eq!(
             simulation_scope(2, FaultConfig::default(), current).await,
@@ -735,15 +797,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn equivalent_replica_rpcs_to_one_host_resolve_every_waiter() {
         let client = PeerClient::default();
-        let first = client.status(HostId(2), VsetId(7), 11);
-        let second = client.status(HostId(2), VsetId(7), 11);
+        let first = client.status(HostId(2), VolumeId(7), 11);
+        let second = client.status(HostId(2), VolumeId(7), 11);
         assert_eq!(client.broker.borrow().pending.len(), 1);
         assert_eq!(
-            client.broker.borrow().pending[&PendingKey::Status((HostId(2), VsetId(7), 11))].len(),
+            client.broker.borrow().pending[&PendingKey::Status((HostId(2), VolumeId(7), 11))].len(),
             2
         );
 
-        client.resolve_status(HostId(2), VsetId(7), 11, None);
+        client.resolve_status(HostId(2), VolumeId(7), 11, None);
         assert_eq!(
             simulation_scope(6, FaultConfig::default(), join2(first, second)).await,
             (Ok(None), Ok(None))
@@ -754,12 +816,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn equivalent_replica_rpcs_to_different_hosts_keep_independent_waiters() {
         let client = PeerClient::default();
-        let first = client.status(HostId(2), VsetId(7), 11);
-        let second = client.status(HostId(3), VsetId(7), 11);
+        let first = client.status(HostId(2), VolumeId(7), 11);
+        let second = client.status(HostId(3), VolumeId(7), 11);
         assert_eq!(client.broker.borrow().pending.len(), 2);
 
-        client.resolve_status(HostId(3), VsetId(7), 11, None);
-        client.resolve_status(HostId(2), VsetId(7), 11, None);
+        client.resolve_status(HostId(3), VolumeId(7), 11, None);
+        client.resolve_status(HostId(2), VolumeId(7), 11, None);
         assert_eq!(
             simulation_scope(5, FaultConfig::default(), join2(first, second)).await,
             (Ok(None), Ok(None))
@@ -779,7 +841,7 @@ mod tests {
             let peers = Rc::clone(&peers);
             async move {
                 client
-                    .replica_status(peers.as_ref(), HostId(2), VsetId(7), 11, 1)
+                    .replica_status(peers.as_ref(), HostId(2), VolumeId(7), 11)
                     .await
             }
         })
@@ -808,11 +870,10 @@ mod tests {
                         .offer_migration_once(
                             peers.as_ref(),
                             HostId(2),
-                            VsetId(7),
+                            VolumeId(7),
                             CURRENT_MIGRATION_FENCE,
                             vec![1, 2, 3],
                             None,
-                            1,
                         )
                         .await
                     {
@@ -847,11 +908,10 @@ mod tests {
                     .offer_migration_once(
                         peers.as_ref(),
                         HostId(2),
-                        VsetId(7),
+                        VolumeId(7),
                         CURRENT_MIGRATION_FENCE,
                         vec![1, 2, 3],
                         None,
-                        1,
                     )
                     .await
             }
@@ -881,11 +941,10 @@ mod tests {
                     .offer_migration_once(
                         peers.as_ref(),
                         HostId(2),
-                        VsetId(7),
+                        VolumeId(7),
                         CURRENT_MIGRATION_FENCE,
                         vec![4, 5, 6],
                         None,
-                        1,
                     )
                     .await
             }

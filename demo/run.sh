@@ -64,21 +64,21 @@ say "start VM on host 0, restored from the GCS-held base"
 R=$(post "$API0/vm"); VM=$(field "$R" id)
 show "vm $VM running"
 
-say "guest work, mirrored into its blockd vset (3 synced bursts)"
+say "guest work, mirrored into its blockd volume (3 synced bursts)"
 R=$(post "$API0/vm/$VM/work?bursts=3")
 show "burst $(field "$R" burst), guest sum $(field "$R" guest_sum)"
 R=$(post "$API0/vm/$VM/verify")
-show "vset verifies: ok=$(field "$R" ok)"
+show "volume verifies: ok=$(field "$R" ok)"
 
 say "fork: snapshot the live VM, start 3 forks sharing ONE memory copy"
 R=$(post "$API0/vm/$VM/fork?n=3")
 show "$R"
 [ "$(field "$R" pss_sum)" -lt "$(field "$R" rss_sum)" ] || { echo "FORKS NOT SHARING"; exit 1; }
 
-say "live-migrate VM $VM to host 1: vset over TCP, microVM via GCS"
+say "live-migrate VM $VM to host 1: volume over TCP, microVM via GCS"
 post "$API1/vm/$VM/expect" >/dev/null
 R=$(post "$API0/vm/$VM/migrate?to=1")
-show "source: snapshot+publish $(field "$R" snapshot_ms)ms, vset handoff $(field "$R" handoff_ms)ms"
+show "source: snapshot+publish $(field "$R" snapshot_ms)ms, volume handoff $(field "$R" handoff_ms)ms"
 for _ in $(seq 1 150); do
   S=$(get "$API1/status")
   grep -q "\"id\":$VM,.*\"state\":\"running\"" <<<"$S" && break
@@ -86,7 +86,7 @@ for _ in $(seq 1 150); do
 done
 grep -q "\"id\":$VM,.*\"state\":\"running\"" <<<"$S" || { echo "MIGRATION NEVER LANDED"; exit 1; }
 R=$(post "$API1/vm/$VM/verify")
-show "vset verifies ON HOST 1: ok=$(field "$R" ok) at burst $(field "$R" burst)"
+show "volume verifies ON HOST 1: ok=$(field "$R" ok) at burst $(field "$R" burst)"
 post "$API1/vm/$VM/work?bursts=1" >/dev/null
 show "and keeps working there"
 
@@ -99,7 +99,7 @@ ssh0 'sudo systemctl kill --signal=KILL blockd-demod' || true
 R=$(post "$API1/vm/$BVM/restore")
 show "host 1 restored vm $BVM from the bucket: verdict $(field "$R" verdict)"
 R=$(post "$API1/vm/$BVM/verify")
-show "vset verifies after restore: ok=$(field "$R" ok) at burst $(field "$R" burst)"
+show "volume verifies after restore: ok=$(field "$R" ok) at burst $(field "$R" burst)"
 [ "$(field "$R" ok)" = "true" ] || { echo "RESTORE VERIFY FAILED"; exit 1; }
 
 say "the bill (host 1's view)"

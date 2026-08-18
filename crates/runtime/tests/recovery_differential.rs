@@ -15,7 +15,7 @@ use blockd_core::hostmeta::{DaemonStats, HostConfig};
 use blockd_core::journal::JournalRecord;
 use blockd_core::layout::{self, BlobName};
 use blockd_core::protocol::Verdict;
-use blockd_core::types::VsetId;
+use blockd_core::types::VolumeId;
 use blockd_core::world::{BlobEntry, BlobError, Blobs};
 use blockd_exec::ProductionContext;
 use blockd_runtime::world::FileBlobs;
@@ -96,7 +96,7 @@ impl Blobs for MemoryBlobs {
 async fn recover<W: Blobs + 'static>(
     config: HostConfig,
     world: Rc<W>,
-) -> (BTreeMap<VsetId, Verdict>, DaemonStats) {
+) -> (BTreeMap<VolumeId, Verdict>, DaemonStats) {
     let state = Rc::new(RefCell::new(HostState::new(config)));
     let verdicts = ProductionContext::new(|_| {})
         .scope({
@@ -159,15 +159,15 @@ async fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
         // Backed recovery now defers its verdict until the fenced head read,
         // which this scan-only differential deliberately does not drive.
         // Keep the non-vacuity guard on the durable inputs instead: each
-        // counted vset has at least one intact journal candidate that both
+        // counted volume has at least one intact journal candidate that both
         // scan paths fed into the same deferred recovery state.
         let recoverable: BTreeSet<_> = blobs
             .iter()
             .filter_map(|(name, bytes)| match layout::parse_blob(name) {
-                Some(BlobName::Journal { vset, .. })
-                    if JournalRecord::decode(vset, bytes).is_ok() =>
+                Some(BlobName::Journal { volume, .. })
+                    if JournalRecord::decode(volume, bytes).is_ok() =>
                 {
-                    Some(vset)
+                    Some(volume)
                 }
                 _ => None,
             })
@@ -176,7 +176,7 @@ async fn disk_actor_recovers_exactly_like_the_simulated_snapshot() {
         fs::remove_dir_all(&root).expect("cleanup");
     }
     // The equality above must have been about something: across the seeds,
-    // real vsets recovered to real verdicts.
+    // real volumes recovered to real verdicts.
     assert!(
         nontrivial >= 3,
         "only {nontrivial} recoverable journal sets seen"

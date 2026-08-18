@@ -84,11 +84,11 @@ pub(super) async fn bootstrap_host_authority<W: Store>(
             Err(error) => return Err(error),
         };
         let mut host = state.borrow_mut();
-        host.authority_session = Some(session);
-        host.authority_host_epoch = versioned.record.epoch();
-        host.authority_serving = true;
-        host.authority_last_poll = now();
-        host.authority_placement = Some(placement);
+        host.authority.session = Some(session);
+        host.authority.host_epoch = versioned.record.epoch();
+        host.authority.serving = true;
+        host.authority.last_poll = now();
+        host.authority.placement = Some(placement);
         return Ok(());
     }
 }
@@ -103,8 +103,8 @@ pub(super) async fn host_session_monitor<W: Store + 'static>(state: SharedHost, 
             let host = state.borrow();
             (
                 host.config.host,
-                host.authority_session,
-                host.authority_last_poll,
+                host.authority.session,
+                host.authority.last_poll,
             )
         };
         let Some(session) = session else {
@@ -120,9 +120,9 @@ pub(super) async fn host_session_monitor<W: Store + 'static>(state: SharedHost, 
                 },
             )) if found == session => {
                 let mut state = state.borrow_mut();
-                state.authority_last_poll = now();
-                state.authority_host_epoch = observed.record.epoch();
-                state.authority_serving = true;
+                state.authority.last_poll = now();
+                state.authority.host_epoch = observed.record.epoch();
+                state.authority.serving = true;
             }
             Ok(Some(super::authority::VersionedSession {
                 record: HostSessionRecord::Challenge { session: found, .. },
@@ -130,16 +130,16 @@ pub(super) async fn host_session_monitor<W: Store + 'static>(state: SharedHost, 
             })) if found == session => {
                 {
                     let mut state = state.borrow_mut();
-                    state.authority_last_poll = now();
-                    state.authority_serving = false;
+                    state.authority.last_poll = now();
+                    state.authority.serving = false;
                     state.counters.lease_challenges += 1;
                 }
                 match poll_or_defend_host_session(world.as_ref(), host, session).await {
                     Ok(PollSession::Defended(defended) | PollSession::Active(defended)) => {
                         let mut state = state.borrow_mut();
-                        state.authority_last_poll = now();
-                        state.authority_host_epoch = defended.record.epoch();
-                        state.authority_serving = true;
+                        state.authority.last_poll = now();
+                        state.authority.host_epoch = defended.record.epoch();
+                        state.authority.serving = true;
                         state.counters.lease_defenses += 1;
                     }
                     Err(AuthorityError::Unavailable) => {}
@@ -161,7 +161,7 @@ pub(super) async fn host_session_monitor<W: Store + 'static>(state: SharedHost, 
 
 fn self_fence(state: &SharedHost) {
     let mut state = state.borrow_mut();
-    state.authority_serving = false;
+    state.authority.serving = false;
     state.counters.lease_self_fences += 1;
     state.fail("host session fenced");
 }

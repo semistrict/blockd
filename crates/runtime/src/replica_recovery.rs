@@ -15,7 +15,7 @@ use blockd_core::layout;
 use blockd_core::replica_recovery::{
     ReplicaExport, prepare_replica_publication, prepare_replica_recovery_claim,
 };
-use blockd_core::types::{HostId, VsetId};
+use blockd_core::types::{HostId, VolumeId};
 
 use crate::store::ObjectStore;
 
@@ -45,7 +45,7 @@ pub async fn install_replica_recovery(
     target: &Path,
     store: Arc<dyn ObjectStore>,
     claimant: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     verified_head_version: u64,
     export: &ReplicaExport,
 ) -> Result<InstalledReplicaRecovery, InstallReplicaRecoveryError> {
@@ -57,11 +57,11 @@ pub async fn install_replica_recovery(
     }
     let (observed_version, observed_bytes) = store
         .clone()
-        .get(layout::head_key(vset))
+        .get(layout::head_key(volume))
         .await
         .map_err(|_| InstallReplicaRecoveryError::HeadUnavailable)?
         .ok_or(InstallReplicaRecoveryError::HeadMissing)?;
-    let observed = HeadRecord::decode(vset, &observed_bytes)
+    let observed = HeadRecord::decode(volume, &observed_bytes)
         .map_err(|_| InstallReplicaRecoveryError::HeadCorrupt)?;
     if observed_version != verified_head_version {
         return Err(InstallReplicaRecoveryError::ClaimConflict);
@@ -70,14 +70,14 @@ pub async fn install_replica_recovery(
     let writer_fence = store
         .clone()
         .put_cas(
-            layout::head_key(vset),
+            layout::head_key(volume),
             Some(claim.expected_version),
             claim.head.encode(),
         )
         .await
         .map_err(|_| InstallReplicaRecoveryError::ClaimConflict)?;
     let publication =
-        prepare_replica_publication(vset, claimant, writer_fence, &claim.head, export)
+        prepare_replica_publication(volume, claimant, writer_fence, &claim.head, export)
             .map_err(|_| InstallReplicaRecoveryError::ExportCorrupt)?;
     for (key, bytes) in &publication.store_objects {
         store
@@ -88,7 +88,7 @@ pub async fn install_replica_recovery(
     }
     let head_version = store
         .put_cas(
-            layout::head_key(vset),
+            layout::head_key(volume),
             Some(writer_fence),
             publication.head.encode(),
         )
@@ -96,7 +96,7 @@ pub async fn install_replica_recovery(
         .map_err(|_| InstallReplicaRecoveryError::ClaimConflict)?;
     let target = target.to_owned();
     let blobs = publication.export.blobs;
-    tokio::task::spawn_blocking(move || durable_promote(&target, vset, writer_fence, &blobs))
+    tokio::task::spawn_blocking(move || durable_promote(&target, volume, writer_fence, &blobs))
         .await
         .map_err(|_| InstallReplicaRecoveryError::LocalIo)??;
     Ok(InstalledReplicaRecovery {
@@ -107,7 +107,7 @@ pub async fn install_replica_recovery(
 
 fn durable_promote(
     target: &Path,
-    vset: VsetId,
+    volume: VolumeId,
     writer_fence: u64,
     blobs: &[(String, Vec<u8>)],
 ) -> Result<(), InstallReplicaRecoveryError> {
@@ -121,7 +121,7 @@ fn durable_promote(
         .ok_or(InstallReplicaRecoveryError::LocalIo)?;
     let quarantine = parent.join(format!(
         ".{target_name}.recovery-{:016x}-{writer_fence:016x}",
-        vset.0
+        volume.0
     ));
     std::fs::create_dir(&quarantine).map_err(|_| InstallReplicaRecoveryError::LocalIo)?;
     let mut directories = BTreeSet::from([quarantine.clone()]);
@@ -163,7 +163,7 @@ mod tests {
     use std::sync::Mutex;
 
     use blockd_core::head::StashAssignment;
-    use blockd_core::journal::{RecordKind, VsetConfig};
+    use blockd_core::journal::{RecordKind, VolumeConfig};
     use blockd_core::protocol::{ReplicaCommitInfo, StoreFault};
     use blockd_core::types::JournalSeq;
 
@@ -217,10 +217,10 @@ mod tests {
 
     #[tokio::test]
     async fn promotion_claims_refences_publishes_then_atomically_installs() {
-        let vset = VsetId(7);
+        let volume = VolumeId(7);
         let store = Arc::new(MemoryStore::default());
         let head = HeadRecord {
-            vset,
+            volume,
             holder: HostId(0),
             fence: 1,
             manifest: None,
@@ -235,14 +235,13 @@ mod tests {
         };
         store
             .clone()
-            .put_cas(layout::head_key(vset), None, head.encode())
+            .put_cas(layout::head_key(volume), None, head.encode())
             .await
             .expect("initial head");
         let record = JournalRecord {
-            config: VsetConfig {
-                kind: blockd_core::journal::VsetKind::Compute,
-                disk_volumes: 1,
-                pages_per_volume: 8,
+            config: VolumeConfig {
+                kind: blockd_core::journal::VolumeKind::Data,
+                pages: 8,
             },
             seq: JournalSeq(3),
             fence: 1,
@@ -251,10 +250,10 @@ mod tests {
             sync_covered_through: 5,
             post_state_checksum: 0,
             files: Vec::new(),
-            overlay: BTreeMap::new(),
+            runtime_page_index: BTreeMap::new(),
             migrated_from: None,
         };
-        let bytes = record.encode(vset);
+        let bytes = record.encode(volume);
         let export = ReplicaExport {
             source_peer: HostId(1),
             assignment_epoch: 1,
@@ -265,29 +264,29 @@ mod tests {
             },
             sync_covered_through: 5,
             blobs: vec![
-                (layout::journal_blob(vset, 1, record.seq), bytes.clone()),
-                (layout::journal_mirror_blob(vset, 1, record.seq), bytes),
+                (layout::journal_blob(volume, 1, record.seq), bytes.clone()),
+                (layout::journal_mirror_blob(volume, 1, record.seq), bytes),
             ],
         };
         let target = std::env::temp_dir().join(format!(
             "blockd-recovery-install-{}-{}",
             std::process::id(),
-            vset.0
+            volume.0
         ));
         let _ = std::fs::remove_dir_all(&target);
         let installed =
-            install_replica_recovery(&target, store.clone(), HostId(2), vset, 1, &export)
+            install_replica_recovery(&target, store.clone(), HostId(2), volume, 1, &export)
                 .await
                 .expect("install");
         assert_eq!(installed.writer_fence, 2);
         assert_eq!(installed.head_version, 3);
         let (_, head_bytes) = store
             .clone()
-            .get(layout::head_key(vset))
+            .get(layout::head_key(volume))
             .await
             .expect("get")
             .expect("head");
-        let published = HeadRecord::decode(vset, &head_bytes).expect("head");
+        let published = HeadRecord::decode(volume, &head_bytes).expect("head");
         assert_eq!(published.holder, HostId(2));
         assert_eq!(published.manifest.expect("manifest").fence, 2);
         assert_eq!(published.stash, None);
@@ -300,7 +299,7 @@ mod tests {
         assert_eq!(published.retired_stashes[0].through, export.info);
         assert!(
             target
-                .join(layout::journal_blob(vset, 2, record.seq))
+                .join(layout::journal_blob(volume, 2, record.seq))
                 .exists()
         );
         std::fs::remove_dir_all(target).expect("cleanup");
@@ -308,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn promotion_rejects_an_export_verified_against_an_older_head() {
-        let vset = VsetId(8);
+        let volume = VolumeId(8);
         let store = Arc::new(MemoryStore::default());
         let assignment = StashAssignment {
             assignment_epoch: 1,
@@ -318,7 +317,7 @@ mod tests {
             membership_epoch: 1,
         };
         let verified_head = HeadRecord {
-            vset,
+            volume,
             holder: HostId(0),
             fence: 1,
             manifest: None,
@@ -327,14 +326,13 @@ mod tests {
         };
         store
             .clone()
-            .put_cas(layout::head_key(vset), None, verified_head.encode())
+            .put_cas(layout::head_key(volume), None, verified_head.encode())
             .await
             .expect("initial head");
         let record = JournalRecord {
-            config: VsetConfig {
-                kind: blockd_core::journal::VsetKind::Compute,
-                disk_volumes: 1,
-                pages_per_volume: 8,
+            config: VolumeConfig {
+                kind: blockd_core::journal::VolumeKind::Data,
+                pages: 8,
             },
             seq: JournalSeq(3),
             fence: 1,
@@ -343,10 +341,10 @@ mod tests {
             sync_covered_through: 5,
             post_state_checksum: 0,
             files: Vec::new(),
-            overlay: BTreeMap::new(),
+            runtime_page_index: BTreeMap::new(),
             migrated_from: None,
         };
-        let bytes = record.encode(vset);
+        let bytes = record.encode(volume);
         let export = ReplicaExport {
             source_peer: assignment.active_peer,
             assignment_epoch: assignment.assignment_epoch,
@@ -357,8 +355,8 @@ mod tests {
             },
             sync_covered_through: record.sync_covered_through,
             blobs: vec![
-                (layout::journal_blob(vset, 1, record.seq), bytes.clone()),
-                (layout::journal_mirror_blob(vset, 1, record.seq), bytes),
+                (layout::journal_blob(volume, 1, record.seq), bytes.clone()),
+                (layout::journal_mirror_blob(volume, 1, record.seq), bytes),
             ],
         };
 
@@ -374,17 +372,17 @@ mod tests {
         };
         store
             .clone()
-            .put_cas(layout::head_key(vset), Some(1), advanced_head.encode())
+            .put_cas(layout::head_key(volume), Some(1), advanced_head.encode())
             .await
             .expect("concurrent head advance");
 
         let target = std::env::temp_dir().join(format!(
             "blockd-stale-recovery-install-{}-{}",
             std::process::id(),
-            vset.0
+            volume.0
         ));
         let _ = std::fs::remove_dir_all(&target);
-        let result = install_replica_recovery(&target, store, HostId(2), vset, 1, &export).await;
+        let result = install_replica_recovery(&target, store, HostId(2), volume, 1, &export).await;
         if target.exists() {
             std::fs::remove_dir_all(&target).expect("cleanup unexpected install");
         }

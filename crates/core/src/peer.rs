@@ -7,7 +7,7 @@
 //! Payload layout after the standard frame header: `from u16 | discriminant
 //! u8 | fields`, fields in [`PeerMsg`] declaration order.
 //! `Vec<u8>` encodes as `len u32 | bytes`; `Option<Vec<u8>>` prefixes a
-//! presence byte. Embedded blobs (records and segment entries) are
+//! presence byte. Embedded blobs (records and blx entries) are
 //! already framed and verified by their consumers. Inline VMM bytes are
 //! protected by the peer frame and checked against the offered record before
 //! use (R8.1: the reader decides).
@@ -17,7 +17,7 @@ use crate::protocol::{MAX_OBJECT_BYTES, PeerMsg, PeerRequestId};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
 };
-use crate::types::{HostId, SegId, VsetId};
+use crate::types::{HostId, ObjectId, VolumeId};
 
 pub const MAGIC_PEER: u32 = u32::from_le_bytes(*b"BPM1");
 
@@ -52,35 +52,36 @@ fn decode_opt_bytes(d: &mut Dec) -> Result<Option<Vec<u8>>, DecodeError> {
 pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
     let mut e = Enc::new();
     e.u16(from.0);
+    e.u8(msg.tag());
     match msg {
         PeerMsg::MigrateOffer {
-            vset,
+            volume,
             record,
             vmstate,
         } => {
-            e.u8(0);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u32(u32::try_from(record.len()).expect("record fits u32"));
             e.bytes(record);
             opt_bytes(&mut e, vmstate.as_deref());
         }
-        PeerMsg::MigrateAccept { vset, offer_fence } => {
-            e.u8(1);
-            e.u64(vset.0);
+        PeerMsg::MigrateAccept {
+            volume,
+            offer_fence,
+        } => {
+            e.u64(volume.0);
             e.u64(*offer_fence);
         }
         PeerMsg::FetchRange {
             io,
-            vset,
+            volume,
             replica_assignment_epoch,
             fence,
-            seg,
+            object,
             offset,
             len,
         } => {
-            e.u8(2);
             e.u64(io.0);
-            e.u64(vset.0);
+            e.u64(volume.0);
             if let Some(epoch) = replica_assignment_epoch {
                 e.u8(1);
                 e.u64(*epoch);
@@ -89,40 +90,33 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
                 e.u64(0);
             }
             e.u64(*fence);
-            e.u64(seg.0);
+            e.u64(object.0);
             e.u32(*offset);
             e.u32(*len);
         }
-        PeerMsg::Page { io, bytes } => {
-            e.u8(3);
+        PeerMsg::Page { io, bytes } | PeerMsg::VnodeClosure { io, bytes } => {
             e.u64(io.0);
             opt_bytes(&mut e, bytes.as_deref());
         }
-        PeerMsg::Released {
-            vset,
-            release_fence,
-        } => {
-            e.u8(6);
-            e.u64(vset.0);
-            e.u64(*release_fence);
-        }
         PeerMsg::ReleasedAck {
-            vset,
+            volume,
+            release_fence,
+        }
+        | PeerMsg::Released {
+            volume,
             release_fence,
         } => {
-            e.u8(7);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*release_fence);
         }
         PeerMsg::ReplicaPut {
-            vset,
+            volume,
             assignment_epoch,
             artifact: id,
             checksum,
             bytes,
         } => {
-            e.u8(8);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*assignment_epoch);
             encode_artifact(&mut e, *id);
             e.u32(*checksum);
@@ -130,26 +124,24 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
             e.bytes(bytes);
         }
         PeerMsg::ReplicaPutAck {
-            vset,
+            volume,
             assignment_epoch,
             artifact: id,
             checksum,
         } => {
-            e.u8(9);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*assignment_epoch);
             encode_artifact(&mut e, *id);
             e.u32(*checksum);
         }
         PeerMsg::ReplicaCommit {
-            vset,
+            volume,
             assignment_epoch,
             info,
             required,
             record,
         } => {
-            e.u8(10);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*assignment_epoch);
             encode_commit_info(&mut e, *info);
             e.u32(u32::try_from(required.len()).expect("required count fits u32"));
@@ -160,30 +152,27 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
             e.bytes(record);
         }
         PeerMsg::ReplicaCommitAck {
-            vset,
+            volume,
             assignment_epoch,
             info,
         } => {
-            e.u8(11);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*assignment_epoch);
             encode_commit_info(&mut e, *info);
         }
         PeerMsg::ReplicaStatus {
-            vset,
+            volume,
             assignment_epoch,
         } => {
-            e.u8(12);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*assignment_epoch);
         }
         PeerMsg::ReplicaStatusReply {
-            vset,
+            volume,
             assignment_epoch,
             committed,
         } => {
-            e.u8(13);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*assignment_epoch);
             match committed {
                 None => e.u8(0),
@@ -193,28 +182,21 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
                 }
             }
         }
-        PeerMsg::ReplicaRelease {
-            vset,
-            assignment_epoch,
-            through,
-        } => {
-            e.u8(15);
-            e.u64(vset.0);
-            e.u64(*assignment_epoch);
-            encode_commit_info(&mut e, *through);
-        }
         PeerMsg::ReplicaReleaseAck {
-            vset,
+            volume,
+            assignment_epoch,
+            through,
+        }
+        | PeerMsg::ReplicaRelease {
+            volume,
             assignment_epoch,
             through,
         } => {
-            e.u8(16);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*assignment_epoch);
             encode_commit_info(&mut e, *through);
         }
         PeerMsg::VnodeAdopt { io, proof } => {
-            e.u8(18);
             e.u64(io.0);
             encode_authority_proof(&mut e, *proof);
         }
@@ -223,45 +205,36 @@ pub fn encode_peer(from: HostId, msg: &PeerMsg) -> Vec<u8> {
             proof,
             closures,
         } => {
-            e.u8(19);
             e.u64(io.0);
             encode_authority_proof(&mut e, *proof);
             e.u32(u32::try_from(closures.len()).expect("closure count fits"));
             for closure in closures {
-                e.u64(closure.vset.0);
+                e.u64(closure.volume.0);
                 e.u64(closure.sequence);
                 e.u32(closure.checksum);
                 e.u32(closure.len);
             }
         }
         PeerMsg::VnodeFetchClosure { io, vnode, closure } => {
-            e.u8(20);
             e.u64(io.0);
             e.u32(vnode.0);
             encode_protected_closure(&mut e, *closure);
         }
-        PeerMsg::VnodeClosure { io, bytes } => {
-            e.u8(21);
-            e.u64(io.0);
-            opt_bytes(&mut e, bytes.as_deref());
-        }
         PeerMsg::VnodeCommit {
             io,
             proof,
-            vset,
+            volume,
             sequence,
             bytes,
         } => {
-            e.u8(22);
             e.u64(io.0);
             encode_authority_proof(&mut e, *proof);
-            e.u64(vset.0);
+            e.u64(volume.0);
             e.u64(*sequence);
             e.u32(u32::try_from(bytes.len()).expect("closure fits u32"));
             e.bytes(bytes);
         }
         PeerMsg::VnodeCommitAck { io, closure } => {
-            e.u8(23);
             e.u64(io.0);
             encode_protected_closure(&mut e, *closure);
         }
@@ -282,30 +255,30 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
     let from = HostId(d.u16()?);
     let msg = match d.u8()? {
         0 => {
-            let vset = VsetId(d.u64()?);
+            let volume = VolumeId(d.u64()?);
             let len = usize::try_from(d.u32()?).expect("u32 fits usize");
             let record = d.bytes(len)?.to_vec();
             let vmstate = decode_opt_bytes(&mut d)?;
             PeerMsg::MigrateOffer {
-                vset,
+                volume,
                 record,
                 vmstate,
             }
         }
         1 => PeerMsg::MigrateAccept {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             offer_fence: d.u64()?,
         },
         2 => PeerMsg::FetchRange {
             io: PeerRequestId(d.u64()?),
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             replica_assignment_epoch: match d.u8()? {
                 0 if d.u64()? == 0 => None,
                 1 => Some(d.u64()?),
                 _ => return Err(DecodeError),
             },
             fence: d.u64()?,
-            seg: SegId(d.u64()?),
+            object: ObjectId(d.u64()?),
             offset: d.u32()?,
             len: d.u32()?,
         },
@@ -314,21 +287,21 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             bytes: decode_opt_bytes(&mut d)?,
         },
         6 => PeerMsg::Released {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             release_fence: d.u64()?,
         },
         7 => PeerMsg::ReleasedAck {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             release_fence: d.u64()?,
         },
         8 => {
-            let vset = VsetId(d.u64()?);
+            let volume = VolumeId(d.u64()?);
             let assignment_epoch = d.u64()?;
             let artifact = decode_artifact(&mut d)?;
             let checksum = d.u32()?;
             let len = usize::try_from(d.u32()?).expect("u32 fits usize");
             PeerMsg::ReplicaPut {
-                vset,
+                volume,
                 assignment_epoch,
                 artifact,
                 checksum,
@@ -336,13 +309,13 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             }
         }
         9 => PeerMsg::ReplicaPutAck {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             assignment_epoch: d.u64()?,
             artifact: decode_artifact(&mut d)?,
             checksum: d.u32()?,
         },
         10 => {
-            let vset = VsetId(d.u64()?);
+            let volume = VolumeId(d.u64()?);
             let assignment_epoch = d.u64()?;
             let info = decode_commit_info(&mut d)?;
             let count = d.u32()?;
@@ -355,7 +328,7 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             }
             let len = usize::try_from(d.u32()?).expect("u32 fits usize");
             PeerMsg::ReplicaCommit {
-                vset,
+                volume,
                 assignment_epoch,
                 info,
                 required,
@@ -363,16 +336,16 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             }
         }
         11 => PeerMsg::ReplicaCommitAck {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             assignment_epoch: d.u64()?,
             info: decode_commit_info(&mut d)?,
         },
         12 => PeerMsg::ReplicaStatus {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             assignment_epoch: d.u64()?,
         },
         13 => PeerMsg::ReplicaStatusReply {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             assignment_epoch: d.u64()?,
             committed: match d.u8()? {
                 0 => None,
@@ -381,12 +354,12 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             },
         },
         15 => PeerMsg::ReplicaRelease {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
         },
         16 => PeerMsg::ReplicaReleaseAck {
-            vset: VsetId(d.u64()?),
+            volume: VolumeId(d.u64()?),
             assignment_epoch: d.u64()?,
             through: decode_commit_info(&mut d)?,
         },
@@ -404,7 +377,7 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
             let mut closures = Vec::with_capacity(usize::try_from(count).expect("count fits"));
             for _ in 0..count {
                 closures.push(crate::vnode_member::ProtectedClosureRef {
-                    vset: VsetId(d.u64()?),
+                    volume: VolumeId(d.u64()?),
                     sequence: d.u64()?,
                     checksum: d.u32()?,
                     len: d.u32()?,
@@ -428,13 +401,13 @@ pub fn decode_peer(bytes: &[u8]) -> Result<(HostId, PeerMsg), DecodeError> {
         22 => {
             let io = PeerRequestId(d.u64()?);
             let proof = decode_authority_proof(&mut d)?;
-            let vset = VsetId(d.u64()?);
+            let volume = VolumeId(d.u64()?);
             let sequence = d.u64()?;
             let len = usize::try_from(d.u32()?).map_err(|_| DecodeError)?;
             PeerMsg::VnodeCommit {
                 io,
                 proof,
-                vset,
+                volume,
                 sequence,
                 bytes: d.bytes(len)?.to_vec(),
             }
@@ -457,7 +430,7 @@ fn encode_authority_proof(e: &mut Enc, proof: crate::authority::AuthorityProof) 
 }
 
 fn encode_protected_closure(e: &mut Enc, closure: crate::vnode_member::ProtectedClosureRef) {
-    e.u64(closure.vset.0);
+    e.u64(closure.volume.0);
     e.u64(closure.sequence);
     e.u32(closure.checksum);
     e.u32(closure.len);
@@ -467,7 +440,7 @@ fn decode_protected_closure(
     d: &mut Dec<'_>,
 ) -> Result<crate::vnode_member::ProtectedClosureRef, DecodeError> {
     Ok(crate::vnode_member::ProtectedClosureRef {
-        vset: VsetId(d.u64()?),
+        volume: VolumeId(d.u64()?),
         sequence: d.u64()?,
         checksum: d.u32()?,
         len: d.u32()?,
@@ -495,9 +468,9 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     fn samples() -> Vec<PeerMsg> {
-        let segment = ReplicaArtifact::Segment {
+        let blx = ReplicaArtifact::Blx {
             fence: 4,
-            seg: SegId(12),
+            object: ObjectId(12),
         };
         let info = ReplicaCommitInfo {
             writer_fence: 4,
@@ -518,20 +491,20 @@ mod tests {
         };
         vec![
             PeerMsg::MigrateOffer {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 record: vec![0xAB; 17],
                 vmstate: Some(vec![0xCD; 9]),
             },
             PeerMsg::MigrateAccept {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 offer_fence: 0,
             },
             PeerMsg::FetchRange {
                 io: PeerRequestId(99),
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 replica_assignment_epoch: Some(8),
                 fence: 3,
-                seg: SegId(12),
+                object: ObjectId(12),
                 offset: 4096,
                 len: 640,
             },
@@ -544,59 +517,59 @@ mod tests {
                 bytes: None,
             },
             PeerMsg::Released {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 release_fence: 3,
             },
             PeerMsg::ReleasedAck {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 release_fence: 3,
             },
             PeerMsg::ReplicaPut {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
-                artifact: segment,
+                artifact: blx,
                 checksum: 0xAABB_CCDD,
                 bytes: vec![0x5A; 31],
             },
             PeerMsg::ReplicaPutAck {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
-                artifact: segment,
+                artifact: blx,
                 checksum: 0xAABB_CCDD,
             },
             PeerMsg::ReplicaCommit {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
                 info,
-                required: vec![segment],
+                required: vec![blx],
                 record: vec![0xC3; 27],
             },
             PeerMsg::ReplicaCommitAck {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
                 info,
             },
             PeerMsg::ReplicaStatus {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
             },
             PeerMsg::ReplicaStatusReply {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
                 committed: None,
             },
             PeerMsg::ReplicaStatusReply {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
                 committed: Some(info),
             },
             PeerMsg::ReplicaRelease {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
                 through: info,
             },
             PeerMsg::ReplicaReleaseAck {
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 assignment_epoch: 3,
                 through: info,
             },
@@ -608,7 +581,7 @@ mod tests {
                 io: PeerRequestId(103),
                 proof,
                 closures: vec![crate::vnode_member::ProtectedClosureRef {
-                    vset: VsetId(7),
+                    volume: VolumeId(7),
                     sequence: 44,
                     checksum: 0x1234_5678,
                     len: 99,
@@ -618,7 +591,7 @@ mod tests {
                 io: PeerRequestId(104),
                 vnode: crate::authority::VnodeId(2),
                 closure: crate::vnode_member::ProtectedClosureRef {
-                    vset: VsetId(7),
+                    volume: VolumeId(7),
                     sequence: 44,
                     checksum: 0x1234_5678,
                     len: 99,
@@ -631,14 +604,14 @@ mod tests {
             PeerMsg::VnodeCommit {
                 io: PeerRequestId(105),
                 proof,
-                vset: VsetId(7),
+                volume: VolumeId(7),
                 sequence: 45,
                 bytes: vec![0xA6; 101],
             },
             PeerMsg::VnodeCommitAck {
                 io: PeerRequestId(105),
                 closure: crate::vnode_member::ProtectedClosureRef {
-                    vset: VsetId(7),
+                    volume: VolumeId(7),
                     sequence: 45,
                     checksum: 0x8765_4321,
                     len: 101,

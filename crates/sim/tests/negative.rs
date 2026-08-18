@@ -1,7 +1,7 @@
 //! Fault injection tests that verify oracle violations are detected.
 
 use blockd_core::hostmeta::HostConfig;
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::types::{HostId, millis, secs};
 use blockd_sim::cluster::Sabotage;
 use blockd_sim::harness::{FaultPlan, HarnessConfig, run};
@@ -23,8 +23,8 @@ fn base_config() -> HarnessConfig {
         passive_disk_capacity: None,
         blobs: BlobDevConfig::nvme(),
         store: StoreConfig::gcs(),
-        vset_count: 2,
-        vset: VsetConfig::compute(2, 16),
+        volume_count: 2,
+        volume: VolumeConfig::data(16),
         horizon: secs(2),
         think: (millis(1), millis(5)),
         checkpoint_interval: None,
@@ -61,7 +61,7 @@ fn oracle_catches_dropped_write_protection() {
     // see it (R3.8/R8.1) — this is the failure mode write protection
     // exists to prevent.
     let mut config = base_config();
-    config.vset_count = 1;
+    config.volume_count = 1;
     config.host.cache_pages = 8;
     config.horizon = millis(500);
     config.checkpoint_interval = Some(millis(100));
@@ -89,8 +89,8 @@ fn oracle_catches_dropped_write_protection() {
 fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
     let config = blockd_sim::cluster::ClusterConfig {
         hosts: 2,
-        vset_count: 1,
-        vset_config: VsetConfig::compute(2, 16),
+        volume_count: 1,
+        volume_config: VolumeConfig::memory(16),
         daemon: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
@@ -117,10 +117,9 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         peer_link_outages: vec![],
         fault_points: vec![],
         store_outage: None,
-        rot_resume_set_at: None,
         drop_peer: None,
         race_restore: false,
-        migrate_at: vec![(millis(1_000), blockd_core::types::VsetId(1), 1)],
+        migrate_at: vec![(millis(1_000), blockd_core::types::VolumeId(1), 1)],
         sabotage: Some(Sabotage::EagerHandoffAck),
         guest_sync_share: None,
     };

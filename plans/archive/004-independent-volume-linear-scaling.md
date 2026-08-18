@@ -1,4 +1,4 @@
-# Plan 004: Independent-vset multicore scaling
+# Plan 004: Independent-volume multicore scaling
 
 ## Status
 
@@ -15,8 +15,8 @@ thread-safe shared state and do not shard a fork lineage.
 
 Move only the already thread-safe host-memory and userfaultfd syscalls to a
 fixed eight-thread worker pool. A fair keyed dispatcher admits at most one job
-per vset, preserves FIFO ordering within that vset, overlaps independent
-vsets, aggregates multi-vset write protection, and treats shutdown barriers as
+per volume, preserves FIFO ordering within that volume, overlaps independent
+volumes, aggregates multi-volume write protection, and treats shutdown barriers as
 prefix fences. The actor still makes every cache, residency, recovery, and
 fork/COW decision.
 
@@ -31,18 +31,18 @@ The benchmark must distinguish two paths:
 
 ## Changes
 
-- Removed the duplicate per-vset segment scan from observability publication
+- Removed the duplicate per-volume BLX scan from observability publication
   and changed full snapshots from a workload-controlled 1 kHz cadence to
   100 ms.
 - Added a persistent guest-access lease so the profile uses one long-lived OS
-  thread per vset instead of an executor/blocking-pool handoff per access.
+  thread per volume instead of an executor/blocking-pool handoff per access.
 - Added resident-minor-fault remapping. A present cache page now receives
   `UFFDIO_CONTINUE` rather than leaving the guest blocked.
 - Replaced the serial fault syscall loop with a fixed keyed worker pool.
-  Same-vset work remains FIFO; different vsets reached eight concurrent jobs.
+  Same-volume work remains FIFO; different volumes reached eight concurrent jobs.
 - Added queue, active-concurrency, service, and join-failure evidence to runtime
   artifacts.
-- Added deterministic tests for distinct-vset overlap, same-vset
+- Added deterministic tests for distinct-volume overlap, same-volume
   serialization, barrier prefix draining, worker panic recovery, and persistent
   guest-operation serialization.
 - Added a manifest-validating scaling verifier that requires three comparable
@@ -51,8 +51,8 @@ The benchmark must distinguish two paths:
 
 ## Lima acceptance matrix
 
-The retained workload uses one runtime lane, 64 independent compute vsets, a
-prefaulted 256-page hot set per vset, cache headroom of 512 pages per vset, 80%
+The retained workload uses one runtime lane, 64 independent compute volumes, a
+prefaulted 256-page hot set per volume, cache headroom of 512 pages per volume, 80%
 reads / 20% writes, persistent guest threads, one-in-1,024 latency sampling,
 and three 30-second repetitions. CPU sets are pinned to cores `0`, `0-1`,
 `0-3`, and `0-7`.
@@ -73,7 +73,7 @@ it does not assume superlinear capacity on other hosts.
 The verifier command is:
 
 ```sh
-scripts/verify-independent-vset-scaling.sh ARTIFACT_ROOT
+scripts/verify-independent-volume-scaling.sh ARTIFACT_ROOT
 ```
 
 The final post-refactor smoke reproduced the result at 111.00 M/s on one core
@@ -82,7 +82,7 @@ p99 bound and zero errors.
 
 ## Fork, sharing, and failure gates
 
-A separate one-runtime mixed-lineage smoke used 64 total vsets, 57 measured
+A separate one-runtime mixed-lineage smoke used 64 total volumes, 57 measured
 descendants, seven independent roots, and up to seven generations. It recorded:
 
 - 5,963 shared-base fills during the measured phase;
@@ -96,7 +96,7 @@ fork descendants still use the same retained cache and mappings and then
 diverge through copy-on-write.
 
 The worker-panic regression returns an error to the affected caller, releases
-the vset key, executes the same-vset successor, and increments the failure
+the volume key, executes the same-volume successor, and increments the failure
 counter instead of stranding the queue or a shutdown barrier.
 
 ## Forced-refault diagnostic

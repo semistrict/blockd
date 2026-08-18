@@ -58,12 +58,17 @@ async fn availability_controls_distinguish_fencing_from_immutable_data() {
 async fn prefix_listing_returns_complete_logical_keys() {
     let (_server, endpoint) = FakeGcs::start().await;
     let store = store_against(&endpoint);
-    for key in ["v/01/head", "v/01/s/1", "v/02/head", "b/01/rec"] {
+    for key in [
+        "v/01/head",
+        "v/01/o/0001-0001.blx",
+        "v/02/head",
+        "b/01/root",
+    ] {
         store.put(key, vec![1]).await.expect("put listed object");
     }
     assert_eq!(
         store.list_prefix("v/01/").await.expect("list prefix"),
-        vec!["v/01/head".to_owned(), "v/01/s/1".to_owned()]
+        vec!["v/01/head".to_owned(), "v/01/o/0001-0001.blx".to_owned(),]
     );
 }
 
@@ -97,27 +102,28 @@ async fn the_store_contract_holds_against_generation_semantics() {
     assert_eq!(ghost, Err(StoreFault::CasConflict { actual: None }));
 
     // Plain put/get round-trip with matching generations.
-    let seg = (0u8..=255).cycle().take(10_000).collect::<Vec<u8>>();
-    let vs = store.put("v/01/s/seg-0", seg.clone()).await.expect("put");
-    assert_eq!(store.get("v/01/s/seg-0").await, Ok(Some((vs, seg.clone()))));
+    let object = (0u8..=255).cycle().take(10_000).collect::<Vec<u8>>();
+    let key = "v/01/o/0001-0001.blx";
+    let vs = store.put(key, object.clone()).await.expect("put");
+    assert_eq!(store.get(key).await, Ok(Some((vs, object.clone()))));
     assert_eq!(store.get("v/01/absent").await, Ok(None));
 
     // Ranged reads: exact slice, EOF-straddling tail, past-EOF miss.
     assert_eq!(
-        store.get_range("v/01/s/seg-0", 256, 512).await,
-        Ok(Some((vs, seg[256..768].to_vec())))
+        store.get_range(key, 256, 512).await,
+        Ok(Some((vs, object[256..768].to_vec())))
     );
     assert_eq!(
-        store.get_range("v/01/s/seg-0", 9_900, 500).await,
-        Ok(Some((vs, seg[9_900..].to_vec())))
+        store.get_range(key, 9_900, 500).await,
+        Ok(Some((vs, object[9_900..].to_vec())))
     );
-    assert_eq!(store.get_range("v/01/s/seg-0", 10_000, 1).await, Ok(None));
+    assert_eq!(store.get_range(key, 10_000, 1).await, Ok(None));
     assert_eq!(store.get_range("v/01/nothing", 0, 8).await, Ok(None));
 
     // Delete is fire-and-forget and idempotent.
-    store.delete("v/01/s/seg-0").await;
-    store.delete("v/01/s/seg-0").await;
-    assert_eq!(store.get("v/01/s/seg-0").await, Ok(None));
+    store.delete(key).await;
+    store.delete(key).await;
+    assert_eq!(store.get(key).await, Ok(None));
 
     // The wire carried exactly the headers the contract requires.
     let seen = fake.seen.lock().expect("lock").clone();
@@ -322,13 +328,13 @@ async fn gcs_real_bucket_round_trip() {
         .expect("replace");
     assert!(v2 > v1);
     let body = vec![0xA5u8; 100_000];
-    let vs = store.put("seg", body.clone()).await.expect("put");
-    assert_eq!(store.get("seg").await, Ok(Some((vs, body.clone()))));
+    let vs = store.put("object", body.clone()).await.expect("put");
+    assert_eq!(store.get("object").await, Ok(Some((vs, body.clone()))));
     assert_eq!(
-        store.get_range("seg", 50_000, 1_000).await,
+        store.get_range("object", 50_000, 1_000).await,
         Ok(Some((vs, body[50_000..51_000].to_vec())))
     );
-    assert_eq!(store.get_range("seg", 100_000, 1).await, Ok(None));
+    assert_eq!(store.get_range("object", 100_000, 1).await, Ok(None));
     assert_eq!(store.get("missing").await, Ok(None));
     assert!(
         store
@@ -337,7 +343,7 @@ async fn gcs_real_bucket_round_trip() {
             .expect("list")
             .contains(&"head".to_owned())
     );
-    store.delete("seg").await;
+    store.delete("object").await;
     store.delete("head").await;
-    assert_eq!(store.get("seg").await, Ok(None));
+    assert_eq!(store.get("object").await, Ok(None));
 }

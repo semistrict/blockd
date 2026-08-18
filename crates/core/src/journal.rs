@@ -10,60 +10,54 @@ use std::collections::BTreeMap;
 use crate::blx::{BlockKey, BlockSpace};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::manifest::ObjectRef;
-use crate::segment::PageLoc;
-use crate::types::{
-    Epoch, Gen, HostId, JournalSeq, PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size,
-};
+use crate::page_file::PageFileLoc;
+use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, PageNo, VolumeId, page_size};
 
 pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
 const MAGIC_MIGRATION_INDEX: u32 = u32::from_le_bytes(*b"BMIX");
 
 pub type MigrationBlockChecksums = BTreeMap<BlockKey, (Gen, u64)>;
 
-/// The immutable consistency/lifecycle kind of a vset (R1.1).
+/// The immutable consistency/lifecycle kind of a volume (R1.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
-pub enum VsetKind {
-    /// Guest memory at volume zero followed by guest disk volumes.
-    Compute = 0,
+pub enum VolumeKind {
+    Memory = 0,
+    Data = 1,
 }
 
-/// Immutable configuration of a vset, carried in every record.
+/// Immutable configuration of a volume, carried in every record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct VsetConfig {
-    pub kind: VsetKind,
-    /// Highest valid volume index. Compute volume zero is memory.
-    pub disk_volumes: u8,
-    pub pages_per_volume: u32,
+pub struct VolumeConfig {
+    pub kind: VolumeKind,
+    pub pages: u32,
 }
 
-impl VsetConfig {
-    pub const fn compute(disk_volumes: u8, pages_per_volume: u32) -> Self {
+impl VolumeConfig {
+    pub const fn memory(pages: u32) -> Self {
         Self {
-            kind: VsetKind::Compute,
-            disk_volumes,
-            pages_per_volume,
+            kind: VolumeKind::Memory,
+            pages,
         }
     }
 
-    /// All logical volumes of the vset.
-    pub fn volumes(&self, vset: VsetId) -> impl Iterator<Item = VolumeId> + use<> {
-        (0..=self.disk_volumes).map(move |idx| VolumeId {
-            vset,
-            idx: VolumeIdx(idx),
-        })
+    pub const fn data(pages: u32) -> Self {
+        Self {
+            kind: VolumeKind::Data,
+            pages,
+        }
     }
 
     pub fn contains(&self, page: PageId) -> bool {
-        page.volume.idx.0 <= self.disk_volumes && page.page.0 < self.pages_per_volume
+        page.page.0 < self.pages
     }
 
-    pub fn is_memory(&self, idx: VolumeIdx) -> bool {
-        idx.is_memory()
+    pub fn is_memory(&self) -> bool {
+        self.kind == VolumeKind::Memory
     }
 
     fn valid(self) -> bool {
-        self.pages_per_volume > 0 && self.kind == VsetKind::Compute
+        self.pages > 0
     }
 }
 
@@ -73,7 +67,7 @@ pub enum RecordKind {
     /// Background writeback / sync commit: disk volumes restorable by cold
     /// boot; memory entries serve refaults but restore invalid (R3.7).
     Commit,
-    /// A whole-vset checkpoint (R1.2): memory, vmstate and disks of one
+    /// A memory-volume checkpoint (R1.2): memory and vmstate from one
     /// instant; restore resumes.
     Checkpoint {
         epoch: Epoch,
@@ -89,17 +83,17 @@ pub struct MigrationSource {
     pub offer_fence: Option<u64>,
 }
 
-/// A full consistency point of one vset at one capture instant.
+/// A full consistency point of one volume at one capture instant.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct JournalRecord {
-    pub config: VsetConfig,
+    pub config: VolumeConfig,
     pub seq: JournalSeq,
     /// The writer incarnation (head CAS version at claim, R6.3/R6.4).
     pub fence: u64,
     pub kind: RecordKind,
-    /// The vset mutation counter at the capture instant.
+    /// The volume mutation counter at the capture instant.
     pub capture_seq: u64,
-    /// Sync watermark (R3.8): the highest sync barrier this vset has ever
+    /// Sync watermark (R3.8): the highest sync barrier this volume has ever
     /// acknowledged (or acknowledges by this record's durability). Monotone
     /// across records, so it survives reclamation of the record that
     /// originally covered a sync. Recovery must never choose a resume point
@@ -113,8 +107,8 @@ pub struct JournalRecord {
     /// index; page locations below are runtime-only lookup state.
     pub files: Vec<ObjectRef>,
     /// Runtime-only lookup state used by migration messages.
-    pub overlay: BTreeMap<PageId, (Gen, PageLoc)>,
-    /// Migration provenance (R7.2): while an in-migrated vset still
+    pub runtime_page_index: BTreeMap<PageId, (Gen, PageFileLoc)>,
+    /// Migration provenance (R7.2): while an in-migrated volume still
     /// hydrates from its source, every record names that source. The
     /// destination's first record — the durable ACCEPT of the handoff —
     /// must let a recovery finish the handshake it interrupts: answer the
@@ -124,12 +118,24 @@ pub struct JournalRecord {
 }
 
 impl JournalRecord {
-    pub fn encode(&self, vset: VsetId) -> Vec<u8> {
-        assert!(self.config.valid(), "invalid vset config");
+    pub const fn commit_info(&self) -> crate::protocol::ReplicaCommitInfo {
+        crate::protocol::ReplicaCommitInfo {
+            writer_fence: self.fence,
+            seq: self.seq,
+            sync_covered_through: self.sync_covered_through,
+        }
+    }
+
+    pub fn encode(&self, volume: VolumeId) -> Vec<u8> {
+        assert!(self.config.valid(), "invalid volume config");
+        assert!(
+            !matches!(self.kind, RecordKind::Checkpoint { .. }) || self.config.is_memory(),
+            "only memory volumes carry checkpoint vmstate"
+        );
         let mut e = Enc::new();
-        e.u16(7); // version: accepted migration source fence
+        e.u16(8); // version: one independently addressed volume
         e.u32(u32::try_from(page_size()).expect("page size fits u32"));
-        e.u64(vset.0);
+        e.u64(volume.0);
         e.u64(self.seq.0);
         e.u64(self.fence);
         match self.kind {
@@ -174,8 +180,7 @@ impl JournalRecord {
             }
         }
         e.u8(self.config.kind as u8);
-        e.u8(self.config.disk_volumes);
-        e.u32(self.config.pages_per_volume);
+        e.u32(self.config.pages);
         // The sole current durability policy is primary plus one passive.
         e.u8(2);
         e.u32(u32::try_from(self.files.len()).expect("file count fits u32"));
@@ -189,32 +194,33 @@ impl JournalRecord {
     /// record. A destination persists this form only while it still depends
     /// on the source, so local recovery can resume post-copy hydration after a
     /// daemon crash. Ordinary journal records never carry the index.
-    pub fn encode_migration(&self, vset: VsetId) -> Vec<u8> {
-        self.encode_migration_with_checksums(vset, &BTreeMap::new())
+    pub fn encode_migration(&self, volume: VolumeId) -> Vec<u8> {
+        self.encode_migration_with_checksums(volume, &BTreeMap::new())
     }
 
     pub fn encode_migration_with_checksums(
         &self,
-        vset: VsetId,
+        volume: VolumeId,
         block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
     ) -> Vec<u8> {
-        let durable = self.encode(vset);
+        let durable = self.encode(volume);
         let mut index = Enc::new();
-        index.u32(u32::try_from(self.overlay.len()).expect("overlay count fits u32"));
-        for (page, (generation, loc)) in &self.overlay {
-            index.u8(page.volume.idx.0);
+        index.u32(
+            u32::try_from(self.runtime_page_index.len())
+                .expect("runtime_page_index count fits u32"),
+        );
+        for (page, (generation, loc)) in &self.runtime_page_index {
             index.u32(page.page.0);
             index.u64(generation.0);
             index.u64(loc.base);
             index.u64(loc.fence);
-            index.u64(loc.seg.0);
+            index.u64(loc.object.0);
             index.u32(loc.offset);
             index.u32(loc.len);
         }
         index.u32(u32::try_from(block_checksums.len()).expect("block checksum count fits u32"));
         for (key, (generation, checksum)) in block_checksums {
             index.u8(key.space as u8);
-            index.u8(key.volume);
             index.u32(key.block);
             index.u64(generation.0);
             index.u64(*checksum);
@@ -233,17 +239,17 @@ impl JournalRecord {
 
     /// Verify and decode a record. Any damage is one answer: corrupt.
     #[allow(clippy::too_many_lines)]
-    pub fn decode(vset: VsetId, bytes: &[u8]) -> Result<JournalRecord, DecodeError> {
+    pub fn decode(volume: VolumeId, bytes: &[u8]) -> Result<JournalRecord, DecodeError> {
         let payload = open_frame(MAGIC_JOURNAL, bytes)?;
         let mut d = Dec::new(payload);
         let version = d.u16()?;
-        if version != 7 {
+        if version != 8 {
             return Err(DecodeError);
         }
         if d.u32()? != u32::try_from(page_size()).expect("page size fits u32") {
             return Err(DecodeError);
         }
-        if d.u64()? != vset.0 {
+        if d.u64()? != volume.0 {
             return Err(DecodeError);
         }
         let seq = JournalSeq(d.u64()?);
@@ -281,20 +287,23 @@ impl JournalRecord {
             host,
             offer_fence: offered_fence,
         });
-        let vset_kind = match d.u8()? {
-            0 => VsetKind::Compute,
+        let volume_kind = match d.u8()? {
+            0 => VolumeKind::Memory,
+            1 => VolumeKind::Data,
             _ => return Err(DecodeError),
         };
-        let config = VsetConfig {
-            kind: vset_kind,
-            disk_volumes: d.u8()?,
-            pages_per_volume: d.u32()?,
+        let config = VolumeConfig {
+            kind: volume_kind,
+            pages: d.u32()?,
         };
         let durability_tag = d.u8()?;
         if durability_tag != 2 {
             return Err(DecodeError);
         }
         if !config.valid() {
+            return Err(DecodeError);
+        }
+        if matches!(kind, RecordKind::Checkpoint { .. }) && !config.is_memory() {
             return Err(DecodeError);
         }
         let file_count = d.u32()?;
@@ -313,17 +322,13 @@ impl JournalRecord {
             sync_covered_through,
             post_state_checksum,
             files,
-            overlay: BTreeMap::new(),
+            runtime_page_index: BTreeMap::new(),
             migrated_from,
         })
     }
 
-    pub fn decode_migration(vset: VsetId, bytes: &[u8]) -> Result<JournalRecord, DecodeError> {
-        Self::decode_migration_with_checksums(vset, bytes).map(|(record, _)| record)
-    }
-
     pub fn decode_migration_with_checksums(
-        vset: VsetId,
+        volume: VolumeId,
         bytes: &[u8],
     ) -> Result<(JournalRecord, MigrationBlockChecksums), DecodeError> {
         let prefix = bytes.get(..8).ok_or(DecodeError)?;
@@ -332,33 +337,32 @@ impl JournalRecord {
         ))
         .map_err(|_| DecodeError)?;
         let durable_end = 8usize.checked_add(durable_len).ok_or(DecodeError)?;
-        let mut record = Self::decode(vset, bytes.get(8..durable_end).ok_or(DecodeError)?)?;
+        let mut record = Self::decode(volume, bytes.get(8..durable_end).ok_or(DecodeError)?)?;
         let payload = open_frame(
             MAGIC_MIGRATION_INDEX,
             bytes.get(durable_end..).ok_or(DecodeError)?,
         )?;
         let mut d = Dec::new(payload);
         let count = d.u32()?;
-        let mut overlay = BTreeMap::new();
+        let mut runtime_page_index = BTreeMap::new();
         for _ in 0..count {
-            let volume = VolumeIdx(d.u8()?);
             let page_no = PageNo(d.u32()?);
             let generation = Gen(d.u64()?);
-            let loc = PageLoc {
+            let loc = PageFileLoc {
                 base: d.u64()?,
                 fence: d.u64()?,
-                seg: crate::types::SegId(d.u64()?),
+                object: crate::types::ObjectId(d.u64()?),
                 offset: d.u32()?,
                 len: d.u32()?,
             };
             let page = PageId {
-                volume: VolumeId { vset, idx: volume },
+                volume,
                 page: page_no,
             };
             if !record.config.contains(page) {
                 return Err(DecodeError);
             }
-            if overlay.insert(page, (generation, loc)).is_some() {
+            if runtime_page_index.insert(page, (generation, loc)).is_some() {
                 return Err(DecodeError);
             }
         }
@@ -373,21 +377,17 @@ impl JournalRecord {
             };
             let key = BlockKey {
                 space,
-                volume: d.u8()?,
                 block: d.u32()?,
             };
             let generation = Gen(d.u64()?);
             let checksum = d.u64()?;
             let valid = match key.space {
                 BlockSpace::Memory => {
-                    record.config.kind == VsetKind::Compute
-                        && key.volume == 0
-                        && key.block < record.config.pages_per_volume
+                    record.config.kind == VolumeKind::Memory && key.block < record.config.pages
                 }
-                BlockSpace::Vmm => record.config.kind == VsetKind::Compute && key.volume == 0,
+                BlockSpace::Vmm => record.config.kind == VolumeKind::Memory,
                 BlockSpace::Data => {
-                    key.volume <= record.config.disk_volumes
-                        && key.block < record.config.pages_per_volume
+                    record.config.kind == VolumeKind::Data && key.block < record.config.pages
                 }
             };
             if !valid
@@ -399,7 +399,7 @@ impl JournalRecord {
             }
         }
         d.finish()?;
-        record.overlay = overlay;
+        record.runtime_page_index = runtime_page_index;
         Ok((record, block_checksums))
     }
 }
@@ -410,14 +410,11 @@ mod tests {
     use crate::blx::{BlockKey, BlockSpace, NamespaceKind};
     use crate::format::{crc32c, open_frame, seal_frame};
     use crate::manifest::ObjectIdentity;
-    use crate::types::SegId;
+    use crate::types::ObjectId;
 
-    fn sample_page(volume: u8, page: u32) -> PageId {
+    fn sample_page(_kind: u8, page: u32) -> PageId {
         PageId {
-            volume: VolumeId {
-                vset: VsetId(0xA1),
-                idx: VolumeIdx(volume),
-            },
+            volume: VolumeId(0xA1),
             page: PageNo(page),
         }
     }
@@ -428,10 +425,10 @@ mod tests {
             sample_page(0, 3),
             (
                 Gen(7),
-                PageLoc {
+                PageFileLoc {
                     base: 0,
                     fence: 6,
-                    seg: SegId(2),
+                    object: ObjectId(2),
                     offset: 27,
                     len: 90,
                 },
@@ -441,20 +438,19 @@ mod tests {
             sample_page(1, 0),
             (
                 Gen(9),
-                PageLoc {
+                PageFileLoc {
                     base: 0,
                     fence: 6,
-                    seg: SegId(2),
+                    object: ObjectId(2),
                     offset: 117,
                     len: 88,
                 },
             ),
         );
         JournalRecord {
-            config: VsetConfig {
-                kind: VsetKind::Compute,
-                disk_volumes: 2,
-                pages_per_volume: 16,
+            config: VolumeConfig {
+                kind: VolumeKind::Memory,
+                pages: 16,
             },
             seq: JournalSeq(5),
             fence: 6,
@@ -467,7 +463,7 @@ mod tests {
             sync_covered_through: 90,
             post_state_checksum: 23,
             files: Vec::new(),
-            overlay: pages,
+            runtime_page_index: pages,
             migrated_from: Some(MigrationSource {
                 host: HostId(2),
                 offer_fence: Some(5),
@@ -478,14 +474,14 @@ mod tests {
     #[test]
     fn records_round_trip_and_are_byte_pinned() {
         let record = sample_record();
-        let bytes = record.encode(VsetId(0xA1));
+        let bytes = record.encode(VolumeId(0xA1));
         let mut durable = record.clone();
-        durable.overlay.clear();
-        assert_eq!(JournalRecord::decode(VsetId(0xA1), &bytes), Ok(durable));
+        durable.runtime_page_index.clear();
+        assert_eq!(JournalRecord::decode(VolumeId(0xA1), &bytes), Ok(durable));
         // Byte pin (R10.2): any change here is a storage format change.
         let expected = match page_size() {
-            4096 => (114, 0xF261_B291),
-            16_384 => (114, 0x36DF_2844),
+            4096 => (113, 0x468A_9C73),
+            16_384 => (113, 0xAC8B_6E78),
             size => panic!("byte pin missing for {size}-byte pages"),
         };
         assert_eq!((bytes.len(), crc32c(&bytes)), expected);
@@ -499,35 +495,36 @@ mod tests {
             .as_mut()
             .expect("migration provenance")
             .offer_fence = Some(0);
-        let bytes = record.encode_migration(VsetId(0xA1));
+        let bytes = record.encode_migration(VolumeId(0xA1));
         assert_eq!(
-            JournalRecord::decode_migration(VsetId(0xA1), &bytes),
+            JournalRecord::decode_migration_with_checksums(VolumeId(0xA1), &bytes)
+                .map(|(decoded, _)| decoded),
             Ok(record)
         );
     }
 
     #[test]
     fn records_reject_any_single_bit_flip() {
-        let bytes = sample_record().encode(VsetId(0xA1));
+        let bytes = sample_record().encode(VolumeId(0xA1));
         for bit in 0..bytes.len() * 8 {
             let mut damaged = bytes.clone();
             damaged[bit / 8] ^= 1 << (bit % 8);
             assert!(
-                JournalRecord::decode(VsetId(0xA1), &damaged).is_err(),
+                JournalRecord::decode(VolumeId(0xA1), &damaged).is_err(),
                 "flip of bit {bit} went undetected"
             );
         }
     }
 
     #[test]
-    fn records_are_bound_to_their_vset() {
-        let bytes = sample_record().encode(VsetId(0xA1));
-        assert!(JournalRecord::decode(VsetId(0xA2), &bytes).is_err());
+    fn records_are_bound_to_their_volume() {
+        let bytes = sample_record().encode(VolumeId(0xA1));
+        assert!(JournalRecord::decode(VolumeId(0xA2), &bytes).is_err());
     }
 
     #[test]
     fn records_reject_a_different_system_page_size() {
-        let bytes = sample_record().encode(VsetId(0xA1));
+        let bytes = sample_record().encode(VolumeId(0xA1));
         let mut payload = open_frame(MAGIC_JOURNAL, &bytes)
             .expect("record frame")
             .to_vec();
@@ -538,38 +535,37 @@ mod tests {
         };
         payload[2..6].copy_from_slice(&incompatible.to_le_bytes());
         let incompatible = seal_frame(MAGIC_JOURNAL, &payload);
-        assert!(JournalRecord::decode(VsetId(0xA1), &incompatible).is_err());
+        assert!(JournalRecord::decode(VolumeId(0xA1), &incompatible).is_err());
     }
 
     #[test]
     fn runtime_page_index_is_not_persisted() {
-        let vset = VsetId(0xA1);
+        let volume = VolumeId(0xA1);
         let record = sample_record();
         let mut without_runtime_index = record.clone();
-        without_runtime_index.overlay.clear();
+        without_runtime_index.runtime_page_index.clear();
 
-        assert_eq!(record.encode(vset), without_runtime_index.encode(vset));
+        assert_eq!(record.encode(volume), without_runtime_index.encode(volume));
         assert_eq!(
-            JournalRecord::decode(vset, &record.encode(vset)),
+            JournalRecord::decode(volume, &record.encode(volume)),
             Ok(without_runtime_index)
         );
     }
 
     #[test]
     fn uncompacted_local_files_may_exceed_the_archive_overlap_limit() {
-        let vset = VsetId(0xA1);
+        let volume = VolumeId(0xA1);
         let mut record = sample_record();
-        record.overlay.clear();
+        record.runtime_page_index.clear();
         let key = BlockKey {
             space: BlockSpace::Data,
-            volume: 1,
             block: 7,
         };
         record.files = (0..=crate::blx::MAX_OVERLAPPING_FILES)
             .map(|index| ObjectRef {
                 identity: ObjectIdentity {
-                    namespace_kind: NamespaceKind::Vset,
-                    namespace_id: vset.0,
+                    namespace_kind: NamespaceKind::Volume,
+                    namespace_id: volume.0,
                     writer_fence: record.fence,
                     object_id: u64::try_from(index).expect("index fits u64"),
                 },
@@ -589,7 +585,7 @@ mod tests {
             })
             .collect();
 
-        let bytes = record.encode(vset);
-        assert_eq!(JournalRecord::decode(vset, &bytes), Ok(record));
+        let bytes = record.encode(volume);
+        assert_eq!(JournalRecord::decode(volume, &bytes), Ok(record));
     }
 }

@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::blx::{BlockKey, BlxObject, MAX_OVERLAPPING_FILES, NamespaceKind};
 use crate::format::{Dec, DecodeError, Enc, checksum64, open_frame, seal_frame};
 use crate::head::ManifestPtr;
-use crate::journal::{VsetConfig, VsetKind};
-use crate::types::{Epoch, VsetId, page_size};
+use crate::journal::{VolumeConfig, VolumeKind};
+use crate::types::{Epoch, JournalSeq, VolumeId, page_size};
 
 pub const MAGIC_FILE_LIST: u32 = u32::from_le_bytes(*b"BLFL");
 pub const MAGIC_MANIFEST: u32 = u32::from_le_bytes(*b"BLMF");
@@ -28,11 +28,22 @@ pub struct ObjectIdentity {
 }
 
 impl ObjectIdentity {
+    pub const fn volume(volume: VolumeId, writer_fence: u64, object_id: u64) -> Self {
+        Self {
+            namespace_kind: NamespaceKind::Volume,
+            namespace_id: volume.0,
+            writer_fence,
+            object_id,
+        }
+    }
+
     pub fn store_key(self) -> String {
         match self.namespace_kind {
-            NamespaceKind::Vset => {
-                crate::layout::blx_key(VsetId(self.namespace_id), self.writer_fence, self.object_id)
-            }
+            NamespaceKind::Volume => crate::layout::blx_key(
+                VolumeId(self.namespace_id),
+                self.writer_fence,
+                self.object_id,
+            ),
             NamespaceKind::ImportedBase => format!(
                 "b/{:016x}/o/{:016x}-{:016x}.blx",
                 self.namespace_id, self.writer_fence, self.object_id
@@ -49,7 +60,7 @@ impl ObjectIdentity {
 
     fn decode(d: &mut Dec<'_>) -> Result<Self, DecodeError> {
         Ok(Self {
-            namespace_kind: decode_namespace(d.u8()?)?,
+            namespace_kind: NamespaceKind::decode(d.u8()?)?,
             namespace_id: d.u64()?,
             writer_fence: d.u64()?,
             object_id: d.u64()?,
@@ -108,8 +119,8 @@ impl ObjectRef {
         e.u64(self.batch_id);
         e.u32(self.chunk_index);
         e.u32(self.chunk_count);
-        encode_key(self.first_key, e);
-        encode_key(self.last_key, e);
+        self.first_key.encode(e);
+        self.last_key.encode(e);
         e.u64(self.pre_state_checksum);
         e.u64(self.post_state_checksum);
         e.u32(self.size);
@@ -126,8 +137,8 @@ impl ObjectRef {
             batch_id: d.u64()?,
             chunk_index: d.u32()?,
             chunk_count: d.u32()?,
-            first_key: decode_key(d)?,
-            last_key: decode_key(d)?,
+            first_key: BlockKey::decode(d)?,
+            last_key: BlockKey::decode(d)?,
             pre_state_checksum: d.u64()?,
             post_state_checksum: d.u64()?,
             size: d.u32()?,
@@ -167,6 +178,12 @@ pub struct FileListRef {
     pub checksum: u64,
 }
 
+impl FileListRef {
+    pub fn store_key(self, volume: VolumeId) -> String {
+        crate::layout::complete_file_list_key(volume, self.writer_fence, self.list_id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RecoveryKind {
@@ -186,18 +203,22 @@ impl RecoveryKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompleteFileList {
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub writer_fence: u64,
     pub list_id: u64,
     pub objects: Vec<ObjectRef>,
 }
 
 impl CompleteFileList {
+    pub fn store_key(&self) -> String {
+        crate::layout::complete_file_list_key(self.volume, self.writer_fence, self.list_id)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         assert_valid_objects(&self.objects);
         let mut e = Enc::new();
         e.u16(FORMAT_VERSION);
-        e.u64(self.vset.0);
+        e.u64(self.volume.0);
         e.u64(self.writer_fence);
         e.u64(self.list_id);
         e.u32(u32::try_from(self.objects.len()).expect("file count fits u32"));
@@ -207,7 +228,7 @@ impl CompleteFileList {
         let content_checksum = checksum64(&e.finish());
         let mut e = Enc::new();
         e.u16(FORMAT_VERSION);
-        e.u64(self.vset.0);
+        e.u64(self.volume.0);
         e.u64(self.writer_fence);
         e.u64(self.list_id);
         e.u32(u32::try_from(self.objects.len()).expect("file count fits u32"));
@@ -223,13 +244,17 @@ impl CompleteFileList {
         bytes
     }
 
-    pub fn decode(expected: FileListRef, vset: VsetId, bytes: &[u8]) -> Result<Self, DecodeError> {
+    pub fn decode(
+        expected: FileListRef,
+        volume: VolumeId,
+        bytes: &[u8],
+    ) -> Result<Self, DecodeError> {
         if bytes.len() > MAX_METADATA_OBJECT_BYTES || checksum64(bytes) != expected.checksum {
             return Err(DecodeError);
         }
         let payload = open_frame(MAGIC_FILE_LIST, bytes)?;
         let mut d = Dec::new(payload);
-        if d.u16()? != FORMAT_VERSION || d.u64()? != vset.0 {
+        if d.u16()? != FORMAT_VERSION || d.u64()? != volume.0 {
             return Err(DecodeError);
         }
         let writer_fence = d.u64()?;
@@ -246,7 +271,7 @@ impl CompleteFileList {
         d.finish()?;
         let mut content = Enc::new();
         content.u16(FORMAT_VERSION);
-        content.u64(vset.0);
+        content.u64(volume.0);
         content.u64(writer_fence);
         content.u64(list_id);
         content.u32(u32::try_from(objects.len()).expect("count fits u32"));
@@ -258,7 +283,7 @@ impl CompleteFileList {
         }
         validate_objects(&objects, Some(MAX_OVERLAPPING_FILES))?;
         Ok(Self {
-            vset,
+            volume,
             writer_fence,
             list_id,
             objects,
@@ -277,7 +302,7 @@ impl CompleteFileList {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub writer_fence: u64,
     pub journal_seq: u64,
     pub archive_seq: u64,
@@ -285,7 +310,7 @@ pub struct Manifest {
     pub sync_covered_through: u64,
     pub recovery_kind: RecoveryKind,
     pub checkpoint_epoch: Epoch,
-    pub config: VsetConfig,
+    pub config: VolumeConfig,
     pub vmstate_logical_length: u64,
     pub base: Option<BaseRef>,
     pub complete_list: Option<FileListRef>,
@@ -302,43 +327,57 @@ pub struct ManifestClosure {
     pub files: Vec<ObjectRef>,
 }
 
-pub fn decode_manifest_closure(
-    vset: VsetId,
-    pointer: ManifestPtr,
-    manifest_bytes: &[u8],
-    complete_list_bytes: Option<&[u8]>,
-) -> Result<ManifestClosure, DecodeError> {
-    if checksum64(manifest_bytes) != pointer.checksum {
-        return Err(DecodeError);
+impl ManifestClosure {
+    pub fn decode(
+        volume: VolumeId,
+        pointer: ManifestPtr,
+        manifest_bytes: &[u8],
+        complete_list_bytes: Option<&[u8]>,
+    ) -> Result<Self, DecodeError> {
+        if checksum64(manifest_bytes) != pointer.checksum {
+            return Err(DecodeError);
+        }
+        let manifest = Manifest::decode(volume, manifest_bytes)?;
+        if (
+            manifest.writer_fence,
+            manifest.journal_seq,
+            manifest.archive_seq,
+            manifest.capture_seq,
+        ) != (
+            pointer.fence,
+            pointer.journal_seq.0,
+            pointer.seq.0,
+            pointer.capture_seq,
+        ) {
+            return Err(DecodeError);
+        }
+        let complete_list = match (manifest.complete_list, complete_list_bytes) {
+            (None, None) => None,
+            (Some(reference), Some(bytes)) => {
+                Some(CompleteFileList::decode(reference, volume, bytes)?)
+            }
+            _ => return Err(DecodeError),
+        };
+        let files = manifest.current_files(complete_list.as_ref())?;
+        Ok(Self {
+            manifest,
+            complete_list,
+            files,
+        })
     }
-    let manifest = Manifest::decode(vset, manifest_bytes)?;
-    if (
-        manifest.writer_fence,
-        manifest.journal_seq,
-        manifest.archive_seq,
-        manifest.capture_seq,
-    ) != (
-        pointer.fence,
-        pointer.journal_seq.0,
-        pointer.seq.0,
-        pointer.capture_seq,
-    ) {
-        return Err(DecodeError);
-    }
-    let complete_list = match (manifest.complete_list, complete_list_bytes) {
-        (None, None) => None,
-        (Some(reference), Some(bytes)) => Some(CompleteFileList::decode(reference, vset, bytes)?),
-        _ => return Err(DecodeError),
-    };
-    let files = manifest.current_files(complete_list.as_ref())?;
-    Ok(ManifestClosure {
-        manifest,
-        complete_list,
-        files,
-    })
 }
 
 impl Manifest {
+    pub fn pointer(&self, encoded: &[u8]) -> ManifestPtr {
+        ManifestPtr {
+            fence: self.writer_fence,
+            journal_seq: JournalSeq(self.journal_seq),
+            seq: JournalSeq(self.archive_seq),
+            capture_seq: self.capture_seq,
+            checksum: checksum64(encoded),
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, ManifestTooLarge> {
         assert_manifest_shape(self);
         let mut e = Enc::new();
@@ -359,13 +398,13 @@ impl Manifest {
         }
     }
 
-    pub fn decode(vset: VsetId, bytes: &[u8]) -> Result<Self, DecodeError> {
+    pub fn decode(volume: VolumeId, bytes: &[u8]) -> Result<Self, DecodeError> {
         if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(DecodeError);
         }
         let payload = open_frame(MAGIC_MANIFEST, bytes)?;
         let mut d = Dec::new(payload);
-        let mut manifest = decode_manifest_prefix(vset, &mut d)?;
+        let mut manifest = decode_manifest_prefix(volume, &mut d)?;
         let added_count = usize::try_from(d.u32()?).expect("u32 fits usize");
         for _ in 0..added_count {
             manifest.added.push(ObjectRef::decode_from(&mut d)?);
@@ -531,7 +570,7 @@ pub struct BaseManifest {
     pub sync_covered_through: u64,
     pub recovery_kind: RecoveryKind,
     pub checkpoint_epoch: Epoch,
-    pub config: VsetConfig,
+    pub config: VolumeConfig,
     pub vmstate_logical_length: u64,
     pub post_state_checksum: u64,
     pub metadata_checksum: u64,
@@ -639,7 +678,7 @@ pub fn bound_manifest(
     }
     let objects = manifest.current_files(current_complete_list)?;
     let list = CompleteFileList {
-        vset: manifest.vset,
+        volume: manifest.volume,
         writer_fence: manifest.writer_fence,
         list_id: new_list_id,
         objects,
@@ -656,7 +695,7 @@ pub fn bound_manifest(
 
 fn encode_manifest_prefix(manifest: &Manifest, e: &mut Enc) {
     e.u16(FORMAT_VERSION);
-    e.u64(manifest.vset.0);
+    e.u64(manifest.volume.0);
     e.u64(manifest.writer_fence);
     e.u64(manifest.journal_seq);
     e.u64(manifest.archive_seq);
@@ -673,8 +712,8 @@ fn encode_manifest_prefix(manifest: &Manifest, e: &mut Enc) {
     e.u64(manifest.metadata_checksum);
 }
 
-fn decode_manifest_prefix(vset: VsetId, d: &mut Dec<'_>) -> Result<Manifest, DecodeError> {
-    if d.u16()? != FORMAT_VERSION || d.u64()? != vset.0 {
+fn decode_manifest_prefix(volume: VolumeId, d: &mut Dec<'_>) -> Result<Manifest, DecodeError> {
+    if d.u16()? != FORMAT_VERSION || d.u64()? != volume.0 {
         return Err(DecodeError);
     }
     let writer_fence = d.u64()?;
@@ -689,7 +728,7 @@ fn decode_manifest_prefix(vset: VsetId, d: &mut Dec<'_>) -> Result<Manifest, Dec
     }
     let config = decode_config(d)?;
     Ok(Manifest {
-        vset,
+        volume,
         writer_fence,
         journal_seq,
         archive_seq,
@@ -708,23 +747,26 @@ fn decode_manifest_prefix(vset: VsetId, d: &mut Dec<'_>) -> Result<Manifest, Dec
     })
 }
 
-fn encode_config(config: VsetConfig, e: &mut Enc) {
+fn encode_config(config: VolumeConfig, e: &mut Enc) {
     e.u8(config.kind as u8);
-    e.u8(config.disk_volumes);
-    e.u32(config.pages_per_volume);
+    e.u8(0);
+    e.u32(config.pages);
 }
 
-fn decode_config(d: &mut Dec<'_>) -> Result<VsetConfig, DecodeError> {
+fn decode_config(d: &mut Dec<'_>) -> Result<VolumeConfig, DecodeError> {
     let kind = match d.u8()? {
-        0 => VsetKind::Compute,
+        0 => VolumeKind::Memory,
+        1 => VolumeKind::Data,
         _ => return Err(DecodeError),
     };
-    let config = VsetConfig {
+    if d.u8()? != 0 {
+        return Err(DecodeError);
+    }
+    let config = VolumeConfig {
         kind,
-        disk_volumes: d.u8()?,
-        pages_per_volume: d.u32()?,
+        pages: d.u32()?,
     };
-    if config.pages_per_volume == 0 {
+    if config.pages == 0 {
         return Err(DecodeError);
     }
     Ok(config)
@@ -809,39 +851,6 @@ fn decode_list_ref(d: &mut Dec<'_>) -> Result<Option<FileListRef>, DecodeError> 
         1 => Ok(Some(value)),
         _ => Err(DecodeError),
     }
-}
-
-fn decode_namespace(value: u8) -> Result<NamespaceKind, DecodeError> {
-    match value {
-        0 => Ok(NamespaceKind::Vset),
-        1 => Ok(NamespaceKind::ImportedBase),
-        _ => Err(DecodeError),
-    }
-}
-
-fn encode_key(key: BlockKey, e: &mut Enc) {
-    e.u8(key.space as u8);
-    e.u8(key.volume);
-    e.u16(0);
-    e.u32(key.block);
-}
-
-fn decode_key(d: &mut Dec<'_>) -> Result<BlockKey, DecodeError> {
-    let space = match d.u8()? {
-        0 => crate::blx::BlockSpace::Memory,
-        1 => crate::blx::BlockSpace::Data,
-        2 => crate::blx::BlockSpace::Vmm,
-        _ => return Err(DecodeError),
-    };
-    let volume = d.u8()?;
-    if d.u16()? != 0 || (space == crate::blx::BlockSpace::Memory && volume != 0) {
-        return Err(DecodeError);
-    }
-    Ok(BlockKey {
-        space,
-        volume,
-        block: d.u32()?,
-    })
 }
 
 fn assert_manifest_shape(manifest: &Manifest) {
@@ -994,7 +1003,7 @@ mod tests {
     fn object(id: u64) -> ObjectRef {
         ObjectRef {
             identity: ObjectIdentity {
-                namespace_kind: NamespaceKind::Vset,
+                namespace_kind: NamespaceKind::Volume,
                 namespace_id: 7,
                 writer_fence: 3,
                 object_id: id,
@@ -1006,12 +1015,10 @@ mod tests {
             chunk_count: 1,
             first_key: BlockKey {
                 space: BlockSpace::Data,
-                volume: 0,
                 block: u32::try_from(id).expect("test object id fits u32"),
             },
             last_key: BlockKey {
                 space: BlockSpace::Data,
-                volume: 0,
                 block: u32::try_from(id).expect("test object id fits u32"),
             },
             pre_state_checksum: id - 1,
@@ -1025,7 +1032,7 @@ mod tests {
 
     fn manifest() -> Manifest {
         Manifest {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             writer_fence: 3,
             journal_seq: 6,
             archive_seq: 8,
@@ -1033,7 +1040,7 @@ mod tests {
             sync_covered_through: 9,
             recovery_kind: RecoveryKind::DiskOnly,
             checkpoint_epoch: Epoch(0),
-            config: VsetConfig::compute(1, 1024),
+            config: VolumeConfig::data(1024),
             vmstate_logical_length: 0,
             base: None,
             complete_list: None,
@@ -1058,21 +1065,21 @@ mod tests {
     fn manifest_round_trips_and_is_bounded() {
         let manifest = manifest();
         let bytes = manifest.encode().expect("bounded manifest");
-        assert_eq!(Manifest::decode(VsetId(7), &bytes), Ok(manifest));
+        assert_eq!(Manifest::decode(VolumeId(7), &bytes), Ok(manifest));
         assert!(bytes.len() <= MAX_MANIFEST_BYTES);
     }
 
     #[test]
     fn complete_list_round_trips_and_changes_produce_current_files() {
         let list = CompleteFileList {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             writer_fence: 3,
             list_id: 2,
             objects: vec![object(1), object(2)],
         };
         let bytes = list.encode();
         let reference = list.reference();
-        let decoded = CompleteFileList::decode(reference, VsetId(7), &bytes).expect("file list");
+        let decoded = CompleteFileList::decode(reference, VolumeId(7), &bytes).expect("file list");
         let mut manifest = manifest();
         manifest.complete_list = Some(reference);
         let mut third = object(3);
@@ -1106,7 +1113,7 @@ mod tests {
         later.pre_state_checksum = 7;
         later.post_state_checksum = 9;
         let list = CompleteFileList {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             writer_fence: 3,
             list_id: 6,
             objects: vec![compacted, later],
@@ -1135,7 +1142,7 @@ mod tests {
             manifest.removed[0].encode(&mut e);
             seal_frame(MAGIC_MANIFEST, &e.finish())
         };
-        assert!(Manifest::decode(VsetId(7), &bytes).is_err());
+        assert!(Manifest::decode(VolumeId(7), &bytes).is_err());
     }
 
     #[test]
@@ -1162,7 +1169,7 @@ mod tests {
             sync_covered_through: 9,
             recovery_kind: RecoveryKind::DiskOnly,
             checkpoint_epoch: Epoch(0),
-            config: VsetConfig::compute(1, 1024),
+            config: VolumeConfig::data(1024),
             vmstate_logical_length: 0,
             post_state_checksum: 11,
             metadata_checksum: 12,

@@ -11,8 +11,6 @@ filter = '''
 package(blockd-runtime) and (
     binary(fc_e2e_linux)
     | binary(fc_perf_linux)
-    | binary(fc_sqlite_e2e_linux)
-    | binary(fc_virtiofs_sqlite_e2e_linux)
     | binary(migrate_e2e_linux)
     | binary(replica_e2e_linux)
     | binary(replica_disk_linux)

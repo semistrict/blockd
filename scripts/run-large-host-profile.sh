@@ -2,13 +2,13 @@
 set -euo pipefail
 
 if [[ $# -lt 3 || $# -gt 5 ]]; then
-    echo "usage: $0 ARTIFACT_DIR VSET_COUNT PROVENANCE [DURATION_SECS] [runtime|firecracker]" >&2
+    echo "usage: $0 ARTIFACT_DIR VOLUME_COUNT PROVENANCE [DURATION_SECS] [runtime|firecracker]" >&2
     echo "provenance: independent | star | balanced:N | chain:N | mixed:SEED:ROOT_PPM:MAX_DEPTH" >&2
     exit 2
 fi
 
 artifact_dir=$1
-vset_count=$2
+volume_count=$2
 provenance=$3
 duration_secs=${4:-900}
 backend=${5:-runtime}
@@ -64,7 +64,7 @@ fi
 case $backend in
     runtime)
         profile_test=large_host_profile_linux
-        profile_name=profile_vset_scale_and_fork_provenance
+        profile_name=profile_volume_scale_and_fork_provenance
         ;;
     firecracker)
         profile_test=large_host_fc_profile_linux
@@ -144,7 +144,7 @@ trap cleanup_background EXIT INT TERM
 
 set +e
 BLOCKD_PROFILE_ARTIFACT_DIR=$runtime_artifacts \
-BLOCKD_PROFILE_VSET_COUNT=$vset_count \
+BLOCKD_PROFILE_VOLUME_COUNT=$volume_count \
 BLOCKD_PROFILE_PROVENANCE=$provenance \
 BLOCKD_PROFILE_DURATION_SECS=$duration_secs \
 BLOCKD_PROFILE_REVISION=$revision \

@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "name": "decider-throughput",
+  "name": "actor-throughput",
   "seed": 42,
   "shape": {
     "disk_volumes": 1,
-    "pages_per_volume": 512,
+    "pages": 512,
     "backed_up": false
   },
   "phases": [

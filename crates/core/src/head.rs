@@ -1,8 +1,8 @@
-//! The head record: one small object per archived vset at
+//! The head record: one small object per archived volume at
 //! `layout::head_key`, and the system's assignment authority (R6.3). Every
 //! update goes through the store's compare-and-swap; the store version that
 //! a successful claim returns *is* the claimant's fence — the namespace all
-//! of its segments and manifests live under. Two hosts racing to restore
+//! of its BLX files and manifests live under. Two hosts racing to restore
 //! resolve to exactly one runner by CAS alone, and a fenced former holder's
 //! CAS failures make it structurally unable to publish (R6.4).
 //!
@@ -11,7 +11,7 @@
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
 use crate::protocol::ReplicaCommitInfo;
-use crate::types::{HostId, JournalSeq, VsetId};
+use crate::types::{HostId, JournalSeq, VolumeId};
 
 pub const MAGIC_HEAD: u32 = u32::from_le_bytes(*b"BHD1");
 
@@ -27,6 +27,16 @@ pub struct ManifestPtr {
     pub capture_seq: u64,
     /// Binds the pointer to the exact encoded manifest bytes.
     pub checksum: u64,
+}
+
+impl ManifestPtr {
+    pub fn manifest_key(self, volume: VolumeId) -> String {
+        crate::layout::manifest_key(volume, self.fence, self.seq)
+    }
+
+    pub fn pending_key(self, volume: VolumeId) -> String {
+        crate::layout::pending_manifest_key(volume, self.fence, self.seq)
+    }
 }
 
 /// Durable passive-stash placement. Health is deliberately absent: this is
@@ -58,8 +68,8 @@ pub struct RetiredStash {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HeadRecord {
-    pub vset: VsetId,
-    /// The host currently assigned to run this vset.
+    pub volume: VolumeId,
+    /// The host currently assigned to run this volume.
     pub holder: HostId,
     /// The holder's fence (the head version its claim returned).
     pub fence: u64,
@@ -77,7 +87,7 @@ impl HeadRecord {
         let version = 4;
         assert!(self.retired_stashes.len() <= MAX_RETIRED_STASHES);
         e.u16(version);
-        e.u64(self.vset.0);
+        e.u64(self.volume.0);
         e.u16(self.holder.0);
         e.u64(self.fence);
         match &self.manifest {
@@ -123,14 +133,14 @@ impl HeadRecord {
     }
 
     /// Verify and decode a head record (R8.1 applies to the store too).
-    pub fn decode(vset: VsetId, bytes: &[u8]) -> Result<HeadRecord, DecodeError> {
+    pub fn decode(volume: VolumeId, bytes: &[u8]) -> Result<HeadRecord, DecodeError> {
         let payload = open_frame(MAGIC_HEAD, bytes)?;
         let mut d = Dec::new(payload);
         let version = d.u16()?;
         if version != 4 {
             return Err(DecodeError);
         }
-        if d.u64()? != vset.0 {
+        if d.u64()? != volume.0 {
             return Err(DecodeError);
         }
         let holder = HostId(d.u16()?);
@@ -192,7 +202,7 @@ impl HeadRecord {
         }
         d.finish()?;
         Ok(HeadRecord {
-            vset,
+            volume,
             holder,
             fence,
             manifest,
@@ -209,7 +219,7 @@ mod tests {
 
     fn sample() -> HeadRecord {
         HeadRecord {
-            vset: VsetId(0xA1),
+            volume: VolumeId(0xA1),
             holder: HostId(3),
             fence: 4,
             manifest: Some(ManifestPtr {
@@ -233,7 +243,7 @@ mod tests {
     #[test]
     fn heads_round_trip_and_are_byte_pinned() {
         let bytes = sample().encode();
-        assert_eq!(HeadRecord::decode(VsetId(0xA1), &bytes), Ok(sample()));
+        assert_eq!(HeadRecord::decode(VolumeId(0xA1), &bytes), Ok(sample()));
         // Byte pin (R10.2): any change here is a storage format change.
         assert_eq!(bytes.len(), 104);
         assert_eq!(crc32c(&bytes), 0x7943_6F92);
@@ -246,7 +256,7 @@ mod tests {
             let mut damaged = bytes.clone();
             damaged[bit / 8] ^= 1 << (bit % 8);
             assert!(
-                HeadRecord::decode(VsetId(0xA1), &damaged).is_err(),
+                HeadRecord::decode(VolumeId(0xA1), &damaged).is_err(),
                 "flip of bit {bit} went undetected"
             );
         }
@@ -255,7 +265,7 @@ mod tests {
     #[test]
     fn heads_without_manifest_round_trip() {
         let head = HeadRecord {
-            vset: VsetId(0xA1),
+            volume: VolumeId(0xA1),
             holder: HostId(0),
             fence: 1,
             manifest: None,
@@ -263,7 +273,7 @@ mod tests {
             retired_stashes: Vec::new(),
         };
         let bytes = head.encode();
-        assert_eq!(HeadRecord::decode(VsetId(0xA1), &bytes), Ok(head));
+        assert_eq!(HeadRecord::decode(VolumeId(0xA1), &bytes), Ok(head));
     }
 
     #[test]
@@ -275,11 +285,11 @@ mod tests {
         e.u64(4);
         e.u8(0);
         let bytes = seal_frame(MAGIC_HEAD, &e.finish());
-        assert!(HeadRecord::decode(VsetId(0xA1), &bytes).is_err());
+        assert!(HeadRecord::decode(VolumeId(0xA1), &bytes).is_err());
     }
 
     #[test]
-    fn version_three_preserves_transition_epoch_and_retired_history() {
+    fn version_four_preserves_transition_epoch_and_retired_history() {
         let mut head = sample();
         head.stash.as_mut().expect("stash").active_assignment_epoch = 7;
         head.retired_stashes.push(RetiredStash {
@@ -291,6 +301,6 @@ mod tests {
                 sync_covered_through: 15,
             },
         });
-        assert_eq!(HeadRecord::decode(head.vset, &head.encode()), Ok(head));
+        assert_eq!(HeadRecord::decode(head.volume, &head.encode()), Ok(head));
     }
 }

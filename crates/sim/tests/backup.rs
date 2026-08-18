@@ -1,9 +1,9 @@
 //! Single-host simulation of archival, store outages, and remote recovery.
 
 use blockd_core::hostmeta::{ArchivePolicy, HostConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::layout;
-use blockd_core::types::{HostId, VsetId, millis, page_size, secs};
+use blockd_core::types::{HostId, VolumeId, millis, page_size, secs};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run};
 use blockd_sim::model::{BlobDevConfig, StoreConfig, StoreObjectKind};
 use blockd_sim::rng::Ppm;
@@ -27,8 +27,8 @@ fn base_config() -> HarnessConfig {
         passive_disk_capacity: None,
         blobs: BlobDevConfig::nvme(),
         store: StoreConfig::gcs(),
-        vset_count: 2,
-        vset: VsetConfig::compute(2, 16),
+        volume_count: 2,
+        volume: VolumeConfig::data(16),
         horizon: secs(2),
         think: (millis(1), millis(5)),
         checkpoint_interval: None,
@@ -45,16 +45,16 @@ fn assert_clean(report: &RunReport) {
 }
 
 #[test]
-fn every_vset_is_published_by_its_primary() {
+fn every_volume_is_published_by_its_primary() {
     let report = run(11, base_config());
     assert_clean(&report);
     // The archive advanced on its own cadence without checkpoints.
     assert_eq!(report.counters.checkpoints_done, 0);
     assert!(report.counters.manifests_published > 0);
     assert_eq!(report.counters.fenced, 0);
-    for vset in [VsetId(1), VsetId(2)] {
-        let prefix = layout::vset_prefix(vset);
-        assert!(report.store_keys.contains(&layout::head_key(vset)));
+    for volume in [VolumeId(1), VolumeId(2)] {
+        let prefix = layout::volume_prefix(volume);
+        assert!(report.store_keys.contains(&layout::head_key(volume)));
         assert!(
             report
                 .store_keys
@@ -72,8 +72,8 @@ fn every_vset_is_published_by_its_primary() {
 #[test]
 fn hot_working_set_reports_archive_amplification_baseline() {
     let mut config = base_config();
-    config.vset_count = 1;
-    config.vset = VsetConfig::compute(2, 256);
+    config.volume_count = 1;
+    config.volume = VolumeConfig::data(256);
     config.hot_pages = Some((Ppm::percent(95), 8));
     config.horizon = secs(2);
     let report = run(0xA11C_0001, config);
@@ -116,24 +116,24 @@ fn hot_working_set_reports_archive_amplification_baseline() {
         report.store_keys
     );
     assert!(report.store.logical_changed_bytes > 0);
-    assert!(report.published_segment_bytes > 0);
+    assert!(report.published_blx_bytes > 0);
     eprintln!(
-        "archive-baseline horizon_ns={} put_attempts={} put_successes={} unique_bytes={} retry_bytes={} logical_changed_bytes={} final_segment_bytes={} final_live_entry_bytes={} final_dead_entry_bytes={}",
+        "archive-baseline horizon_ns={} put_attempts={} put_successes={} unique_bytes={} retry_bytes={} logical_changed_bytes={} final_blx_bytes={} final_live_entry_bytes={} final_dead_entry_bytes={}",
         secs(2),
         report.store.put_attempts,
         report.store.put_successes,
         report.store.unique_bytes,
         report.store.retry_bytes,
         report.store.logical_changed_bytes,
-        report.published_segment_bytes,
+        report.published_blx_bytes,
         report.published_live_entry_bytes,
         report.published_dead_entry_bytes,
     );
     assert_eq!(
-        report.published_segment_bytes,
+        report.published_blx_bytes,
         report.published_live_entry_bytes
             + report.published_dead_entry_bytes
-            + report.published_segment_overhead_bytes
+            + report.published_blx_overhead_bytes
     );
 }
 
@@ -156,7 +156,7 @@ fn store_outage_queues_backups_and_drains_after() {
 fn journal_rot_is_survived_via_restore_from_backup() {
     // Recover from the newest archived point after local journal corruption.
     let mut config = base_config();
-    config.vset_count = 1;
+    config.volume_count = 1;
     config.horizon = secs(4);
     config.checkpoint_interval = Some(millis(300));
     config.faults = FaultPlan {
@@ -196,12 +196,12 @@ fn backed_runs_replay_byte_for_byte() {
 }
 
 #[test]
-fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
-    // R2.7, droppable class: segments the backup already holds are dropped
+fn nvme_pressure_reclaims_backed_blx_files_and_never_corrupts() {
+    // R2.7, droppable class: BLX files the backup already holds are dropped
     // under disk pressure; refaults refetch from the store (R2.3). Slowness
     // and loud pressure — never corruption, never a kill.
     let mut config = base_config();
-    config.vset_count = 1;
+    config.volume_count = 1;
     config.host.cache_pages = 24;
     config.host.disk_capacity = Some(16 * page_size() as u64);
     config.host.disk_headroom = 4 * page_size() as u64;

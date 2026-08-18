@@ -4,15 +4,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::blx::{BatchMeta, NamespaceKind, compact_objects, open_object};
+use crate::blx::{BatchMeta, BlxObject, NamespaceKind, compact_objects};
 use crate::head::{HeadRecord, ManifestPtr, RetiredStash};
 use crate::journal::JournalRecord;
 use crate::layout;
 use crate::manifest::{CompleteFileList, Manifest, ObjectRef};
+use crate::page_file::scan_page_file;
 use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::replica_spool::{ReplicaCommitFrame, ReplicaSpoolScan, scan_replica_spool};
-use crate::segment::scan_segment;
-use crate::types::{HostId, VsetId};
+use crate::types::{HostId, VolumeId};
 
 pub type ReplicaStoreObjects = Vec<(String, Vec<u8>)>;
 
@@ -145,7 +145,7 @@ pub fn prepare_replica_recovery_claim(
 }
 
 pub fn refence_replica_export(
-    vset: VsetId,
+    volume: VolumeId,
     export: &ReplicaExport,
     new_fence: u64,
 ) -> Result<ReplicaExport, ReplicaRecoveryError> {
@@ -160,13 +160,13 @@ pub fn refence_replica_export(
             .then_some(bytes)
         })
         .ok_or(ReplicaRecoveryError::NoCommit)?;
-    let mut record = JournalRecord::decode(vset, record_bytes).map_err(|_| {
+    let mut record = JournalRecord::decode(volume, record_bytes).map_err(|_| {
         ReplicaRecoveryError::CorruptObject {
             key: "recovery journal".to_owned(),
         }
     })?;
     record.fence = new_fence;
-    let record_bytes = record.encode(vset);
+    let record_bytes = record.encode(volume);
     let mut blobs: Vec<_> = export
         .blobs
         .iter()
@@ -179,11 +179,11 @@ pub fn refence_replica_export(
         .cloned()
         .collect();
     blobs.push((
-        layout::journal_blob(vset, new_fence, record.seq),
+        layout::journal_blob(volume, new_fence, record.seq),
         record_bytes.clone(),
     ));
     blobs.push((
-        layout::journal_mirror_blob(vset, new_fence, record.seq),
+        layout::journal_mirror_blob(volume, new_fence, record.seq),
         record_bytes,
     ));
     blobs.sort_by(|left, right| left.0.cmp(&right.0));
@@ -194,7 +194,7 @@ pub fn refence_replica_export(
 }
 
 pub fn prepare_replica_publication(
-    vset: VsetId,
+    volume: VolumeId,
     claimant: HostId,
     writer_fence: u64,
     claimed_head: &HeadRecord,
@@ -205,12 +205,12 @@ pub fn prepare_replica_publication(
         assignment_epoch: export.assignment_epoch,
         through: export.info,
     };
-    let export = refence_replica_export(vset, export, writer_fence)?;
-    let (record, record_bytes) = publication_record(vset, writer_fence, &export)?;
+    let export = refence_replica_export(volume, export, writer_fence)?;
+    let (record, record_bytes) = publication_record(volume, writer_fence, &export)?;
     let (store_objects, manifest) =
-        build_replica_archive(vset, writer_fence, &record, record_bytes, &export)?;
+        build_replica_archive(volume, writer_fence, &record, record_bytes, &export)?;
     let mut head = claimed_head.clone();
-    head.vset = vset;
+    head.volume = volume;
     head.holder = claimant;
     head.fence = writer_fence;
     head.manifest = Some(manifest);
@@ -227,7 +227,7 @@ pub fn prepare_replica_publication(
 }
 
 fn publication_record(
-    vset: VsetId,
+    volume: VolumeId,
     writer_fence: u64,
     export: &ReplicaExport,
 ) -> Result<(JournalRecord, &[u8]), ReplicaRecoveryError> {
@@ -243,14 +243,14 @@ fn publication_record(
         })
         .ok_or(ReplicaRecoveryError::NoCommit)?;
     let record =
-        JournalRecord::decode(vset, bytes).map_err(|_| ReplicaRecoveryError::CorruptObject {
+        JournalRecord::decode(volume, bytes).map_err(|_| ReplicaRecoveryError::CorruptObject {
             key: "recovery journal".to_owned(),
         })?;
     Ok((record, bytes))
 }
 
 fn build_replica_archive(
-    vset: VsetId,
+    volume: VolumeId,
     writer_fence: u64,
     record: &JournalRecord,
     record_bytes: &[u8],
@@ -263,20 +263,17 @@ fn build_replica_archive(
     }
     let mut inputs = Vec::new();
     for (name, bytes) in &export.blobs {
-        if matches!(
-            layout::parse_blob(name),
-            Some(layout::BlobName::Segment { .. })
-        ) {
+        if matches!(layout::parse_blob(name), Some(layout::BlobName::Blx { .. })) {
             inputs.push(
-                open_object(bytes)
+                BlxObject::open(bytes)
                     .map_err(|_| ReplicaRecoveryError::CorruptObject { key: name.clone() })?,
             );
         }
     }
     let compacted = compact_objects(
         BatchMeta {
-            namespace_kind: NamespaceKind::Vset,
-            namespace_id: vset.0,
+            namespace_kind: NamespaceKind::Volume,
+            namespace_id: volume.0,
             writer_fence,
             first_object_id: u64::MAX - 1024,
             min_seq: record.seq.0,
@@ -289,7 +286,7 @@ fn build_replica_archive(
         true,
     )
     .map_err(|_| ReplicaRecoveryError::CorruptObject {
-        key: "recovery segment".to_owned(),
+        key: "recovery blx".to_owned(),
     })?;
     let mut store_objects = Vec::new();
     let objects = compacted
@@ -301,19 +298,19 @@ fn build_replica_archive(
         })
         .collect::<Vec<_>>();
     let list = CompleteFileList {
-        vset,
+        volume,
         writer_fence,
         list_id: record.seq.0,
         objects,
     };
     store_objects.push((
-        layout::complete_file_list_key(vset, writer_fence, record.seq.0),
+        layout::complete_file_list_key(volume, writer_fence, record.seq.0),
         list.encode(),
     ));
     let (recovery_kind, checkpoint_epoch, vmstate_logical_length) =
         crate::engine::recovery_policy::recovery_metadata(record);
     let archive = Manifest {
-        vset,
+        volume,
         writer_fence,
         journal_seq: record.seq.0,
         archive_seq: record.seq.0,
@@ -335,15 +332,9 @@ fn build_replica_archive(
         .map_err(|_| ReplicaRecoveryError::CorruptObject {
             key: "recovery manifest".to_owned(),
         })?;
-    let manifest = ManifestPtr {
-        fence: writer_fence,
-        journal_seq: record.seq,
-        seq: record.seq,
-        capture_seq: record.capture_seq,
-        checksum: crate::format::checksum64(&archive_bytes),
-    };
+    let manifest = archive.pointer(&archive_bytes);
     store_objects.push((
-        layout::manifest_key(vset, manifest.fence, manifest.seq),
+        layout::manifest_key(volume, manifest.fence, manifest.seq),
         archive_bytes,
     ));
     Ok((store_objects, manifest))
@@ -351,7 +342,7 @@ fn build_replica_archive(
 
 pub fn report_replica_recovery(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     head_version: u64,
     head: &HeadRecord,
     residues: &[ReplicaResidue<'_>],
@@ -368,7 +359,7 @@ pub fn report_replica_recovery(
     };
     let mut best = None;
     for &residue in residues {
-        match inventory_replica(source, vset, residue) {
+        match inventory_replica(source, volume, residue) {
             Ok(inventory) => {
                 if let Some(info) = inventory.committed {
                     let rank = (info.sync_covered_through, info.seq);
@@ -389,7 +380,7 @@ pub fn report_replica_recovery(
         report.chosen_assignment_epoch = Some(epoch);
         report.covered_sync_through = Some(covered);
     }
-    match export_replica_recovery(source, vset, head_version, head, residues, store_objects) {
+    match export_replica_recovery(source, volume, head_version, head, residues, store_objects) {
         Ok(export) => {
             report.status = ReplicaRecoveryStatus::Complete;
             report.chosen_source = Some(export.source_peer);
@@ -412,12 +403,12 @@ pub fn report_replica_recovery(
 
 pub fn inventory_replica(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     residue: ReplicaResidue<'_>,
 ) -> Result<ReplicaInventory, ReplicaRecoveryError> {
     let scan = scan_replica_spool(residue.bytes)
         .map_err(|_| ReplicaRecoveryError::CorruptSpool { peer: residue.peer })?;
-    verify_scan_identity(source, vset, residue, &scan)?;
+    verify_scan_identity(source, volume, residue, &scan)?;
     Ok(ReplicaInventory {
         peer: residue.peer,
         assignment_epoch: residue.assignment_epoch,
@@ -434,7 +425,7 @@ pub fn inventory_replica(
 /// could not complete during an object-store outage.
 pub fn export_replica_recovery(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     head_version: u64,
     head: &HeadRecord,
     residues: &[ReplicaResidue<'_>],
@@ -460,9 +451,9 @@ pub fn export_replica_recovery(
         }
         let scan = scan_replica_spool(residue.bytes)
             .map_err(|_| ReplicaRecoveryError::CorruptSpool { peer: residue.peer })?;
-        verify_scan_identity(source, vset, residue, &scan)?;
+        verify_scan_identity(source, volume, residue, &scan)?;
         if let Some(commit) = scan.commits.last() {
-            let record = JournalRecord::decode(vset, &commit.record)
+            let record = JournalRecord::decode(volume, &commit.record)
                 .map_err(|_| ReplicaRecoveryError::CorruptSpool { peer: residue.peer })?;
             if !named
                 && (head.holder != source
@@ -498,14 +489,14 @@ pub fn export_replica_recovery(
     };
     let commit = scan.commits.last().expect("candidate has commit");
     if let Some(ptr) = head.manifest {
-        let key = layout::manifest_key(vset, ptr.fence, ptr.seq);
+        let key = ptr.manifest_key(volume);
         let bytes = store_objects
             .get(&key)
             .ok_or_else(|| ReplicaRecoveryError::MissingObject { key: key.clone() })?;
         if crate::format::checksum64(bytes) != ptr.checksum {
             return Err(ReplicaRecoveryError::CorruptObject { key });
         }
-        let store_record = Manifest::decode(vset, bytes)
+        let store_record = Manifest::decode(volume, bytes)
             .map_err(|_| ReplicaRecoveryError::CorruptObject { key: key.clone() })?;
         if (
             store_record.writer_fence,
@@ -515,7 +506,7 @@ pub fn export_replica_recovery(
         {
             return Err(ReplicaRecoveryError::CorruptObject { key });
         }
-        let peer_record = JournalRecord::decode(vset, &commit.record)
+        let peer_record = JournalRecord::decode(volume, &commit.record)
             .map_err(|_| ReplicaRecoveryError::CorruptSpool { peer: residue.peer })?;
         let peer_rank = (
             commit.info.sync_covered_through,
@@ -531,7 +522,7 @@ pub fn export_replica_recovery(
             return Err(ReplicaRecoveryError::StoreRecoveryPointNewer);
         }
     }
-    export_commit(vset, residue, &scan, commit, store_objects)
+    export_commit(volume, residue, &scan, commit, store_objects)
 }
 
 fn allowed_replica_epochs(
@@ -560,17 +551,17 @@ fn allowed_replica_epochs(
 
 fn verify_scan_identity(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     residue: ReplicaResidue<'_>,
     scan: &ReplicaSpoolScan,
 ) -> Result<(), ReplicaRecoveryError> {
     let identity_ok = scan.artifacts.values().all(|frame| {
         frame.source == source
-            && frame.vset == vset
+            && frame.volume == volume
             && frame.assignment_epoch == residue.assignment_epoch
     }) && scan.commits.iter().all(|commit| {
         commit.source == source
-            && commit.vset == vset
+            && commit.volume == volume
             && commit.assignment_epoch == residue.assignment_epoch
     });
     if identity_ok {
@@ -581,47 +572,44 @@ fn verify_scan_identity(
 }
 
 fn export_commit(
-    vset: VsetId,
+    volume: VolumeId,
     residue: ReplicaResidue<'_>,
     scan: &ReplicaSpoolScan,
     commit: &ReplicaCommitFrame,
     store_objects: &BTreeMap<String, Vec<u8>>,
 ) -> Result<ReplicaExport, ReplicaRecoveryError> {
-    let record = JournalRecord::decode(vset, &commit.record)
+    let record = JournalRecord::decode(volume, &commit.record)
         .map_err(|_| ReplicaRecoveryError::CorruptSpool { peer: residue.peer })?;
-    let needed_segments: BTreeSet<(u64, crate::types::SegId)> = record
+    let needed_blx_files: BTreeSet<crate::manifest::ObjectIdentity> = record
         .files
         .iter()
         .filter(|file| {
-            file.identity.namespace_kind == crate::blx::NamespaceKind::Vset
-                && file.identity.namespace_id == vset.0
+            file.identity.namespace_kind == crate::blx::NamespaceKind::Volume
+                && file.identity.namespace_id == volume.0
         })
-        .map(|file| {
-            (
-                file.identity.writer_fence,
-                crate::types::SegId(file.identity.object_id),
-            )
-        })
+        .map(|file| file.identity)
         .collect();
     let mut blobs = BTreeMap::new();
-    for (fence, seg) in needed_segments {
-        let artifact = ReplicaArtifact::Segment { fence, seg };
-        let key = layout::segment_key(vset, fence, seg);
+    for identity in needed_blx_files {
+        let fence = identity.writer_fence;
+        let object = crate::types::ObjectId(identity.object_id);
+        let artifact = ReplicaArtifact::Blx { fence, object };
+        let key = layout::blx_key(volume, fence, object.0);
         let bytes = artifact_bytes(scan, artifact, &key, store_objects)?;
-        let intact = scan_segment(&bytes).is_ok_and(|(got_vset, got_fence, got_seg, _)| {
-            (got_vset, got_fence, got_seg) == (vset, fence, seg)
+        let intact = scan_page_file(&bytes).is_ok_and(|(got_volume, got_fence, got_seg, _)| {
+            (got_volume, got_fence, got_seg) == (volume, fence, object)
         });
         if !intact {
             return Err(ReplicaRecoveryError::CorruptObject { key });
         }
-        blobs.insert(layout::segment_blob(vset, fence, seg), bytes);
+        blobs.insert(layout::blx_blob(volume, fence, object), bytes);
     }
     blobs.insert(
-        layout::journal_blob(vset, record.fence, record.seq),
+        layout::journal_blob(volume, record.fence, record.seq),
         commit.record.clone(),
     );
     blobs.insert(
-        layout::journal_mirror_blob(vset, record.fence, record.seq),
+        layout::journal_mirror_blob(volume, record.fence, record.seq),
         commit.record.clone(),
     );
     Ok(ReplicaExport {
@@ -652,63 +640,67 @@ fn artifact_bytes(
 mod tests {
     use super::*;
     use crate::head::StashAssignment;
-    use crate::journal::{RecordKind, VsetConfig};
+    use crate::journal::{RecordKind, VolumeConfig};
+    use crate::page_file::PageBatchBuilder;
     use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
-    use crate::segment::SegmentBatchBuilder;
-    use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, page_size};
+    use crate::types::{Gen, JournalSeq, ObjectId, PageId, PageNo, page_size};
 
     fn file_ref(bytes: &[u8]) -> crate::manifest::ObjectRef {
-        crate::manifest::ObjectRef::from_blx(&crate::blx::open_object(bytes).expect("valid BLX"))
+        crate::manifest::ObjectRef::from_blx(&BlxObject::open(bytes).expect("valid BLX"))
     }
 
     fn recovery_spool(
         source: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         seq: u64,
         covered: u64,
         fill: u8,
     ) -> (Vec<u8>, Vec<u8>, JournalRecord) {
         let page = PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(1),
-            },
+            volume,
             page: PageNo(2),
         };
-        let seg = SegId(seq);
-        let mut builder = SegmentBatchBuilder::new(vset, 4, seg);
+        let object = ObjectId(seq);
+        let mut builder = PageBatchBuilder::new(volume, 4, object);
         builder.add(page, Gen(seq), &vec![fill; page_size()]);
-        let (_, segment, locs) = builder.finish().pop().expect("fixture object");
-        let artifact = ReplicaArtifact::Segment { fence: 4, seg };
+        let (_, blx, locs) = builder.finish().pop().expect("fixture object");
+        let artifact = ReplicaArtifact::Blx { fence: 4, object };
         let info = ReplicaCommitInfo {
             writer_fence: 4,
             seq: JournalSeq(seq),
             sync_covered_through: covered,
         };
         let record = JournalRecord {
-            config: VsetConfig::compute(1, 8),
+            config: VolumeConfig::data(8),
             seq: info.seq,
             fence: info.writer_fence,
             kind: RecordKind::Commit,
             capture_seq: seq,
             sync_covered_through: covered,
             post_state_checksum: 0,
-            files: vec![file_ref(&segment)],
-            overlay: locs
+            files: vec![file_ref(&blx)],
+            runtime_page_index: locs
                 .into_iter()
                 .map(|(page, generation, loc)| (page, (generation, loc)))
                 .collect(),
             migrated_from: None,
         };
-        let encoded = record.encode(vset);
-        let mut spool = seal_replica_artifact(source, vset, assignment_epoch, artifact, &segment)
+        let encoded = record.encode(volume);
+        let mut spool = seal_replica_artifact(source, volume, assignment_epoch, artifact, &blx)
             .expect("artifact");
         spool.extend(
-            seal_replica_commit(source, vset, assignment_epoch, info, &[artifact], &encoded)
-                .expect("commit"),
+            seal_replica_commit(
+                source,
+                volume,
+                assignment_epoch,
+                info,
+                &[artifact],
+                &encoded,
+            )
+            .expect("commit"),
         );
-        (spool, segment, record)
+        (spool, blx, record)
     }
 
     #[test]
@@ -716,20 +708,17 @@ mod tests {
     fn lost_primary_exports_a_complete_normal_local_recovery_set() {
         let source = HostId(0);
         let peer = HostId(1);
-        let vset = VsetId(7);
+        let volume = VolumeId(7);
         let page = PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(1),
-            },
+            volume,
             page: PageNo(2),
         };
-        let mut builder = SegmentBatchBuilder::new(vset, 4, SegId(9));
+        let mut builder = PageBatchBuilder::new(volume, 4, ObjectId(9));
         builder.add(page, Gen(3), &vec![0xA5; page_size()]);
-        let (_, segment, locs) = builder.finish().pop().expect("fixture object");
-        let artifact = ReplicaArtifact::Segment {
+        let (_, blx, locs) = builder.finish().pop().expect("fixture object");
+        let artifact = ReplicaArtifact::Blx {
             fence: 4,
-            seg: SegId(9),
+            object: ObjectId(9),
         };
         let info = ReplicaCommitInfo {
             writer_fence: 4,
@@ -737,10 +726,9 @@ mod tests {
             sync_covered_through: 12,
         };
         let record = JournalRecord {
-            config: VsetConfig {
-                kind: crate::journal::VsetKind::Compute,
-                disk_volumes: 1,
-                pages_per_volume: 8,
+            config: VolumeConfig {
+                kind: crate::journal::VolumeKind::Data,
+                pages: 8,
             },
             seq: info.seq,
             fence: info.writer_fence,
@@ -748,21 +736,20 @@ mod tests {
             capture_seq: 11,
             sync_covered_through: info.sync_covered_through,
             post_state_checksum: 0,
-            files: vec![file_ref(&segment)],
-            overlay: locs
+            files: vec![file_ref(&blx)],
+            runtime_page_index: locs
                 .into_iter()
                 .map(|(page, generation, loc)| (page, (generation, loc)))
                 .collect(),
             migrated_from: None,
         }
-        .encode(vset);
-        let mut spool =
-            seal_replica_artifact(source, vset, 1, artifact, &segment).expect("artifact");
+        .encode(volume);
+        let mut spool = seal_replica_artifact(source, volume, 1, artifact, &blx).expect("artifact");
         spool.extend(
-            seal_replica_commit(source, vset, 1, info, &[artifact], &record).expect("commit"),
+            seal_replica_commit(source, volume, 1, info, &[artifact], &record).expect("commit"),
         );
         let head = HeadRecord {
-            vset,
+            volume,
             holder: source,
             fence: 4,
             manifest: None,
@@ -777,7 +764,7 @@ mod tests {
         };
         let export = export_replica_recovery(
             source,
-            vset,
+            volume,
             head.fence,
             &head,
             &[ReplicaResidue {
@@ -792,7 +779,7 @@ mod tests {
         assert_eq!(export.sync_covered_through, 12);
         let report = report_replica_recovery(
             source,
-            vset,
+            volume,
             head.fence,
             &head,
             &[ReplicaResidue {
@@ -808,26 +795,28 @@ mod tests {
         assert_eq!(claim.expected_version, 9);
         assert_eq!(claim.head.holder, HostId(3));
         assert_eq!(claim.head.stash.expect("verified source").active_peer, peer);
-        let refenced = refence_replica_export(vset, &export, 10).expect("fresh writer fence");
+        let refenced = refence_replica_export(volume, &export, 10).expect("fresh writer fence");
         let (_, journal) = refenced
             .blobs
             .iter()
-            .find(|(name, _)| *name == layout::journal_blob(vset, 10, JournalSeq(8)))
+            .find(|(name, _)| *name == layout::journal_blob(volume, 10, JournalSeq(8)))
             .expect("refenced journal");
         assert_eq!(
-            JournalRecord::decode(vset, journal).expect("journal").fence,
+            JournalRecord::decode(volume, journal)
+                .expect("journal")
+                .fence,
             10
         );
         assert!(export.blobs.iter().any(|(name, bytes)| {
-            name == &layout::segment_blob(vset, 4, SegId(9)) && bytes == &segment
+            name == &layout::blx_blob(volume, 4, ObjectId(9)) && bytes == &blx
         }));
         assert_eq!(
             export
                 .blobs
                 .iter()
                 .filter(|(name, _)| {
-                    name == &layout::journal_blob(vset, 4, JournalSeq(8))
-                        || name == &layout::journal_mirror_blob(vset, 4, JournalSeq(8))
+                    name == &layout::journal_blob(volume, 4, JournalSeq(8))
+                        || name == &layout::journal_mirror_blob(volume, 4, JournalSeq(8))
                 })
                 .count(),
             2
@@ -836,9 +825,9 @@ mod tests {
 
     #[test]
     fn recovery_never_scans_an_unnamed_peer() {
-        let vset = VsetId(7);
+        let volume = VolumeId(7);
         let head = HeadRecord {
-            vset,
+            volume,
             holder: HostId(0),
             fence: 1,
             manifest: None,
@@ -854,7 +843,7 @@ mod tests {
         assert_eq!(
             export_replica_recovery(
                 HostId(0),
-                vset,
+                volume,
                 head.fence,
                 &head,
                 &[ReplicaResidue {
@@ -872,10 +861,10 @@ mod tests {
     fn recovery_accepts_a_complete_offline_replacement_from_the_current_writer_fence() {
         let source = HostId(0);
         let replacement = HostId(2);
-        let vset = VsetId(17);
-        let (spool, _, _) = recovery_spool(source, vset, 2, 8, 12, 0xA5);
+        let volume = VolumeId(17);
+        let (spool, _, _) = recovery_spool(source, volume, 2, 8, 12, 0xA5);
         let head = HeadRecord {
-            vset,
+            volume,
             holder: source,
             fence: 4,
             manifest: None,
@@ -890,7 +879,7 @@ mod tests {
         };
         let export = export_replica_recovery(
             source,
-            vset,
+            volume,
             head.fence,
             &head,
             &[ReplicaResidue {
@@ -910,10 +899,10 @@ mod tests {
     fn recovery_rejects_an_offline_replacement_from_a_stale_writer_fence() {
         let source = HostId(0);
         let replacement = HostId(2);
-        let vset = VsetId(18);
-        let (spool, _, _) = recovery_spool(source, vset, 2, 8, 12, 0xA5);
+        let volume = VolumeId(18);
+        let (spool, _, _) = recovery_spool(source, volume, 2, 8, 12, 0xA5);
         let head = HeadRecord {
-            vset,
+            volume,
             holder: source,
             fence: 5,
             manifest: None,
@@ -929,7 +918,7 @@ mod tests {
         assert_eq!(
             export_replica_recovery(
                 source,
-                vset,
+                volume,
                 head.fence,
                 &head,
                 &[ReplicaResidue {
@@ -950,11 +939,10 @@ mod tests {
     fn recovery_refuses_peer_residue_older_than_the_store_manifest() {
         let source = HostId(0);
         let peer = HostId(1);
-        let vset = VsetId(8);
-        let config = VsetConfig {
-            kind: crate::journal::VsetKind::Compute,
-            disk_volumes: 1,
-            pages_per_volume: 8,
+        let volume = VolumeId(8);
+        let config = VolumeConfig {
+            kind: crate::journal::VolumeKind::Data,
+            pages: 8,
         };
         let peer_info = ReplicaCommitInfo {
             writer_fence: 4,
@@ -970,11 +958,11 @@ mod tests {
             sync_covered_through: peer_info.sync_covered_through,
             post_state_checksum: 0,
             files: Vec::new(),
-            overlay: BTreeMap::new(),
+            runtime_page_index: BTreeMap::new(),
             migrated_from: None,
         }
-        .encode(vset);
-        let spool = seal_replica_commit(source, vset, 1, peer_info, &[], &peer_record)
+        .encode(volume);
+        let spool = seal_replica_commit(source, volume, 1, peer_info, &[], &peer_record)
             .expect("valid older residue");
 
         let store_record = JournalRecord {
@@ -986,11 +974,11 @@ mod tests {
             sync_covered_through: 13,
             post_state_checksum: 0,
             files: Vec::new(),
-            overlay: BTreeMap::new(),
+            runtime_page_index: BTreeMap::new(),
             migrated_from: None,
         };
         let head = HeadRecord {
-            vset,
+            volume,
             holder: source,
             fence: 4,
             manifest: Some(crate::head::ManifestPtr {
@@ -998,7 +986,7 @@ mod tests {
                 journal_seq: store_record.seq,
                 seq: store_record.seq,
                 capture_seq: store_record.capture_seq,
-                checksum: crate::format::checksum64(&store_record.encode(vset)),
+                checksum: crate::format::checksum64(&store_record.encode(volume)),
             }),
             stash: Some(StashAssignment {
                 assignment_epoch: 1,
@@ -1010,14 +998,14 @@ mod tests {
             retired_stashes: Vec::new(),
         };
         let store_objects = BTreeMap::from([(
-            layout::manifest_key(vset, store_record.fence, store_record.seq),
-            store_record.encode(vset),
+            layout::manifest_key(volume, store_record.fence, store_record.seq),
+            store_record.encode(volume),
         )]);
 
         assert!(
             export_replica_recovery(
                 source,
-                vset,
+                volume,
                 head.fence,
                 &head,
                 &[ReplicaResidue {
@@ -1035,13 +1023,13 @@ mod tests {
     #[test]
     fn recovery_after_activation_selects_the_new_active_and_exact_bytes() {
         let source = HostId(0);
-        let vset = VsetId(19);
-        let (old_spool, old_segment, _) = recovery_spool(source, vset, 8, 80, 80, 0x18);
-        let (active_spool, active_segment, active_record) =
-            recovery_spool(source, vset, 9, 90, 90, 0xA9);
-        assert_ne!(old_segment, active_segment);
+        let volume = VolumeId(19);
+        let (old_spool, old_blx, _) = recovery_spool(source, volume, 8, 80, 80, 0x18);
+        let (active_spool, active_blx, active_record) =
+            recovery_spool(source, volume, 9, 90, 90, 0xA9);
+        assert_ne!(old_blx, active_blx);
         let head = HeadRecord {
-            vset,
+            volume,
             holder: source,
             fence: 4,
             manifest: None,
@@ -1074,24 +1062,30 @@ mod tests {
                 bytes: &active_spool,
             },
         ];
-        let export =
-            export_replica_recovery(source, vset, head.fence, &head, &residues, &BTreeMap::new())
-                .expect("new active is a complete recovery source");
+        let export = export_replica_recovery(
+            source,
+            volume,
+            head.fence,
+            &head,
+            &residues,
+            &BTreeMap::new(),
+        )
+        .expect("new active is a complete recovery source");
         assert_eq!(export.source_peer, HostId(3));
         assert_eq!(export.assignment_epoch, 9);
         assert_eq!(export.sync_covered_through, 90);
         assert!(export.blobs.iter().any(|(name, bytes)| {
-            name == &layout::segment_blob(vset, 4, SegId(90)) && bytes == &active_segment
+            name == &layout::blx_blob(volume, 4, ObjectId(90)) && bytes == &active_blx
         }));
         let (_, bytes) = export
             .blobs
             .iter()
-            .find(|(name, _)| name == &layout::journal_blob(vset, 4, JournalSeq(90)))
+            .find(|(name, _)| name == &layout::journal_blob(volume, 4, JournalSeq(90)))
             .expect("active journal exported");
         let mut expected = active_record;
-        expected.overlay.clear();
+        expected.runtime_page_index.clear();
         assert_eq!(
-            JournalRecord::decode(vset, bytes).expect("exported journal"),
+            JournalRecord::decode(volume, bytes).expect("exported journal"),
             expected
         );
     }
@@ -1099,12 +1093,12 @@ mod tests {
     #[test]
     fn recovery_during_transition_uses_only_a_complete_covering_cut() {
         let source = HostId(0);
-        let vset = VsetId(20);
-        let (active_spool, _, active_record) = recovery_spool(source, vset, 11, 110, 110, 0x11);
-        let (transition_spool, transition_segment, transition_record) =
-            recovery_spool(source, vset, 12, 120, 120, 0x12);
+        let volume = VolumeId(20);
+        let (active_spool, _, active_record) = recovery_spool(source, volume, 11, 110, 110, 0x11);
+        let (transition_spool, transition_blx, transition_record) =
+            recovery_spool(source, volume, 12, 120, 120, 0x12);
         let head = HeadRecord {
-            vset,
+            volume,
             holder: source,
             fence: 4,
             manifest: None,
@@ -1120,7 +1114,7 @@ mod tests {
 
         let active_only = export_replica_recovery(
             source,
-            vset,
+            volume,
             head.fence,
             &head,
             &[ReplicaResidue {
@@ -1136,15 +1130,15 @@ mod tests {
         let (_, journal) = active_only
             .blobs
             .iter()
-            .find(|(name, _)| name == &layout::journal_blob(vset, 4, JournalSeq(110)))
+            .find(|(name, _)| name == &layout::journal_blob(volume, 4, JournalSeq(110)))
             .expect("old active journal");
         let mut expected = active_record;
-        expected.overlay.clear();
-        assert_eq!(JournalRecord::decode(vset, journal).unwrap(), expected);
+        expected.runtime_page_index.clear();
+        assert_eq!(JournalRecord::decode(volume, journal).unwrap(), expected);
 
         let transition_complete = export_replica_recovery(
             source,
-            vset,
+            volume,
             head.fence,
             &head,
             &[
@@ -1165,15 +1159,15 @@ mod tests {
         assert_eq!(transition_complete.source_peer, HostId(2));
         assert_eq!(transition_complete.sync_covered_through, 120);
         assert!(transition_complete.blobs.iter().any(|(name, bytes)| {
-            name == &layout::segment_blob(vset, 4, SegId(120)) && bytes == &transition_segment
+            name == &layout::blx_blob(volume, 4, ObjectId(120)) && bytes == &transition_blx
         }));
         let (_, journal) = transition_complete
             .blobs
             .iter()
-            .find(|(name, _)| name == &layout::journal_blob(vset, 4, JournalSeq(120)))
+            .find(|(name, _)| name == &layout::journal_blob(volume, 4, JournalSeq(120)))
             .expect("transition journal");
         let mut expected = transition_record;
-        expected.overlay.clear();
-        assert_eq!(JournalRecord::decode(vset, journal).unwrap(), expected);
+        expected.runtime_page_index.clear();
+        assert_eq!(JournalRecord::decode(volume, journal).unwrap(), expected);
     }
 }

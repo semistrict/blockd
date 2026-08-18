@@ -20,9 +20,9 @@ use serde_json::{Value, json};
 #[path = "support/provenance.rs"]
 mod provenance;
 
-use provenance::{Provenance, Topology, VsetProvenance};
+use provenance::{Provenance, Topology, VolumeProvenance};
 
-const DEFAULT_VSET_COUNT: usize = 12;
+const DEFAULT_VOLUME_COUNT: usize = 12;
 const DEFAULT_MEM_MIB: u32 = 128;
 const DEFAULT_HOT_PAGES: u32 = 1_024;
 const DEFAULT_DURATION_SECS: u64 = 30;
@@ -46,11 +46,11 @@ impl ProfileConfig {
         let artifact_dir = std::env::var_os("BLOCKD_PROFILE_ARTIFACT_DIR")
             .map(PathBuf::from)
             .ok_or_else(|| "BLOCKD_PROFILE_ARTIFACT_DIR must name a new directory".to_owned())?;
-        let vset_count = env_parse("BLOCKD_PROFILE_VSET_COUNT", DEFAULT_VSET_COUNT)?;
+        let volume_count = env_parse("BLOCKD_PROFILE_VOLUME_COUNT", DEFAULT_VOLUME_COUNT)?;
         let topology = std::env::var("BLOCKD_PROFILE_PROVENANCE")
             .unwrap_or_else(|_| "star".to_owned())
             .parse::<Topology>()?;
-        let provenance = Provenance::build(vset_count, &topology)?;
+        let provenance = Provenance::build(volume_count, &topology)?;
         let fc_dir = PathBuf::from(
             std::env::var("BLOCKD_FC_DIR").unwrap_or_else(|_| "/var/tmp/blockd-fc".to_owned()),
         );
@@ -205,14 +205,18 @@ struct BaseServer {
 async fn create_root(
     config: &ProfileConfig,
     scratch: &Path,
-    node: &VsetProvenance,
+    node: &VolumeProvenance,
 ) -> (FcVm, String) {
-    let mut vm = FcVm::spawn(&config.fc, &scratch.join(format!("vm-{}.sock", node.vset))).await;
+    let mut vm = FcVm::spawn(
+        &config.fc,
+        &scratch.join(format!("vm-{}.sock", node.volume)),
+    )
+    .await;
     vm.boot(&config.kernel, &config.initrd, config.mem_mib)
         .await;
     vm.wait_line("READY").await;
     vm.cmd(
-        &format!("fill {} {}", config.seed ^ node.vset, config.hot_pages),
+        &format!("fill {} {}", config.seed ^ node.volume, config.hot_pages),
         "FILLED ",
     )
     .await;
@@ -258,8 +262,11 @@ async fn create_fleet(
                 servers.push(server);
             }
             let (snapshot, shmem_path) = &bases[&parent];
-            let mut child =
-                FcVm::spawn(&config.fc, &scratch.join(format!("vm-{}.sock", node.vset))).await;
+            let mut child = FcVm::spawn(
+                &config.fc,
+                &scratch.join(format!("vm-{}.sock", node.volume)),
+            )
+            .await;
             child
                 .load_snapshot_shmem(
                     snapshot,
@@ -274,7 +281,7 @@ async fn create_fleet(
             assert_eq!(
                 inherited, checksums[&parent],
                 "fork {} did not inherit parent {parent}",
-                node.vset
+                node.volume
             );
             (child, inherited)
         } else {
@@ -284,7 +291,7 @@ async fn create_fleet(
         vm.cmd(
             &format!(
                 "mark {marker_page} {}",
-                0xb10c_0000_0000_0000_u64 | node.vset
+                0xb10c_0000_0000_0000_u64 | node.volume
             ),
             "MARKED",
         )
@@ -292,17 +299,17 @@ async fn create_fleet(
         let checksum = vm.cmd(&format!("sum {}", config.hot_pages), "SUM ").await;
         assert_ne!(
             checksum, inherited_checksum,
-            "vset {} did not diverge",
-            node.vset
+            "volume {} did not diverge",
+            node.volume
         );
-        checksums.insert(node.vset, checksum);
-        vms.insert(node.vset, vm);
+        checksums.insert(node.volume, checksum);
+        vms.insert(node.volume, vm);
     }
     (vms, servers, checksums)
 }
 
 struct WorkerResult {
-    vset: u64,
+    volume: u64,
     vm: FcVm,
     operations: u64,
     errors: u64,
@@ -310,7 +317,7 @@ struct WorkerResult {
 }
 
 async fn run_worker(
-    vset: u64,
+    volume: u64,
     mut vm: FcVm,
     mut checksum: String,
     hot_pages: u32,
@@ -326,7 +333,7 @@ async fn run_worker(
         if operations.is_multiple_of(16) {
             let page = u32::try_from(operations / 16 % u64::from(hot_pages)).expect("page fits");
             vm.cmd(
-                &format!("mark {page} {}", vset ^ operations.rotate_left(11)),
+                &format!("mark {page} {}", volume ^ operations.rotate_left(11)),
                 "MARKED",
             )
             .await;
@@ -339,7 +346,7 @@ async fn run_worker(
         operations += 1;
     }
     WorkerResult {
-        vset,
+        volume,
         vm,
         operations,
         errors,
@@ -410,7 +417,7 @@ async fn profile_firecracker_scale_and_fork_provenance() {
             "schema": 1,
             "profile": "firecracker-shared-mapping-lineage",
             "revision": std::env::var("BLOCKD_PROFILE_REVISION").ok(),
-            "vset_count": config.provenance.vset_count,
+            "volume_count": config.provenance.volume_count,
             "fork_provenance": config.provenance,
             "mem_mib": config.mem_mib,
             "hot_pages": config.hot_pages,
@@ -433,11 +440,11 @@ async fn profile_firecracker_scale_and_fork_provenance() {
     let deadline = start_at + config.duration;
     let workers = vms
         .into_iter()
-        .map(|(vset, vm)| {
+        .map(|(volume, vm)| {
             run_worker(
-                vset,
+                volume,
                 vm,
-                checksums[&vset].clone(),
+                checksums[&volume].clone(),
                 config.hot_pages,
                 start_at,
                 deadline,
@@ -462,12 +469,14 @@ async fn profile_firecracker_scale_and_fork_provenance() {
         errors, 0,
         "Firecracker profile observed checksum mismatches"
     );
-    assert!(operations >= u64::try_from(config.provenance.vset_count).expect("vset count fits"));
+    assert!(
+        operations >= u64::try_from(config.provenance.volume_count).expect("volume count fits")
+    );
     let latency = aggregate_histograms(&results);
     let mut process_memory = Vec::with_capacity(results.len());
     for result in &results {
         let (rss, pss) = rss_pss_of_pid(result.vm.pid()).await;
-        process_memory.push(json!({ "vset": result.vset, "rss": rss, "pss": pss }));
+        process_memory.push(json!({ "volume": result.volume, "rss": rss, "pss": pss }));
     }
     let base_resident = join_all(servers.iter().map(|base| base.server.resident_bytes()))
         .await
@@ -485,7 +494,7 @@ async fn profile_firecracker_scale_and_fork_provenance() {
     write_json(
         &config.artifact_dir.join("summary.json"),
         &json!({
-            "vset_count": config.provenance.vset_count,
+            "volume_count": config.provenance.volume_count,
             "provenance_topology": config.provenance.topology,
             "root_count": config.provenance.roots,
             "max_generation": config.provenance.max_generation,

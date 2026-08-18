@@ -2,62 +2,44 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::future::Future;
 use std::rc::Rc;
 
-use crate::channel::{UnboundedReceiver, unbounded};
+use crate::channel::{TryRecvError, UnboundedReceiver, unbounded};
 use crate::{TaskId, spawn};
 
-pub struct ActorCollection<E> {
+pub struct TaskSet {
     actors: Rc<RefCell<BTreeMap<TaskId, tokio::task::AbortHandle>>>,
-    failures_rx: UnboundedReceiver<E>,
-    failures_tx: crate::channel::UnboundedSender<E>,
+    completed_rx: UnboundedReceiver<TaskId>,
+    completed_tx: crate::channel::UnboundedSender<TaskId>,
 }
 
-pub type TaskSet = ActorCollection<Infallible>;
-
-impl<E: 'static> Default for ActorCollection<E> {
+impl Default for TaskSet {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<E: 'static> ActorCollection<E> {
+impl TaskSet {
     pub fn new() -> Self {
-        let (failures_tx, failures_rx) = unbounded();
+        let (completed_tx, completed_rx) = unbounded();
         Self {
             actors: Rc::new(RefCell::new(BTreeMap::new())),
-            failures_rx,
-            failures_tx,
+            completed_rx,
+            completed_tx,
         }
     }
 
     pub fn spawn(&mut self, future: impl Future<Output = ()> + 'static) -> TaskId {
-        self.spawn_inner(async move {
-            future.await;
-            None
-        })
-    }
-
-    pub fn spawn_result(
-        &mut self,
-        future: impl Future<Output = Result<(), E>> + 'static,
-    ) -> TaskId {
-        self.spawn_inner(async move { future.await.err() })
-    }
-
-    fn spawn_inner(&mut self, future: impl Future<Output = Option<E>> + 'static) -> TaskId {
         let actors = Rc::clone(&self.actors);
-        let failures = self.failures_tx.clone();
+        let completed = self.completed_tx.clone();
         let task_id = Rc::new(Cell::new(u64::MAX));
         let child_id = Rc::clone(&task_id);
         let handle = spawn(async move {
-            let failure = future.await;
-            actors.borrow_mut().remove(&child_id.get());
-            if let Some(failure) = failure {
-                let _ = failures.send(failure);
-            }
+            future.await;
+            let id = child_id.get();
+            actors.borrow_mut().remove(&id);
+            let _ = completed.send(id);
         });
         let (id, abort) = handle.detach_abort_handle();
         task_id.set(id);
@@ -65,8 +47,12 @@ impl<E: 'static> ActorCollection<E> {
         id
     }
 
-    pub async fn next_failure(&mut self) -> Option<E> {
-        self.failures_rx.recv().await
+    pub async fn next_done(&mut self) -> Option<TaskId> {
+        self.completed_rx.recv().await
+    }
+
+    pub fn try_next_done(&mut self) -> Result<TaskId, TryRecvError> {
+        self.completed_rx.try_recv()
     }
 
     pub fn len(&self) -> usize {
@@ -86,7 +72,7 @@ impl<E: 'static> ActorCollection<E> {
     }
 }
 
-impl<E> Drop for ActorCollection<E> {
+impl Drop for TaskSet {
     fn drop(&mut self) {
         for (_, abort) in self.actors.borrow_mut().split_off(&0) {
             abort.abort();
@@ -99,7 +85,7 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use super::{ActorCollection, TaskSet};
+    use super::TaskSet;
     use crate::{FaultConfig, delay, simulation_scope, yield_now};
 
     async fn simulate<T>(seed: u64, future: impl Future<Output = T>) -> T {
@@ -146,11 +132,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reports_child_failures_and_reaps_the_child() {
+    async fn reports_child_completion_and_reaps_the_child() {
         simulate(1, async move {
-            let mut children = ActorCollection::<&'static str>::new();
-            children.spawn_result(async { Err("failed") });
-            assert_eq!(children.next_failure().await, Some("failed"));
+            let mut children = TaskSet::new();
+            let child = children.spawn(async {});
+            assert_eq!(children.next_done().await, Some(child));
             assert!(children.is_empty());
         })
         .await;
@@ -195,13 +181,11 @@ mod tests {
     async fn repeated_completion_keeps_the_owned_handle_set_bounded() {
         simulate(9, async move {
             let mut children = TaskSet::new();
-            let (completed, mut completions) = crate::channel::unbounded();
             for index in 0..10_000_u64 {
-                let completed = completed.clone();
-                children.spawn(async move {
-                    let _ = completed.send(index);
+                let child = children.spawn(async move {
+                    let _ = index;
                 });
-                assert_eq!(completions.recv().await, Some(index));
+                assert_eq!(children.next_done().await, Some(child));
                 yield_now().await;
                 assert!(children.len() <= 1, "completed handles accumulated");
             }

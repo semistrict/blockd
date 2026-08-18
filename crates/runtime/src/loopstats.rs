@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use crate::metrics::{AtomicHistogram, HistogramSnapshot, detailed_profile_metrics_enabled};
 
-pub(crate) const POLL_KINDS: [&str; 1] = ["ActorPoll"];
+const ACTOR_POLL: &str = "ActorPoll";
 
 pub(crate) const WORLD_KINDS: [&str; 24] = [
     "Fill",
@@ -37,7 +37,7 @@ pub(crate) const WORLD_KINDS: [&str; 24] = [
     "StoreGet",
     "StoreGetRange",
     "StoreDelete",
-    "VsetFenced",
+    "VolumeFenced",
     "Admin",
     "PeerSend",
     "Abort",
@@ -64,7 +64,7 @@ pub(crate) mod world_kind {
     pub const STORE_GET: usize = 17;
     pub const STORE_GET_RANGE: usize = 18;
     pub const STORE_DELETE: usize = 19;
-    pub const VSET_FENCED: usize = 20;
+    pub const VOLUME_FENCED: usize = 20;
     pub const ADMIN: usize = 21;
     pub const PEER_SEND: usize = 22;
     pub const ABORT: usize = 23;
@@ -108,7 +108,7 @@ impl Cell {
 }
 
 pub struct LoopStats {
-    poll: [Cell; POLL_KINDS.len()],
+    poll: Cell,
     world: [Cell; WORLD_KINDS.len()],
     poll_gap: AtomicHistogram,
     last_poll_end_ns: AtomicU64,
@@ -119,7 +119,7 @@ pub struct LoopStats {
 impl Default for LoopStats {
     fn default() -> Self {
         Self {
-            poll: std::array::from_fn(|_| Cell::default()),
+            poll: Cell::default(),
             world: std::array::from_fn(|_| Cell::default()),
             poll_gap: AtomicHistogram::default(),
             last_poll_end_ns: AtomicU64::new(0),
@@ -140,7 +140,7 @@ impl LoopStats {
                     .observe_ns(start_ns.saturating_sub(previous_end));
             }
         }
-        self.poll[0].add(ns, self.detailed);
+        self.poll.add(ns, self.detailed);
     }
 
     pub(crate) fn record_world(&self, kind: usize, ns: u64) {
@@ -149,14 +149,8 @@ impl LoopStats {
 
     /// (name, count, total ns) per actor-poll kind.
     pub fn poll_totals(&self) -> Vec<(&'static str, u64, u64)> {
-        POLL_KINDS
-            .iter()
-            .zip(&self.poll)
-            .map(|(name, cell)| {
-                let (count, ns) = cell.read();
-                (*name, count, ns)
-            })
-            .collect()
+        let (count, ns) = self.poll.read();
+        vec![(ACTOR_POLL, count, ns)]
     }
 
     /// (name, count, total ns) per async world-operation kind.
@@ -173,11 +167,7 @@ impl LoopStats {
 
     /// Cumulative duration distributions per actor-poll kind.
     pub fn poll_histograms(&self) -> Vec<(&'static str, HistogramSnapshot)> {
-        POLL_KINDS
-            .iter()
-            .zip(&self.poll)
-            .map(|(name, cell)| (*name, cell.snapshot()))
-            .collect()
+        vec![(ACTOR_POLL, self.poll.snapshot())]
     }
 
     /// Cumulative duration distributions per async world-operation kind.
@@ -196,8 +186,8 @@ impl LoopStats {
 
     /// Loop time spent polling actors plus completing world operations.
     pub fn busy_ns(&self) -> u64 {
-        let cells = self.poll.iter().chain(&self.world);
-        cells.map(|cell| cell.read().1).sum()
+        self.actor_busy_ns()
+            .saturating_add(self.world.iter().map(|cell| cell.read().1).sum())
     }
 
     /// Wall time spent actively polling protocol actors.
@@ -206,7 +196,7 @@ impl LoopStats {
     /// operations and is therefore the appropriate numerator for diagnosing
     /// saturation of the current-thread actor executor.
     pub fn actor_busy_ns(&self) -> u64 {
-        self.poll.iter().map(|cell| cell.read().1).sum()
+        self.poll.read().1
     }
 
     /// Observed lifetime not spent actively polling protocol actors.
@@ -221,24 +211,6 @@ impl LoopStats {
     pub fn actor_occupancy(&self) -> f64 {
         let busy = self.actor_busy_ns();
         let total = busy.saturating_add(self.actor_idle_ns());
-        if total == 0 {
-            return 0.0;
-        }
-        busy as f64 / total as f64
-    }
-
-    /// Loop time spent blocked waiting for an event.
-    pub fn idle_ns(&self) -> u64 {
-        u64::try_from(self.started.elapsed().as_nanos())
-            .unwrap_or(u64::MAX)
-            .saturating_sub(self.busy_ns())
-    }
-
-    /// Busy fraction of the loop's observed lifetime, in [0, 1].
-    #[allow(clippy::cast_precision_loss)] // presentation math
-    pub fn occupancy(&self) -> f64 {
-        let busy = self.busy_ns();
-        let total = busy + self.idle_ns();
         if total == 0 {
             return 0.0;
         }
@@ -273,10 +245,10 @@ impl LoopStats {
         section("production world operations:", self.world_totals());
         let _ = writeln!(
             out,
-            "  occupancy {:.1}% (busy {:.1}ms, idle {:.1}ms)",
-            self.occupancy() * 100.0,
-            self.busy_ns() as f64 / 1_000_000.0,
-            self.idle_ns() as f64 / 1_000_000.0,
+            "  actor occupancy {:.1}% (busy {:.1}ms, idle {:.1}ms)",
+            self.actor_occupancy() * 100.0,
+            self.actor_busy_ns() as f64 / 1_000_000.0,
+            self.actor_idle_ns() as f64 / 1_000_000.0,
         );
         out
     }

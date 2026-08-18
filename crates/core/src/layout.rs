@@ -1,34 +1,34 @@
 //! Names for local durable blobs and object-store keys.
 //!
-//! Every segment and manifest is namespaced by the writer's **fence** — the
+//! Every blx and manifest is namespaced by the writer's **fence** — the
 //! head record's CAS version at claim time (R6.3). A fenced former holder
 //! keeps its own namespace, and since only the head record (updated by CAS)
 //! makes state reachable, nothing a fenced holder writes can ever fork
 //! durable state (R6.4): its keys simply dangle.
 //!
 //! Local blobs (relative to the daemon's data root):
-//! - `v/<vset:016x>/j/<fence:016x>-<seq:016x>.rec` — journal record
+//! - `v/<volume:016x>/j/<fence:016x>-<seq:016x>.rec` — journal record
 //!   (framed, R10.2), plus a byte-identical `.recm` mirror: the newest
 //!   record is the sole carrier of its newly-acked sync watermark, and a
 //!   bit rotting it after the ack would silently roll acked syncs back
 //!   (R3.8) — recovery accepts whichever copy decodes intact
-//! - `v/<vset:016x>/o/<fence:016x>-<object:016x>.blx` — a local BLX data file
+//! - `v/<volume:016x>/o/<fence:016x>-<object:016x>.blx` — a local BLX data file
 //!
 //! Object store keys (relative to the cluster's bucket + prefix, R9.1):
-//! - `v/<vset:016x>/head`  — head record: CAS assignment authority (R6.3)
+//! - `v/<volume:016x>/head`  — head record: CAS assignment authority (R6.3)
 //!   and pointer to the newest backed-up manifest
-//! - `v/<vset:016x>/m/<fence:016x>-<seq:016x>` — manifest: the selected
+//! - `v/<volume:016x>/m/<fence:016x>-<seq:016x>` — manifest: the selected
 //!   journal cut, optionally rewritten to archive-only page locations
-//! - `v/<vset:016x>/p/<fence:016x>-<seq:016x>` — pending publication root:
+//! - `v/<volume:016x>/p/<fence:016x>-<seq:016x>` — pending publication root:
 //!   the manifest bytes retained until the head CAS makes them authoritative
-//! - `v/<vset:016x>/o/<fence:016x>-<object:016x>.blx` — the same immutable
+//! - `v/<volume:016x>/o/<fence:016x>-<object:016x>.blx` — the same immutable
 //!   BLX bytes used locally
 //! - `b/<base:016x>/…` — bases
 //! - `cluster/tls/public-keys/<host:04x>.member` — a node's current self-signed
 //!   TLS certificate and advertised peer endpoint; possession of write access
 //!   to this directory grants cluster membership
 
-use crate::types::{HostId, JournalSeq, SegId, VsetId};
+use crate::types::{HostId, JournalSeq, ObjectId, VolumeId};
 
 pub fn placement_key() -> String {
     "cluster/placement".to_owned()
@@ -54,56 +54,53 @@ pub fn vnode_member_blob(vnode: crate::authority::VnodeId) -> String {
     format!("authority/vnodes/{:08x}.state", vnode.0)
 }
 
-pub fn vnode_closure_blob(vnode: crate::authority::VnodeId, vset: VsetId, sequence: u64) -> String {
+pub fn vnode_closure_blob(
+    vnode: crate::authority::VnodeId,
+    volume: VolumeId,
+    sequence: u64,
+) -> String {
     format!(
-        "authority/vnodes/{:08x}/vsets/{:016x}/{sequence:016x}.closure",
-        vnode.0, vset.0
+        "authority/vnodes/{:08x}/volumes/{:016x}/{sequence:016x}.closure",
+        vnode.0, volume.0
     )
 }
 
-pub fn journal_blob(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
-    format!("v/{:016x}/j/{fence:016x}-{:016x}.rec", vset.0, seq.0)
+pub fn journal_blob(volume: VolumeId, fence: u64, seq: JournalSeq) -> String {
+    format!("v/{:016x}/j/{fence:016x}-{:016x}.rec", volume.0, seq.0)
 }
 
 /// The record's byte-identical mirror (rot redundancy, R3.8/R8.1).
-pub fn journal_mirror_blob(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
-    format!("v/{:016x}/j/{fence:016x}-{:016x}.recm", vset.0, seq.0)
+pub fn journal_mirror_blob(volume: VolumeId, fence: u64, seq: JournalSeq) -> String {
+    format!("v/{:016x}/j/{fence:016x}-{:016x}.recm", volume.0, seq.0)
 }
 
-pub fn segment_blob(vset: VsetId, fence: u64, seg: SegId) -> String {
-    blx_key(vset, fence, seg.0)
+pub fn blx_blob(volume: VolumeId, fence: u64, object: ObjectId) -> String {
+    blx_key(volume, fence, object.0)
 }
 
-pub fn head_key(vset: VsetId) -> String {
-    format!("v/{:016x}/head", vset.0)
+pub fn head_key(volume: VolumeId) -> String {
+    format!("v/{:016x}/head", volume.0)
 }
 
-/// The vset's recorded resume set (R6.2): what the last resume touched
-/// first, so the next restore can prefetch it. Overwritten in place; best
-/// effort — a missing or stale set only costs demand faults.
-pub fn resume_set_key(vset: VsetId) -> String {
-    format!("v/{:016x}/rs", vset.0)
+pub fn manifest_key(volume: VolumeId, fence: u64, seq: JournalSeq) -> String {
+    archive_manifest_key(volume, fence, seq.0)
 }
 
-pub fn manifest_key(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
-    archive_manifest_key(vset, fence, seq.0)
-}
-
-pub fn archive_manifest_key(vset: VsetId, fence: u64, archive_seq: u64) -> String {
+pub fn archive_manifest_key(volume: VolumeId, fence: u64, archive_seq: u64) -> String {
     format!(
         "v/{:016x}/m/{fence:016x}-{archive_seq:016x}.manifest",
-        vset.0
+        volume.0
     )
 }
 
-pub fn complete_file_list_key(vset: VsetId, fence: u64, list_id: u64) -> String {
-    format!("v/{:016x}/f/{fence:016x}-{list_id:016x}.files", vset.0)
+pub fn complete_file_list_key(volume: VolumeId, fence: u64, list_id: u64) -> String {
+    format!("v/{:016x}/f/{fence:016x}-{list_id:016x}.files", volume.0)
 }
 
-pub fn blx_key(origin_vset: VsetId, fence: u64, object_id: u64) -> String {
+pub fn blx_key(origin_volume: VolumeId, fence: u64, object_id: u64) -> String {
     format!(
         "v/{:016x}/o/{fence:016x}-{object_id:016x}.blx",
-        origin_vset.0
+        origin_volume.0
     )
 }
 
@@ -116,36 +113,32 @@ pub fn base_manifest_key(base: u64, manifest_id: u64) -> String {
 }
 
 /// Durable root for a manifest publication that has not reached the head CAS.
-pub fn pending_manifest_key(vset: VsetId, fence: u64, seq: JournalSeq) -> String {
-    format!("v/{:016x}/p/{fence:016x}-{:016x}", vset.0, seq.0)
+pub fn pending_manifest_key(volume: VolumeId, fence: u64, seq: JournalSeq) -> String {
+    format!("v/{:016x}/p/{fence:016x}-{:016x}", volume.0, seq.0)
 }
 
-pub fn segment_key(vset: VsetId, fence: u64, seg: SegId) -> String {
-    blx_key(vset, fence, seg.0)
-}
-
-/// Prefix under which every object of one vset lives (R4.4 audits, GC).
-pub fn vset_prefix(vset: VsetId) -> String {
-    format!("v/{:016x}/", vset.0)
+/// Prefix under which every object of one volume lives (R4.4 audits, GC).
+pub fn volume_prefix(volume: VolumeId) -> String {
+    format!("v/{:016x}/", volume.0)
 }
 
 /// The local outbound-handoff marker (R7.2): its durable presence means
-/// this host gave the vset away and may only serve peer fetches for it.
-pub fn handoff_blob(vset: VsetId) -> String {
-    format!("v/{:016x}/handoff", vset.0)
+/// this host gave the volume away and may only serve peer fetches for it.
+pub fn handoff_blob(volume: VolumeId) -> String {
+    format!("v/{:016x}/handoff", volume.0)
 }
 
 /// Generation zero of an append-only passive-replica spool.
-pub fn replica_spool_blob(source: HostId, vset: VsetId, assignment_epoch: u64) -> String {
-    replica_spool_segment_blob(source, vset, assignment_epoch, 0)
+pub fn replica_spool_blob(source: HostId, volume: VolumeId, assignment_epoch: u64) -> String {
+    replica_spool_generation_blob(source, volume, assignment_epoch, 0)
 }
 
 /// One bounded append-only spool generation. Callers supply typed fields
 /// only; no network-provided path is accepted. Generation zero retains the
 /// pre-rotation name, while later generations sort after it numerically.
-pub fn replica_spool_segment_blob(
+pub fn replica_spool_generation_blob(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     assignment_epoch: u64,
     generation: u64,
 ) -> String {
@@ -154,44 +147,34 @@ pub fn replica_spool_segment_blob(
     } else {
         format!("{assignment_epoch:016x}-{generation:016x}.spool")
     };
-    format!("r/{:04x}/{:016x}/{suffix}", source.0, vset.0)
+    format!("r/{:04x}/{:016x}/{suffix}", source.0, volume.0)
 }
 
 /// Parse an object-store key back into its meaning (GC's mark phase).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StoreKey {
     Head {
-        vset: VsetId,
-    },
-    Manifest {
-        vset: VsetId,
-        fence: u64,
-        seq: JournalSeq,
+        volume: VolumeId,
     },
     ArchiveManifest {
-        vset: VsetId,
+        volume: VolumeId,
         fence: u64,
         archive_seq: u64,
     },
     CompleteFileList {
-        vset: VsetId,
+        volume: VolumeId,
         fence: u64,
         list_id: u64,
     },
     Blx {
-        origin_vset: VsetId,
+        origin_volume: VolumeId,
         fence: u64,
         object_id: u64,
     },
     PendingManifest {
-        vset: VsetId,
+        volume: VolumeId,
         fence: u64,
         seq: JournalSeq,
-    },
-    Segment {
-        vset: VsetId,
-        fence: u64,
-        seg: SegId,
     },
     BaseRoot {
         base: u64,
@@ -217,26 +200,21 @@ fn hex_pair(value: &str) -> Option<(u64, u64)> {
 
 pub fn parse_key(key: &str) -> Option<StoreKey> {
     if let Some(rest) = key.strip_prefix("v/") {
-        let (vset_hex, rest) = rest.split_once('/')?;
-        let vset = VsetId(u64::from_str_radix(vset_hex, 16).ok()?);
+        let (volume_hex, rest) = rest.split_once('/')?;
+        let volume = VolumeId(u64::from_str_radix(volume_hex, 16).ok()?);
         if rest == "head" {
-            return Some(StoreKey::Head { vset });
+            return Some(StoreKey::Head { volume });
         }
         if let Some(body) = rest.strip_prefix("m/") {
             if let Some(body) = body.strip_suffix(".manifest") {
                 let (fence, archive_seq) = hex_pair(body)?;
                 return Some(StoreKey::ArchiveManifest {
-                    vset,
+                    volume,
                     fence,
                     archive_seq,
                 });
             }
-            let (fence, seq) = hex_pair(body)?;
-            return Some(StoreKey::Manifest {
-                vset,
-                fence,
-                seq: JournalSeq(seq),
-            });
+            return None;
         }
         if let Some(body) = rest
             .strip_prefix("f/")
@@ -244,7 +222,7 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
         {
             let (fence, list_id) = hex_pair(body)?;
             return Some(StoreKey::CompleteFileList {
-                vset,
+                volume,
                 fence,
                 list_id,
             });
@@ -255,7 +233,7 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
         {
             let (fence, object_id) = hex_pair(body)?;
             return Some(StoreKey::Blx {
-                origin_vset: vset,
+                origin_volume: volume,
                 fence,
                 object_id,
             });
@@ -263,17 +241,9 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
         if let Some(body) = rest.strip_prefix("p/") {
             let (fence, seq) = hex_pair(body)?;
             return Some(StoreKey::PendingManifest {
-                vset,
+                volume,
                 fence,
                 seq: JournalSeq(seq),
-            });
-        }
-        if let Some(body) = rest.strip_prefix("s/") {
-            let (fence, seg) = hex_pair(body)?;
-            return Some(StoreKey::Segment {
-                vset,
-                fence,
-                seg: SegId(seg),
             });
         }
         return None;
@@ -311,21 +281,21 @@ pub fn parse_key(key: &str) -> Option<StoreKey> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlobName {
     Journal {
-        vset: VsetId,
+        volume: VolumeId,
         fence: u64,
         seq: JournalSeq,
     },
-    Segment {
-        vset: VsetId,
+    Blx {
+        volume: VolumeId,
         fence: u64,
-        seg: SegId,
+        object: ObjectId,
     },
     Handoff {
-        vset: VsetId,
+        volume: VolumeId,
     },
     ReplicaSpool {
         source: HostId,
-        vset: VsetId,
+        volume: VolumeId,
         assignment_epoch: u64,
         generation: u64,
     },
@@ -335,7 +305,7 @@ pub fn parse_blob(name: &str) -> Option<BlobName> {
     if let Some(rest) = name.strip_prefix("r/") {
         let mut parts = rest.split('/');
         let source = HostId(u16::from_str_radix(parts.next()?, 16).ok()?);
-        let vset = VsetId(u64::from_str_radix(parts.next()?, 16).ok()?);
+        let volume = VolumeId(u64::from_str_radix(parts.next()?, 16).ok()?);
         let file = parts.next()?.strip_suffix(".spool")?;
         let (assignment, generation) = match file.split_once('-') {
             None => (file, 0),
@@ -349,14 +319,14 @@ pub fn parse_blob(name: &str) -> Option<BlobName> {
         }
         return Some(BlobName::ReplicaSpool {
             source,
-            vset,
+            volume,
             assignment_epoch,
             generation,
         });
     }
     let rest = name.strip_prefix("v/")?;
-    let (vset_hex, rest) = rest.split_once('/')?;
-    let vset = VsetId(u64::from_str_radix(vset_hex, 16).ok()?);
+    let (volume_hex, rest) = rest.split_once('/')?;
+    let volume = VolumeId(u64::from_str_radix(volume_hex, 16).ok()?);
     // A mirror parses as the same journal record: recovery accepts
     // whichever copy decodes intact.
     if let Some(body) = rest
@@ -365,15 +335,19 @@ pub fn parse_blob(name: &str) -> Option<BlobName> {
     {
         let (fence, seq) = hex_pair(body)?;
         let seq = JournalSeq(seq);
-        return Some(BlobName::Journal { vset, fence, seq });
+        return Some(BlobName::Journal { volume, fence, seq });
     }
     if let Some(body) = rest.strip_prefix("o/").and_then(|r| r.strip_suffix(".blx")) {
-        let (fence, seg) = hex_pair(body)?;
-        let seg = SegId(seg);
-        return Some(BlobName::Segment { vset, fence, seg });
+        let (fence, object) = hex_pair(body)?;
+        let object = ObjectId(object);
+        return Some(BlobName::Blx {
+            volume,
+            fence,
+            object,
+        });
     }
     if rest == "handoff" {
-        return Some(BlobName::Handoff { vset });
+        return Some(BlobName::Handoff { volume });
     }
     None
 }
@@ -385,26 +359,26 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn names_are_pinned_and_parse_back() {
-        let vset = VsetId(0x0BAD_CAFE);
+        let volume = VolumeId(0x0BAD_CAFE);
         assert_eq!(
-            journal_blob(vset, 2, JournalSeq(0x1F)),
+            journal_blob(volume, 2, JournalSeq(0x1F)),
             "v/000000000badcafe/j/0000000000000002-000000000000001f.rec"
         );
         assert_eq!(
-            segment_blob(vset, 2, SegId(3)),
+            blx_blob(volume, 2, ObjectId(3)),
             "v/000000000badcafe/o/0000000000000002-0000000000000003.blx"
         );
-        assert_eq!(head_key(vset), "v/000000000badcafe/head");
+        assert_eq!(head_key(volume), "v/000000000badcafe/head");
         assert_eq!(
-            archive_manifest_key(vset, 2, 5),
+            archive_manifest_key(volume, 2, 5),
             "v/000000000badcafe/m/0000000000000002-0000000000000005.manifest"
         );
         assert_eq!(
-            complete_file_list_key(vset, 2, 7),
+            complete_file_list_key(volume, 2, 7),
             "v/000000000badcafe/f/0000000000000002-0000000000000007.files"
         );
         assert_eq!(
-            blx_key(vset, 2, 3),
+            blx_key(volume, 2, 3),
             "v/000000000badcafe/o/0000000000000002-0000000000000003.blx"
         );
         assert_eq!(base_root_key(9), "b/0000000000000009/root");
@@ -413,36 +387,36 @@ mod tests {
             "b/0000000000000009/m/0000000000000004.manifest"
         );
         assert_eq!(
-            manifest_key(vset, 2, JournalSeq(5)),
+            manifest_key(volume, 2, JournalSeq(5)),
             "v/000000000badcafe/m/0000000000000002-0000000000000005.manifest"
         );
         assert_eq!(
-            segment_key(vset, 2, SegId(3)),
+            blx_key(volume, 2, 3),
             "v/000000000badcafe/o/0000000000000002-0000000000000003.blx"
         );
-        assert_eq!(vset_prefix(vset), "v/000000000badcafe/");
+        assert_eq!(volume_prefix(volume), "v/000000000badcafe/");
         assert_eq!(
-            replica_spool_blob(HostId(3), vset, 9),
+            replica_spool_blob(HostId(3), volume, 9),
             "r/0003/000000000badcafe/0000000000000009.spool"
         );
         assert_eq!(
             parse_blob("r/0003/000000000badcafe/0000000000000009.spool"),
             Some(BlobName::ReplicaSpool {
                 source: HostId(3),
-                vset,
+                volume,
                 assignment_epoch: 9,
                 generation: 0,
             })
         );
         assert_eq!(
-            replica_spool_segment_blob(HostId(3), vset, 9, 2),
+            replica_spool_generation_blob(HostId(3), volume, 9, 2),
             "r/0003/000000000badcafe/0000000000000009-0000000000000002.spool"
         );
         assert_eq!(
             parse_blob("r/0003/000000000badcafe/0000000000000009-0000000000000002.spool"),
             Some(BlobName::ReplicaSpool {
                 source: HostId(3),
-                vset,
+                volume,
                 assignment_epoch: 9,
                 generation: 2,
             })
@@ -450,7 +424,7 @@ mod tests {
         assert_eq!(
             parse_key("v/000000000badcafe/m/0000000000000002-0000000000000005.manifest"),
             Some(StoreKey::ArchiveManifest {
-                vset,
+                volume,
                 fence: 2,
                 archive_seq: 5,
             })
@@ -458,7 +432,7 @@ mod tests {
         assert_eq!(
             parse_key("v/000000000badcafe/f/0000000000000002-0000000000000007.files"),
             Some(StoreKey::CompleteFileList {
-                vset,
+                volume,
                 fence: 2,
                 list_id: 7,
             })
@@ -466,7 +440,7 @@ mod tests {
         assert_eq!(
             parse_key("v/000000000badcafe/o/0000000000000002-0000000000000003.blx"),
             Some(StoreKey::Blx {
-                origin_vset: vset,
+                origin_volume: volume,
                 fence: 2,
                 object_id: 3,
             })
@@ -485,7 +459,7 @@ mod tests {
         assert_eq!(
             parse_key("v/000000000badcafe/p/0000000000000002-000000000000001f"),
             Some(StoreKey::PendingManifest {
-                vset,
+                volume,
                 fence: 2,
                 seq: JournalSeq(0x1F)
             })
@@ -493,17 +467,17 @@ mod tests {
         assert_eq!(
             parse_blob("v/000000000badcafe/j/0000000000000002-000000000000001f.rec"),
             Some(BlobName::Journal {
-                vset,
+                volume,
                 fence: 2,
                 seq: JournalSeq(0x1F)
             })
         );
         assert_eq!(
             parse_blob("v/000000000badcafe/o/0000000000000002-0000000000000003.blx"),
-            Some(BlobName::Segment {
-                vset,
+            Some(BlobName::Blx {
+                volume,
                 fence: 2,
-                seg: SegId(3)
+                object: ObjectId(3)
             })
         );
         assert_eq!(parse_blob("garbage"), None);

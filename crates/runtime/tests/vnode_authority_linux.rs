@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use blockd_core::authority::{PlacementRecord, VnodeAuthority, VnodeId, VnodePlacement};
 use blockd_core::engine::{commit_vnode_closure, read_vnode_closure, read_vnode_member};
 use blockd_core::layout;
-use blockd_core::types::{HostId, VsetId};
+use blockd_core::types::{HostId, VolumeId};
 use blockd_core::vnode_member::VnodeMemberRecord;
 use blockd_core::world::Blobs;
 use blockd_exec::ProductionContext;
@@ -69,7 +69,7 @@ async fn fsynced_generation_and_closure_survive_reopen_and_a_torn_tail() {
                     &blobs,
                     &placement,
                     authority,
-                    VsetId(7),
+                    VolumeId(7),
                     55,
                     b"durable protected closure".to_vec(),
                 )
@@ -110,7 +110,7 @@ async fn fsynced_generation_and_closure_survive_reopen_and_a_torn_tail() {
         .expect("read member log")
         .expect("member state exists");
     assert_eq!(recovered.authority, authority);
-    assert_eq!(recovered.closure(VsetId(7)), Some(closure));
+    assert_eq!(recovered.closure(VolumeId(7)), Some(closure));
     assert_eq!(
         ProductionContext::new(|_| {})
             .scope({

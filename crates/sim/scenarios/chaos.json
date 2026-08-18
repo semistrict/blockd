@@ -5,7 +5,7 @@
   "description": "Single-host checkpoint, crash, bit-rot, and object-store chaos.",
   "kind": "single-host",
   "topology": {
-    "pages_per_volume": 12
+    "pages": 12
   },
   "workload": {
     "horizon": "3s",

@@ -18,6 +18,14 @@ isolation; if the fault server dies, its VMs stop.
 
 ## Standing decisions
 
+### Volumes are independent
+
+`VolumeId` names exactly one memory or block volume. The core has no VM-level
+storage identity, member index, cross-volume journal, or cross-volume lease.
+An orchestrator that pauses a VM may submit snapshots for its volumes at the
+same time; each request advances, publishes, restores, forks, and migrates
+under that volume's own head and fence.
+
 ### One read-only data-file format
 
 [STORAGE_DESIGN.md](STORAGE_DESIGN.md) defines the storage format. Changed
@@ -38,7 +46,7 @@ the saved guest state. Each local commit record is written twice (`.rec` and
 
 Assignment authority is the head object's conditional-write version
 (R6.3): a claim's returned version IS the claimant's fence, and every
-artifact the holder writes — journal records, segments, manifests — lives
+artifact the holder writes — journal records, BLX files, manifests — lives
 under that fence in its names. A fenced former holder's writes dangle
 unreachably (R6.4) without any revocation protocol.
 
@@ -65,9 +73,9 @@ page-cache pages and divergence is kernel copy-on-write.
 
 Captures complete on local NVMe (R3.6), while guest sync acknowledgement also
 requires a durable passive copy (R4.1). The primary archives protected state
-asynchronously, independent of checkpoints. Restore fetches only the head,
-manifest, and resume set before the guest's first instruction; pages follow on
-demand (R6.2). Fault sources prefer local NVMe, then a peer, then the store
+asynchronously, independent of checkpoints. Restore fetches only metadata
+before the guest's first instruction; pages follow on demand. Fault sources
+prefer local NVMe, then a peer, then the store
 (R2.3).
 
 Peer-stashed durability changes only the acknowledgment point of guest disk
@@ -81,12 +89,12 @@ passive never uploads to the object store; it remains the durable recovery copy
 until the primary's published archive covers its commit. Cleanup then releases
 wholly covered sealed spool files without entering the guest sync path.
 
-The per-vset head remains the global authority. Besides holder and writer
+The per-volume head remains the global authority. Besides holder and writer
 fence, a peer-stashed head records one active stash, an assignment epoch, and
 at most one transition stash. Hosts derive an ordered candidate list from a
 versioned authenticated roster with deterministic weighted rendezvous hashing;
 the list is placement preference, never replication. A failed active stash
-puts the vset in degraded mode: new sync replies queue, one replacement is
+puts the volume in degraded mode: new sync replies queue, one replacement is
 named by head CAS, only the outstanding closure is seeded there, and a second
 head CAS activates it after a covering durable commit. Recovery inventories
 the head's active and transition peers plus the object store and accepts only a
@@ -116,19 +124,22 @@ the guest, and releases stale peer residue through the normal watermark path.
 
 ### Migration is a durable two-sided handoff
 
-Post-copy: a source pauses and captures a final whole record, then makes an
-outbound handoff marker durable before offering it. The destination makes the
-record durable as its own first journal entry before resuming the guest. An
-offer normally carries the captured VMM bytes directly; if it cannot, the
-destination verifies and reads those bytes from the source before resume.
-Whichever side crashes, at most one host can own the vset (R6.3/R7.2); a source
+For a memory volume, the source pauses and captures a final memory-and-VMM
+record, then makes an outbound handoff marker durable before offering it. The
+destination makes the record durable as its own first journal entry before
+resuming the guest. An offer normally carries the captured VMM bytes directly;
+if it cannot, the destination verifies and reads those bytes from the source
+before resume. A block volume hands off its newest committed record without a
+guest-memory pause.
+Whichever side crashes, at most one host can own the volume (R6.3/R7.2); a source
 recovering with an intact marker serves fetches and never runs or attaches it.
 
 ### Failure behavior
 
-The daemon recovers from durable state alone and gives each vset an explicit
-verdict. A vset resumes from its newest whole checkpoint or cold-boots at sync
-consistency (R8.2). Bytes are verified before use; an unservable page fails its
+The daemon recovers from durable state alone and gives each volume an explicit
+verdict. A memory volume resumes from its newest checkpoint; a block volume
+attaches at sync consistency for cold boot (R8.2). Bytes are verified before
+use; an unservable page fails its
 guest rather than substituting data (R8.1). Memory or NVMe pressure stalls work
 and emits signals without discarding state (R2.5/R2.7).
 
@@ -162,16 +173,16 @@ wire boundaries. Recovery and inbound migration are not
 request completions and therefore arrive on a separate typed lifecycle-event
 stream.
 
-Dynamic children live in structured actor collections. Completion reaps a
+Dynamic children live in structured task sets. Completion reaps a
 child even while ingress is idle, dropping an owner cancels the complete
-subtree, and child failures propagate to the host supervisor. Core operations
-return typed rejection, stale, unavailable, and fatal outcomes. The root alone
+subtree. Core operations return typed rejection, stale, unavailable, and fatal
+outcomes. The root alone
 turns a host-fatal outcome into process termination in production or a
 deterministic host failure in simulation. Fallible guest-memory calls follow
 the same rule; mandatory unservable pages are reported to the root rather than
 terminating from a world callback.
 
-Each vset has typed ownership slots for mutation, migration, publication, and
+Each volume has typed ownership slots for mutation, migration, publication, and
 replication. A mutation owner is capture (writeback, checkpoint, or migration)
 or hydration; only capture can own a page-drain state,
 and cancellation leases release exactly the owner they acquired. This makes
@@ -180,10 +191,10 @@ API while retaining orthogonal publication and replication progress.
 
 Writeback cadence uses one host timer plus a deterministic ordered work set.
 Faults, lifecycle transitions, peer progress, and operation completion enqueue
-only affected vsets; each timer turn drains that set in bounded poll batches.
-Idle vsets allocate no actor, timer, device, thread, or provisioned-size
+only affected volumes; each timer turn drains that set in bounded poll batches.
+Idle volumes allocate no actor, timer, device, thread, or provisioned-size
 buffer. Startup store reconciliation is separately limited to 32 children and
-emits externally visible lifecycle outcomes in vset order. Peer RPC call sites
+emits externally visible lifecycle outcomes in volume order. Peer RPC call sites
 await a typed client future whose broker owns wire-ID allocation, authenticated
 reply matching, timeout cleanup, and retry; duplicated and late replies cannot
 complete a different call.

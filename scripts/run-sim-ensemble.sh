@@ -15,7 +15,7 @@ artifact_dir=$4
 case "$scenario" in
     chaos|cluster|migration|peer-stash|peer-rare|explore|\
     cold-restore-outage|nvme-pressure-backed|\
-    migration-release-blackout|hot-compaction|resume-set-rot|\
+    migration-release-blackout|hot-compaction|\
     peer-commit-crashes|peer-transfer-crashes|\
     peer-transition-before-cas|peer-transition-after-seed|\
     peer-transition-after-active) ;;

@@ -1,5 +1,5 @@
-//! Cross-sandbox interference through the one event loop: K noisy vsets
-//! dirtying memory as fast as they can, one probe vset doing paced ops,
+//! Cross-sandbox interference through the one event loop: K noisy volumes
+//! dirtying memory as fast as they can, one probe volume doing paced ops,
 //! REAL uffd + REAL disk blobs (fsync included). The probe's latency as K
 //! grows IS the number the single-loop architecture must answer for; the
 //! loop-stats attribution shows the remaining on-loop dispatch cost after
@@ -17,24 +17,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use blockd_core::journal::VsetConfig;
-use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_core::journal::VolumeConfig;
+use blockd_core::types::{PageId, PageNo, VolumeId};
 use blockd_runtime::{Runtime, RuntimeConfig};
 
 mod support;
 
 const NOISY_FLEETS: [usize; 4] = [0, 4, 16, 48];
-const PAGES_PER_VOLUME: u32 = 2048; // 8 MiB working set per vset
+const PAGES_PER_VOLUME: u32 = 2048; // 8 MiB working set per volume
 const PHASE: Duration = Duration::from_secs(3);
 const PROBE_PACE: Duration = Duration::from_millis(2);
-const PROBE_VSET: VsetId = VsetId(1000);
+const PROBE_VOLUME: VolumeId = VolumeId(1000);
 
-fn pid(vset: VsetId, page: u32) -> PageId {
+fn pid(volume: VolumeId, page: u32) -> PageId {
     PageId {
-        volume: VolumeId {
-            vset,
-            idx: VolumeIdx(1),
-        },
+        volume: volume,
         page: PageNo(page),
     }
 }
@@ -50,8 +47,8 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn vset_config() -> VsetConfig {
-    VsetConfig::compute(1, PAGES_PER_VOLUME)
+fn volume_config() -> VolumeConfig {
+    VolumeConfig::data(PAGES_PER_VOLUME)
 }
 
 struct Lcg(u64);
@@ -109,10 +106,13 @@ async fn run_phase(noisy: usize) -> PhaseResult {
     ];
     let rt = Arc::new(Runtime::new(&configs[0], store).await);
     for n in 0..noisy {
-        rt.create_vset(VsetId(u64::try_from(n).expect("fits") + 1), vset_config())
-            .await;
+        rt.create_volume(
+            VolumeId(u64::try_from(n).expect("fits") + 1),
+            volume_config(),
+        )
+        .await;
     }
-    rt.create_vset(PROBE_VSET, vset_config()).await;
+    rt.create_volume(PROBE_VOLUME, volume_config()).await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let noisy_ops = Arc::new(AtomicU64::new(0));
@@ -121,13 +121,13 @@ async fn run_phase(noisy: usize) -> PhaseResult {
         let rt = rt.clone();
         let stop = stop.clone();
         let noisy_ops = noisy_ops.clone();
-        let vset = VsetId(u64::try_from(n).expect("fits") + 1);
+        let volume = VolumeId(u64::try_from(n).expect("fits") + 1);
         workers.push(tokio::task::spawn_local(async move {
             let mut lcg = Lcg(0x9e37 + u64::try_from(n).expect("fits"));
             let mut op = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let page = u32::try_from(lcg.next() % u64::from(PAGES_PER_VOLUME)).expect("fits");
-                rt.guest_write(vset, pid(vset, page), 0x6000_0000 + op)
+                rt.guest_write(volume, pid(volume, page), 0x6000_0000 + op)
                     .await;
                 op += 1;
             }
@@ -147,9 +147,9 @@ async fn run_phase(noisy: usize) -> PhaseResult {
             while !stop.load(Ordering::Relaxed) {
                 let page = u32::try_from(lcg.next() % u64::from(PAGES_PER_VOLUME)).expect("fits");
                 let started = Instant::now();
-                rt.guest_write(PROBE_VSET, pid(PROBE_VSET, page), 0x7000_0000 + op)
+                rt.guest_write(PROBE_VOLUME, pid(PROBE_VOLUME, page), 0x7000_0000 + op)
                     .await;
-                let _ = rt.guest_read(PROBE_VSET, pid(PROBE_VSET, page)).await;
+                let _ = rt.guest_read(PROBE_VOLUME, pid(PROBE_VOLUME, page)).await;
                 micros.push(u64::try_from(started.elapsed().as_micros()).expect("fits"));
                 op += 1;
                 tokio::time::sleep(PROBE_PACE).await;
@@ -172,7 +172,7 @@ async fn run_phase(noisy: usize) -> PhaseResult {
     let result = PhaseResult {
         probe_micros,
         noisy_ops: noisy_ops.load(Ordering::Relaxed),
-        occupancy: stats.occupancy(),
+        occupancy: stats.actor_occupancy(),
         fills,
         fill_ns,
         blob_writes,
@@ -194,12 +194,12 @@ async fn profile_probe_latency_under_noisy_neighbors() {
             let result = run_phase(noisy).await;
             let mut sorted = result.probe_micros.clone();
             sorted.sort_unstable();
-            // At 48 noisy vsets today the probe barely moves (~56 ops in 3s,
+            // At 48 noisy volumes today the probe barely moves (~56 ops in 3s,
             // ~50ms/op against a 2ms pace) — the collapse is the finding, and
             // the printed numbers carry it; the floor only guards vacuity.
             assert!(
                 sorted.len() >= 20,
-                "probe managed only {} ops under {noisy} noisy vsets",
+                "probe managed only {} ops under {noisy} noisy volumes",
                 sorted.len()
             );
             eprintln!(

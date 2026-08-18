@@ -51,8 +51,8 @@ them in release mode with output enabled:
 
 ```sh
 cargo test --release -p blockd-core --test perf_crc -- --ignored --nocapture
-cargo test --release -p blockd-core --test perf_replica -- --ignored --nocapture
-cargo test --release -p blockd-runtime --test perf_decider -- --nocapture
+cargo test --release -p blockd-core --test perf_replication -- --ignored --nocapture
+cargo test --release -p blockd-runtime --test perf_actor -- --nocapture
 cargo test --release -p blockd-runtime --test loop_interference_linux -- --nocapture
 cargo test --release -p blockd-runtime --test fc_perf_linux -- --ignored --nocapture
 ```
@@ -63,9 +63,9 @@ governor, and background load.
 ### Large-host lineage profile
 
 The ignored large-host runtime profile is parameterized independently by live
-vset count and fork provenance. It creates the recorded lineage through real
+volume count and fork provenance. It creates the recorded lineage through real
 checkpoint, retained-base, and fork operations, then captures actor-loop,
-fault-work queue/dispatch/service, per-vset fault, local I/O, and `perf stat`
+fault-work queue/dispatch/service, per-volume fault, local I/O, and `perf stat`
 measurements during a fixed-duration read/write phase.
 
 Run one retained configuration on an otherwise-idle Linux host with swap off
@@ -88,8 +88,8 @@ The provenance argument is one of:
 - `chain:N`, where `N` is the maximum generation before a new root
 - `mixed:SEED:ROOT_PPM:MAX_DEPTH`
 
-Use a new artifact directory for every repetition. Compare vset scaling while
-holding provenance fixed, then compare provenance at the same vset count and
+Use a new artifact directory for every repetition. Compare volume scaling while
+holding provenance fixed, then compare provenance at the same volume count and
 seed. Set `BLOCKD_PROFILE_CPU_LIST=0-7` to restrict the measured process tree
 with `taskset` for the diagnostic CPU-count sweep; record topology-aware CPU
 lists rather than assuming adjacent logical CPUs are physical cores. The runtime
@@ -100,7 +100,7 @@ The default prefaults the configured hot set before measurement. For a cold
 first-touch/refault phase, set `BLOCKD_PROFILE_PREFAULT_HOTSET=0`, choose
 `BLOCKD_PROFILE_PAGES_PER_VOLUME` and `BLOCKD_PROFILE_HOT_PAGES` large enough
 that the phase cannot warm the entire set, and record
-`BLOCKD_PROFILE_CACHE_PAGES_PER_VSET`. Do not undersize the cache merely to
+`BLOCKD_PROFILE_CACHE_PAGES_PER_VOLUME`. Do not undersize the cache merely to
 force churn unless pressure/eviction progress is itself the scenario under
 test. Set `BLOCKD_PROFILE_TIMEOUT_SECS` to a positive outer guard for smoke and
 diagnostic runs; a timeout invalidates the cell and must not be treated as a
@@ -112,8 +112,8 @@ then receives deterministic contents across the whole hot set before its first
 checkpoint and retained-base creation. Set `BLOCKD_PROFILE_MEASURE_ROOTS=0` to
 keep those seed roots idle during measurement so a directly mapped root cannot
 dominate aggregate descendant throughput. This combination requires a
-provenance topology with at least one fork and records `active_vset_count`, both
-switches, and the total live-vset count in the manifest. Shared-fill and
+provenance topology with at least one fork and records `active_volume_count`, both
+switches, and the total live-volume count in the manifest. Shared-fill and
 write-protect fault deltas in `runtime.json` are the correctness evidence that
 the measured descendants reused and then diverged from the retained base.
 
@@ -126,7 +126,7 @@ because the external counters deliberately cover the complete process
 lifecycle.
 
 The runtime profile keeps one persistent guest thread and one guest-operation
-lease per measured vset. This matches a VM vCPU touching its mapping directly;
+lease per measured volume. This matches a VM vCPU touching its mapping directly;
 it avoids measuring a fresh executor handoff on every access. Latency sampling
 defaults to one operation in 1,024 and is recorded as
 `latency_sample_rate` in the manifest. Override it with
@@ -145,9 +145,9 @@ operation and forces a minor userfaultfd round trip on the next access. This is
 a kernel wakeup and fault-progress stress test. It is intentionally not a
 linear-scaling acceptance workload: normal resident guest accesses do not
 traverse the runtime, and Linux userfaultfd wake/schedule costs can dominate
-this mode even when vsets and userfaultfd contexts are isolated.
+this mode even when volumes and userfaultfd contexts are isolated.
 
-For independent-vset multicore acceptance, use a fixed fleet, prefault the hot
+For independent-volume multicore acceptance, use a fixed fleet, prefault the hot
 set, disable forced refaults, and retain a realistic read/write mix. Run at
 least three repetitions on topology-aware 1/2/4/8-core CPU lists, report the
 median throughput speedup and efficiency, and keep the forced-refault matrix
@@ -159,7 +159,7 @@ After collecting at least three comparable repetitions per core count, enforce
 the 80% median parallel-efficiency gate and the 20% p99-regression guard with:
 
 ```sh
-scripts/verify-independent-vset-scaling.sh ARTIFACT_ROOT
+scripts/verify-independent-volume-scaling.sh ARTIFACT_ROOT
 ```
 
 The verifier rejects mixed workload manifests, non-independent provenance,
@@ -186,7 +186,7 @@ scripts/run-large-host-profile.sh \
 
 In that tier, each recorded parent with children owns one snapshot fill server;
 its children map the same shmem file privately and diverge through copy-on-write.
-Keep its results separate from the runtime tier, then compare how vset count and
+Keep its results separate from the runtime tier, then compare how volume count and
 the same provenance shapes change CPU stacks, fill deduplication, Rss/Pss,
 refault latency, and throughput.
 
@@ -235,8 +235,8 @@ normalized sampled-stack table:
 scripts/summarize-large-host-matrix.sh artifacts/large-host/runtime-matrix
 ```
 
-Compare `summary.tsv` at fixed provenance while increasing vset count, then at
-fixed vset count while changing provenance. Use `hotspots.tsv` to identify CPU
+Compare `summary.tsv` at fixed provenance while increasing volume count, then at
+fixed volume count while changing provenance. Use `hotspots.tsv` to identify CPU
 symbols whose overhead share appears, disappears, or shifts materially along
 either axis. Confirm candidate explanations against fault-work queue delay,
 blocking dispatch/service, poll-only actor occupancy, storage counters, Pss/Rss,
@@ -244,7 +244,7 @@ and memory-bandwidth/NUMA counters available on the host; sampled-stack share
 alone is not a causal attribution.
 
 Compare any two stack-sampled cells directly (for example, fixed provenance at
-64 versus 256 vsets, or fixed vset count with independent versus star roots):
+64 versus 256 volumes, or fixed volume count with independent versus star roots):
 
 ```sh
 scripts/compare-large-host-hotspots.sh \

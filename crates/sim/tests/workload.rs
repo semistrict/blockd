@@ -1,4 +1,4 @@
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::types::{micros, millis};
 use blockd_sim::harness::{FaultPlan, HarnessConfig, run_workload};
 use blockd_workload::{Backend, Operation, WorkloadModel, WorkloadSpec};
@@ -19,8 +19,8 @@ impl Backend for ReferenceBackend {
 
 fn config_for(spec: &WorkloadSpec) -> HarnessConfig {
     let mut config = blockd_sim::presets::single_host_base();
-    config.vset_count = 1;
-    config.vset = VsetConfig::compute(spec.shape.disk_volumes, spec.shape.pages_per_volume);
+    config.volume_count = u16::from(spec.shape.disk_volumes) + 1;
+    config.volume = VolumeConfig::memory(spec.shape.pages);
     config.horizon = millis(10_000);
     config.think = (micros(1), micros(2));
     config.checkpoint_interval = None;

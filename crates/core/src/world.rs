@@ -33,7 +33,7 @@ use blockd_exec::Request;
 
 use crate::engine::HostFatal;
 use crate::protocol::{AdminCall, AdminEvent, AdminResult, PeerMsg, ReqId, StoreFault};
-use crate::types::{HostId, PageId, VolumeId, VsetId};
+use crate::types::{HostId, PageId, VolumeId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlobError {
@@ -44,7 +44,7 @@ pub enum BlobError {
     Io,
 }
 
-/// One durable local artifact discovered during recovery. Immutable segment
+/// One durable local artifact discovered during recovery. Immutable blx
 /// payloads may leave `bytes` empty while still reporting their exact length;
 /// metadata-bearing artifacts provide their complete bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,7 +171,7 @@ pub trait GuestMem {
     async fn fill_shared(
         &self,
         page: PageId,
-        share: (u64, u64, crate::types::SegId, u32),
+        share: (u64, u64, crate::types::ObjectId, u32),
         bytes: Option<Vec<u8>>,
         writable: bool,
     ) -> Result<(), GuestMemoryError>;
@@ -185,18 +185,29 @@ pub trait GuestMem {
     async fn fail(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError>;
-    async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError>;
-    async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError>;
-    async fn resume(&self, vset: VsetId, pause: Option<GuestPause>)
-    -> Result<(), GuestMemoryError>;
+    async fn install_vmstate(
+        &self,
+        volume: VolumeId,
+        bytes: Vec<u8>,
+    ) -> Result<(), GuestMemoryError>;
+    async fn pause(&self, volume: VolumeId) -> Result<GuestPause, GuestMemoryError>;
+    async fn resume(
+        &self,
+        volume: VolumeId,
+        pause: Option<GuestPause>,
+    ) -> Result<(), GuestMemoryError>;
     /// Commit a paused guest as stopped on this host without resuming it.
     /// Migration uses this after its durable local cut and before any peer or
     /// object-store work.
-    async fn commit_pause(&self, vset: VsetId, pause: GuestPause) -> Result<(), GuestMemoryError>;
+    async fn commit_pause(
+        &self,
+        volume: VolumeId,
+        pause: GuestPause,
+    ) -> Result<(), GuestMemoryError>;
     async fn harvest_accessed(&self) -> Vec<PageId>;
     async fn next_fault(&self) -> Option<GuestFault>;
     async fn next_sync(&self) -> Option<GuestSyncRequest>;
-    async fn fence(&self, vset: VsetId) -> Result<(), GuestMemoryError>;
+    async fn fence(&self, volume: VolumeId) -> Result<(), GuestMemoryError>;
 }
 
 pub trait AdminIo {
@@ -204,3 +215,11 @@ pub trait AdminIo {
     async fn emit_admin_event(&self, event: AdminEvent);
     async fn host_failed(&self, failure: HostFatal);
 }
+
+/// Complete world boundary used by the host actor tree.
+///
+/// Narrow helpers should continue to name only the capabilities they need;
+/// this alias is for actors that genuinely span the full host boundary.
+pub trait HostWorld: Blobs + Store + Peers + GuestMem + AdminIo + 'static {}
+
+impl<T> HostWorld for T where T: Blobs + Store + Peers + GuestMem + AdminIo + 'static {}

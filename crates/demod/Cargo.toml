@@ -22,7 +22,6 @@ opentelemetry-http = { version = "0.32.0", default-features = false }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace"] }
 reqwest = { workspace = true, features = ["hickory-dns", "http2", "rustls"] }
-rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0.151"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tower-http = { version = "0.7.0", features = ["limit", "timeout"] }

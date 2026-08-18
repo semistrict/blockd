@@ -13,8 +13,8 @@ pub fn page_pattern(page: PageId, vol_seq: u64) -> Vec<u8> {
     for word in (1..page_size() / 8).step_by(4) {
         let mut mix = 0xcbf2_9ce4_8422_2325_u64;
         for value in [
-            page.volume.vset.0,
-            u64::from(page.volume.idx.0),
+            page.volume.0,
+            page.volume.0,
             u64::from(page.page.0),
             vol_seq,
             word as u64,
@@ -33,17 +33,14 @@ pub fn claimed_vol_seq(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use blockd_core::types::{PageNo, VolumeId, VolumeIdx, VsetId};
+    use blockd_core::types::{PageNo, VolumeId};
 
     use super::*;
 
     #[test]
     fn patterns_are_exact_page_bound_sequences() {
         let page = PageId {
-            volume: VolumeId {
-                vset: VsetId(2),
-                idx: VolumeIdx(1),
-            },
+            volume: VolumeId(2),
             page: PageNo(7),
         };
         let bytes = page_pattern(page, 41);

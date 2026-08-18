@@ -8,4 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

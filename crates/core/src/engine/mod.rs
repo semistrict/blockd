@@ -4,6 +4,7 @@ mod authority;
 mod backup;
 mod blob;
 mod capture;
+mod ctx;
 mod error;
 mod fault;
 mod host;
@@ -28,8 +29,8 @@ pub use authority::{
     read_host_session, read_placement, read_vnode_authority, revoke_host_session,
     verify_authority_proof,
 };
+pub use backup::publish_latest;
 pub(crate) use backup::reconcile_backed_recovery_event;
-pub use backup::{publish_latest, reconcile_backed_recovery};
 pub use capture::{capture_local, checkpoint_local};
 pub use error::HostFatal;
 pub use fault::serve_fault;
@@ -39,11 +40,11 @@ pub use migration::{
     hydrate_tail, migrate_out, peer_fetch_page, peer_fetch_replica_page, peer_source,
     reoffer_outbound,
 };
-pub use reclaim::{cleanup_local, reclaim_backed_segments};
+pub use reclaim::{cleanup_local, reclaim_backed_blx_files};
 pub use recovery::recover_local;
 pub use replica::{create_peer_stashed, replica_message, replicate_latest, retry_replica_releases};
-pub use restore::restore_vset;
-pub use state::{HostState, SharedHost, VsetState};
+pub use restore::restore_volume;
+pub use state::{HostState, SharedHost, VolumeState};
 pub use vnode_member::{
     adopt_vnode_generation, adopt_vnode_quorum, claim_vnode_authority, commit_active_vnode_quorum,
     commit_vnode_closure, failover_vnode, read_vnode_closure, read_vnode_member,

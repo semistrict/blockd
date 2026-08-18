@@ -49,18 +49,6 @@ pub fn peer_stash_chaos() -> ClusterConfig {
     cluster("peer-stash")
 }
 
-pub fn peer_attrition() -> ClusterConfig {
-    cluster("peer-attrition")
-}
-
 pub fn swizzle_peer_links() -> ClusterConfig {
     cluster("peer-links")
-}
-
-pub fn peer_stash_rare() -> ClusterConfig {
-    cluster("peer-rare")
-}
-
-pub fn placement_fear() -> ClusterConfig {
-    cluster("placement-fear")
 }

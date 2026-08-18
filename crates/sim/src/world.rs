@@ -4,29 +4,24 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use blockd_core::blx::scan_object;
+use blockd_core::blx::BlxObject;
 use blockd_core::engine::HostFatal;
 use blockd_core::head::{HeadRecord, ManifestPtr};
 use blockd_core::layout;
-use blockd_core::manifest::{Manifest, ManifestClosure, decode_manifest_closure};
+use blockd_core::manifest::{Manifest, ManifestClosure};
 use blockd_core::protocol::{AdminCall, AdminEvent, AdminResult, PeerMsg, StoreFault};
-use blockd_core::types::{Gen, HostId, PageId, VsetId, page_size};
+use blockd_core::types::{Gen, HostId, PageId, VolumeId, page_size};
 use blockd_core::world::{
     AdminIo, AdminRequest, BlobEntry, BlobError, Blobs, FillSource, GuestFault, GuestMem,
     GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store, StoreError,
 };
 use blockd_exec::channel::{OneSender, UnboundedReceiver, UnboundedSender, oneshot, unbounded};
-use blockd_exec::{Response, current_poll, delay, now, random_u64, request};
+use blockd_exec::{Response, current_poll, delay, now, random_between, random_u64, request};
 
 use crate::model::{
     BlobDevConfig, CrashFate, MAX_OBJECT_BYTES, StoreConfig, StoreCounters, StoreObjectKind,
 };
 use crate::peer_transport::PeerTransport;
-
-fn random_between(low: u64, high: u64) -> u64 {
-    assert!(low <= high);
-    low + random_u64() % (high - low + 1)
-}
 
 struct ReceiverLease<'a, T> {
     slot: &'a RefCell<Option<UnboundedReceiver<T>>>,
@@ -36,14 +31,14 @@ struct ReceiverLease<'a, T> {
 
 struct PendingGuestPause<'a> {
     world: &'a SimWorld,
-    vset: VsetId,
+    volume: VolumeId,
     generation: u64,
     active: bool,
 }
 
 struct PendingGuestOperation<'a> {
     world: &'a SimWorld,
-    vset: VsetId,
+    volume: VolumeId,
     active: bool,
 }
 
@@ -56,7 +51,7 @@ impl PendingGuestOperation<'_> {
 impl Drop for PendingGuestOperation<'_> {
     fn drop(&mut self) {
         if self.active {
-            self.world.cancel_guest_op(self.vset);
+            self.world.cancel_guest_op(self.volume);
         }
     }
 }
@@ -74,14 +69,14 @@ impl Drop for PendingGuestPause<'_> {
                 .world
                 .pause_generations
                 .borrow()
-                .get(&self.vset)
+                .get(&self.volume)
                 .copied()
                 != Some(self.generation)
         {
             return;
         }
-        self.world.pause_started.borrow_mut().remove(&self.vset);
-        let was_paused = self.world.memory.borrow_mut().paused.remove(&self.vset);
+        self.world.pause_started.borrow_mut().remove(&self.volume);
+        let was_paused = self.world.memory.borrow_mut().paused.remove(&self.volume);
         if was_paused {
             // `fault()` enters through `begin_guest_op()`, so a request that
             // observes this paused bit waits in `operation_waiters`; it cannot
@@ -90,7 +85,7 @@ impl Drop for PendingGuestPause<'_> {
                 .world
                 .operation_waiters
                 .borrow_mut()
-                .remove(&self.vset)
+                .remove(&self.volume)
                 .unwrap_or_default()
             {
                 let _ = waiter.send(());
@@ -203,7 +198,7 @@ struct BlobState {
     bytes_written: u64,
     bytes_read: u64,
     bitflips: u64,
-    map_bytes_written: u64,
+    journal_bytes_written: u64,
     max_record_blob_bytes: u64,
 }
 
@@ -214,28 +209,22 @@ struct StoreState {
     outage: bool,
     attempted_payloads: BTreeSet<(String, usize, u32)>,
     seen_payloads: BTreeSet<(String, usize, u32)>,
-    archived_generations: BTreeMap<VsetId, BTreeMap<PageId, Gen>>,
+    archived_generations: BTreeMap<VolumeId, BTreeMap<PageId, Gen>>,
     counters: StoreCounters,
 }
 
 impl StoreState {
-    fn manifest_closure(&self, vset: VsetId, pointer: ManifestPtr) -> Option<ManifestClosure> {
-        let (_, manifest_bytes) =
-            self.objects
-                .get(&layout::manifest_key(vset, pointer.fence, pointer.seq))?;
-        let list_bytes = Manifest::decode(vset, manifest_bytes)
+    fn manifest_closure(&self, volume: VolumeId, pointer: ManifestPtr) -> Option<ManifestClosure> {
+        let (_, manifest_bytes) = self.objects.get(&pointer.manifest_key(volume))?;
+        let list_bytes = Manifest::decode(volume, manifest_bytes)
             .ok()?
             .complete_list
             .and_then(|reference| {
                 self.objects
-                    .get(&layout::complete_file_list_key(
-                        vset,
-                        reference.writer_fence,
-                        reference.list_id,
-                    ))
+                    .get(&reference.store_key(volume))
                     .map(|(_, bytes)| bytes.as_slice())
             });
-        decode_manifest_closure(vset, pointer, manifest_bytes, list_bytes).ok()
+        ManifestClosure::decode(volume, pointer, manifest_bytes, list_bytes).ok()
     }
 
     fn object_kind(key: &str) -> StoreObjectKind {
@@ -245,10 +234,12 @@ impl StoreState {
             StoreObjectKind::Manifest
         } else if key.starts_with("b/") {
             StoreObjectKind::Base
-        } else if key.ends_with("/rs") {
-            StoreObjectKind::ResumeSet
-        } else if key.contains("/s/") {
-            StoreObjectKind::Segment
+        } else if key.contains("/o/")
+            && std::path::Path::new(key)
+                .extension()
+                .is_some_and(|extension| extension == "blx")
+        {
+            StoreObjectKind::Blx
         } else {
             StoreObjectKind::Other
         }
@@ -303,23 +294,23 @@ impl StoreState {
     }
 
     fn observe_archive_head(&mut self, key: &str, bytes: &[u8]) {
-        let Some(encoded_vset) = key
+        let Some(encoded_volume) = key
             .strip_prefix("v/")
             .and_then(|rest| rest.split('/').next())
         else {
             return;
         };
-        let Ok(raw_vset) = u64::from_str_radix(encoded_vset, 16) else {
+        let Ok(raw_volume) = u64::from_str_radix(encoded_volume, 16) else {
             return;
         };
-        let vset = VsetId(raw_vset);
-        let Ok(head) = HeadRecord::decode(vset, bytes) else {
+        let volume = VolumeId(raw_volume);
+        let Ok(head) = HeadRecord::decode(volume, bytes) else {
             return;
         };
         let Some(pointer) = head.manifest else {
             return;
         };
-        let Some(closure) = self.manifest_closure(vset, pointer) else {
+        let Some(closure) = self.manifest_closure(volume, pointer) else {
             return;
         };
         let manifest = closure.manifest;
@@ -329,16 +320,16 @@ impl StoreState {
             let Some((_, bytes)) = self.objects.get(&file.identity.store_key()) else {
                 continue;
             };
-            let Ok((_, footer)) = scan_object(bytes) else {
+            let Ok((_, footer)) = BlxObject::scan(bytes) else {
                 continue;
             };
             for entry in footer.entries {
-                if let Some(page) = entry.key.to_page(manifest.config.kind, vset) {
+                if let Some(page) = entry.key.to_page(manifest.config.kind, volume) {
                     current.insert(page, entry.generation);
                 }
             }
         }
-        let previous = self.archived_generations.entry(vset).or_default();
+        let previous = self.archived_generations.entry(volume).or_default();
         let changed = current
             .iter()
             .filter(|(page, generation)| previous.get(page) != Some(generation))
@@ -351,12 +342,12 @@ impl StoreState {
 #[derive(Default)]
 struct MemoryState {
     pages: BTreeMap<PageId, Vec<u8>>,
-    shared_pages: BTreeMap<(u64, u64, blockd_core::types::SegId, u32), Vec<u8>>,
+    shared_pages: BTreeMap<(u64, u64, blockd_core::types::ObjectId, u32), Vec<u8>>,
     protected: BTreeSet<PageId>,
     accessed: BTreeSet<PageId>,
-    paused: BTreeSet<VsetId>,
-    in_ops: BTreeSet<VsetId>,
-    vmstate: BTreeMap<VsetId, u64>,
+    paused: BTreeSet<VolumeId>,
+    in_ops: BTreeSet<VolumeId>,
+    vmstate: BTreeMap<VolumeId, u64>,
     failed: BTreeSet<PageId>,
 }
 
@@ -368,9 +359,9 @@ pub(crate) struct OracleSnapshot {
 
 #[derive(Default)]
 struct CheckpointOracle {
-    by_vmstate: BTreeMap<(VsetId, u64), Vec<OracleSnapshot>>,
-    latest: BTreeMap<VsetId, OracleSnapshot>,
-    by_capture: BTreeMap<(VsetId, u64), OracleSnapshot>,
+    by_vmstate: BTreeMap<(VolumeId, u64), Vec<OracleSnapshot>>,
+    latest: BTreeMap<VolumeId, OracleSnapshot>,
+    by_capture: BTreeMap<(VolumeId, u64), OracleSnapshot>,
 }
 
 type OracleState = (
@@ -397,12 +388,11 @@ pub(crate) struct SimWorld {
     memory: RefCell<MemoryState>,
     admin: Stream<AdminRequest>,
     admin_events: Stream<(u64, u64, AdminEvent)>,
-    admin_event_generations: RefCell<BTreeMap<VsetId, u64>>,
-    admin_event_generation_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
+    admin_event_generations: RefCell<BTreeMap<VolumeId, u64>>,
+    admin_event_generation_waiters: RefCell<BTreeMap<VolumeId, Vec<OneSender<()>>>>,
     incarnation: Cell<u64>,
     faults: Stream<GuestFault>,
     syncs: Stream<GuestSyncRequest>,
-    peers: Stream<(HostId, PeerMsg)>,
     peer_transport: RefCell<Option<Rc<PeerTransport>>>,
     aborts: Stream<&'static str>,
     fault_waiters: RefCell<BTreeMap<PageId, Vec<OneSender<bool>>>>,
@@ -418,11 +408,11 @@ pub(crate) struct SimWorld {
     page_read_poll: Cell<Option<u64>>,
     page_reads_in_poll: Cell<u64>,
     max_page_reads_in_poll: Cell<u64>,
-    pause_started: RefCell<BTreeMap<VsetId, u64>>,
-    pause_generations: RefCell<BTreeMap<VsetId, u64>>,
-    pause_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
-    operation_waiters: RefCell<BTreeMap<VsetId, Vec<OneSender<()>>>>,
-    oracle_pages: RefCell<BTreeMap<VsetId, OracleState>>,
+    pause_started: RefCell<BTreeMap<VolumeId, u64>>,
+    pause_generations: RefCell<BTreeMap<VolumeId, u64>>,
+    pause_waiters: RefCell<BTreeMap<VolumeId, Vec<OneSender<()>>>>,
+    operation_waiters: RefCell<BTreeMap<VolumeId, Vec<OneSender<()>>>>,
+    oracle_pages: RefCell<BTreeMap<VolumeId, OracleState>>,
     checkpoint_oracle: Rc<RefCell<CheckpointOracle>>,
     max_pause_ns: Cell<u64>,
 }
@@ -514,7 +504,6 @@ impl SimWorld {
             incarnation: Cell::new(0),
             faults: Stream::new(),
             syncs: Stream::new(),
-            peers: Stream::new(),
             peer_transport: RefCell::new(None),
             aborts: Stream::new(),
             fault_waiters: RefCell::new(BTreeMap::new()),
@@ -559,33 +548,37 @@ impl SimWorld {
 
     pub(crate) fn register_oracle_pages(
         &self,
-        vset: VsetId,
+        volume: VolumeId,
         pages: Rc<RefCell<BTreeMap<PageId, Vec<u8>>>>,
         unknown: Rc<RefCell<BTreeSet<PageId>>>,
     ) {
         self.oracle_pages
             .borrow_mut()
-            .insert(vset, (pages, unknown));
+            .insert(volume, (pages, unknown));
     }
 
-    pub(crate) fn checkpoint_snapshots(&self, vset: VsetId, vmstate: u64) -> Vec<OracleSnapshot> {
+    pub(crate) fn checkpoint_snapshots(
+        &self,
+        volume: VolumeId,
+        vmstate: u64,
+    ) -> Vec<OracleSnapshot> {
         self.checkpoint_oracle
             .borrow()
             .by_vmstate
-            .get(&(vset, vmstate))
+            .get(&(volume, vmstate))
             .cloned()
             .unwrap_or_default()
     }
 
     pub(crate) fn capture_snapshot(
         &self,
-        vset: VsetId,
+        volume: VolumeId,
         capture_seq: u64,
     ) -> Option<OracleSnapshot> {
         self.checkpoint_oracle
             .borrow()
             .by_capture
-            .get(&(vset, capture_seq))
+            .get(&(volume, capture_seq))
             .cloned()
     }
 
@@ -613,25 +606,25 @@ impl SimWorld {
         None
     }
 
-    pub(crate) fn admin_event_generation(&self, vset: VsetId) -> u64 {
+    pub(crate) fn admin_event_generation(&self, volume: VolumeId) -> u64 {
         self.admin_event_generations
             .borrow()
-            .get(&vset)
+            .get(&volume)
             .copied()
             .unwrap_or(0)
     }
 
     pub(crate) async fn wait_for_admin_event_generation_change(
         &self,
-        vset: VsetId,
+        volume: VolumeId,
         generation: u64,
     ) {
         let changed = {
-            if self.admin_event_generation(vset) == generation {
+            if self.admin_event_generation(volume) == generation {
                 let (wake, changed) = oneshot();
                 self.admin_event_generation_waiters
                     .borrow_mut()
-                    .entry(vset)
+                    .entry(volume)
                     .or_default()
                     .push(wake);
                 Some(changed)
@@ -654,9 +647,9 @@ impl SimWorld {
             .admin_event_generations
             .borrow()
             .iter()
-            .map(|(&vset, &generation)| {
+            .map(|(&volume, &generation)| {
                 (
-                    vset,
+                    volume,
                     generation
                         .checked_add(1)
                         .expect("admin event generation overflow"),
@@ -704,22 +697,22 @@ impl SimWorld {
         let store = self.store.borrow();
         let mut files = BTreeMap::new();
         for (key, (_, head_bytes)) in &store.objects {
-            let Some(encoded_vset) = key
+            let Some(encoded_volume) = key
                 .strip_prefix("v/")
                 .and_then(|rest| rest.strip_suffix("/head"))
             else {
                 continue;
             };
-            let Ok(vset) = u64::from_str_radix(encoded_vset, 16).map(VsetId) else {
+            let Ok(volume) = u64::from_str_radix(encoded_volume, 16).map(VolumeId) else {
                 continue;
             };
-            let Ok(head) = HeadRecord::decode(vset, head_bytes) else {
+            let Ok(head) = HeadRecord::decode(volume, head_bytes) else {
                 continue;
             };
             let Some(pointer) = head.manifest else {
                 continue;
             };
-            let Some(closure) = store.manifest_closure(vset, pointer) else {
+            let Some(closure) = store.manifest_closure(volume, pointer) else {
                 continue;
             };
             files.extend(closure.files.into_iter().map(|file| (file.identity, file)));
@@ -732,7 +725,7 @@ impl SimWorld {
             let Some((_, bytes)) = store.objects.get(&file.identity.store_key()) else {
                 continue;
             };
-            let Ok((_, footer)) = scan_object(bytes) else {
+            let Ok((_, footer)) = BlxObject::scan(bytes) else {
                 continue;
             };
             total = total.saturating_add(bytes.len() as u64);
@@ -798,18 +791,6 @@ impl SimWorld {
             .count()
     }
 
-    pub(crate) fn rot_store_suffix(&self, suffix: &str) -> u64 {
-        let mut store = self.store.borrow_mut();
-        let mut changed = 0_u64;
-        for (key, (_, bytes)) in &mut store.objects {
-            if key.ends_with(suffix) && !bytes.is_empty() {
-                bytes[0] ^= 1;
-                changed = changed.saturating_add(1);
-            }
-        }
-        changed
-    }
-
     pub(crate) fn set_store_outage(&self, outage: bool) {
         self.store.borrow_mut().outage = outage;
     }
@@ -856,7 +837,6 @@ impl SimWorld {
         self.faults.discard_pending();
         self.syncs.discard_pending();
         self.admin.discard_pending();
-        self.peers.discard_pending();
         self.aborts.discard_pending();
         let pause_waiters = std::mem::take(&mut *self.pause_waiters.borrow_mut());
         let operation_waiters = std::mem::take(&mut *self.operation_waiters.borrow_mut());
@@ -870,18 +850,18 @@ impl SimWorld {
         *self.memory.borrow_mut() = MemoryState::default();
     }
 
-    pub(crate) fn reset_guest_memory(&self, vset: VsetId) {
+    pub(crate) fn reset_guest_memory(&self, volume: VolumeId) {
         let mut memory = self.memory.borrow_mut();
-        memory.pages.retain(|page, _| page.volume.vset != vset);
-        memory.accessed.retain(|page| page.volume.vset != vset);
-        memory.protected.retain(|page| page.volume.vset != vset);
-        memory.failed.retain(|page| page.volume.vset != vset);
-        memory.paused.remove(&vset);
-        memory.in_ops.remove(&vset);
-        memory.vmstate.remove(&vset);
+        memory.pages.retain(|page, _| page.volume != volume);
+        memory.accessed.retain(|page| page.volume != volume);
+        memory.protected.retain(|page| page.volume != volume);
+        memory.failed.retain(|page| page.volume != volume);
+        memory.paused.remove(&volume);
+        memory.in_ops.remove(&volume);
+        memory.vmstate.remove(&volume);
     }
 
-    pub(crate) fn bitflip_segment(&self) -> bool {
+    pub(crate) fn bitflip_blx(&self) -> bool {
         self.bitflip_local(|name| {
             std::path::Path::new(name)
                 .extension()
@@ -956,51 +936,51 @@ impl SimWorld {
 
     pub(crate) fn write_metrics(&self) -> (u64, u64) {
         let blobs = self.blobs.borrow();
-        (blobs.map_bytes_written, blobs.max_record_blob_bytes)
+        (blobs.journal_bytes_written, blobs.max_record_blob_bytes)
     }
 
-    pub(crate) fn set_vmstate(&self, vset: VsetId, vmstate: u64) {
+    pub(crate) fn set_vmstate(&self, volume: VolumeId, vmstate: u64) {
         {
             let mut memory = self.memory.borrow_mut();
-            memory.vmstate.insert(vset, vmstate);
-            memory.in_ops.remove(&vset);
+            memory.vmstate.insert(volume, vmstate);
+            memory.in_ops.remove(&volume);
         }
         for waiter in self
             .pause_waiters
             .borrow_mut()
-            .remove(&vset)
+            .remove(&volume)
             .unwrap_or_default()
         {
             let _ = waiter.send(());
         }
     }
 
-    fn cancel_guest_op(&self, vset: VsetId) {
-        self.memory.borrow_mut().in_ops.remove(&vset);
+    fn cancel_guest_op(&self, volume: VolumeId) {
+        self.memory.borrow_mut().in_ops.remove(&volume);
         for waiter in self
             .pause_waiters
             .borrow_mut()
-            .remove(&vset)
+            .remove(&volume)
             .unwrap_or_default()
         {
             let _ = waiter.send(());
         }
     }
 
-    async fn begin_guest_op(&self, vset: VsetId) {
+    async fn begin_guest_op(&self, volume: VolumeId) {
         loop {
             let wait = {
                 let mut memory = self.memory.borrow_mut();
-                if memory.paused.contains(&vset) {
+                if memory.paused.contains(&volume) {
                     let (send, receive) = oneshot();
                     self.operation_waiters
                         .borrow_mut()
-                        .entry(vset)
+                        .entry(volume)
                         .or_default()
                         .push(send);
                     Some(receive)
                 } else {
-                    memory.in_ops.insert(vset);
+                    memory.in_ops.insert(volume);
                     None
                 }
             };
@@ -1011,12 +991,12 @@ impl SimWorld {
         }
     }
 
-    pub(crate) fn is_paused(&self, vset: VsetId) -> bool {
-        self.memory.borrow().paused.contains(&vset)
+    pub(crate) fn is_paused(&self, volume: VolumeId) -> bool {
+        self.memory.borrow().paused.contains(&volume)
     }
 
-    pub(crate) fn vmstate_ready(&self, vset: VsetId) -> bool {
-        self.memory.borrow().vmstate.contains_key(&vset)
+    pub(crate) fn vmstate_ready(&self, volume: VolumeId) -> bool {
+        self.memory.borrow().vmstate.contains_key(&volume)
     }
 
     pub(crate) fn page_bytes(&self, page: PageId) -> Option<Vec<u8>> {
@@ -1025,7 +1005,7 @@ impl SimWorld {
 
     pub(crate) fn write_resident(&self, page: PageId, bytes: Vec<u8>) -> bool {
         let mut memory = self.memory.borrow_mut();
-        if memory.paused.contains(&page.volume.vset)
+        if memory.paused.contains(&page.volume)
             || memory.failed.contains(&page)
             || !memory.pages.contains_key(&page)
             || memory.protected.contains(&page)
@@ -1038,16 +1018,16 @@ impl SimWorld {
     }
 
     pub(crate) async fn fault(&self, page: PageId, write: bool) -> bool {
-        self.begin_guest_op(page.volume.vset).await;
+        self.begin_guest_op(page.volume).await;
         let operation = PendingGuestOperation {
             world: self,
-            vset: page.volume.vset,
+            volume: page.volume,
             active: true,
         };
         loop {
             let (ready, paused) = {
                 let memory = self.memory.borrow();
-                let paused = memory.paused.contains(&page.volume.vset);
+                let paused = memory.paused.contains(&page.volume);
                 (
                     !memory.failed.contains(&page)
                         && !paused
@@ -1093,10 +1073,10 @@ impl SimWorld {
     }
 
     pub(crate) async fn sync(&self, sync: GuestSync) -> bool {
-        self.begin_guest_op(sync.volume.vset).await;
+        self.begin_guest_op(sync.volume).await;
         let operation = PendingGuestOperation {
             world: self,
-            vset: sync.volume.vset,
+            volume: sync.volume,
             active: true,
         };
         let (request, receive) = request(sync);
@@ -1142,8 +1122,10 @@ impl SimWorld {
         let extension = std::path::Path::new(&name)
             .extension()
             .and_then(|extension| extension.to_str());
-        if matches!(extension, Some("rec" | "recm" | "map")) {
-            blobs.map_bytes_written = blobs.map_bytes_written.saturating_add(bytes.len() as u64);
+        if matches!(extension, Some("rec" | "recm")) {
+            blobs.journal_bytes_written = blobs
+                .journal_bytes_written
+                .saturating_add(bytes.len() as u64);
         }
         if matches!(extension, Some("rec" | "recm")) {
             blobs.max_record_blob_bytes = blobs.max_record_blob_bytes.max(bytes.len() as u64);
@@ -1364,17 +1346,14 @@ impl Store for SimWorld {
             }
         };
         if result.is_ok()
-            && let Some(
-                layout::StoreKey::Manifest { vset, .. }
-                | layout::StoreKey::ArchiveManifest { vset, .. },
-            ) = parsed_key
-            && let Ok(manifest) = Manifest::decode(vset, &bytes)
+            && let Some(layout::StoreKey::ArchiveManifest { volume, .. }) = parsed_key
+            && let Ok(manifest) = Manifest::decode(volume, &bytes)
         {
             let mut oracle = self.checkpoint_oracle.borrow_mut();
-            if let Some(snapshot) = oracle.latest.get(&vset).cloned() {
+            if let Some(snapshot) = oracle.latest.get(&volume).cloned() {
                 oracle
                     .by_capture
-                    .insert((vset, manifest.capture_seq), snapshot);
+                    .insert((volume, manifest.capture_seq), snapshot);
             }
         }
         delay(self.store_latency(bytes.len())).await;
@@ -1528,7 +1507,7 @@ impl Peers for SimWorld {
         if let Some(transport) = transport {
             return transport.recv().await;
         }
-        self.peers.recv().await
+        std::future::pending().await
     }
 }
 
@@ -1589,7 +1568,7 @@ impl GuestMem for SimWorld {
     async fn fill_shared(
         &self,
         page: PageId,
-        share: (u64, u64, blockd_core::types::SegId, u32),
+        share: (u64, u64, blockd_core::types::ObjectId, u32),
         bytes: Option<Vec<u8>>,
         writable: bool,
     ) -> Result<(), GuestMemoryError> {
@@ -1619,7 +1598,11 @@ impl GuestMem for SimWorld {
         Ok(())
     }
 
-    async fn install_vmstate(&self, vset: VsetId, bytes: Vec<u8>) -> Result<(), GuestMemoryError> {
+    async fn install_vmstate(
+        &self,
+        volume: VolumeId,
+        bytes: Vec<u8>,
+    ) -> Result<(), GuestMemoryError> {
         let raw: [u8; 8] = bytes
             .get(..8)
             .ok_or(GuestMemoryError::Unservable)?
@@ -1628,48 +1611,51 @@ impl GuestMem for SimWorld {
         self.memory
             .borrow_mut()
             .vmstate
-            .insert(vset, u64::from_le_bytes(raw));
+            .insert(volume, u64::from_le_bytes(raw));
         Ok(())
     }
 
-    async fn pause(&self, vset: VsetId) -> Result<GuestPause, GuestMemoryError> {
+    async fn pause(&self, volume: VolumeId) -> Result<GuestPause, GuestMemoryError> {
         let generation = {
             let mut generations = self.pause_generations.borrow_mut();
             let generation = generations
-                .get(&vset)
+                .get(&volume)
                 .copied()
                 .unwrap_or(0)
                 .checked_add(1)
                 .expect("guest pause generation overflow");
-            generations.insert(vset, generation);
+            generations.insert(volume, generation);
             generation
         };
-        self.pause_started.borrow_mut().entry(vset).or_insert(now());
+        self.pause_started
+            .borrow_mut()
+            .entry(volume)
+            .or_insert(now());
         let pending = PendingGuestPause {
             world: self,
-            vset,
+            volume,
             generation,
             active: true,
         };
         loop {
             let decision = {
                 let mut memory = self.memory.borrow_mut();
-                if memory.in_ops.contains(&vset) || !memory.vmstate.contains_key(&vset) {
+                if memory.in_ops.contains(&volume) || !memory.vmstate.contains_key(&volume) {
                     let (send, receive) = oneshot();
                     self.pause_waiters
                         .borrow_mut()
-                        .entry(vset)
+                        .entry(volume)
                         .or_default()
                         .push(send);
                     Err(receive)
                 } else {
-                    memory.paused.insert(vset);
-                    Ok(memory.vmstate.get(&vset).copied().unwrap_or(0))
+                    memory.paused.insert(volume);
+                    Ok(memory.vmstate.get(&volume).copied().unwrap_or(0))
                 }
             };
             match decision {
                 Ok(vmstate) => {
-                    if let Some((pages, unknown)) = self.oracle_pages.borrow().get(&vset) {
+                    if let Some((pages, unknown)) = self.oracle_pages.borrow().get(&volume) {
                         let snapshot = OracleSnapshot {
                             pages: pages.borrow().clone(),
                             unknown: unknown.borrow().clone(),
@@ -1677,7 +1663,7 @@ impl GuestMem for SimWorld {
                         let memory = self.memory.borrow();
                         let zero = vec![0; blockd_core::types::page_size()];
                         for (page, actual) in memory.pages.iter().filter(|(page, _)| {
-                            page.volume.vset == vset && !snapshot.unknown.contains(page)
+                            page.volume == volume && !snapshot.unknown.contains(page)
                         }) {
                             assert_eq!(
                                 actual,
@@ -1687,8 +1673,8 @@ impl GuestMem for SimWorld {
                         }
                         drop(memory);
                         let mut oracle = self.checkpoint_oracle.borrow_mut();
-                        oracle.latest.insert(vset, snapshot.clone());
-                        let candidates = oracle.by_vmstate.entry((vset, vmstate)).or_default();
+                        oracle.latest.insert(volume, snapshot.clone());
+                        let candidates = oracle.by_vmstate.entry((volume, vmstate)).or_default();
                         if candidates.last() != Some(&snapshot) {
                             candidates.push(snapshot);
                         }
@@ -1709,23 +1695,23 @@ impl GuestMem for SimWorld {
 
     async fn resume(
         &self,
-        vset: VsetId,
+        volume: VolumeId,
         pause: Option<GuestPause>,
     ) -> Result<(), GuestMemoryError> {
         if pause.is_some_and(|pause| {
-            self.pause_generations.borrow().get(&vset).copied() != Some(pause.generation)
+            self.pause_generations.borrow().get(&volume).copied() != Some(pause.generation)
         }) {
             return Ok(());
         }
-        if let Some(started) = self.pause_started.borrow_mut().remove(&vset) {
+        if let Some(started) = self.pause_started.borrow_mut().remove(&volume) {
             self.max_pause_ns
                 .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
         }
-        self.memory.borrow_mut().paused.remove(&vset);
+        self.memory.borrow_mut().paused.remove(&volume);
         for waiter in self
             .operation_waiters
             .borrow_mut()
-            .remove(&vset)
+            .remove(&volume)
             .unwrap_or_default()
         {
             let _ = waiter.send(());
@@ -1734,7 +1720,7 @@ impl GuestMem for SimWorld {
             .fault_waiters
             .borrow()
             .keys()
-            .filter(|page| page.volume.vset == vset)
+            .filter(|page| page.volume == volume)
             .copied()
             .collect::<Vec<_>>();
         for page in pages {
@@ -1745,11 +1731,15 @@ impl GuestMem for SimWorld {
         Ok(())
     }
 
-    async fn commit_pause(&self, vset: VsetId, pause: GuestPause) -> Result<(), GuestMemoryError> {
-        if self.pause_generations.borrow().get(&vset).copied() != Some(pause.generation) {
+    async fn commit_pause(
+        &self,
+        volume: VolumeId,
+        pause: GuestPause,
+    ) -> Result<(), GuestMemoryError> {
+        if self.pause_generations.borrow().get(&volume).copied() != Some(pause.generation) {
             return Ok(());
         }
-        if let Some(started) = self.pause_started.borrow_mut().remove(&vset) {
+        if let Some(started) = self.pause_started.borrow_mut().remove(&volume) {
             self.max_pause_ns
                 .set(self.max_pause_ns.get().max(now().saturating_sub(started)));
         }
@@ -1770,12 +1760,12 @@ impl GuestMem for SimWorld {
         self.syncs.recv().await
     }
 
-    async fn fence(&self, vset: VsetId) -> Result<(), GuestMemoryError> {
+    async fn fence(&self, volume: VolumeId) -> Result<(), GuestMemoryError> {
         let pages = self
             .fault_waiters
             .borrow()
             .keys()
-            .filter(|page| page.volume.vset == vset)
+            .filter(|page| page.volume == volume)
             .copied()
             .collect::<Vec<_>>();
         for page in pages {
@@ -1791,26 +1781,25 @@ impl AdminIo for SimWorld {
     }
 
     async fn emit_admin_event(&self, event: AdminEvent) {
-        let vset = match event {
-            AdminEvent::VsetRecovered { vset, .. } | AdminEvent::VsetMigratedIn { vset, .. } => {
-                vset
-            }
+        let volume = match event {
+            AdminEvent::VolumeRecovered { volume, .. }
+            | AdminEvent::VolumeMigratedIn { volume, .. } => volume,
         };
         let generation = {
             let mut generations = self.admin_event_generations.borrow_mut();
             let generation = generations
-                .get(&vset)
+                .get(&volume)
                 .copied()
                 .unwrap_or(0)
                 .checked_add(1)
                 .expect("admin event generation overflow");
-            generations.insert(vset, generation);
+            generations.insert(volume, generation);
             generation
         };
         for waiter in self
             .admin_event_generation_waiters
             .borrow_mut()
-            .remove(&vset)
+            .remove(&volume)
             .unwrap_or_default()
         {
             let _ = waiter.send(());
@@ -1846,10 +1835,10 @@ mod tests {
     };
     use blockd_core::engine::{HostState, host_actor_with_state};
     use blockd_core::hostmeta::{AuthorityHostConfig, HostConfig, ReplicaPlacementConfig};
-    use blockd_core::journal::VsetConfig;
+    use blockd_core::journal::VolumeConfig;
     use blockd_core::placement::PeerCandidate;
     use blockd_core::protocol::{AdminCall, AdminSuccess, ReqId};
-    use blockd_core::types::VsetId;
+    use blockd_core::types::VolumeId;
     use blockd_core::vnode_member::adoption_quorum;
     use blockd_exec::{FaultConfig, SimulationContext, delay, spawn, yield_now};
 
@@ -1966,19 +1955,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn healthy_session_polling_uses_reads_without_lease_writes() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let actor_world = Rc::clone(&world);
+        let metrics_world = Rc::clone(&world);
+        let world = Rc::clone(&world);
         simulate!(8, async move {
-            create_host_session(actor_world.as_ref(), HostId(1), 101).await?;
+            create_host_session(world.as_ref(), HostId(1), 101).await?;
             for _ in 0..4 {
-                let polled =
-                    poll_or_defend_host_session(actor_world.as_ref(), HostId(1), 101).await?;
+                let polled = poll_or_defend_host_session(world.as_ref(), HostId(1), 101).await?;
                 assert!(matches!(polled, PollSession::Active(_)));
             }
             Ok::<_, AuthorityError>(())
         })
         .expect("healthy holder remains active");
 
-        let metrics = world.store_metrics();
+        let metrics = metrics_world.store_metrics();
         assert_eq!(metrics.gets, 4);
         assert_eq!(metrics.cas_attempts, 1);
         assert_eq!(metrics.cas_successes, 1);
@@ -1987,33 +1976,32 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exact_challenge_cas_fences_the_losing_side() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let actor_world = Rc::clone(&world);
+        let metrics_world = Rc::clone(&world);
+        let world = Rc::clone(&world);
         simulate!(9, async move {
-            create_host_session(actor_world.as_ref(), HostId(1), 101)
+            create_host_session(world.as_ref(), HostId(1), 101)
                 .await
                 .expect("create session");
-            let challenged =
-                challenge_host_session(actor_world.as_ref(), HostId(1), HostId(2), 9001, 50)
-                    .await
-                    .expect("install challenge");
+            let challenged = challenge_host_session(world.as_ref(), HostId(1), HostId(2), 9001, 50)
+                .await
+                .expect("install challenge");
 
-            let joined =
-                challenge_host_session(actor_world.as_ref(), HostId(1), HostId(3), 9002, 51)
-                    .await
-                    .expect("concurrent suspect joins existing challenge");
+            let joined = challenge_host_session(world.as_ref(), HostId(1), HostId(3), 9002, 51)
+                .await
+                .expect("concurrent suspect joins existing challenge");
             assert_eq!(joined, challenged);
 
             assert!(matches!(
-                poll_or_defend_host_session(actor_world.as_ref(), HostId(1), 101).await,
+                poll_or_defend_host_session(world.as_ref(), HostId(1), 101).await,
                 Ok(PollSession::Defended(_))
             ));
             assert_eq!(
-                revoke_host_session(actor_world.as_ref(), challenged, 9001).await,
+                revoke_host_session(world.as_ref(), challenged, 9001).await,
                 Err(AuthorityError::Conflict)
             );
         });
 
-        let metrics = world.store_metrics();
+        let metrics = metrics_world.store_metrics();
         assert_eq!(metrics.cas_successes, 3);
         assert_eq!(metrics.cas_conflicts, 1);
     }
@@ -2130,7 +2118,7 @@ mod tests {
                 worlds[2].as_ref(),
                 &placement,
                 old,
-                VsetId(7),
+                VolumeId(7),
                 44,
                 closure.clone(),
             )
@@ -2140,7 +2128,7 @@ mod tests {
                 worlds[1].as_ref(),
                 &placement,
                 old,
-                VsetId(7),
+                VolumeId(7),
                 44,
                 closure.clone(),
             )
@@ -2166,7 +2154,7 @@ mod tests {
                     .expect("new primary member adopts");
             let inventory = adoption_quorum(&placement, next_proof, &[receipt_two, receipt_three])
                 .expect("two members form adoption quorum");
-            let recovered = inventory[&VsetId(7)];
+            let recovered = inventory[&VolumeId(7)];
             assert_eq!(recovered.sequence, 44);
             assert_eq!(
                 read_vnode_closure(worlds[2].as_ref(), VnodeId(0), recovered).await,
@@ -2178,7 +2166,7 @@ mod tests {
                     worlds[2].as_ref(),
                     &placement,
                     old,
-                    VsetId(7),
+                    VolumeId(7),
                     45,
                     b"stale primary".to_vec(),
                 )
@@ -2390,7 +2378,7 @@ mod tests {
                 test_worlds[0].as_ref(),
                 &placement,
                 old,
-                VsetId(7),
+                VolumeId(7),
                 88,
                 bytes.clone(),
             )
@@ -2400,7 +2388,7 @@ mod tests {
                 test_worlds[2].as_ref(),
                 &placement,
                 old,
-                VsetId(7),
+                VolumeId(7),
                 88,
                 bytes,
             )
@@ -2420,9 +2408,9 @@ mod tests {
             .expect("fail over to host one");
             assert_eq!(proof.authority.generation, 2);
             assert_eq!(proof.authority.primary, HostId(1));
-            assert_eq!(inventory[&VsetId(7)].sequence, 88);
+            assert_eq!(inventory[&VolumeId(7)].sequence, 88);
             assert_eq!(
-                read_vnode_closure(test_worlds[1].as_ref(), VnodeId(0), inventory[&VsetId(7)],)
+                read_vnode_closure(test_worlds[1].as_ref(), VnodeId(0), inventory[&VolumeId(7)],)
                     .await
                     .expect("read protected closure"),
                 b"quorum protected before failover"
@@ -2431,7 +2419,7 @@ mod tests {
             let committed = commit_active_vnode_quorum(
                 &states[1],
                 test_worlds[1].as_ref(),
-                VsetId(7),
+                VolumeId(7),
                 89,
                 b"new primary hot-path closure".to_vec(),
             )
@@ -2450,7 +2438,7 @@ mod tests {
                     test_worlds[1].as_ref(),
                     &placement,
                     old,
-                    VsetId(7),
+                    VolumeId(7),
                     90,
                     b"stale".to_vec(),
                 )
@@ -2467,10 +2455,7 @@ mod tests {
     async fn unservable_page_failure_matches_the_production_fatal_signal() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
-            volume: blockd_core::types::VolumeId {
-                vset: VsetId(1),
-                idx: blockd_core::types::VolumeIdx(0),
-            },
+            volume: VolumeId(1),
             page: blockd_core::types::PageNo(3),
         };
         let failed = simulate!(8, {
@@ -2482,7 +2467,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn actor_world_runs_creation_through_the_real_async_host() {
+    async fn world_runs_creation_through_the_real_async_host() {
         let host = HostId(1);
         let passive_host = HostId(2);
         let placement = |local: HostId| ReplicaPlacementConfig {
@@ -2539,9 +2524,9 @@ mod tests {
             wedge_ticks: 0,
             replica_placement: Some(placement(passive_host)),
         })));
-        let reply = world.request_admin(AdminCall::CreateVset {
-            vset: VsetId(2),
-            config: VsetConfig::compute(1, 4),
+        let reply = world.request_admin(AdminCall::CreateVolume {
+            volume: VolumeId(2),
+            config: VolumeConfig::data(4),
             from_base: None,
         });
         simulate!(4, async move {
@@ -2550,9 +2535,11 @@ mod tests {
             let reply = reply.await.ok();
             assert_eq!(
                 reply,
-                Some(Ok(AdminSuccess::VsetCreated { vset: VsetId(2) }))
+                Some(Ok(AdminSuccess::VolumeCreated {
+                    volume: VolumeId(2)
+                }))
             );
-            assert!(state.borrow().vsets[&VsetId(2)].ready);
+            assert!(state.borrow().volumes[&VolumeId(2)].ready);
             drop(actor);
             drop(passive);
             blockd_exec::run_ready().await;
@@ -2563,16 +2550,13 @@ mod tests {
     async fn paused_guests_do_not_emit_faults_until_resume() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
-            volume: blockd_core::types::VolumeId {
-                vset: VsetId(1),
-                idx: blockd_core::types::VolumeIdx(0),
-            },
+            volume: VolumeId(1),
             page: blockd_core::types::PageNo(3),
         };
         let seen_at = Rc::new(Cell::new(None));
-        world.set_vmstate(VsetId(1), 0);
+        world.set_vmstate(VolumeId(1), 0);
         simulate!(9, async move {
-            let pause = GuestMem::pause(world.as_ref(), VsetId(1)).await;
+            let pause = GuestMem::pause(world.as_ref(), VolumeId(1)).await;
             assert_eq!(pause.as_ref().map(|pause| pause.vmstate), Ok(0));
             spawn({
                 let world = Rc::clone(&world);
@@ -2600,7 +2584,7 @@ mod tests {
                 let world = Rc::clone(&world);
                 async move {
                     delay(10).await;
-                    GuestMem::resume(world.as_ref(), VsetId(1), pause.ok())
+                    GuestMem::resume(world.as_ref(), VolumeId(1), pause.ok())
                         .await
                         .expect("simulated resume succeeds");
                 }
@@ -2614,38 +2598,38 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stale_resume_cannot_release_a_newer_pause() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let vset = VsetId(1);
-        world.set_vmstate(vset, 9);
+        let volume = VolumeId(1);
+        world.set_vmstate(volume, 9);
         simulate!(11, async move {
-            let first = GuestMem::pause(world.as_ref(), vset)
+            let first = GuestMem::pause(world.as_ref(), volume)
                 .await
                 .expect("first pause");
-            let second = GuestMem::pause(world.as_ref(), vset)
+            let second = GuestMem::pause(world.as_ref(), volume)
                 .await
                 .expect("second pause");
-            GuestMem::resume(world.as_ref(), vset, Some(first))
+            GuestMem::resume(world.as_ref(), volume, Some(first))
                 .await
                 .expect("stale resume is harmless");
-            assert!(world.memory.borrow().paused.contains(&vset));
-            GuestMem::resume(world.as_ref(), vset, Some(second))
+            assert!(world.memory.borrow().paused.contains(&volume));
+            GuestMem::resume(world.as_ref(), volume, Some(second))
                 .await
                 .expect("matching resume succeeds");
-            assert!(!world.memory.borrow().paused.contains(&vset));
+            assert!(!world.memory.borrow().paused.contains(&volume));
         });
     }
 
     #[tokio::test(start_paused = true)]
     async fn checkpoint_pause_waits_for_an_inflight_guest_operation() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let vset = VsetId(1);
-        world.memory.borrow_mut().in_ops.insert(vset);
+        let volume = VolumeId(1);
+        world.memory.borrow_mut().in_ops.insert(volume);
         let paused_at = Rc::new(Cell::new(None));
         simulate!(10, async move {
             let pause = spawn({
                 let world = Rc::clone(&world);
                 let paused_at = Rc::clone(&paused_at);
                 async move {
-                    let vmstate = GuestMem::pause(world.as_ref(), vset).await;
+                    let vmstate = GuestMem::pause(world.as_ref(), volume).await;
                     paused_at.set(Some(now()));
                     vmstate
                 }
@@ -2654,7 +2638,7 @@ mod tests {
                 let world = Rc::clone(&world);
                 async move {
                     delay(10).await;
-                    world.set_vmstate(vset, 7);
+                    world.set_vmstate(volume, 7);
                 }
             })
             .detach();
@@ -2669,31 +2653,28 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancelling_a_pending_pause_clears_its_bookkeeping() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let vset = VsetId(1);
-        world.memory.borrow_mut().in_ops.insert(vset);
+        let volume = VolumeId(1);
+        world.memory.borrow_mut().in_ops.insert(volume);
         simulate!(12, async move {
             let pause = spawn({
                 let world = Rc::clone(&world);
-                async move { GuestMem::pause(world.as_ref(), vset).await }
+                async move { GuestMem::pause(world.as_ref(), volume).await }
             });
             blockd_exec::run_ready().await;
-            assert!(world.pause_started.borrow().contains_key(&vset));
+            assert!(world.pause_started.borrow().contains_key(&volume));
             drop(pause);
             blockd_exec::run_ready().await;
-            assert!(!world.pause_started.borrow().contains_key(&vset));
-            assert!(!world.memory.borrow().paused.contains(&vset));
+            assert!(!world.pause_started.borrow().contains_key(&volume));
+            assert!(!world.memory.borrow().paused.contains(&volume));
         });
     }
 
     #[tokio::test(start_paused = true)]
     async fn cancelling_a_pending_fault_releases_the_guest_operation() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let vset = VsetId(1);
+        let volume = VolumeId(1);
         let page = PageId {
-            volume: blockd_core::types::VolumeId {
-                vset,
-                idx: blockd_core::types::VolumeIdx(1),
-            },
+            volume,
             page: blockd_core::types::PageNo(3),
         };
         simulate!(14, async move {
@@ -2702,24 +2683,24 @@ mod tests {
                 async move { world.fault(page, false).await }
             });
             blockd_exec::run_ready().await;
-            assert!(world.memory.borrow().in_ops.contains(&vset));
+            assert!(world.memory.borrow().in_ops.contains(&volume));
             drop(fault);
             blockd_exec::run_ready().await;
-            assert!(!world.memory.borrow().in_ops.contains(&vset));
+            assert!(!world.memory.borrow().in_ops.contains(&volume));
         });
     }
 
     #[tokio::test(start_paused = true)]
     async fn advancing_incarnation_invalidates_active_recovery_generations() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let vset = VsetId(1);
+        let volume = VolumeId(1);
         let (_, generation) = simulate!(13, {
             let world = Rc::clone(&world);
             async move {
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
@@ -2733,17 +2714,14 @@ mod tests {
 
         world.advance_incarnation();
 
-        assert_ne!(world.admin_event_generation(vset), generation);
+        assert_ne!(world.admin_event_generation(volume), generation);
     }
 
     #[test]
     fn crash_discards_stale_guest_events() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
-            volume: blockd_core::types::VolumeId {
-                vset: VsetId(1),
-                idx: blockd_core::types::VolumeIdx(1),
-            },
+            volume: VolumeId(1),
             page: blockd_core::types::PageNo(3),
         };
         assert!(world.faults.send(GuestFault {
@@ -2768,9 +2746,9 @@ mod tests {
     async fn scheduled_record_rot_targets_the_newest_requested_copy() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let older =
-            blockd_core::layout::journal_blob(VsetId(1), 2, blockd_core::types::JournalSeq(3));
+            blockd_core::layout::journal_blob(VolumeId(1), 2, blockd_core::types::JournalSeq(3));
         let newer =
-            blockd_core::layout::journal_blob(VsetId(1), 2, blockd_core::types::JournalSeq(4));
+            blockd_core::layout::journal_blob(VolumeId(1), 2, blockd_core::types::JournalSeq(4));
         world
             .blobs
             .borrow_mut()
@@ -2801,7 +2779,7 @@ mod tests {
     async fn write_metrics_include_blobs_deleted_before_the_report() {
         let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let name =
-            blockd_core::layout::journal_blob(VsetId(1), 1, blockd_core::types::JournalSeq(0));
+            blockd_core::layout::journal_blob(VolumeId(1), 1, blockd_core::types::JournalSeq(0));
         let task_world = Rc::clone(&world);
         simulate!(21, async move {
             Blobs::write(task_world.as_ref(), name.clone(), vec![1; 32])

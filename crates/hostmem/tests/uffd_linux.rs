@@ -102,7 +102,7 @@ fn first_touch_faults_missing_and_resolves_via_continue() {
     assert_eq!(faults.load(Ordering::SeqCst), 1);
 }
 
-/// Prefetch (R6.2): populate + eager CONTINUE before any guest touch.
+/// Prefetch: populate + eager CONTINUE before any guest touch.
 /// The guest's later read takes NO fault at all.
 #[test]
 fn proactive_continue_prefetches_without_any_fault() {

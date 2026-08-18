@@ -5,7 +5,6 @@ use blockd_exec::{delay, now};
 
 use super::SharedHost;
 use crate::layout::StoreKey;
-use crate::types::SimTime;
 use crate::world::{Store, StoreError};
 
 const GC_INTERVAL_MULTIPLIER: u64 = 600;
@@ -37,21 +36,20 @@ pub(super) async fn store_gc_actor<W: Store>(state: SharedHost, world: Rc<W>) {
 
 async fn store_gc_pass<W: Store>(
     world: &W,
-    observed_at: &mut BTreeMap<String, SimTime>,
+    observed_at: &mut BTreeMap<String, u64>,
     grace: u64,
 ) -> Result<usize, StoreError> {
     let keys = Store::list_prefix(world, "").await?;
     let present = keys.iter().cloned().collect::<BTreeSet<_>>();
     observed_at.retain(|key, _| present.contains(key));
 
-    let observed_now = SimTime(now());
+    let observed_now = now();
     let mut objects = Vec::with_capacity(keys.len());
     for key in keys {
         let needs_body = matches!(
             crate::layout::parse_key(&key),
             Some(
                 StoreKey::Head { .. }
-                    | StoreKey::Manifest { .. }
                     | StoreKey::ArchiveManifest { .. }
                     | StoreKey::CompleteFileList { .. }
                     | StoreKey::PendingManifest { .. }
@@ -89,14 +87,12 @@ mod tests {
     use super::*;
     use crate::blx::{BlockKey, BlockSpace, NamespaceKind};
     use crate::head::{HeadRecord, ManifestPtr};
-    use crate::journal::{JournalRecord, RecordKind, VsetConfig};
+    use crate::journal::{JournalRecord, RecordKind, VolumeConfig};
     use crate::layout;
     use crate::manifest::{CompleteFileList, Manifest, ObjectIdentity, ObjectRef, RecoveryKind};
+    use crate::page_file::PageFileLoc;
     use crate::protocol::StoreFault;
-    use crate::segment::PageLoc;
-    use crate::types::{
-        Gen, HostId, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, VsetId,
-    };
+    use crate::types::{Gen, HostId, JournalSeq, ObjectId, PageId, PageNo, VolumeId};
     use crate::world::StoreError;
 
     #[derive(Default)]
@@ -159,14 +155,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn collector_renews_grace_then_deletes_only_unreachable_objects() {
         let store = TestStore::default();
-        let vset = VsetId(1);
-        let head_key = layout::head_key(vset);
+        let volume = VolumeId(1);
+        let head_key = layout::head_key(volume);
         store.objects.borrow_mut().insert(
             head_key.clone(),
             (
                 1,
                 HeadRecord {
-                    vset,
+                    volume,
                     holder: HostId(1),
                     fence: 1,
                     manifest: None,
@@ -176,7 +172,7 @@ mod tests {
                 .encode(),
             ),
         );
-        let orphan = layout::segment_key(vset, 1, crate::types::SegId(9));
+        let orphan = layout::blx_key(volume, 1, 9);
         store
             .objects
             .borrow_mut()
@@ -205,7 +201,7 @@ mod tests {
         assert_eq!(result, (true, false));
         assert!(
             !store.fetched.borrow().contains(&expected_orphan),
-            "segment payloads must not be fetched during GC"
+            "blx payloads must not be fetched during GC"
         );
     }
 
@@ -213,25 +209,22 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn collector_preserves_inflight_publication_roots() {
         let store = Rc::new(TestStore::default());
-        let vset = VsetId(2);
+        let volume = VolumeId(2);
         let fence = 3;
         let seq = JournalSeq(4);
         let page = PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(1),
-            },
+            volume,
             page: PageNo(0),
         };
-        let location = PageLoc {
+        let location = PageFileLoc {
             base: 0,
             fence,
-            seg: SegId(4),
+            object: ObjectId(4),
             offset: 0,
             len: 1,
         };
         let record = JournalRecord {
-            config: VsetConfig::compute(1, 4),
+            config: VolumeConfig::data(4),
             seq,
             fence,
             kind: RecordKind::Commit,
@@ -239,15 +232,15 @@ mod tests {
             sync_covered_through: 5,
             post_state_checksum: 0,
             files: Vec::new(),
-            overlay: BTreeMap::from([(page, (Gen(1), location))]),
+            runtime_page_index: BTreeMap::from([(page, (Gen(1), location))]),
             migrated_from: None,
         };
         let object = ObjectRef {
             identity: ObjectIdentity {
-                namespace_kind: NamespaceKind::Vset,
-                namespace_id: vset.0,
+                namespace_kind: NamespaceKind::Volume,
+                namespace_id: volume.0,
                 writer_fence: fence,
-                object_id: location.seg.0,
+                object_id: location.object.0,
             },
             min_seq: seq.0,
             max_seq: seq.0,
@@ -256,12 +249,10 @@ mod tests {
             chunk_count: 1,
             first_key: BlockKey {
                 space: BlockSpace::Data,
-                volume: 1,
                 block: 0,
             },
             last_key: BlockKey {
                 space: BlockSpace::Data,
-                volume: 1,
                 block: 0,
             },
             pre_state_checksum: 0,
@@ -272,13 +263,13 @@ mod tests {
             object_checksum: 0,
         };
         let list = CompleteFileList {
-            vset,
+            volume,
             writer_fence: fence,
             list_id: seq.0,
             objects: vec![object],
         };
         let archive = Manifest {
-            vset,
+            volume,
             writer_fence: fence,
             journal_seq: record.seq.0,
             archive_seq: seq.0,
@@ -296,18 +287,18 @@ mod tests {
             removed: Vec::new(),
         };
         let archive_bytes = archive.encode().expect("bounded manifest");
-        let head = layout::head_key(vset);
-        let manifest = layout::manifest_key(vset, fence, seq);
-        let pending = layout::pending_manifest_key(vset, fence, seq);
-        let segment = layout::segment_key(vset, fence, location.seg);
-        let list_key = layout::complete_file_list_key(vset, fence, seq.0);
+        let head = layout::head_key(volume);
+        let manifest = layout::manifest_key(volume, fence, seq);
+        let pending = layout::pending_manifest_key(volume, fence, seq);
+        let blx = layout::blx_key(volume, fence, location.object.0);
+        let list_key = layout::complete_file_list_key(volume, fence, seq.0);
         store.objects.borrow_mut().extend([
             (
                 head.clone(),
                 (
                     1,
                     HeadRecord {
-                        vset,
+                        volume,
                         holder: HostId(1),
                         fence,
                         manifest: None,
@@ -319,7 +310,7 @@ mod tests {
             ),
             (pending.clone(), (1, archive_bytes.clone())),
             (list_key, (1, list.encode())),
-            (segment.clone(), (1, vec![1, 2, 3])),
+            (blx.clone(), (1, vec![1, 2, 3])),
         ]);
         let task_store = Rc::clone(&store);
         simulation_scope(2, FaultConfig::default(), async move {
@@ -342,7 +333,7 @@ mod tests {
                 (
                     2,
                     HeadRecord {
-                        vset,
+                        volume,
                         holder: HostId(1),
                         fence,
                         manifest: Some(ManifestPtr {
@@ -365,7 +356,7 @@ mod tests {
         })
         .await;
 
-        assert!(store.objects.borrow().contains_key(&segment));
+        assert!(store.objects.borrow().contains_key(&blx));
         assert!(!store.objects.borrow().contains_key(&pending));
     }
 

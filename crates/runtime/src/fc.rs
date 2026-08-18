@@ -472,9 +472,9 @@ impl ShmemServer {
     }
 
     /// The cold-tier variant: fills come from object storage at
-    /// segment granularity — a fault on any page of a `part_bytes` part
+    /// blx granularity — a fault on any page of a `part_bytes` part
     /// fetches the whole part object with one `GetObject` (the store tier
-    /// of R2.3: segment-granular, never per-page round trips). Distinct
+    /// of R2.3: blx-granular, never per-page round trips). Distinct
     /// parts fetch concurrently, concurrent faults on one part share one
     /// fetch, and each demand fault keeps the next `readahead_parts` parts
     /// in flight ahead of a sequential reader.
@@ -583,7 +583,7 @@ async fn create_shmem(shmem_path: &Path, mem_bytes: u64) -> Arc<std::fs::File> {
 
 /// Where a shmem fill's bytes come from: the snapshot memory file (warm
 /// local tier, page granules) or object storage (cold tier,
-/// `part_bytes` segment-object granules).
+/// `part_bytes` blx-object granules).
 enum Filler {
     File(PathBuf),
     Store {

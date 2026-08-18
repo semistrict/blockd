@@ -7,17 +7,15 @@
 //! ghost truth. A run is `(seed, config) → trace hash`, byte-for-byte
 //! replayable.
 
-pub mod actor_cluster;
-pub mod actor_harness;
-pub(crate) mod actor_world;
 mod checkpoint_schedule;
-pub use actor_cluster as cluster;
+pub mod cluster;
 pub mod guest;
-pub use actor_harness as harness;
+pub mod harness;
 pub mod model;
 pub mod peer_transport;
 pub mod presets;
 pub mod scenario;
+pub(crate) mod world;
 
 pub use blockd_exec::rng;
 pub use blockd_exec::trace as hash;

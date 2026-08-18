@@ -4,7 +4,7 @@
   "seed": 7,
   "shape": {
     "disk_volumes": 2,
-    "pages_per_volume": 16,
+    "pages": 16,
     "backed_up": false
   },
   "phases": [

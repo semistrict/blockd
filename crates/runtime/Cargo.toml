@@ -46,6 +46,3 @@ tokio-rustls = "0.26.4"
 blockd-sim = { path = "../sim" }
 blockd-workload = { path = "../workload" }
 tempfile = "3.23.0"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true

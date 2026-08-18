@@ -501,7 +501,7 @@ impl Uffd {
         Ok(())
     }
 
-    /// Fill's second half — and the whole of a prefetch (R6.2): map the
+    /// Fill's second half — and the whole of a prefetch: map the
     /// already-populated page-cache page into the registered range.
     /// `protect` installs it write-protected (capture-armed).
     pub fn continue_range(&self, start: usize, len: usize, protect: bool) -> io::Result<()> {

@@ -7,12 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
 use crate::journal::JournalRecord;
+use crate::page_file::scan_page_file;
 use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 use crate::replica_wire::{
     decode_artifact, decode_commit_info, encode_artifact, encode_commit_info,
 };
-use crate::segment::scan_segment;
-use crate::types::{HostId, VsetId};
+use crate::types::{HostId, VolumeId};
 
 pub const MAGIC_REPLICA_ARTIFACT: u32 = u32::from_le_bytes(*b"BRA1");
 pub const MAGIC_REPLICA_COMMIT: u32 = u32::from_le_bytes(*b"BRC1");
@@ -20,7 +20,7 @@ pub const MAGIC_REPLICA_COMMIT: u32 = u32::from_le_bytes(*b"BRC1");
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReplicaArtifactFrame {
     pub source: HostId,
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub assignment_epoch: u64,
     pub artifact: ReplicaArtifact,
     pub checksum: u32,
@@ -30,7 +30,7 @@ pub struct ReplicaArtifactFrame {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReplicaCommitFrame {
     pub source: HostId,
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub assignment_epoch: u64,
     pub info: ReplicaCommitInfo,
     pub required: Vec<ReplicaArtifact>,
@@ -58,24 +58,24 @@ impl From<DecodeError> for ReplicaSpoolError {
 
 pub fn seal_replica_artifact(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     assignment_epoch: u64,
     artifact: ReplicaArtifact,
     bytes: &[u8],
 ) -> Result<Vec<u8>, ReplicaSpoolError> {
     let checksum = crc32c(bytes);
-    seal_verified_replica_artifact(source, vset, assignment_epoch, artifact, checksum, bytes)
+    seal_verified_replica_artifact(source, volume, assignment_epoch, artifact, checksum, bytes)
 }
 
 /// Verify an immutable artifact without constructing its spool frame. The
 /// source uses this before network transfer so validation does not allocate
 /// and checksum a full frame that will immediately be discarded.
 pub fn verify_replica_artifact(
-    vset: VsetId,
+    volume: VolumeId,
     artifact: ReplicaArtifact,
     bytes: &[u8],
 ) -> Result<(), ReplicaSpoolError> {
-    verify_artifact(vset, artifact, bytes)
+    verify_artifact(volume, artifact, bytes)
 }
 
 /// Seal an artifact whose transport checksum has already been computed.
@@ -83,17 +83,17 @@ pub fn verify_replica_artifact(
 /// redundant second checksum pass is skipped.
 pub fn seal_verified_replica_artifact(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     assignment_epoch: u64,
     artifact: ReplicaArtifact,
     checksum: u32,
     bytes: &[u8],
 ) -> Result<Vec<u8>, ReplicaSpoolError> {
-    verify_artifact(vset, artifact, bytes)?;
+    verify_artifact(volume, artifact, bytes)?;
     let mut e = Enc::new();
     e.u16(1);
     e.u16(source.0);
-    e.u64(vset.0);
+    e.u64(volume.0);
     e.u64(assignment_epoch);
     encode_artifact(&mut e, artifact);
     e.u32(checksum);
@@ -104,7 +104,7 @@ pub fn seal_verified_replica_artifact(
 
 pub fn seal_replica_commit(
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     assignment_epoch: u64,
     info: ReplicaCommitInfo,
     required: &[ReplicaArtifact],
@@ -113,11 +113,11 @@ pub fn seal_replica_commit(
     if required.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(ReplicaSpoolError);
     }
-    verify_record(vset, info, record)?;
+    verify_record(volume, info, record)?;
     let mut e = Enc::new();
     e.u16(1);
     e.u16(source.0);
-    e.u64(vset.0);
+    e.u64(volume.0);
     e.u64(assignment_epoch);
     encode_commit_info(&mut e, info);
     e.u32(u32::try_from(required.len()).map_err(|_| ReplicaSpoolError)?);
@@ -137,7 +137,7 @@ pub fn scan_replica_spool(bytes: &[u8]) -> Result<ReplicaSpoolScan, ReplicaSpool
         uncommitted_artifacts: BTreeSet::new(),
         commits: Vec::new(),
     };
-    let mut identity: Option<(HostId, VsetId, u64)> = None;
+    let mut identity: Option<(HostId, VolumeId, u64)> = None;
     while scan.valid_len < bytes.len() {
         let rest = &bytes[scan.valid_len..];
         let Some(frame_len) = framed_len(rest) else {
@@ -152,7 +152,7 @@ pub fn scan_replica_spool(bytes: &[u8]) -> Result<ReplicaSpoolScan, ReplicaSpool
                 check_identity(
                     &mut identity,
                     artifact.source,
-                    artifact.vset,
+                    artifact.volume,
                     artifact.assignment_epoch,
                 )?;
                 match scan.artifacts.get(&artifact.artifact) {
@@ -171,7 +171,7 @@ pub fn scan_replica_spool(bytes: &[u8]) -> Result<ReplicaSpoolScan, ReplicaSpool
                 check_identity(
                     &mut identity,
                     commit.source,
-                    commit.vset,
+                    commit.volume,
                     commit.assignment_epoch,
                 )?;
                 if commit
@@ -214,12 +214,12 @@ fn framed_len(bytes: &[u8]) -> Option<usize> {
 }
 
 fn check_identity(
-    identity: &mut Option<(HostId, VsetId, u64)>,
+    identity: &mut Option<(HostId, VolumeId, u64)>,
     source: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     assignment_epoch: u64,
 ) -> Result<(), ReplicaSpoolError> {
-    let incoming = (source, vset, assignment_epoch);
+    let incoming = (source, volume, assignment_epoch);
     match identity {
         None => *identity = Some(incoming),
         Some(existing) if *existing == incoming => {}
@@ -235,7 +235,7 @@ fn open_artifact(bytes: &[u8]) -> Result<ReplicaArtifactFrame, ReplicaSpoolError
         return Err(ReplicaSpoolError);
     }
     let source = HostId(d.u16()?);
-    let vset = VsetId(d.u64()?);
+    let volume = VolumeId(d.u64()?);
     let assignment_epoch = d.u64()?;
     let artifact = decode_artifact(&mut d)?;
     let checksum = d.u32()?;
@@ -245,10 +245,10 @@ fn open_artifact(bytes: &[u8]) -> Result<ReplicaArtifactFrame, ReplicaSpoolError
     if crc32c(&artifact_bytes) != checksum {
         return Err(ReplicaSpoolError);
     }
-    verify_artifact(vset, artifact, &artifact_bytes)?;
+    verify_artifact(volume, artifact, &artifact_bytes)?;
     Ok(ReplicaArtifactFrame {
         source,
-        vset,
+        volume,
         assignment_epoch,
         artifact,
         checksum,
@@ -263,7 +263,7 @@ fn open_commit(bytes: &[u8]) -> Result<ReplicaCommitFrame, ReplicaSpoolError> {
         return Err(ReplicaSpoolError);
     }
     let source = HostId(d.u16()?);
-    let vset = VsetId(d.u64()?);
+    let volume = VolumeId(d.u64()?);
     let assignment_epoch = d.u64()?;
     let info = decode_commit_info(&mut d)?;
     let count = d.u32()?;
@@ -280,10 +280,10 @@ fn open_commit(bytes: &[u8]) -> Result<ReplicaCommitFrame, ReplicaSpoolError> {
     let len = usize::try_from(d.u32()?).map_err(|_| ReplicaSpoolError)?;
     let record = d.bytes(len)?.to_vec();
     d.finish()?;
-    verify_record(vset, info, &record)?;
+    verify_record(volume, info, &record)?;
     Ok(ReplicaCommitFrame {
         source,
-        vset,
+        volume,
         assignment_epoch,
         info,
         required,
@@ -292,14 +292,14 @@ fn open_commit(bytes: &[u8]) -> Result<ReplicaCommitFrame, ReplicaSpoolError> {
 }
 
 fn verify_artifact(
-    vset: VsetId,
+    volume: VolumeId,
     artifact: ReplicaArtifact,
     bytes: &[u8],
 ) -> Result<(), ReplicaSpoolError> {
     match artifact {
-        ReplicaArtifact::Segment { fence, seg } => {
-            let (got_vset, got_fence, got_seg, _) = scan_segment(bytes)?;
-            if (got_vset, got_fence, got_seg) != (vset, fence, seg) {
+        ReplicaArtifact::Blx { fence, object } => {
+            let (got_volume, got_fence, got_seg, _) = scan_page_file(bytes)?;
+            if (got_volume, got_fence, got_seg) != (volume, fence, object) {
                 return Err(ReplicaSpoolError);
             }
         }
@@ -308,11 +308,11 @@ fn verify_artifact(
 }
 
 fn verify_record(
-    vset: VsetId,
+    volume: VolumeId,
     info: ReplicaCommitInfo,
     bytes: &[u8],
 ) -> Result<(), ReplicaSpoolError> {
-    let record = JournalRecord::decode(vset, bytes)?;
+    let record = JournalRecord::decode(volume, bytes)?;
     if record.fence != info.writer_fence
         || record.seq != info.seq
         || record.sync_covered_through != info.sync_covered_through
@@ -328,25 +328,22 @@ mod tests {
 
     use super::*;
     use crate::format::crc32c;
-    use crate::journal::{RecordKind, VsetConfig};
-    use crate::segment::SegmentBatchBuilder;
-    use crate::types::{Gen, JournalSeq, PageId, PageNo, SegId, VolumeId, VolumeIdx, page_size};
+    use crate::journal::{RecordKind, VolumeConfig};
+    use crate::page_file::PageBatchBuilder;
+    use crate::types::{Gen, JournalSeq, ObjectId, PageId, PageNo, page_size};
 
     fn fixture() -> (ReplicaArtifact, Vec<u8>, ReplicaCommitInfo, Vec<u8>) {
-        let vset = VsetId(7);
+        let volume = VolumeId(7);
         let page = PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(1),
-            },
+            volume,
             page: PageNo(2),
         };
-        let mut builder = SegmentBatchBuilder::new(vset, 4, SegId(9));
+        let mut builder = PageBatchBuilder::new(volume, 4, ObjectId(9));
         builder.add(page, Gen(3), &vec![0xA5; page_size()]);
-        let (_, segment, locs) = builder.finish().pop().expect("fixture object");
-        let artifact = ReplicaArtifact::Segment {
+        let (_, blx, locs) = builder.finish().pop().expect("fixture object");
+        let artifact = ReplicaArtifact::Blx {
             fence: 4,
-            seg: SegId(9),
+            object: ObjectId(9),
         };
         let info = ReplicaCommitInfo {
             writer_fence: 4,
@@ -354,10 +351,9 @@ mod tests {
             sync_covered_through: 12,
         };
         let record = JournalRecord {
-            config: VsetConfig {
-                kind: crate::journal::VsetKind::Compute,
-                disk_volumes: 1,
-                pages_per_volume: 16,
+            config: VolumeConfig {
+                kind: crate::journal::VolumeKind::Data,
+                pages: 16,
             },
             seq: info.seq,
             fence: info.writer_fence,
@@ -366,20 +362,20 @@ mod tests {
             sync_covered_through: info.sync_covered_through,
             post_state_checksum: 0,
             files: Vec::new(),
-            overlay: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
+            runtime_page_index: BTreeMap::from([(page, (Gen(3), locs[0].2))]),
             migrated_from: None,
         }
-        .encode(vset);
-        (artifact, segment, info, record)
+        .encode(volume);
+        (artifact, blx, info, record)
     }
 
     #[test]
     fn complete_spool_scans_to_one_recovery_commit() {
-        let (artifact, segment, info, record) = fixture();
-        let mut spool = seal_replica_artifact(HostId(2), VsetId(7), 5, artifact, &segment)
+        let (artifact, blx, info, record) = fixture();
+        let mut spool = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx)
             .expect("artifact valid");
         spool.extend(
-            seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record)
+            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record)
                 .expect("commit valid"),
         );
         let scan = scan_replica_spool(&spool).expect("spool valid");
@@ -393,9 +389,9 @@ mod tests {
 
     #[test]
     fn commit_spool_frame_bytes_are_pinned() {
-        let artifact = ReplicaArtifact::Segment {
+        let artifact = ReplicaArtifact::Blx {
             fence: 4,
-            seg: SegId(9),
+            object: ObjectId(9),
         };
         let info = ReplicaCommitInfo {
             writer_fence: 4,
@@ -403,10 +399,9 @@ mod tests {
             sync_covered_through: 12,
         };
         let record = JournalRecord {
-            config: VsetConfig {
-                kind: crate::journal::VsetKind::Compute,
-                disk_volumes: 1,
-                pages_per_volume: 16,
+            config: VolumeConfig {
+                kind: crate::journal::VolumeKind::Data,
+                pages: 16,
             },
             seq: info.seq,
             fence: info.writer_fence,
@@ -415,15 +410,15 @@ mod tests {
             sync_covered_through: info.sync_covered_through,
             post_state_checksum: 0,
             files: Vec::new(),
-            overlay: BTreeMap::new(),
+            runtime_page_index: BTreeMap::new(),
             migrated_from: None,
         }
-        .encode(VsetId(7));
-        let frame = seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record)
+        .encode(VolumeId(7));
+        let frame = seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record)
             .expect("commit valid");
         let expected_pin = match page_size() {
-            4096 => (195, 0x0FC3_0B7B),
-            16_384 => (195, 0x44FB_D9B3),
+            4096 => (194, 0x1ED3_5E1B),
+            16_384 => (194, 0x9640_CB5A),
             size => panic!("spool frame pin missing for {size}-byte pages"),
         };
         assert_eq!((frame.len(), crc32c(&frame)), expected_pin);
@@ -431,27 +426,24 @@ mod tests {
 
     #[test]
     fn scan_retains_artifacts_appended_after_the_last_commit() {
-        let (artifact, segment, info, record) = fixture();
-        let mut spool = seal_replica_artifact(HostId(2), VsetId(7), 5, artifact, &segment).unwrap();
+        let (artifact, blx, info, record) = fixture();
+        let mut spool = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
         spool.extend(
-            seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record).unwrap(),
+            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap(),
         );
 
         let page = PageId {
-            volume: VolumeId {
-                vset: VsetId(7),
-                idx: VolumeIdx(1),
-            },
+            volume: VolumeId(7),
             page: PageNo(3),
         };
-        let mut builder = SegmentBatchBuilder::new(VsetId(7), 4, SegId(10));
+        let mut builder = PageBatchBuilder::new(VolumeId(7), 4, ObjectId(10));
         builder.add(page, Gen(4), &vec![0x5A; page_size()]);
-        let (_, next_segment, _) = builder.finish().pop().expect("fixture object");
-        let next = ReplicaArtifact::Segment {
+        let (_, next_blx, _) = builder.finish().pop().expect("fixture object");
+        let next = ReplicaArtifact::Blx {
             fence: 4,
-            seg: SegId(10),
+            object: ObjectId(10),
         };
-        spool.extend(seal_replica_artifact(HostId(2), VsetId(7), 5, next, &next_segment).unwrap());
+        spool.extend(seal_replica_artifact(HostId(2), VolumeId(7), 5, next, &next_blx).unwrap());
 
         let scan = scan_replica_spool(&spool).expect("spool valid");
         assert_eq!(scan.commits.len(), 1);
@@ -460,11 +452,11 @@ mod tests {
 
     #[test]
     fn every_torn_commit_tail_is_ignored() {
-        let (artifact, segment, info, record) = fixture();
+        let (artifact, blx, info, record) = fixture();
         let artifact_frame =
-            seal_replica_artifact(HostId(2), VsetId(7), 5, artifact, &segment).unwrap();
+            seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
         let commit =
-            seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record).unwrap();
+            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap();
         for kept in 0..commit.len() {
             let mut torn = artifact_frame.clone();
             torn.extend_from_slice(&commit[..kept]);
@@ -479,8 +471,8 @@ mod tests {
 
     #[test]
     fn every_torn_artifact_tail_is_ignored() {
-        let (artifact, segment, _, _) = fixture();
-        let frame = seal_replica_artifact(HostId(2), VsetId(7), 5, artifact, &segment).unwrap();
+        let (artifact, blx, _, _) = fixture();
+        let frame = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
         for kept in 0..frame.len() {
             let scan = scan_replica_spool(&frame[..kept]).expect("torn tail is recoverable");
             assert!(scan.artifacts.is_empty());
@@ -495,19 +487,19 @@ mod tests {
     fn commit_before_required_data_is_rejected() {
         let (artifact, _, info, record) = fixture();
         let commit =
-            seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record).unwrap();
+            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap();
         assert_eq!(scan_replica_spool(&commit), Err(ReplicaSpoolError));
     }
 
     #[test]
     fn conflicting_duplicate_artifact_is_rejected() {
-        let (artifact, segment, _, _) = fixture();
-        let frame = seal_replica_artifact(HostId(2), VsetId(7), 5, artifact, &segment).unwrap();
-        let mut conflicting_segment = segment;
-        let last = conflicting_segment.len() - 1;
-        conflicting_segment[last] ^= 1;
+        let (artifact, blx, _, _) = fixture();
+        let frame = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
+        let mut conflicting_blx = blx;
+        let last = conflicting_blx.len() - 1;
+        conflicting_blx[last] ^= 1;
         assert!(
-            seal_replica_artifact(HostId(2), VsetId(7), 5, artifact, &conflicting_segment).is_err()
+            seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &conflicting_blx).is_err()
         );
         let mut duplicate = frame.clone();
         duplicate.extend(frame);
@@ -517,10 +509,10 @@ mod tests {
 
     #[test]
     fn every_single_bit_spool_corruption_removes_the_recovery_commit() {
-        let (artifact, segment, info, record) = fixture();
-        let mut spool = seal_replica_artifact(HostId(2), VsetId(7), 5, artifact, &segment).unwrap();
+        let (artifact, blx, info, record) = fixture();
+        let mut spool = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
         spool.extend(
-            seal_replica_commit(HostId(2), VsetId(7), 5, info, &[artifact], &record).unwrap(),
+            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap(),
         );
         for bit in 0..spool.len() * 8 {
             let mut damaged = spool.clone();

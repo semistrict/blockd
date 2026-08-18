@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use blockd_core::protocol::{AdminResult, ReqId};
-use blockd_core::types::VsetId;
+use blockd_core::types::VolumeId;
 use blockd_exec::channel::unbounded;
 use blockd_exec::{Either, Response, TaskSet, delay, now, select2};
 
@@ -11,8 +11,8 @@ pub async fn run(
     interval: u64,
     horizon: u64,
     first_request: u64,
-    mut candidates: impl FnMut() -> Vec<VsetId>,
-    mut start: impl FnMut(VsetId, ReqId) -> Option<Response<AdminResult>>,
+    mut candidates: impl FnMut() -> Vec<VolumeId>,
+    mut start: impl FnMut(VolumeId, ReqId) -> Option<Response<AdminResult>>,
 ) {
     let mut req = first_request;
     let mut actors = TaskSet::new();
@@ -26,35 +26,35 @@ pub async fn run(
         if now() >= next_cadence {
             if now() > horizon {
                 while !active.is_empty() {
-                    let Some(vset) = completions.recv().await else {
+                    let Some(volume) = completions.recv().await else {
                         return;
                     };
-                    active.remove(&vset);
+                    active.remove(&volume);
                 }
                 return;
             }
-            for vset in candidates() {
-                if !active.contains(&vset) && queued.insert(vset) {
-                    pending.push_back(vset);
+            for volume in candidates() {
+                if !active.contains(&volume) && queued.insert(volume) {
+                    pending.push_back(volume);
                 }
             }
             next_cadence = now().saturating_add(interval);
         }
         while active.len() < CONCURRENCY {
-            let Some(vset) = pending.pop_front() else {
+            let Some(volume) = pending.pop_front() else {
                 break;
             };
-            queued.remove(&vset);
+            queued.remove(&volume);
             let request = ReqId(req);
             req = req.checked_add(1).expect("checkpoint request overflow");
-            let Some(reply) = start(vset, request) else {
+            let Some(reply) = start(volume, request) else {
                 continue;
             };
-            assert!(active.insert(vset));
+            assert!(active.insert(volume));
             let completed = completed.clone();
             actors.spawn(async move {
                 let _ = reply.await;
-                let _ = completed.send(vset);
+                let _ = completed.send(volume);
             });
         }
         match select2(
@@ -63,8 +63,8 @@ pub async fn run(
         )
         .await
         {
-            Either::First(Some(vset)) => {
-                active.remove(&vset);
+            Either::First(Some(volume)) => {
+                active.remove(&volume);
             }
             Either::First(None) => return,
             Either::Second(()) => {}

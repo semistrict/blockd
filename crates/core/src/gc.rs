@@ -6,9 +6,9 @@
 //! R4.5).
 //!
 //! It can never delete a base (base roots are roots until an explicit
-//! `DeleteBase` removes them), never a live vset's state (its head roots
-//! its newest manifest and every segment that manifest references,
-//! including inherited base segments), and never anything an explicit
+//! `DeleteBase` removes them), never a live volume's state (its head roots
+//! its newest manifest and every blx that manifest references,
+//! including inherited base BLX files), and never anything an explicit
 //! delete has not unrooted. Undecodable roots are kept: GC refuses to act
 //! on anything it cannot vouch for (R8.1's spirit).
 
@@ -17,14 +17,13 @@ use std::collections::BTreeSet;
 use crate::head::HeadRecord;
 use crate::layout::{self, StoreKey};
 use crate::manifest::{BaseManifest, BaseRoot, CompleteFileList, Manifest, ObjectRef};
-use crate::types::SimTime;
 
 /// Compute the deletion list for one GC pass over a bucket listing.
 /// `objects` is the full LIST (key, last-write time, bytes); reads of
 /// manifests and base roots happen from these bytes exactly
 /// as the real process would GET them.
 #[allow(clippy::too_many_lines)]
-pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) -> Vec<String> {
+pub fn plan(now: u64, grace: u64, objects: &[(String, u64, Vec<u8>)]) -> Vec<String> {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let find = |key: &str| objects.iter().find(|(k, _, _)| k == key);
     let mut unsafe_root = false;
@@ -33,21 +32,16 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
     // everything undecodable among them (never act on what you can't read).
     for (key, _, bytes) in objects {
         match layout::parse_key(key) {
-            Some(StoreKey::Head { vset }) => {
+            Some(StoreKey::Head { volume }) => {
                 keep.insert(key);
-                // A live head roots its resume set (R6.2) — tiny, refreshed
-                // in place, and worthless the moment the head is gone.
-                if let Some((k, _, _)) = find(&layout::resume_set_key(vset)) {
-                    keep.insert(k);
-                }
-                let Ok(head) = HeadRecord::decode(vset, bytes) else {
+                let Ok(head) = HeadRecord::decode(volume, bytes) else {
                     unsafe_root = true;
                     continue;
                 };
                 let Some(ptr) = head.manifest else {
                     continue;
                 };
-                let manifest_key = layout::manifest_key(vset, ptr.fence, ptr.seq);
+                let manifest_key = ptr.manifest_key(volume);
                 let Some((key, _, manifest_bytes)) = find(&manifest_key) else {
                     unsafe_root = true;
                     continue;
@@ -57,7 +51,7 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
                     unsafe_root = true;
                     continue;
                 }
-                let Ok(manifest) = Manifest::decode(vset, manifest_bytes) else {
+                let Ok(manifest) = Manifest::decode(volume, manifest_bytes) else {
                     unsafe_root = true;
                     continue;
                 };
@@ -92,10 +86,10 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
     // and the head CAS. Once that head reaches this record (or a newer one),
     // the marker becomes ordinary garbage because the head owns the closure.
     for (key, _, bytes) in objects {
-        let Some(StoreKey::PendingManifest { vset, fence, seq }) = layout::parse_key(key) else {
+        let Some(StoreKey::PendingManifest { volume, fence, seq }) = layout::parse_key(key) else {
             continue;
         };
-        let Ok(manifest) = Manifest::decode(vset, bytes) else {
+        let Ok(manifest) = Manifest::decode(volume, bytes) else {
             keep.insert(key);
             unsafe_root = true;
             continue;
@@ -105,8 +99,8 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
             unsafe_root = true;
             continue;
         }
-        let published = find(&layout::head_key(vset)).is_some_and(|(_, _, bytes)| {
-            HeadRecord::decode(vset, bytes)
+        let published = find(&layout::head_key(volume)).is_some_and(|(_, _, bytes)| {
+            HeadRecord::decode(volume, bytes)
                 .ok()
                 .and_then(|head| head.manifest)
                 .is_some_and(|current| {
@@ -135,14 +129,14 @@ pub fn plan(now: SimTime, grace: u64, objects: &[(String, SimTime, Vec<u8>)]) ->
     objects
         .iter()
         .filter(|(key, put_at, _)| {
-            !keep.contains(key.as_str()) && now.nanos().saturating_sub(put_at.nanos()) > grace
+            !keep.contains(key.as_str()) && now.saturating_sub(*put_at) > grace
         })
         .map(|(key, _, _)| key.clone())
         .collect()
 }
 
 fn mark_manifest<'a>(
-    objects: &'a [(String, SimTime, Vec<u8>)],
+    objects: &'a [(String, u64, Vec<u8>)],
     keep: &mut BTreeSet<&'a str>,
     manifest: &Manifest,
 ) -> bool {
@@ -150,16 +144,12 @@ fn mark_manifest<'a>(
     let list = match manifest.complete_list {
         None => None,
         Some(reference) => {
-            let key = layout::complete_file_list_key(
-                manifest.vset,
-                reference.writer_fence,
-                reference.list_id,
-            );
+            let key = reference.store_key(manifest.volume);
             let Some((key, _, bytes)) = find(&key) else {
                 return false;
             };
             keep.insert(key);
-            let Ok(list) = CompleteFileList::decode(reference, manifest.vset, bytes) else {
+            let Ok(list) = CompleteFileList::decode(reference, manifest.volume, bytes) else {
                 return false;
             };
             Some(list)
@@ -190,7 +180,7 @@ fn mark_manifest<'a>(
 }
 
 fn mark_objects<'a>(
-    objects: &'a [(String, SimTime, Vec<u8>)],
+    objects: &'a [(String, u64, Vec<u8>)],
     keep: &mut BTreeSet<&'a str>,
     references: &[ObjectRef],
 ) {

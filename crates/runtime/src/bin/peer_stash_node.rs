@@ -16,18 +16,17 @@ mod linux {
     use std::sync::Arc;
 
     use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
-    use blockd_core::journal::VsetConfig;
+    use blockd_core::journal::VolumeConfig;
     use blockd_core::placement::PeerCandidate;
-    use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
+    use blockd_core::types::{HostId, PageId, PageNo, VolumeId, millis};
     use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, Runtime, RuntimeConfig};
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     use tokio::net::{TcpListener, TcpStream};
 
-    const VSET: VsetId = VsetId(1);
-    const VSET_CONFIG: VsetConfig = VsetConfig {
-        kind: blockd_core::journal::VsetKind::Compute,
-        disk_volumes: 1,
-        pages_per_volume: 64,
+    const VOLUME: VolumeId = VolumeId(1);
+    const VOLUME_CONFIG: VolumeConfig = VolumeConfig {
+        kind: blockd_core::journal::VolumeKind::Data,
+        pages: 64,
     };
 
     #[derive(Clone)]
@@ -120,10 +119,7 @@ mod linux {
 
     fn page() -> PageId {
         PageId {
-            volume: VolumeId {
-                vset: VSET,
-                idx: VolumeIdx(1),
-            },
+            volume: VOLUME,
             page: PageNo(3),
         }
     }
@@ -148,23 +144,23 @@ mod linux {
             ["PING"] => reply(&mut reply_stream, "OK").await,
             ["WRITE", value] => {
                 let value: u64 = value.parse().expect("write value");
-                runtime.guest_write(VSET, page(), value).await;
-                assert!(runtime.guest_sync(VSET, VolumeIdx(1)).await);
+                runtime.guest_write(VOLUME, page(), value).await;
+                assert!(runtime.guest_sync(VOLUME).await);
                 reply(&mut reply_stream, "OK").await;
             }
             ["READ"] => {
-                let bytes = runtime.guest_read(VSET, page()).await;
+                let bytes = runtime.guest_read(VOLUME, page()).await;
                 let value = u64::from_ne_bytes(bytes[..8].try_into().expect("word"));
                 reply(&mut reply_stream, &format!("VALUE {value}")).await;
             }
             ["METRICS"] => {
                 let counters = runtime.counters();
                 let metrics = runtime.replica_metrics();
-                let response = metrics.iter().find(|metric| metric.vset == VSET).map_or_else(
+                let response = metrics.iter().find(|metric| metric.volume == VOLUME).map_or_else(
                     || "PASSIVE".to_owned(),
                     |metric| format!(
                             "active={} transition={} epoch={} ack={} peer={} store={} queued={} \
-                             nonactive={} cleanup={} replacement={} incidents={}",
+                             nonactive={} replacement={} incidents={}",
                             metric.active_peer.map_or(-1, |host| i32::from(host.0)),
                             metric.transition_peer.map_or(-1, |host| i32::from(host.0)),
                             metric.assignment_epoch.unwrap_or(0),
@@ -173,7 +169,6 @@ mod linux {
                             metric.store_published_through,
                             metric.queued_syncs,
                             counters.replica_nonactive_bytes,
-                            counters.replica_cleanup_rewrite_bytes,
                             counters.replica_replacement_bytes,
                             runtime.incidents().len(),
                     ),
@@ -205,20 +200,20 @@ mod linux {
         }));
         let runtime_config = runtime_config(&config);
         let runtime = Arc::new(if existed {
-            let vsets = if config.primary {
-                BTreeMap::from([(VSET, VSET_CONFIG)])
+            let volumes = if config.primary {
+                BTreeMap::from([(VOLUME, VOLUME_CONFIG)])
             } else {
                 BTreeMap::new()
             };
-            let (runtime, _) = Runtime::recover(&runtime_config, store, &vsets).await;
+            let (runtime, _) = Runtime::recover(&runtime_config, store, &volumes).await;
             if config.primary {
-                let _ = runtime.wait_recovered(VSET).await;
+                let _ = runtime.wait_recovered(VOLUME).await;
             }
             runtime
         } else {
             let runtime = Runtime::new(&runtime_config, store).await;
             if config.primary {
-                runtime.create_vset(VSET, VSET_CONFIG).await;
+                runtime.create_volume(VOLUME, VOLUME_CONFIG).await;
             }
             runtime
         });

@@ -389,16 +389,16 @@ fn reclaim_by_writeback_to_disk_swaps_out_and_demand_pages_back_in() {
     uffd.register_all(&view).expect("register");
     let uffd = Arc::new(uffd);
 
-    // The "NVMe segment": a real file on persistent disk (/var/tmp, never
+    // The "NVMe blx": a real file on persistent disk (/var/tmp, never
     // tmpfs), opened O_DIRECT to keep this test's disk copy out of cache.
     // Page I/O moves straight between our aligned buffers and the device;
     // no page-cache copy of the data exists anywhere to begin with.
     let path = format!("/var/tmp/blockd-swap-test-{}", std::process::id());
-    let file = Arc::new(DirectFile::create(&path).expect("segment file"));
+    let file = Arc::new(DirectFile::create(&path).expect("blx file"));
     let swapped_out = Arc::new(AtomicBool::new(false));
 
     // Handler: before writeback, first touches are zero-fills; after the
-    // swap-out, refills read the disk segment (the store tier of R2.3).
+    // swap-out, refills read the disk blx (the store tier of R2.3).
     {
         let (region, view, uffd, file, swapped_out) = (
             region.clone(),

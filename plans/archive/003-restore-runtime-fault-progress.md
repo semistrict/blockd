@@ -23,7 +23,7 @@ work:
 
 1. A forked child can read a shared-base page, write it, diverge from its parent,
    and checkpoint without aborting or modifying the parent's bytes.
-2. One, two, and four concurrent cold-faulting vsets complete a bounded phase
+2. One, two, and four concurrent cold-faulting volumes complete a bounded phase
    repeatedly without leaving a guest blocked in userfaultfd.
 3. Eviction/refault integration completes deterministically.
 
@@ -36,7 +36,7 @@ futures `Send`.
    inherited page, writes the child, then verifies distinct parent/child bytes
    across checkpoint and refault. It must expect success and should fail before
    the fix.
-2. Add a bounded cold-fault stress regression at one and four vsets. Use guest
+2. Add a bounded cold-fault stress regression at one and four volumes. Use guest
    threads separate from the local actor thread and fail on a deadline rather
    than hanging the suite.
 3. Keep any process-abort repro in a child-process test or outside the green
@@ -51,7 +51,7 @@ futures `Send`.
 2. Update every simulator/model constructor explicitly so tests state which
    fault kind they represent.
 3. Route a write-protect fault separately from a missing/minor fault. A shared
-   page already mapped read-only must acquire the correct per-vset dirty/cache
+   page already mapped read-only must acquire the correct per-volume dirty/cache
    accounting and then use `unprotect`; it must not call `UFFDIO_CONTINUE`.
 4. Preserve copy-on-fault capture ordering, cache reservation, mutation sequence,
    pressure wakeups, and parent/child byte isolation.
@@ -71,7 +71,7 @@ futures `Send`.
 4. Check notification and cancellation races in `AsyncFd`, the critical
    injector, `TaskSet` completion accounting, and shutdown. Fix the narrow
    boundary demonstrated by the counters rather than adding polling.
-5. Prove that a fault reader cannot exit silently while its vset remains live.
+5. Prove that a fault reader cannot exit silently while its volume remains live.
 
 ## Step 4: Verification gate
 
@@ -87,7 +87,7 @@ cargo test --workspace
 ```
 
 Repeat the new progress regression at least 100 times in release mode. Then
-rerun the alternating detailed-metrics control and the 1/2/3/4-vset cold matrix.
+rerun the alternating detailed-metrics control and the 1/2/3/4-volume cold matrix.
 Do not resume Plan 001 unless all repetitions complete and Plan 002's hotspot
 and instrumentation gates are satisfied.
 
@@ -105,7 +105,7 @@ Completed on 2026-08-17 without sharding actor state, cache state, base
 residency, or mappings.
 
 - Kernel `wp` and `minor` classification now reaches the core fault actor.
-  Writing a mapped shared-base page promotes that vset to private dirty state
+  Writing a mapped shared-base page promotes that volume to private dirty state
   and clears write protection instead of attempting another continue.
 - Synthetic guest accesses leave the local actor thread before touching a
   userfaultfd mapping. The non-`Send` protocol tree now runs on one dedicated
@@ -120,11 +120,11 @@ Lima verification:
 
 - The fork read→write→checkpoint→refault regression completed 100/100 bounded
   release-mode repetitions.
-- The four-vset concurrent cold-fault regression completed 100/100 bounded
+- The four-volume concurrent cold-fault regression completed 100/100 bounded
   release-mode repetitions with balanced read/injection counters.
-- Ten consecutive realistic four-vset, 65,536-page, five-second cold profiles
+- Ten consecutive realistic four-volume, 65,536-page, five-second cold profiles
   completed; the same cell previously stalled intermittently.
-- A two-vset fork-star mixed profile completed its 30-second measured phase.
+- A two-volume fork-star mixed profile completed its 30-second measured phase.
 - All 13 Linux host-memory tests passed, including all 11 direct UFFD contract
   tests.
 - Workspace tests and clippy passed after the correctness changes.

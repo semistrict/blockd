@@ -5,8 +5,8 @@
   "description": "A restored guest parks cold demand fills during an object-store outage and converges after healing.",
   "kind": "cluster",
   "topology": {
-    "vset_count": 1,
-    "pages_per_volume": 64
+    "volume_count": 1,
+    "pages": 64
   },
   "workload": {
     "horizon": "5s"

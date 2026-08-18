@@ -21,10 +21,10 @@ done
 
 summary=$artifact_root/summary.tsv
 hotspots=$artifact_root/hotspots.tsv
-printf 'backend\tvset_count\tprovenance\tcpu_list\trepetition\tstacks\troot_count\tmax_generation\toperations_per_second\terrors\toperation_p50_upper_ns\toperation_p90_upper_ns\toperation_p99_upper_ns\toperation_p999_upper_ns\toperation_max_ns\tartifact\n' >"$summary"
-printf 'backend\tvset_count\tprovenance\tcpu_list\trepetition\toverhead\tsymbol\tartifact\n' >"$hotspots"
+printf 'backend\tvolume_count\tprovenance\tcpu_list\trepetition\tstacks\troot_count\tmax_generation\toperations_per_second\terrors\toperation_p50_upper_ns\toperation_p90_upper_ns\toperation_p99_upper_ns\toperation_p999_upper_ns\toperation_max_ns\tartifact\n' >"$summary"
+printf 'backend\tvolume_count\tprovenance\tcpu_list\trepetition\toverhead\tsymbol\tartifact\n' >"$hotspots"
 
-tail -n +2 "$index" | while IFS=$'\t' read -r backend vset_count provenance cpu_list repetition stacks run_dir; do
+tail -n +2 "$index" | while IFS=$'\t' read -r backend volume_count provenance cpu_list repetition stacks run_dir; do
     run_summary=$run_dir/runtime/summary.json
     if [[ ! -f $run_summary ]]; then
         echo "missing completed run summary: $run_summary" >&2
@@ -32,7 +32,7 @@ tail -n +2 "$index" | while IFS=$'\t' read -r backend vset_count provenance cpu_
     fi
     jq -r \
         --arg backend "$backend" \
-        --arg vset_count "$vset_count" \
+        --arg volume_count "$volume_count" \
         --arg provenance "$provenance" \
         --arg cpu_list "$cpu_list" \
         --arg repetition "$repetition" \
@@ -40,7 +40,7 @@ tail -n +2 "$index" | while IFS=$'\t' read -r backend vset_count provenance cpu_
         --arg artifact "$run_dir" \
         '[
             $backend,
-            $vset_count,
+            $volume_count,
             $provenance,
             $cpu_list,
             $repetition,
@@ -61,7 +61,7 @@ tail -n +2 "$index" | while IFS=$'\t' read -r backend vset_count provenance cpu_
     if [[ -f $perf_report ]]; then
         awk \
             -v backend="$backend" \
-            -v vsets="$vset_count" \
+            -v volumes="$volume_count" \
             -v provenance="$provenance" \
             -v cpus="$cpu_list" \
             -v repetition="$repetition" \
@@ -69,7 +69,7 @@ tail -n +2 "$index" | while IFS=$'\t' read -r backend vset_count provenance cpu_
             /^[[:space:]]*[0-9]+([.][0-9]+)?%/ {
                 overhead=$1
                 sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", $0)
-                print backend "\t" vsets "\t" provenance "\t" cpus "\t" repetition "\t" overhead "\t" $0 "\t" artifact
+                print backend "\t" volumes "\t" provenance "\t" cpus "\t" repetition "\t" overhead "\t" $0 "\t" artifact
             }
         ' "$perf_report" >>"$hotspots"
     fi

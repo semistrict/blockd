@@ -2,7 +2,7 @@
 //! list, never a replication set: callers use exactly one active target and
 //! advance only through the fenced head assignment (R6.6).
 
-use crate::types::{HostId, VsetId};
+use crate::types::{HostId, VolumeId};
 
 /// Bound configuration work and make a malicious weight unable to create an
 /// unbounded placement loop.
@@ -23,7 +23,7 @@ pub fn rank_stash_candidates(
     membership_epoch: u64,
     primary: HostId,
     primary_failure_domain: u16,
-    vset: VsetId,
+    volume: VolumeId,
     roster: &[PeerCandidate],
 ) -> Vec<HostId> {
     let has_distinct_domain = roster.iter().any(|candidate| {
@@ -44,7 +44,9 @@ pub fn rank_stash_candidates(
         .map(|candidate| {
             let tokens = candidate.weight.min(MAX_VIRTUAL_TOKENS);
             let score = (0..tokens)
-                .map(|token| placement_hash(membership_epoch, primary, vset, candidate.host, token))
+                .map(|token| {
+                    placement_hash(membership_epoch, primary, volume, candidate.host, token)
+                })
                 .max()
                 .expect("positive token count");
             (score, candidate.host)
@@ -59,7 +61,7 @@ pub fn rank_stash_candidates(
 fn placement_hash(
     membership_epoch: u64,
     primary: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     candidate: HostId,
     token: u16,
 ) -> u64 {
@@ -70,7 +72,7 @@ fn placement_hash(
         .to_le_bytes()
         .into_iter()
         .chain(primary.0.to_le_bytes())
-        .chain(vset.0.to_le_bytes())
+        .chain(volume.0.to_le_bytes())
         .chain(candidate.0.to_le_bytes())
         .chain(token.to_le_bytes())
     {
@@ -103,8 +105,8 @@ mod tests {
             drained: true,
             ..peer(4, 8, 5)
         });
-        let first = rank_stash_candidates(7, HostId(0), 1, VsetId(99), &roster);
-        let second = rank_stash_candidates(7, HostId(0), 1, VsetId(99), &roster);
+        let first = rank_stash_candidates(7, HostId(0), 1, VolumeId(99), &roster);
+        let second = rank_stash_candidates(7, HostId(0), 1, VolumeId(99), &roster);
         assert_eq!(first, second);
         assert_eq!(first.len(), 2);
         assert!(first.contains(&HostId(1)));
@@ -116,7 +118,7 @@ mod tests {
     fn a_distinct_failure_domain_is_preferred_when_available() {
         let roster = vec![peer(1, 1, 9), peer(2, 1, 10), peer(3, 1, 9)];
         assert_eq!(
-            rank_stash_candidates(1, HostId(0), 9, VsetId(1), &roster),
+            rank_stash_candidates(1, HostId(0), 9, VolumeId(1), &roster),
             vec![HostId(2)]
         );
     }
@@ -125,11 +127,14 @@ mod tests {
     fn removing_a_host_moves_only_its_assignments() {
         let roster = vec![peer(1, 1, 1), peer(2, 1, 2), peer(3, 1, 3)];
         let without_two = vec![peer(1, 1, 1), peer(3, 1, 3)];
-        for vset in 1..=2_000 {
-            let before = rank_stash_candidates(5, HostId(0), 0, VsetId(vset), &roster)[0];
-            let after = rank_stash_candidates(5, HostId(0), 0, VsetId(vset), &without_two)[0];
+        for volume in 1..=2_000 {
+            let before = rank_stash_candidates(5, HostId(0), 0, VolumeId(volume), &roster)[0];
+            let after = rank_stash_candidates(5, HostId(0), 0, VolumeId(volume), &without_two)[0];
             if before != HostId(2) {
-                assert_eq!(after, before, "unrelated assignment moved for vset {vset}");
+                assert_eq!(
+                    after, before,
+                    "unrelated assignment moved for volume {volume}"
+                );
             }
         }
     }
@@ -138,8 +143,8 @@ mod tests {
     fn virtual_tokens_apply_weight_without_creating_fanout() {
         let roster = vec![peer(1, 1, 1), peer(2, 4, 2)];
         let mut selections = [0usize; 2];
-        for vset in 1..=10_000 {
-            let ranking = rank_stash_candidates(11, HostId(0), 0, VsetId(vset), &roster);
+        for volume in 1..=10_000 {
+            let ranking = rank_stash_candidates(11, HostId(0), 0, VolumeId(volume), &roster);
             assert_eq!(
                 ranking.len(),
                 2,

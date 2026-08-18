@@ -12,7 +12,7 @@ use blockd_core::replica_recovery::{
     ReplicaRecoveryReport, ReplicaRecoveryStatus, ReplicaResidue, export_replica_recovery,
     report_replica_recovery,
 };
-use blockd_core::types::{HostId, VsetId};
+use blockd_core::types::{HostId, VolumeId};
 use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, install_replica_recovery};
 
 struct Args {
@@ -23,7 +23,7 @@ struct Args {
     prefix: String,
     source: HostId,
     peer: HostId,
-    vset: VsetId,
+    volume: VolumeId,
     residue_root: PathBuf,
     claimant: Option<HostId>,
     target: Option<PathBuf>,
@@ -33,7 +33,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: peer_stash_recover <report|install> \
          --endpoint URL --metadata-endpoint URL --bucket NAME [--prefix PREFIX] \
-         --source HOST --peer HOST --vset ID --residue-root PATH \
+         --source HOST --peer HOST --volume ID --residue-root PATH \
          [--claimant HOST --target PATH]"
     );
     std::process::exit(2)
@@ -69,7 +69,7 @@ fn parse_args() -> Args {
         prefix: values.get("--prefix").cloned().unwrap_or_default(),
         source: parse_host("--source"),
         peer: parse_host("--peer"),
-        vset: VsetId(take("--vset").parse::<u64>().unwrap_or_else(|_| usage())),
+        volume: VolumeId(take("--volume").parse::<u64>().unwrap_or_else(|_| usage())),
         residue_root: take("--residue-root").into(),
         claimant,
         target,
@@ -103,11 +103,11 @@ async fn load_residues(args: &Args) -> Vec<(u64, Vec<u8>)> {
     for (name, path) in files {
         if let Some(BlobName::ReplicaSpool {
             source,
-            vset,
+            volume,
             assignment_epoch,
             generation,
         }) = layout::parse_blob(&name)
-            && (source, vset) == (args.source, args.vset)
+            && (source, volume) == (args.source, args.volume)
         {
             generations
                 .entry(assignment_epoch)
@@ -161,11 +161,11 @@ async fn main() {
     }));
     let (head_version, head_bytes) = store
         .clone()
-        .get(layout::head_key(args.vset))
+        .get(layout::head_key(args.volume))
         .await
         .expect("head store available")
         .expect("fenced head exists");
-    let head = HeadRecord::decode(args.vset, &head_bytes).expect("fenced head decodes");
+    let head = HeadRecord::decode(args.volume, &head_bytes).expect("fenced head decodes");
     let owned = load_residues(&args).await;
     assert!(!owned.is_empty(), "no matching peer residue found");
     let residues = || {
@@ -182,7 +182,7 @@ async fn main() {
     let report = loop {
         let report = report_replica_recovery(
             args.source,
-            args.vset,
+            args.volume,
             head_version,
             &head,
             &residues(),
@@ -219,7 +219,7 @@ async fn main() {
     );
     let export = export_replica_recovery(
         args.source,
-        args.vset,
+        args.volume,
         head_version,
         &head,
         &residues(),
@@ -230,7 +230,7 @@ async fn main() {
         args.target.as_deref().expect("install target"),
         store,
         args.claimant.expect("claimant"),
-        args.vset,
+        args.volume,
         head_version,
         &export,
     )

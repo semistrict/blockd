@@ -6,7 +6,7 @@
 //! bytes before durably adopting the generation.
 
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::types::{HostId, VsetId};
+use crate::types::{HostId, VolumeId};
 
 pub const REPLICATION_FACTOR: usize = 3;
 pub const MAGIC_PLACEMENT: u32 = u32::from_le_bytes(*b"BPL1");
@@ -84,8 +84,8 @@ impl PlacementRecord {
         self.vnodes.get(usize::try_from(vnode.0).ok()?)
     }
 
-    pub fn vnode(&self, vset: VsetId) -> VnodeId {
-        vnode_for(vset, self.vnode_count)
+    pub fn vnode(&self, volume: VolumeId) -> VnodeId {
+        vnode_for(volume, self.vnode_count)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -507,9 +507,9 @@ pub fn valid_placement_transition(
     Ok(())
 }
 
-pub fn vnode_for(vset: VsetId, vnode_count: u32) -> VnodeId {
+pub fn vnode_for(volume: VolumeId, vnode_count: u32) -> VnodeId {
     assert!(vnode_count > 0, "vnode count must be positive");
-    let mut value = vset.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut value = volume.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     value ^= value >> 31;
@@ -639,9 +639,9 @@ mod tests {
 
     #[test]
     fn vnode_mapping_is_stable_and_bounded() {
-        assert_eq!(vnode_for(VsetId(1), 1024), VnodeId(193));
-        assert_eq!(vnode_for(VsetId(2), 1024), VnodeId(718));
-        assert!(vnode_for(VsetId(u64::MAX), 7).0 < 7);
+        assert_eq!(vnode_for(VolumeId(1), 1024), VnodeId(193));
+        assert_eq!(vnode_for(VolumeId(2), 1024), VnodeId(718));
+        assert!(vnode_for(VolumeId(u64::MAX), 7).0 < 7);
     }
 
     #[test]

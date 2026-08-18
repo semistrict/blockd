@@ -131,6 +131,15 @@ pub fn random_u64() -> u64 {
     })
 }
 
+pub fn random_between(low: u64, high: u64) -> u64 {
+    assert!(low <= high);
+    low + random_u64() % (high - low + 1)
+}
+
+pub fn random_hit(probability: crate::rng::Ppm) -> bool {
+    random_u64() % 1_000_000 < u64::from(probability.0)
+}
+
 pub fn fault_point(point: FaultPoint) -> bool {
     with_context(|context| {
         let mut rng = context.rng.borrow_mut();
@@ -446,20 +455,8 @@ impl SimulationContext {
         self.context.fault_hits.borrow().clone()
     }
 
-    pub fn set_fault_config(&self, config: FaultConfig) {
-        *self.context.faults.borrow_mut() = config;
-    }
-
     pub fn now(&self) -> u64 {
         now_for(&self.context)
-    }
-
-    pub fn task_count(&self) -> usize {
-        self.context.live_tasks.get()
-    }
-
-    pub fn trace_records(&self) -> u64 {
-        self.context.trace.borrow().records()
     }
 
     pub fn polls(&self) -> u64 {
@@ -486,14 +483,6 @@ pub fn simulation_trace_hash() -> u64 {
 
 pub fn simulation_polls() -> u64 {
     with_context(|context| context.poll_sequence.get())
-}
-
-pub fn simulation_fault_hits() -> BTreeMap<FaultPoint, u64> {
-    with_context(|context| context.fault_hits.borrow().clone())
-}
-
-pub fn set_simulation_fault_config(config: FaultConfig) {
-    with_context(|context| *context.faults.borrow_mut() = config);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

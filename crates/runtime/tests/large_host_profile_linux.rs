@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::protocol::Verdict;
-use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{PageId, PageNo, VolumeId};
 use blockd_runtime::{
     AtomicHistogram, FaultWorkMetrics, HistogramSnapshot, Runtime, RuntimeConfig,
 };
@@ -27,9 +27,9 @@ use serde_json::{Value, json};
 mod provenance;
 mod support;
 
-use provenance::{Provenance, Topology, VsetProvenance};
+use provenance::{Provenance, Topology, VolumeProvenance};
 
-const DEFAULT_VSET_COUNT: usize = 64;
+const DEFAULT_VOLUME_COUNT: usize = 64;
 const DEFAULT_PAGES_PER_VOLUME: u32 = 256;
 const DEFAULT_HOT_PAGES: u32 = 64;
 const DEFAULT_DURATION_SECS: u64 = 30;
@@ -41,9 +41,9 @@ const DEADLINE_CHECK_INTERVAL: u16 = 256;
 struct ProfileConfig {
     artifact_dir: PathBuf,
     provenance: Provenance,
-    pages_per_volume: u32,
+    pages: u32,
     hot_pages: u32,
-    cache_pages_per_vset: usize,
+    cache_pages: usize,
     runtime_shards: usize,
     prefault_hotset: bool,
     seed_shared_hotset: bool,
@@ -61,33 +61,30 @@ impl ProfileConfig {
         let artifact_dir = std::env::var_os("BLOCKD_PROFILE_ARTIFACT_DIR")
             .map(PathBuf::from)
             .ok_or_else(|| "BLOCKD_PROFILE_ARTIFACT_DIR must name a new directory".to_owned())?;
-        let vset_count = env_parse("BLOCKD_PROFILE_VSET_COUNT", DEFAULT_VSET_COUNT)?;
+        let volume_count = env_parse("BLOCKD_PROFILE_VOLUME_COUNT", DEFAULT_VOLUME_COUNT)?;
         let topology = std::env::var("BLOCKD_PROFILE_PROVENANCE")
             .unwrap_or_else(|_| "star".to_owned())
             .parse::<Topology>()?;
-        let provenance = Provenance::build(vset_count, &topology)?;
-        let pages_per_volume =
-            env_parse("BLOCKD_PROFILE_PAGES_PER_VOLUME", DEFAULT_PAGES_PER_VOLUME)?;
+        let provenance = Provenance::build(volume_count, &topology)?;
+        let pages = env_parse("BLOCKD_PROFILE_PAGES_PER_VOLUME", DEFAULT_PAGES_PER_VOLUME)?;
         let hot_pages = env_parse("BLOCKD_PROFILE_HOT_PAGES", DEFAULT_HOT_PAGES)?;
-        if hot_pages == 0 || hot_pages > pages_per_volume {
-            return Err(format!(
-                "hot pages must be in 1..={pages_per_volume}, got {hot_pages}"
-            ));
+        if hot_pages == 0 || hot_pages > pages {
+            return Err(format!("hot pages must be in 1..={pages}, got {hot_pages}"));
         }
-        if provenance.max_generation >= pages_per_volume {
+        if provenance.max_generation >= pages {
             return Err(format!(
-                "lineage generation {} needs more than {pages_per_volume} pages",
+                "lineage generation {} needs more than {pages} pages",
                 provenance.max_generation
             ));
         }
-        let cache_pages_per_vset = env_parse(
-            "BLOCKD_PROFILE_CACHE_PAGES_PER_VSET",
+        let cache_pages = env_parse(
+            "BLOCKD_PROFILE_CACHE_PAGES_PER_VOLUME",
             usize::try_from(hot_pages)
                 .expect("hot pages fit")
                 .saturating_mul(2),
         )?;
-        if cache_pages_per_vset == 0 {
-            return Err("cache pages per vset must be positive".to_owned());
+        if cache_pages == 0 {
+            return Err("cache pages per volume must be positive".to_owned());
         }
         let requested_runtime_shards = env_parse("BLOCKD_PROFILE_RUNTIME_SHARDS", 1usize)?;
         let runtime_shards = if requested_runtime_shards == 0 {
@@ -109,7 +106,7 @@ impl ProfileConfig {
         let refault_each_access = env_bool("BLOCKD_PROFILE_REFAULT_EACH_ACCESS", false)?;
         if !measure_roots && provenance.nodes.iter().all(|node| node.parent.is_none()) {
             return Err(
-                "BLOCKD_PROFILE_MEASURE_ROOTS=0 requires at least one forked vset".to_owned(),
+                "BLOCKD_PROFILE_MEASURE_ROOTS=0 requires at least one forked volume".to_owned(),
             );
         }
         let duration_secs = env_parse("BLOCKD_PROFILE_DURATION_SECS", DEFAULT_DURATION_SECS)?;
@@ -132,9 +129,9 @@ impl ProfileConfig {
         Ok(Self {
             artifact_dir,
             provenance,
-            pages_per_volume,
+            pages,
             hot_pages,
-            cache_pages_per_vset,
+            cache_pages,
             runtime_shards,
             prefault_hotset,
             seed_shared_hotset,
@@ -190,59 +187,59 @@ where
         .map_err(|error| format!("invalid {name}: {error}"))
 }
 
-fn page(vset: u64, page: u32) -> PageId {
+fn page(volume: u64, page: u32) -> PageId {
     PageId {
-        volume: VolumeId {
-            vset: VsetId(vset),
-            idx: VolumeIdx(1),
-        },
+        volume: VolumeId(volume),
         page: PageNo(page),
     }
 }
 
-fn marker(node: &VsetProvenance) -> u64 {
-    0xb10c_0000_0000_0000 | node.vset
+fn marker(node: &VolumeProvenance) -> u64 {
+    0xb10c_0000_0000_0000 | node.volume
 }
 
 fn shared_seed(root: u64, page_no: u32) -> u64 {
     0x5eed_0000_0000_0000 ^ root.rotate_left(19) ^ u64::from(page_no)
 }
 
-fn runtime_shard(node: &VsetProvenance, shard_count: usize) -> usize {
+fn runtime_shard(node: &VolumeProvenance, shard_count: usize) -> usize {
     usize::try_from(node.root - 1).expect("root index fits") % shard_count
 }
 
 async fn create_fleet(runtimes: &[Arc<Runtime>], config: &ProfileConfig) {
-    let vset_config = VsetConfig::compute(1, config.pages_per_volume);
+    let volume_config = VolumeConfig::data(config.pages);
     let mut prepared_bases = BTreeSet::new();
     for node in &config.provenance.nodes {
         let runtime = &runtimes[runtime_shard(node, runtimes.len())];
         eprintln!(
-            "profile setup: vset={} parent={:?} generation={}",
-            node.vset, node.parent, node.generation
+            "profile setup: volume={} parent={:?} generation={}",
+            node.volume, node.parent, node.generation
         );
         if let Some(parent) = node.parent {
             if prepared_bases.insert(parent) {
                 eprintln!("profile setup: checkpoint parent={parent}");
-                runtime.checkpoint(VsetId(parent)).await;
+                runtime.checkpoint(VolumeId(parent)).await;
                 eprintln!("profile setup: retain base={parent}");
-                runtime.keep_base(VsetId(parent), parent).await;
+                runtime.keep_base(VolumeId(parent), parent).await;
             }
-            eprintln!("profile setup: fork vset={} base={parent}", node.vset);
+            eprintln!("profile setup: fork volume={} base={parent}", node.volume);
             let verdict = runtime
-                .fork_vset(VsetId(node.vset), vset_config, parent)
+                .fork_volume(VolumeId(node.volume), volume_config, parent)
                 .await;
             assert!(
                 matches!(verdict, Verdict::Resume { .. }),
                 "fork {} from {parent} did not resume: {verdict:?}",
-                node.vset
+                node.volume
             );
             let inherited_page = config.provenance.nodes
                 [usize::try_from(parent - 1).expect("parent index fits")]
             .generation;
-            eprintln!("profile setup: verify inherited page vset={}", node.vset);
+            eprintln!(
+                "profile setup: verify inherited page volume={}",
+                node.volume
+            );
             let bytes = runtime
-                .guest_read(VsetId(node.vset), page(node.vset, inherited_page))
+                .guest_read(VolumeId(node.volume), page(node.volume, inherited_page))
                 .await;
             let inherited = u64::from_le_bytes(bytes[..8].try_into().expect("word page"));
             assert_eq!(
@@ -252,32 +249,34 @@ async fn create_fleet(runtimes: &[Arc<Runtime>], config: &ProfileConfig) {
                         [usize::try_from(parent - 1).expect("parent index fits")]
                 ),
                 "fork {} did not inherit parent {parent}'s marker",
-                node.vset
+                node.volume
             );
         } else {
-            eprintln!("profile setup: create root vset={}", node.vset);
-            runtime.create_vset(VsetId(node.vset), vset_config).await;
+            eprintln!("profile setup: create root volume={}", node.volume);
+            runtime
+                .create_volume(VolumeId(node.volume), volume_config)
+                .await;
             if config.seed_shared_hotset {
                 eprintln!(
-                    "profile setup: seed shared hot set vset={} pages={}",
-                    node.vset, config.hot_pages
+                    "profile setup: seed shared hot set volume={} pages={}",
+                    node.volume, config.hot_pages
                 );
                 for page_no in 0..config.hot_pages {
                     runtime
                         .guest_write(
-                            VsetId(node.vset),
-                            page(node.vset, page_no),
-                            shared_seed(node.vset, page_no),
+                            VolumeId(node.volume),
+                            page(node.volume, page_no),
+                            shared_seed(node.volume, page_no),
                         )
                         .await;
                 }
             }
         }
-        eprintln!("profile setup: write marker vset={}", node.vset);
+        eprintln!("profile setup: write marker volume={}", node.volume);
         runtime
             .guest_write(
-                VsetId(node.vset),
-                page(node.vset, node.generation),
+                VolumeId(node.volume),
+                page(node.volume, node.generation),
                 marker(node),
             )
             .await;
@@ -285,7 +284,7 @@ async fn create_fleet(runtimes: &[Arc<Runtime>], config: &ProfileConfig) {
     eprintln!("profile setup: fleet ready");
 }
 
-fn expected_hotset(config: &ProfileConfig, node: &VsetProvenance) -> Vec<u64> {
+fn expected_hotset(config: &ProfileConfig, node: &VolumeProvenance) -> Vec<u64> {
     let mut expected = (0..config.hot_pages)
         .map(|page_no| {
             if config.seed_shared_hotset {
@@ -409,7 +408,7 @@ fn run_worker(
     guest: &blockd_runtime::GuestAccess,
     runtime_handle: &tokio::runtime::Handle,
     config: &ProfileConfig,
-    node: &VsetProvenance,
+    node: &VolumeProvenance,
     ready: &std::sync::Barrier,
     start: &std::sync::Barrier,
     finished: &FinishGate,
@@ -417,25 +416,25 @@ fn run_worker(
     let operation = guest
         .try_begin()
         .unwrap_or_else(|| runtime_handle.block_on(guest.begin()));
-    eprintln!("profile warmup: start vset={}", node.vset);
+    eprintln!("profile warmup: start volume={}", node.volume);
     let mut expected = expected_hotset(config, node);
     if config.prefault_hotset {
         for page_no in 0..config.hot_pages {
-            let observed = operation.read_word(page(node.vset, page_no));
+            let observed = operation.read_word(page(node.volume, page_no));
             assert_eq!(
                 observed,
                 expected[usize::try_from(page_no).expect("page index fits")],
-                "initial page contents for vset {} page {page_no}",
-                node.vset
+                "initial page contents for volume {} page {page_no}",
+                node.volume
             );
         }
     }
-    eprintln!("profile warmup: ready vset={}", node.vset);
+    eprintln!("profile warmup: ready volume={}", node.volume);
     ready.wait();
     start.wait();
 
     let deadline = Instant::now() + config.duration;
-    let mut random = Lcg(config.seed ^ node.vset.rotate_left(17));
+    let mut random = Lcg(config.seed ^ node.volume.rotate_left(17));
     let mut operations = 0u64;
     let mut errors = 0u64;
     let latency = AtomicHistogram::default();
@@ -456,15 +455,15 @@ fn run_worker(
             .then(Instant::now);
         if random.next() % 1_000_000 < u64::from(config.write_ppm) {
             let value = marker(node) ^ operations.rotate_left(23) ^ u64::from(page_no);
-            operation.write_word(page(node.vset, page_no), value);
+            operation.write_word(page(node.volume, page_no), value);
             expected[index] = value;
         } else {
-            let observed = operation.read_word(page(node.vset, page_no));
+            let observed = operation.read_word(page(node.volume, page_no));
             errors += u64::from(observed != expected[index]);
         }
         if config.refault_each_access {
             operation
-                .evict_page(page(node.vset, page_no))
+                .evict_page(page(node.volume, page_no))
                 .expect("evict guest PTE for refault profile");
         }
         if let Some(started) = started {
@@ -527,9 +526,6 @@ fn runtime_snapshot(runtime: &Runtime) -> Value {
                 "operation": name,
                 "histogram": histogram_json(&histogram),
             })).collect::<Vec<_>>(),
-            "busy_ns": loop_stats.busy_ns(),
-            "idle_ns": loop_stats.idle_ns(),
-            "occupancy": loop_stats.occupancy(),
             "actor_busy_ns": loop_stats.actor_busy_ns(),
             "actor_idle_ns": loop_stats.actor_idle_ns(),
             "actor_occupancy": loop_stats.actor_occupancy(),
@@ -537,7 +533,7 @@ fn runtime_snapshot(runtime: &Runtime) -> Value {
         },
         "fault_work": fault_work_json(&runtime.fault_work_metrics()),
         "fault_latency": runtime.fault_latency().into_iter().map(|series| json!({
-            "vset": series.vset.0,
+            "volume": series.volume.0,
             "source": series.source,
             "histogram": histogram_json(&series.histogram),
         })).collect::<Vec<_>>(),
@@ -614,7 +610,7 @@ impl Drop for OwnedScratch {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "large-host performance profile; run explicitly in release mode"]
 #[allow(clippy::too_many_lines)] // one end-to-end setup, measurement, and cleanup workflow
-async fn profile_vset_scale_and_fork_provenance() {
+async fn profile_volume_scale_and_fork_provenance() {
     support::local(async {
         let config = Arc::new(ProfileConfig::from_env().expect("valid profile configuration"));
         config.prepare_artifacts().expect("new artifact directory");
@@ -624,14 +620,14 @@ async fn profile_vset_scale_and_fork_provenance() {
                 "schema": 1,
                 "profile": "runtime-lineage-faults",
                 "revision": std::env::var("BLOCKD_PROFILE_REVISION").ok(),
-                "vset_count": config.provenance.vset_count,
-                "active_vset_count": config.provenance.nodes.iter()
+                "volume_count": config.provenance.volume_count,
+                "active_volume_count": config.provenance.nodes.iter()
                     .filter(|node| config.measure_roots || node.parent.is_some())
                     .count(),
                 "fork_provenance": config.provenance,
-                "pages_per_volume": config.pages_per_volume,
+                "pages": config.pages,
                 "hot_pages": config.hot_pages,
-                "cache_pages_per_vset": config.cache_pages_per_vset,
+                "cache_pages": config.cache_pages,
                 "runtime_shards": config.runtime_shards,
                 "prefault_hotset": config.prefault_hotset,
                 "seed_shared_hotset": config.seed_shared_hotset,
@@ -674,14 +670,14 @@ async fn profile_vset_scale_and_fork_provenance() {
                     addresses,
                 )
             });
-            let shard_vsets = config
+            let shard_volumes = config
                 .provenance
                 .nodes
                 .iter()
                 .filter(|node| runtime_shard(node, config.runtime_shards) == shard)
                 .count();
-            runtime_configs[0].daemon.cache_pages = shard_vsets
-                .saturating_mul(config.cache_pages_per_vset)
+            runtime_configs[0].daemon.cache_pages = shard_volumes
+                .saturating_mul(config.cache_pages)
                 .max(1);
             passives.push(Runtime::new(&runtime_configs[1], store.clone()).await);
             passives.push(Runtime::new(&runtime_configs[2], store.clone()).await);
@@ -698,17 +694,17 @@ async fn profile_vset_scale_and_fork_provenance() {
             .filter(|node| config.measure_roots || node.parent.is_some())
             .cloned()
             .collect::<Vec<_>>();
-        let active_vset_count = measured_nodes.len();
-        let participants = active_vset_count.saturating_add(1);
+        let active_volume_count = measured_nodes.len();
+        let participants = active_volume_count.saturating_add(1);
         let ready = Arc::new(std::sync::Barrier::new(participants));
         let start = Arc::new(std::sync::Barrier::new(participants));
         let finished = Arc::new(FinishGate::default());
         let runtime_handle = tokio::runtime::Handle::current();
-        let mut workers = Vec::with_capacity(active_vset_count);
+        let mut workers = Vec::with_capacity(active_volume_count);
         for node in measured_nodes {
-            eprintln!("profile setup: spawn workload vset={}", node.vset);
+            eprintln!("profile setup: spawn workload volume={}", node.volume);
             let runtime = &runtimes[runtime_shard(&node, runtimes.len())];
-            let guest = runtime.guest_access(VsetId(node.vset));
+            let guest = runtime.guest_access(VolumeId(node.volume));
             let config = Arc::clone(&config);
             let ready = Arc::clone(&ready);
             let start = Arc::clone(&start);
@@ -756,7 +752,7 @@ async fn profile_vset_scale_and_fork_provenance() {
                 }
             })
         });
-        finished.wait_for(active_vset_count);
+        finished.wait_for(active_volume_count);
         if let Some(diagnostics) = diagnostics {
             diagnostics.abort();
         }
@@ -778,7 +774,7 @@ async fn profile_vset_scale_and_fork_provenance() {
         let operations = results.iter().map(|result| result.operations).sum::<u64>();
         let errors = results.iter().map(|result| result.errors).sum::<u64>();
         assert_eq!(errors, 0, "profile observed guest-data mismatches");
-        assert!(operations >= u64::try_from(active_vset_count).expect("vset count fits u64"));
+        assert!(operations >= u64::try_from(active_volume_count).expect("volume count fits u64"));
         let latency = aggregate_histograms(&results);
         write_json(
             &config.artifact_dir.join("runtime.json"),
@@ -787,8 +783,8 @@ async fn profile_vset_scale_and_fork_provenance() {
         write_json(
             &config.artifact_dir.join("summary.json"),
             &json!({
-                "vset_count": config.provenance.vset_count,
-                "active_vset_count": active_vset_count,
+                "volume_count": config.provenance.volume_count,
+                "active_volume_count": active_volume_count,
                 "provenance_topology": config.provenance.topology,
                 "root_count": config.provenance.roots,
                 "max_generation": config.provenance.max_generation,
@@ -826,9 +822,9 @@ fn shared_seed_expected_hotset_preserves_lineage_markers() {
     let config = ProfileConfig {
         artifact_dir: PathBuf::from("unused"),
         provenance,
-        pages_per_volume: 8,
+        pages: 8,
         hot_pages: 8,
-        cache_pages_per_vset: 8,
+        cache_pages: 8,
         runtime_shards: 1,
         prefault_hotset: false,
         seed_shared_hotset: true,

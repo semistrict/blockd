@@ -12,8 +12,8 @@
   },
   "topology": {
     "hosts": { "uniform": { "min": 3, "max": 5 } },
-    "vset_count": { "uniform": { "min": 3, "max": 6 } },
-    "pages_per_volume": { "uniform": { "min": 8, "max": 24 } }
+    "volume_count": { "uniform": { "min": 3, "max": 6 } },
+    "pages": { "uniform": { "min": 8, "max": 24 } }
   },
   "workload": {
     "think": {

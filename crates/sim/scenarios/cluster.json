@@ -24,9 +24,9 @@
   },
   "topology": {
     "hosts": 3,
-    "vset_count": 3,
-    "disk_volumes": 2,
-    "pages_per_volume": 16,
+    "volume_count": 3,
+    "volume_kind": "data",
+    "pages": 16,
     "replica_placement": null
   },
   "workload": {

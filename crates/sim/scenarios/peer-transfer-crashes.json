@@ -4,7 +4,7 @@
   "name": "peer-transfer-crashes",
   "description": "Crash each recovery-closure capture, transfer, and durable passive flush boundary.",
   "kind": "cluster",
-  "topology": { "vset_count": 1 },
+  "topology": { "volume_count": 1 },
   "workload": { "horizon": "6s" },
   "nemeses": {
     "restart_delay": { "min": "10ms", "max": "20ms" },

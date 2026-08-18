@@ -9,47 +9,48 @@ use std::time::Duration;
 
 use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{AdminCall, AdminError, AdminEvent, AdminSuccess, ReqId};
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, page_size};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, page_size};
 use blockd_exec::channel::unbounded;
 use blockd_exec::rng::Ppm;
 use blockd_exec::{
     Either, FaultConfig, OneOf3, SimulationContext, TaskHandle, TaskId, TaskSet, delay, now,
-    random_u64, select2, select3, simulation_polls, simulation_trace_hash, spawn, yield_now,
+    random_between, random_hit, random_u64, select2, select3, simulation_polls,
+    simulation_trace_hash, spawn, yield_now,
 };
 use blockd_workload::{
     LogicalPage, Operation, Program, WorkloadModel, WorkloadOutcome, WorkloadSpec,
 };
 
-use crate::actor_world::{OracleSnapshot, SimWorld};
 use crate::guest::page_pattern;
 use crate::model::{BlobDevConfig, StoreConfig, StoreCounters};
 use crate::peer_transport::{PeerTransport, PeerTransportFaults, PeerTransportStats};
+use crate::world::{OracleSnapshot, SimWorld};
 
 #[derive(Clone, Debug)]
-pub struct ActorHarnessConfig {
+pub struct HarnessConfig {
     pub host: HostConfig,
     /// Optional capacity override for the passive host. When absent, the
     /// passive inherits the primary's device capacity.
     pub passive_disk_capacity: Option<u64>,
     pub blobs: BlobDevConfig,
     pub store: StoreConfig,
-    pub vset_count: u16,
-    pub vset: VsetConfig,
+    pub volume_count: u16,
+    pub volume: VolumeConfig,
     pub horizon: u64,
     pub think: (u64, u64),
     pub sync_share: Option<Ppm>,
     pub hot_pages: Option<(Ppm, u32)>,
     pub checkpoint_interval: Option<u64>,
-    pub faults: ActorFaultPlan,
+    pub faults: FaultPlan,
     pub corrupt_fills: bool,
     pub drop_write_protect: bool,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ActorFaultPlan {
+pub struct FaultPlan {
     pub crash_mean_interval: u64,
     pub crash_at: Vec<u64>,
     pub restart_delay: (u64, u64),
@@ -59,7 +60,7 @@ pub struct ActorFaultPlan {
     pub rot_records_at: Vec<(u64, bool)>,
 }
 
-impl ActorFaultPlan {
+impl FaultPlan {
     pub fn none() -> Self {
         Self {
             restart_delay: (
@@ -72,7 +73,7 @@ impl ActorFaultPlan {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ActorRunReport {
+pub struct RunReport {
     pub trace_hash: u64,
     pub actor_polls: u64,
     pub violations: Vec<String>,
@@ -82,16 +83,16 @@ pub struct ActorRunReport {
     pub blob_count: usize,
     pub store_keys: Vec<String>,
     pub store: StoreCounters,
-    pub published_segment_bytes: u64,
+    pub published_blx_bytes: u64,
     pub published_live_entry_bytes: u64,
     pub published_dead_entry_bytes: u64,
-    pub published_segment_overhead_bytes: u64,
-    pub map_bytes_written: u64,
+    pub published_blx_overhead_bytes: u64,
+    pub journal_bytes_written: u64,
     pub max_page_reads_in_poll: u64,
     pub max_pause_ns: u64,
     pub max_record_blob_bytes: u64,
-    pub seg_bytes_end: u64,
-    pub seg_live_bytes_end: u64,
+    pub blx_bytes_end: u64,
+    pub blx_live_bytes_end: u64,
     pub parked_end: usize,
     pub crashes: u64,
     pub resumes: u64,
@@ -101,10 +102,6 @@ pub struct ActorRunReport {
     pub guest_deaths: u64,
     pub bitflips: u64,
 }
-
-pub use ActorFaultPlan as FaultPlan;
-pub use ActorHarnessConfig as HarnessConfig;
-pub use ActorRunReport as RunReport;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct WorkloadRunReport {
@@ -156,7 +153,6 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
         checkpoints_done,
         syncs_acked,
         guest_rejected,
-        peer_rejected,
         blobs_deleted,
         manifests_published,
         store_retries,
@@ -165,14 +161,13 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
         assignment_claim_conflicts,
         nvme_reclaims,
         nvme_stalls,
-        prefetch_fills,
         hydrate_fills,
         peer_retries,
         cow_captures,
         wedged_guests,
         wedged_hydration,
         wedged_outbound,
-        segs_compacted,
+        blx_files_compacted,
         pages_compacted,
         replica_bytes,
         replica_rejected,
@@ -182,7 +177,6 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
         replica_logical_bytes,
         replica_nonactive_bytes,
         replica_replacement_bytes,
-        replica_cleanup_rewrite_bytes,
         replica_artifact_flushes,
         replica_commit_flushes,
         replica_rotations,
@@ -193,7 +187,7 @@ fn merge_counters(total: &mut Counters, current: &Counters) {
 type SharedHostState = Rc<RefCell<HostState>>;
 type HostSlot = Rc<RefCell<Option<TaskHandle<()>>>>;
 type StateSlot = Rc<RefCell<SharedHostState>>;
-type GuestSlots = Rc<RefCell<BTreeMap<VsetId, Option<TaskHandle<()>>>>>;
+type GuestSlots = Rc<RefCell<BTreeMap<VolumeId, Option<TaskHandle<()>>>>>;
 const RECOVERY_CONCURRENCY: usize = 32;
 const RECOVERY_QUEUE_CAPACITY: usize = 1_024;
 #[cfg(test)]
@@ -208,7 +202,7 @@ struct HarnessPair {
 }
 
 impl HarnessPair {
-    fn new(config: &mut ActorHarnessConfig) -> Self {
+    fn new(config: &mut HarnessConfig) -> Self {
         let primary = config.host.host;
         let passive = HostId(primary.0 ^ u16::MAX);
         config.host.replica_placement = harness_placement(primary, passive);
@@ -237,20 +231,20 @@ struct RecoveryWork {
 
 struct RecoveryContext {
     world: Rc<SimWorld>,
-    guest_states: Rc<BTreeMap<VsetId, Rc<GuestState>>>,
+    guest_states: Rc<BTreeMap<VolumeId, Rc<GuestState>>>,
     guest_slots: GuestSlots,
     events: Rc<RunEvents>,
-    config: ActorHarnessConfig,
+    config: HarnessConfig,
 }
 
 enum RecoverySupervisorEvent {
-    Completed(Option<(VsetId, u64, Option<RecoveryWork>)>),
+    Completed(Option<(VolumeId, u64, Option<RecoveryWork>)>),
     Ingress(Option<(AdminEvent, u64)>),
     RetryReady,
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
-pub fn run(seed: u64, config: ActorHarnessConfig) -> ActorRunReport {
+pub fn run(seed: u64, config: HarnessConfig) -> RunReport {
     run_final_blobs(seed, config).0
 }
 
@@ -369,14 +363,10 @@ async fn yield_ready() {
 /// model implementations and the report exposes actor polls plus the
 /// maximum number of guest-page reads performed by any single poll.
 #[allow(clippy::needless_pass_by_value)]
-pub fn run_capture_profile(
-    seed: u64,
-    mut config: ActorHarnessConfig,
-    dirty_pages: u32,
-) -> ActorRunReport {
+pub fn run_capture_profile(seed: u64, mut config: HarnessConfig, dirty_pages: u32) -> RunReport {
     assert!(dirty_pages != 0, "capture profile needs dirty pages");
-    config.vset_count = 1;
-    config.vset = VsetConfig::compute(1, dirty_pages);
+    config.volume_count = 1;
+    config.volume = VolumeConfig::data(dirty_pages);
     let horizon = config.horizon;
     let pair = HarnessPair::new(&mut config);
     let future = run_capture_profile_inner(
@@ -390,17 +380,17 @@ pub fn run_capture_profile(
 }
 
 async fn run_capture_profile_inner(
-    config: ActorHarnessConfig,
+    config: HarnessConfig,
     dirty_pages: u32,
     world: Rc<SimWorld>,
     passive_world: Rc<SimWorld>,
     passive_state: SharedHostState,
-) -> ActorRunReport {
+) -> RunReport {
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
-    let vset = VsetId(1);
-    let create = world.request_admin(AdminCall::CreateVset {
-        vset,
-        config: config.vset,
+    let volume = VolumeId(1);
+    let create = world.request_admin(AdminCall::CreateVolume {
+        volume,
+        config: config.volume,
         from_base: None,
     });
 
@@ -420,20 +410,17 @@ async fn run_capture_profile_inner(
     assert!(
         matches!(
             created,
-            Some(Ok(AdminSuccess::VsetCreated {
-                vset: VsetId(1),
+            Some(Ok(AdminSuccess::VolumeCreated {
+                volume: VolumeId(1),
                 ..
             }))
         ),
-        "capture-profile vset creation failed: {created:?}"
+        "capture-profile volume creation failed: {created:?}"
     );
 
     for number in 0..dirty_pages {
         let page = PageId {
-            volume: VolumeId {
-                vset,
-                idx: VolumeIdx(1),
-            },
+            volume,
             page: PageNo(number),
         };
         let served = {
@@ -462,8 +449,8 @@ async fn run_capture_profile_inner(
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run_final_blobs(
     seed: u64,
-    mut config: ActorHarnessConfig,
-) -> (ActorRunReport, Vec<(String, Vec<u8>)>) {
+    mut config: HarnessConfig,
+) -> (RunReport, Vec<(String, Vec<u8>)>) {
     let horizon = config.horizon;
     let pair = HarnessPair::new(&mut config);
     let future = run_final_blobs_inner(
@@ -477,11 +464,11 @@ pub fn run_final_blobs(
 
 #[allow(clippy::too_many_lines)]
 async fn run_final_blobs_inner(
-    mut config: ActorHarnessConfig,
+    mut config: HarnessConfig,
     world: Rc<SimWorld>,
     passive_world: Rc<SimWorld>,
     passive_state: SharedHostState,
-) -> (ActorRunReport, Vec<(String, Vec<u8>)>) {
+) -> (RunReport, Vec<(String, Vec<u8>)>) {
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
@@ -490,30 +477,30 @@ async fn run_final_blobs_inner(
         Rc::clone(&state),
         Rc::clone(&world),
     )))));
-    let creates = (1..=config.vset_count)
+    let creates = (1..=config.volume_count)
         .map(|number| {
-            let vset = VsetId(u64::from(number));
-            let reply = world.request_admin(AdminCall::CreateVset {
-                vset,
-                config: config.vset,
+            let volume = VolumeId(u64::from(number));
+            let reply = world.request_admin(AdminCall::CreateVolume {
+                volume,
+                config: config.volume,
                 from_base: None,
             });
-            (vset, reply)
+            (volume, reply)
         })
         .collect::<Vec<_>>();
     {
         let world = Rc::clone(&world);
         let passive_world = Rc::clone(&passive_world);
         async move {
-            for (expected_vset, reply) in creates {
+            for (expected_volume, reply) in creates {
                 match select3(reply, world.next_abort(), passive_world.next_abort()).await {
-                    OneOf3::First(Ok(Ok(AdminSuccess::VsetCreated { vset })))
-                        if vset == expected_vset => {}
+                    OneOf3::First(Ok(Ok(AdminSuccess::VolumeCreated { volume })))
+                        if volume == expected_volume => {}
                     OneOf3::First(Ok(Err(error))) => {
-                        panic!("vset creation failed: {error:?}")
+                        panic!("volume creation failed: {error:?}")
                     }
                     OneOf3::First(reply) => {
-                        panic!("unexpected vset creation reply: {reply:?}")
+                        panic!("unexpected volume creation reply: {reply:?}")
                     }
                     OneOf3::Second(reason) => {
                         panic!("primary aborted during creation: {reason:?}")
@@ -543,31 +530,31 @@ async fn run_final_blobs_inner(
     passive_world.set_blob_fault_epoch(workload_start);
 
     let guest_states = Rc::new(
-        (1..=config.vset_count)
-            .map(|number| (VsetId(u64::from(number)), Rc::new(GuestState::default())))
+        (1..=config.volume_count)
+            .map(|number| (VolumeId(u64::from(number)), Rc::new(GuestState::default())))
             .collect::<BTreeMap<_, _>>(),
     );
-    for (&vset, guest) in guest_states.iter() {
+    for (&volume, guest) in guest_states.iter() {
         world.register_oracle_pages(
-            vset,
+            volume,
             Rc::clone(&guest.expected),
             Rc::clone(&guest.recovering_pages),
         );
-        world.set_vmstate(vset, 0);
+        world.set_vmstate(volume, 0);
     }
     let events = Rc::new(RunEvents::default());
     let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
-    for number in 1..=config.vset_count {
-        let vset = VsetId(u64::from(number));
+    for number in 1..=config.volume_count {
+        let volume = VolumeId(u64::from(number));
         let guest_config = config.clone();
         let guest = spawn(guest_actor(
             Rc::clone(&world),
-            Rc::clone(&guest_states[&vset]),
+            Rc::clone(&guest_states[&volume]),
             Rc::clone(&events),
-            vset,
+            volume,
             guest_config,
         ));
-        guest_slots.borrow_mut().insert(vset, Some(guest));
+        guest_slots.borrow_mut().insert(volume, Some(guest));
     }
 
     let mut supervisor = spawn(recovery_supervisor(
@@ -624,7 +611,7 @@ async fn run_final_blobs_inner(
             Rc::clone(&world),
             interval,
             config.horizon,
-            config.vset_count,
+            config.volume_count,
         )));
     }
 
@@ -657,12 +644,12 @@ async fn run_final_blobs_inner(
     merge_counters(&mut counters, &final_state.borrow().counters);
     merge_counters(&mut counters, &passive_state.borrow().counters);
     let (
-        published_segment_bytes,
+        published_blx_bytes,
         published_live_entry_bytes,
         published_dead_entry_bytes,
-        published_segment_overhead_bytes,
+        published_blx_overhead_bytes,
     ) = world.published_archive_metrics();
-    let mut report = ActorRunReport {
+    let mut report = RunReport {
         trace_hash: simulation_trace_hash(),
         actor_polls: simulation_polls(),
         counters,
@@ -672,16 +659,16 @@ async fn run_final_blobs_inner(
             .sum(),
         per_guest_completed: guest_states
             .iter()
-            .map(|(vset, guest)| (vset.0, guest.total_completed.get()))
+            .map(|(volume, guest)| (volume.0, guest.total_completed.get()))
             .collect(),
         blob_count: blobs.len(),
         store_keys: world.store_keys(),
         store: world.store_metrics(),
-        published_segment_bytes,
+        published_blx_bytes,
         published_live_entry_bytes,
         published_dead_entry_bytes,
-        published_segment_overhead_bytes,
-        seg_live_bytes_end: final_state.borrow().seg_space().0,
+        published_blx_overhead_bytes,
+        blx_live_bytes_end: final_state.borrow().blx_space().0,
         parked_end: final_state.borrow().stats().pressure_waiting_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
         max_pause_ns: world.max_pause_ns(),
@@ -692,18 +679,18 @@ async fn run_final_blobs_inner(
         restores: events.restores.get(),
         guest_deaths: events.guest_deaths.get(),
         bitflips: world.bitflips(),
-        ..ActorRunReport::default()
+        ..RunReport::default()
     };
     for guest in guest_states.values() {
         report
             .violations
             .extend(std::mem::take(&mut *guest.violations.borrow_mut()));
     }
-    (report.map_bytes_written, report.max_record_blob_bytes) = world.write_metrics();
+    (report.journal_bytes_written, report.max_record_blob_bytes) = world.write_metrics();
     for (name, bytes) in &blobs {
         let extension = Path::new(name).extension().and_then(|value| value.to_str());
-        if let Some("seg") = extension {
-            report.seg_bytes_end = report.seg_bytes_end.saturating_add(bytes.len() as u64);
+        if let Some("object") = extension {
+            report.blx_bytes_end = report.blx_bytes_end.saturating_add(bytes.len() as u64);
         }
     }
     if let Some(mut host) = host_slot.borrow_mut().take() {
@@ -746,9 +733,9 @@ fn harness_passive_config(primary: &HostConfig, passive: HostId) -> HostConfig {
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn run_workload_parts(
     seed: u64,
-    mut config: ActorHarnessConfig,
+    mut config: HarnessConfig,
     spec: WorkloadSpec,
-) -> Result<(ActorRunReport, WorkloadOutcome), String> {
+) -> Result<(RunReport, WorkloadOutcome), String> {
     let horizon = config.horizon;
     let pair = HarnessPair::new(&mut config);
     let future = run_workload_inner(
@@ -776,52 +763,72 @@ pub fn run_workload(
 
 #[allow(clippy::too_many_lines)]
 async fn run_workload_inner(
-    config: ActorHarnessConfig,
+    mut config: HarnessConfig,
     spec: WorkloadSpec,
     world: Rc<SimWorld>,
     passive_world: Rc<SimWorld>,
     passive_state: SharedHostState,
-) -> Result<(ActorRunReport, WorkloadOutcome), String> {
+) -> Result<(RunReport, WorkloadOutcome), String> {
     spec.validate().map_err(|error| error.to_string())?;
-    if config.vset_count != 1 {
-        return Err("scripted workloads require exactly one vset".to_owned());
+    let expected_volume_count = u16::from(spec.shape.disk_volumes) + 1;
+    if config.volume_count != expected_volume_count {
+        return Err(format!(
+            "scripted workload requires {expected_volume_count} individual volumes"
+        ));
     }
     world.set_corrupt_fills(config.corrupt_fills);
     world.set_drop_write_protect(config.drop_write_protect);
-    let vset = VsetId(1);
-    let create = world.request_admin(AdminCall::CreateVset {
-        vset,
-        config: config.vset,
-        from_base: None,
-    });
+    let memory_volume = scripted_volume(0);
+    let volume_configs = (0..=spec.shape.disk_volumes)
+        .map(|index| {
+            let config = if index == 0 {
+                VolumeConfig::memory(spec.shape.pages)
+            } else {
+                VolumeConfig::data(spec.shape.pages)
+            };
+            (scripted_volume(index), config)
+        })
+        .collect::<BTreeMap<_, _>>();
     let state = Rc::new(RefCell::new(HostState::new(config.host.clone())));
     let state_slot = Rc::new(RefCell::new(Rc::clone(&state)));
     let host_slot = Rc::new(RefCell::new(Some(spawn(host_actor_with_state(
         Rc::clone(&state),
         Rc::clone(&world),
     )))));
-    let created = {
-        let world = Rc::clone(&world);
-        let passive_world = Rc::clone(&passive_world);
-        async move {
-            match select3(create, world.next_abort(), passive_world.next_abort()).await {
-                OneOf3::First(reply) => reply.ok(),
-                OneOf3::Second(reason) => panic!("primary aborted during creation: {reason:?}"),
-                OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
-            }
+    for (&volume, &volume_config) in &volume_configs {
+        let create = world.request_admin(AdminCall::CreateVolume {
+            volume,
+            config: volume_config,
+            from_base: None,
+        });
+        let created = match select3(create, world.next_abort(), passive_world.next_abort()).await {
+            OneOf3::First(reply) => reply.ok(),
+            OneOf3::Second(reason) => panic!("primary aborted during creation: {reason:?}"),
+            OneOf3::Third(reason) => panic!("passive aborted during creation: {reason:?}"),
+        };
+        if !matches!(
+            created,
+            Some(Ok(AdminSuccess::VolumeCreated { volume: created, .. })) if created == volume
+        ) {
+            return Err(format!("volume {volume:?} creation failed: {created:?}"));
         }
     }
-    .await;
-    if !matches!(
-        created,
-        Some(Ok(AdminSuccess::VsetCreated {
-            vset: VsetId(1),
-            ..
-        }))
-    ) {
-        return Err(format!("vset creation failed: {created:?}"));
+    world.set_vmstate(memory_volume, 0);
+
+    let workload_start = now();
+    config.horizon = workload_start.saturating_add(config.horizon);
+    for at in &mut config.faults.crash_at {
+        *at = workload_start.saturating_add(*at);
     }
-    world.set_vmstate(vset, 0);
+    if let Some((start, stop)) = config.faults.store_outage.as_mut() {
+        *start = workload_start.saturating_add(*start);
+        *stop = workload_start.saturating_add(*stop);
+    }
+    for (at, _) in &mut config.faults.rot_records_at {
+        *at = workload_start.saturating_add(*at);
+    }
+    world.set_blob_fault_epoch(workload_start);
+    passive_world.set_blob_fault_epoch(workload_start);
 
     let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
     let events = Rc::new(RunEvents::default());
@@ -871,7 +878,7 @@ async fn run_workload_inner(
             Rc::clone(&world),
             interval,
             config.horizon,
-            1,
+            expected_volume_count,
         )));
     }
 
@@ -910,10 +917,7 @@ async fn run_workload_inner(
                         world
                             .sync(blockd_core::world::GuestSync {
                                 req: ReqId(next_req),
-                                volume: VolumeId {
-                                    vset,
-                                    idx: VolumeIdx(volume),
-                                },
+                                volume: scripted_volume(volume),
                             })
                             .await
                     }
@@ -925,12 +929,17 @@ async fn run_workload_inner(
                 }
             }
             Operation::Checkpoint => {
-                let req = ReqId(next_req);
-                next_req = next_req.checked_add(1).expect("script request overflow");
-                let reply = world.request_admin(AdminCall::Checkpoint { retry: req, vset });
-                let reply = reply.await;
-                if !matches!(reply, Ok(Ok(AdminSuccess::CheckpointDone { .. }))) {
-                    return Err("scripted checkpoint failed".to_owned());
+                for &volume in volume_configs.keys() {
+                    let req = ReqId(next_req);
+                    next_req = next_req.checked_add(1).expect("script request overflow");
+                    let reply = world
+                        .request_admin(AdminCall::Checkpoint { retry: req, volume })
+                        .await;
+                    if !matches!(reply, Ok(Ok(AdminSuccess::CheckpointDone { .. }))) {
+                        return Err(format!(
+                            "scripted checkpoint for {volume:?} failed: {reply:?}"
+                        ));
+                    }
                 }
             }
             Operation::Crash => {
@@ -942,6 +951,7 @@ async fn run_workload_inner(
                         &mut events.retired_counters.borrow_mut(),
                         &state_slot.borrow().borrow().counters,
                     );
+                    world.advance_incarnation();
                     let _ = world.crash_pending();
                     world.crash_guest_io();
                     events.crashes.set(events.crashes.get().saturating_add(1));
@@ -957,14 +967,23 @@ async fn run_workload_inner(
             }
             Operation::Restore => {
                 let deadline = now().saturating_add(1_000_000_000);
-                let verdict = loop {
+                let mut pending = volume_configs.keys().copied().collect::<BTreeSet<_>>();
+                let mut memory_verdict = None;
+                while !pending.is_empty() {
                     match world.try_next_admin_event() {
-                        Some(AdminEvent::VsetRecovered {
-                            vset: VsetId(1),
-                            verdict,
-                        }) => break Some(verdict),
+                        Some(AdminEvent::VolumeRecovered { volume, verdict })
+                            if pending.remove(&volume) =>
+                        {
+                            if volume == memory_volume {
+                                memory_verdict = Some(verdict);
+                            } else if !matches!(verdict, blockd_core::protocol::Verdict::ColdBoot) {
+                                return Err(format!(
+                                    "data volume {volume:?} recovered with {verdict:?}"
+                                ));
+                            }
+                        }
                         Some(_) => {}
-                        None if now() >= deadline => break None,
+                        None if now() >= deadline => break,
                         None => {
                             delay(
                                 deadline
@@ -974,26 +993,29 @@ async fn run_workload_inner(
                             .await;
                         }
                     }
-                };
-                match verdict {
+                }
+                if !pending.is_empty() {
+                    return Err(format!("scripted recovery omitted volumes: {pending:?}"));
+                }
+                match memory_verdict {
                     Some(blockd_core::protocol::Verdict::Resume {
                         vmstate: recovered, ..
                     }) => {
                         resumes = resumes.saturating_add(1);
                         vmstate = recovered;
-                        world.set_vmstate(vset, vmstate);
+                        world.set_vmstate(memory_volume, vmstate);
                     }
                     Some(blockd_core::protocol::Verdict::ColdBoot) => {
                         cold_boots = cold_boots.saturating_add(1);
                         vmstate = 0;
-                        world.set_vmstate(vset, vmstate);
+                        world.set_vmstate(memory_volume, vmstate);
                     }
                     Some(blockd_core::protocol::Verdict::Unrestorable) => {
                         return Err("scripted recovery was unrestorable".to_owned());
                     }
                     None => {
                         return Err(format!(
-                            "scripted recovery returned no compute verdict (abort={:?})",
+                            "scripted recovery returned no memory verdict (abort={:?})",
                             world.abort_reason()
                         ));
                     }
@@ -1017,7 +1039,7 @@ async fn run_workload_inner(
                 | Operation::Verify { .. }
         ) {
             vmstate = vmstate.saturating_add(1);
-            world.set_vmstate(vset, vmstate);
+            world.set_vmstate(memory_volume, vmstate);
         }
     }
     for mut actor in fault_actors {
@@ -1045,7 +1067,9 @@ async fn run_workload_inner(
     report.unrestorable = unrestorable;
     let outcome = model.outcome(&spec.name);
     report.completed_ops = outcome.completed;
-    report.per_guest_completed.insert(vset.0, outcome.completed);
+    report
+        .per_guest_completed
+        .insert(memory_volume.0, outcome.completed);
     if let Some(mut host) = host_slot.borrow_mut().take() {
         host.cancel();
     }
@@ -1098,48 +1122,49 @@ async fn scripted_write(
 
 fn scripted_page(logical: LogicalPage) -> PageId {
     PageId {
-        volume: VolumeId {
-            vset: VsetId(1),
-            idx: VolumeIdx(logical.volume),
-        },
+        volume: scripted_volume(logical.volume),
         page: PageNo(logical.page),
     }
+}
+
+fn scripted_volume(logical: u8) -> VolumeId {
+    VolumeId(u64::from(logical) + 1)
 }
 
 fn report_from_state(
     world: &SimWorld,
     state: &SharedHostState,
     blobs: &[(String, Vec<u8>)],
-) -> ActorRunReport {
+) -> RunReport {
     let (
-        published_segment_bytes,
+        published_blx_bytes,
         published_live_entry_bytes,
         published_dead_entry_bytes,
-        published_segment_overhead_bytes,
+        published_blx_overhead_bytes,
     ) = world.published_archive_metrics();
-    let mut report = ActorRunReport {
+    let mut report = RunReport {
         trace_hash: simulation_trace_hash(),
         actor_polls: simulation_polls(),
         counters: state.borrow().counters,
         blob_count: blobs.len(),
         store_keys: world.store_keys(),
         store: world.store_metrics(),
-        published_segment_bytes,
+        published_blx_bytes,
         published_live_entry_bytes,
         published_dead_entry_bytes,
-        published_segment_overhead_bytes,
-        seg_live_bytes_end: state.borrow().seg_space().0,
+        published_blx_overhead_bytes,
+        blx_live_bytes_end: state.borrow().blx_space().0,
         parked_end: state.borrow().stats().pressure_waiting_faults,
         max_page_reads_in_poll: world.max_page_reads_in_poll(),
         max_pause_ns: world.max_pause_ns(),
         bitflips: world.bitflips(),
-        ..ActorRunReport::default()
+        ..RunReport::default()
     };
-    (report.map_bytes_written, report.max_record_blob_bytes) = world.write_metrics();
+    (report.journal_bytes_written, report.max_record_blob_bytes) = world.write_metrics();
     for (name, bytes) in blobs {
         let extension = Path::new(name).extension().and_then(|value| value.to_str());
-        if let Some("seg") = extension {
-            report.seg_bytes_end = report.seg_bytes_end.saturating_add(bytes.len() as u64);
+        if let Some("object") = extension {
+            report.blx_bytes_end = report.blx_bytes_end.saturating_add(bytes.len() as u64);
         }
     }
     report
@@ -1148,25 +1173,25 @@ fn report_from_state(
 #[allow(clippy::too_many_lines)]
 async fn recovery_supervisor(
     world: Rc<SimWorld>,
-    guest_states: Rc<BTreeMap<VsetId, Rc<GuestState>>>,
+    guest_states: Rc<BTreeMap<VolumeId, Rc<GuestState>>>,
     guest_slots: GuestSlots,
     events: Rc<RunEvents>,
-    config: ActorHarnessConfig,
+    config: HarnessConfig,
 ) {
     let mut actors = TaskSet::new();
     let (completed, mut completions) = unbounded();
-    let mut active = BTreeMap::<VsetId, (u64, TaskId)>::new();
-    let mut pending = BTreeMap::<VsetId, (u64, RecoveryWork)>::new();
+    let mut active = BTreeMap::<VolumeId, (u64, TaskId)>::new();
+    let mut pending = BTreeMap::<VolumeId, (u64, RecoveryWork)>::new();
     let mut ingress_open = true;
     let retry_delay = config.host.backup_retry.max(1);
     loop {
         while active.len() < RECOVERY_CONCURRENCY {
-            let Some(vset) = pending.iter().find_map(|(&vset, (ready_at, _))| {
-                (*ready_at <= now() && !active.contains_key(&vset)).then_some(vset)
+            let Some(volume) = pending.iter().find_map(|(&volume, (ready_at, _))| {
+                (*ready_at <= now() && !active.contains_key(&volume)).then_some(volume)
             }) else {
                 break;
             };
-            let (_, work) = pending.remove(&vset).expect("selected recovery event");
+            let (_, work) = pending.remove(&volume).expect("selected recovery event");
             let completed = completed.clone();
             let context = RecoveryContext {
                 world: Rc::clone(&world),
@@ -1176,7 +1201,7 @@ async fn recovery_supervisor(
                 config: config.clone(),
             };
             let generation = work.generation;
-            if world.admin_event_generation(vset) != generation {
+            if world.admin_event_generation(volume) != generation {
                 yield_now().await;
                 continue;
             }
@@ -1184,9 +1209,9 @@ async fn recovery_supervisor(
                 let retry =
                     handle_recovery_event(context, work.event, work.count_unrestorable, generation)
                         .await;
-                let _ = completed.send((vset, generation, retry));
+                let _ = completed.send((volume, generation, retry));
             });
-            active.insert(vset, (generation, task));
+            active.insert(volume, (generation, task));
         }
         if !ingress_open && active.is_empty() && pending.is_empty() {
             return;
@@ -1195,7 +1220,7 @@ async fn recovery_supervisor(
         let wait_for_retry = if active.len() < RECOVERY_CONCURRENCY {
             pending
                 .iter()
-                .filter(|(vset, _)| !active.contains_key(vset))
+                .filter(|(volume, _)| !active.contains_key(volume))
                 .map(|(_, (ready_at, _))| ready_at.saturating_sub(now()))
                 .min()
                 .unwrap_or(u64::MAX)
@@ -1221,32 +1246,32 @@ async fn recovery_supervisor(
             }
         };
         match event {
-            RecoverySupervisorEvent::Completed(Some((vset, generation, retry))) => {
+            RecoverySupervisorEvent::Completed(Some((volume, generation, retry))) => {
                 if active
-                    .get(&vset)
+                    .get(&volume)
                     .is_some_and(|(active_generation, _)| *active_generation == generation)
                 {
-                    active.remove(&vset);
-                    if world.admin_event_generation(vset) == generation
+                    active.remove(&volume);
+                    if world.admin_event_generation(volume) == generation
                         && let Some(work) = retry
                     {
                         pending
-                            .entry(vset)
+                            .entry(volume)
                             .or_insert((now().saturating_add(retry_delay), work));
                     }
                 }
             }
             RecoverySupervisorEvent::Completed(None) => return,
             RecoverySupervisorEvent::Ingress(Some((event, generation))) => {
-                let vset = match event {
-                    AdminEvent::VsetRecovered { vset, .. }
-                    | AdminEvent::VsetMigratedIn { vset, .. } => vset,
+                let volume = match event {
+                    AdminEvent::VolumeRecovered { volume, .. }
+                    | AdminEvent::VolumeMigratedIn { volume, .. } => volume,
                 };
-                if let Some((_, task)) = active.remove(&vset) {
+                if let Some((_, task)) = active.remove(&volume) {
                     actors.cancel(task);
                 }
                 pending.insert(
-                    vset,
+                    volume,
                     (
                         now(),
                         RecoveryWork {
@@ -1277,11 +1302,11 @@ async fn handle_recovery_event(
         events,
         config,
     } = context;
-    let (vset, mut verdict, mut local_recovery) = match event {
-        AdminEvent::VsetRecovered { vset, verdict } => (vset, verdict, true),
-        AdminEvent::VsetMigratedIn { vset, verdict } => (vset, verdict, false),
+    let (volume, mut verdict, mut local_recovery) = match event {
+        AdminEvent::VolumeRecovered { volume, verdict } => (volume, verdict, true),
+        AdminEvent::VolumeMigratedIn { volume, verdict } => (volume, verdict, false),
     };
-    if world.admin_event_generation(vset) != generation {
+    if world.admin_event_generation(volume) != generation {
         return None;
     }
     let mut restored = false;
@@ -1291,69 +1316,71 @@ async fn handle_recovery_event(
         }
         match verdict {
             blockd_core::protocol::Verdict::Resume { vmstate, .. } => {
-                guest_states[&vset].exact_recovery.set(true);
+                guest_states[&volume].exact_recovery.set(true);
                 events.resumes.set(events.resumes.get().saturating_add(1));
-                guest_states[&vset].completed.set(vmstate);
-                world.set_vmstate(vset, vmstate);
-                let mut candidates = world.checkpoint_snapshots(vset, vmstate);
+                guest_states[&volume].completed.set(vmstate);
+                world.set_vmstate(volume, vmstate);
+                let mut candidates = world.checkpoint_snapshots(volume, vmstate);
                 if candidates.is_empty() {
                     candidates.push(OracleSnapshot {
-                        pages: guest_states[&vset].durable_expected.borrow().clone(),
-                        unknown: guest_states[&vset].recovering_pages.borrow().clone(),
+                        pages: guest_states[&volume].durable_expected.borrow().clone(),
+                        unknown: guest_states[&volume].recovering_pages.borrow().clone(),
                     });
                 }
                 let expected = candidates
                     .last()
                     .map(|snapshot| snapshot.pages.clone())
                     .unwrap_or_default();
-                *guest_states[&vset].exact_candidates.borrow_mut() = candidates;
-                guest_states[&vset]
+                *guest_states[&volume].exact_candidates.borrow_mut() = candidates;
+                guest_states[&volume]
                     .expected
                     .borrow_mut()
                     .clone_from(&expected);
             }
             blockd_core::protocol::Verdict::ColdBoot => {
-                guest_states[&vset].exact_recovery.set(false);
-                guest_states[&vset].exact_candidates.borrow_mut().clear();
-                guest_states[&vset].completed.set(0);
-                world.set_vmstate(vset, 0);
+                guest_states[&volume].exact_recovery.set(false);
+                guest_states[&volume].exact_candidates.borrow_mut().clear();
+                guest_states[&volume].completed.set(0);
+                world.set_vmstate(volume, 0);
                 events
                     .cold_boots
                     .set(events.cold_boots.get().saturating_add(1));
                 if restored {
-                    guest_states[&vset].durable_expected.borrow_mut().clear();
+                    guest_states[&volume].durable_expected.borrow_mut().clear();
                 }
-                let cold = guest_states[&vset]
+                let cold = guest_states[&volume]
                     .durable_expected
                     .borrow()
                     .iter()
-                    .filter(|(page, _)| page.volume.idx.0 != 0)
                     .map(|(page, bytes)| (*page, bytes.clone()))
                     .collect::<BTreeMap<_, _>>();
-                guest_states[&vset].expected.borrow_mut().clone_from(&cold);
-                *guest_states[&vset].durable_expected.borrow_mut() = cold;
+                guest_states[&volume]
+                    .expected
+                    .borrow_mut()
+                    .clone_from(&cold);
+                *guest_states[&volume].durable_expected.borrow_mut() = cold;
             }
             blockd_core::protocol::Verdict::Unrestorable => {
                 if local_recovery {
                     let restored_reply = match select2(
-                        world.request_admin(AdminCall::RestoreVset { vset }),
-                        world.wait_for_admin_event_generation_change(vset, generation),
+                        world.request_admin(AdminCall::RestoreVolume { volume }),
+                        world.wait_for_admin_event_generation_change(volume, generation),
                     )
                     .await
                     {
                         Either::First(reply) => reply,
                         Either::Second(()) => return None,
                     };
-                    if world.admin_event_generation(vset) != generation {
+                    if world.admin_event_generation(volume) != generation {
                         return None;
                     }
                     match restored_reply {
-                        Ok(Ok(AdminSuccess::VsetRestored {
-                            vset: restored_vset,
+                        Ok(Ok(AdminSuccess::VolumeRestored {
+                            volume: restored_volume,
                             verdict: restored_verdict,
                             ..
                         })) => {
-                            assert_eq!(restored_vset, vset);
+                            assert_eq!(restored_volume, volume);
                             if count_unrestorable {
                                 events
                                     .unrestorable
@@ -1367,8 +1394,8 @@ async fn handle_recovery_event(
                         Ok(Err(AdminError::Busy | AdminError::Stale | AdminError::Unavailable))
                         | Err(_) => {
                             return Some(RecoveryWork {
-                                event: AdminEvent::VsetRecovered {
-                                    vset,
+                                event: AdminEvent::VolumeRecovered {
+                                    volume,
                                     verdict: blockd_core::protocol::Verdict::Unrestorable,
                                 },
                                 count_unrestorable,
@@ -1393,27 +1420,23 @@ async fn handle_recovery_event(
                 return None;
             }
         }
-        *guest_states[&vset].recovering_pages.borrow_mut() = config
-            .vset
-            .volumes(vset)
-            .flat_map(|volume| {
-                (0..config.vset.pages_per_volume).map(move |page| PageId {
-                    volume,
-                    page: PageNo(page),
-                })
+        *guest_states[&volume].recovering_pages.borrow_mut() = (0..config.volume.pages)
+            .map(|page| PageId {
+                volume,
+                page: PageNo(page),
             })
             .collect();
-        if world.admin_event_generation(vset) != generation {
+        if world.admin_event_generation(volume) != generation {
             return None;
         }
         let handle = spawn(guest_actor(
             Rc::clone(&world),
-            Rc::clone(&guest_states[&vset]),
+            Rc::clone(&guest_states[&volume]),
             Rc::clone(&events),
-            vset,
+            volume,
             config.clone(),
         ));
-        let previous = guest_slots.borrow_mut().insert(vset, Some(handle));
+        let previous = guest_slots.borrow_mut().insert(volume, Some(handle));
         assert!(
             previous.is_none_or(|slot| slot.is_none()),
             "recovery started a duplicate guest"
@@ -1430,7 +1453,7 @@ async fn crash_schedule(
     guest_slots: GuestSlots,
     events: Rc<RunEvents>,
     host_config: HostConfig,
-    mut faults: ActorFaultPlan,
+    mut faults: FaultPlan,
     horizon: u64,
 ) {
     if faults.crash_mean_interval != 0 {
@@ -1514,6 +1537,7 @@ async fn crash_and_restart(
         guest.cancel();
         let _ = guest.await;
     }
+    world.advance_incarnation();
     let _ = world.crash_pending();
     world.crash_guest_io();
     events.crashes.set(events.crashes.get().saturating_add(1));
@@ -1542,7 +1566,7 @@ async fn bitflip_schedule(world: Rc<SimWorld>, mean: u64, horizon: u64) {
         if now() > horizon {
             return;
         }
-        let _ = world.bitflip_segment();
+        let _ = world.bitflip_blx();
     }
 }
 
@@ -1563,21 +1587,21 @@ async fn record_bitflip_at(world: Rc<SimWorld>, at: u64, mirror: bool) {
     let _ = world.bitflip_record(Some(mirror));
 }
 
-async fn checkpoint_schedule(world: Rc<SimWorld>, interval: u64, horizon: u64, vset_count: u16) {
+async fn checkpoint_schedule(world: Rc<SimWorld>, interval: u64, horizon: u64, volume_count: u16) {
     crate::checkpoint_schedule::run(
         interval,
         horizon,
         1_u64 << 63,
         || {
-            (1..=vset_count)
-                .map(|number| VsetId(u64::from(number)))
-                .filter(|&vset| world.vmstate_ready(vset))
+            (1..=volume_count)
+                .map(|number| VolumeId(u64::from(number)))
+                .filter(|&volume| world.vmstate_ready(volume))
                 .collect()
         },
-        |vset, retry| {
+        |volume, retry| {
             world
-                .vmstate_ready(vset)
-                .then(|| world.request_admin(AdminCall::Checkpoint { retry, vset }))
+                .vmstate_ready(volume)
+                .then(|| world.request_admin(AdminCall::Checkpoint { retry, volume }))
         },
     )
     .await;
@@ -1588,30 +1612,23 @@ async fn guest_actor(
     world: Rc<SimWorld>,
     state: Rc<GuestState>,
     events: Rc<RunEvents>,
-    vset: VsetId,
-    config: ActorHarnessConfig,
+    volume: VolumeId,
+    config: HarnessConfig,
 ) {
-    let mut next_req = (vset.0 << 48) | 1;
+    let mut next_req = (volume.0 << 48) | 1;
     loop {
         let think = random_between(config.think.0, config.think.1);
         delay(think).await;
         if now() > config.horizon {
             return;
         }
-        while world.is_paused(vset) {
+        while world.is_paused(volume) {
             delay(1_000).await;
         }
         let sync = config
             .sync_share
-            .map_or_else(|| random_u64() % 100 >= 85, hit);
+            .map_or_else(|| random_u64() % 100 >= 85, random_hit);
         if sync {
-            let volume = VolumeId {
-                vset,
-                idx: VolumeIdx(
-                    1 + u8::try_from(random_u64() % u64::from(config.vset.disk_volumes.max(1)))
-                        .expect("volume index fits"),
-                ),
-            };
             let req = ReqId(next_req);
             next_req = next_req.checked_add(1).expect("guest request overflow");
             if !world
@@ -1623,20 +1640,22 @@ async fn guest_actor(
                     .set(events.guest_deaths.get().saturating_add(1));
                 return;
             }
-            let current = state.expected.borrow();
-            let mut durable = state.durable_expected.borrow_mut();
-            durable.retain(|page, _| page.volume != volume);
-            durable.extend(
-                current
-                    .iter()
-                    .filter(|(page, _)| page.volume == volume)
-                    .map(|(page, bytes)| (*page, bytes.clone())),
-            );
-            finish_operation(&world, &state, vset);
+            if !config.volume.is_memory() {
+                let current = state.expected.borrow();
+                let mut durable = state.durable_expected.borrow_mut();
+                durable.retain(|page, _| page.volume != volume);
+                durable.extend(
+                    current
+                        .iter()
+                        .filter(|(page, _)| page.volume == volume)
+                        .map(|(page, bytes)| (*page, bytes.clone())),
+                );
+            }
+            finish_operation(&world, &state, volume);
             continue;
         }
 
-        let page = choose_page(&config, vset);
+        let page = choose_page(&config, volume);
         let write = random_u64() % 100 < 60;
         if !world.fault(page, write).await {
             events
@@ -1727,7 +1746,7 @@ async fn guest_actor(
                 state.expected.borrow_mut().insert(page, actual);
             }
         }
-        finish_operation(&world, &state, vset);
+        finish_operation(&world, &state, volume);
     }
 }
 
@@ -1767,39 +1786,26 @@ fn narrow_exact_candidates(
     !candidates.is_empty()
 }
 
-fn finish_operation(world: &SimWorld, state: &GuestState, vset: VsetId) {
+fn finish_operation(world: &SimWorld, state: &GuestState, volume: VolumeId) {
     let completed = state.completed.get().saturating_add(1);
     state.completed.set(completed);
     state
         .total_completed
         .set(state.total_completed.get().saturating_add(1));
-    world.set_vmstate(vset, completed);
+    world.set_vmstate(volume, completed);
 }
 
-fn choose_page(config: &ActorHarnessConfig, vset: VsetId) -> PageId {
-    let idx = VolumeIdx(
-        u8::try_from(random_u64() % (u64::from(config.vset.disk_volumes) + 1))
-            .expect("volume index fits"),
-    );
-    let pages = config.vset.pages_per_volume;
+fn choose_page(config: &HarnessConfig, volume: VolumeId) -> PageId {
+    let pages = config.volume.pages;
     let page = match config.hot_pages {
-        Some((share, hot)) if hit(share) => random_u64() % u64::from(hot),
+        Some((share, hot)) if random_hit(share) => random_u64() % u64::from(hot),
         Some((_, hot)) if hot < pages => u64::from(hot) + random_u64() % u64::from(pages - hot),
         _ => random_u64() % u64::from(pages),
     };
     PageId {
-        volume: VolumeId { vset, idx },
+        volume,
         page: PageNo(u32::try_from(page).expect("page number fits")),
     }
-}
-
-fn random_between(low: u64, high: u64) -> u64 {
-    assert!(low <= high);
-    low + random_u64() % (high - low + 1)
-}
-
-fn hit(probability: Ppm) -> bool {
-    random_u64() % 1_000_000 < u64::from(probability.0)
 }
 
 #[cfg(test)]
@@ -1823,8 +1829,8 @@ mod tests {
         }};
     }
 
-    fn config() -> ActorHarnessConfig {
-        ActorHarnessConfig {
+    fn config() -> HarnessConfig {
+        HarnessConfig {
             host: HostConfig {
                 archive: Default::default(),
                 host: blockd_core::types::HostId(1),
@@ -1852,14 +1858,14 @@ mod tests {
                 latency_max: 5_000,
                 ns_per_byte: 0,
             },
-            vset_count: 2,
-            vset: VsetConfig::compute(2, 16),
+            volume_count: 2,
+            volume: VolumeConfig::data(16),
             horizon: millis(100),
             think: (50_000, 100_000),
             sync_share: None,
             hot_pages: None,
             checkpoint_interval: None,
-            faults: ActorFaultPlan::default(),
+            faults: FaultPlan::default(),
             corrupt_fills: false,
             drop_write_protect: false,
         }
@@ -1881,7 +1887,7 @@ mod tests {
     #[test]
     fn crash_drops_the_task_tree_and_recovers_in_the_same_simulation() {
         let mut crash = config();
-        crash.vset_count = 1;
+        crash.volume_count = 1;
         crash.faults.crash_at = vec![millis(40)];
         crash.faults.restart_delay = (millis(1), millis(1));
         let first = run(23, crash.clone());
@@ -1897,8 +1903,8 @@ mod tests {
     async fn backed_local_unrestorable_verdict_requests_store_restore() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let volume = VolumeId(1);
+        let guest_states = Rc::new(BTreeMap::from([(volume, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
         let command = simulate!(29, {
@@ -1913,8 +1919,8 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    blockd_core::protocol::AdminEvent::VsetRecovered {
-                        vset,
+                    blockd_core::protocol::AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
@@ -1928,17 +1934,17 @@ mod tests {
         });
         assert!(matches!(
             command,
-            Some(AdminCall::RestoreVset { vset: found }) if found == vset
+            Some(AdminCall::RestoreVolume { volume: found }) if found == volume
         ));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recoverable_restore_failure_retries_without_blocking_another_vset() {
+    async fn recoverable_restore_failure_retries_without_blocking_another_volume() {
         let mut config = config();
         config.host.backup_retry = 1;
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let first = VsetId(1);
-        let second = VsetId(2);
+        let first = VolumeId(1);
+        let second = VolumeId(2);
         let guest_states = Rc::new(BTreeMap::from([
             (first, Rc::new(GuestState::default())),
             (second, Rc::new(GuestState::default())),
@@ -1958,16 +1964,16 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset: first,
+                    AdminEvent::VolumeRecovered {
+                        volume: first,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
                 .await;
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset: second,
+                    AdminEvent::VolumeRecovered {
+                        volume: second,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
@@ -1977,7 +1983,7 @@ mod tests {
                     .await
                     .expect("first restore request");
                 let (call, mut reply) = request.into_parts();
-                assert_eq!(call, AdminCall::RestoreVset { vset: first });
+                assert_eq!(call, AdminCall::RestoreVolume { volume: first });
                 let _ = reply.send(Err(AdminError::Busy));
                 delay(2).await;
                 assert!(
@@ -1991,7 +1997,7 @@ mod tests {
                     .await
                     .expect("retried restore request");
                 let (call, _reply) = request.into_parts();
-                assert_eq!(call, AdminCall::RestoreVset { vset: first });
+                assert_eq!(call, AdminCall::RestoreVolume { volume: first });
                 drop(supervisor);
             }
         });
@@ -2002,8 +2008,8 @@ mod tests {
         let mut config = config();
         config.host.backup_retry = 10;
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let volume = VolumeId(1);
+        let guest_states = Rc::new(BTreeMap::from([(volume, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
         simulate!(32, {
@@ -2019,8 +2025,8 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
@@ -2029,25 +2035,28 @@ mod tests {
                     .await
                     .expect("restore request");
                 let (call, mut reply) = request.into_parts();
-                assert_eq!(call, AdminCall::RestoreVset { vset });
+                assert_eq!(call, AdminCall::RestoreVolume { volume });
 
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
                 .await;
                 delay(1).await;
-                let _ = reply.send(Ok(AdminSuccess::VsetRestored {
-                    vset,
+                let _ = reply.send(Ok(AdminSuccess::VolumeRestored {
+                    volume,
                     verdict: blockd_core::protocol::Verdict::ColdBoot,
                 }));
                 delay(1).await;
 
                 assert!(
-                    guest_slots.borrow().get(&vset).is_some_and(Option::is_some),
+                    guest_slots
+                        .borrow()
+                        .get(&volume)
+                        .is_some_and(Option::is_some),
                     "the newer cold-boot recovery must win over the stale restore"
                 );
                 match select2(AdminIo::next_admin(world.as_ref()), delay(0)).await {
@@ -2065,8 +2074,8 @@ mod tests {
     async fn newer_recovery_preempts_a_blocked_restore() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let volume = VolumeId(1);
+        let guest_states = Rc::new(BTreeMap::from([(volume, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
         simulate!(37, {
@@ -2082,8 +2091,8 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
@@ -2095,8 +2104,8 @@ mod tests {
 
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
@@ -2104,7 +2113,10 @@ mod tests {
                 delay(2).await;
 
                 assert!(
-                    guest_slots.borrow().get(&vset).is_some_and(Option::is_some),
+                    guest_slots
+                        .borrow()
+                        .get(&volume)
+                        .is_some_and(Option::is_some),
                     "the newer recovery must not wait for the stale restore reply"
                 );
                 assert!(
@@ -2120,8 +2132,8 @@ mod tests {
     async fn generation_change_preempts_restore_before_newer_event_admission() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let volume = VolumeId(1);
+        let guest_states = Rc::new(BTreeMap::from([(volume, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
         simulate!(38, {
@@ -2129,8 +2141,8 @@ mod tests {
             async move {
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
@@ -2147,8 +2159,8 @@ mod tests {
                         events,
                         config,
                     },
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                     true,
@@ -2161,8 +2173,8 @@ mod tests {
 
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
@@ -2184,18 +2196,18 @@ mod tests {
     async fn superseded_recovery_work_issues_no_restore_request() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let volume = VolumeId(1);
+        let guest_states = Rc::new(BTreeMap::from([(volume, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
-        let stale_generation = world.admin_event_generation(vset);
+        let stale_generation = world.admin_event_generation(volume);
         simulate!(34, {
             let world = Rc::clone(&world);
             async move {
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
@@ -2209,8 +2221,8 @@ mod tests {
                 };
                 let stale = spawn(handle_recovery_event(
                     context,
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                     false,
@@ -2233,8 +2245,8 @@ mod tests {
     async fn stale_recovery_admission_does_not_block_its_newer_event() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        let guest_states = Rc::new(BTreeMap::from([(vset, Rc::new(GuestState::default()))]));
+        let volume = VolumeId(1);
+        let guest_states = Rc::new(BTreeMap::from([(volume, Rc::new(GuestState::default()))]));
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
         let events = Rc::new(RunEvents::default());
         simulate!(35, {
@@ -2243,16 +2255,16 @@ mod tests {
             async move {
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
                 .await;
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
@@ -2266,8 +2278,11 @@ mod tests {
                 ));
                 delay(2).await;
                 assert!(
-                    guest_slots.borrow().get(&vset).is_some_and(Option::is_some),
-                    "the stale event must not retain the vset's active slot"
+                    guest_slots
+                        .borrow()
+                        .get(&volume)
+                        .is_some_and(Option::is_some),
+                    "the stale event must not retain the volume's active slot"
                 );
                 drop(supervisor);
             }
@@ -2279,12 +2294,12 @@ mod tests {
         let mut config = config();
         config.host.backup_retry = 10;
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let first = VsetId(1);
+        let first = VolumeId(1);
         let guest_states = Rc::new(
             (1..=RECOVERY_QUEUE_CAPACITY)
                 .map(|number| {
                     (
-                        VsetId(u64::try_from(number).expect("vset fits")),
+                        VolumeId(u64::try_from(number).expect("volume fits")),
                         Rc::new(GuestState::default()),
                     )
                 })
@@ -2305,8 +2320,8 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset: first,
+                    AdminEvent::VolumeRecovered {
+                        volume: first,
                         verdict: blockd_core::protocol::Verdict::Unrestorable,
                     },
                 )
@@ -2315,13 +2330,13 @@ mod tests {
                     .await
                     .expect("first restore request");
                 let (call, mut first_reply) = request.into_parts();
-                assert_eq!(call, AdminCall::RestoreVset { vset: first });
+                assert_eq!(call, AdminCall::RestoreVolume { volume: first });
 
                 for number in 2..=RECOVERY_QUEUE_CAPACITY {
                     AdminIo::emit_admin_event(
                         world.as_ref(),
-                        AdminEvent::VsetRecovered {
-                            vset: VsetId(u64::try_from(number).expect("vset fits")),
+                        AdminEvent::VolumeRecovered {
+                            volume: VolumeId(u64::try_from(number).expect("volume fits")),
                             verdict: blockd_core::protocol::Verdict::Unrestorable,
                         },
                     )
@@ -2334,20 +2349,20 @@ mod tests {
                         .await
                         .expect("concurrent restore request");
                     let (call, reply) = request.into_parts();
-                    assert!(matches!(call, AdminCall::RestoreVset { .. }));
+                    assert!(matches!(call, AdminCall::RestoreVolume { .. }));
                     other_replies.push(reply);
                 }
 
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset: first,
+                    AdminEvent::VolumeRecovered {
+                        volume: first,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
                 .await;
-                let _ = first_reply.send(Ok(AdminSuccess::VsetRestored {
-                    vset: first,
+                let _ = first_reply.send(Ok(AdminSuccess::VolumeRestored {
+                    volume: first,
                     verdict: blockd_core::protocol::Verdict::ColdBoot,
                 }));
                 delay(1).await;
@@ -2373,14 +2388,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retrying_restores_release_every_recovery_slot_for_queued_vsets() {
+    async fn retrying_restores_release_every_recovery_slot_for_queued_volumes() {
         let mut config = config();
         config.host.backup_retry = 10;
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let queued = VsetId(u64::try_from(RECOVERY_CONCURRENCY + 1).expect("vset fits"));
+        let queued = VolumeId(u64::try_from(RECOVERY_CONCURRENCY + 1).expect("volume fits"));
         let guest_states = Rc::new(
             (1..=queued.0)
-                .map(|number| (VsetId(number), Rc::new(GuestState::default())))
+                .map(|number| (VolumeId(number), Rc::new(GuestState::default())))
                 .collect(),
         );
         let guest_slots = Rc::new(RefCell::new(BTreeMap::new()));
@@ -2399,8 +2414,8 @@ mod tests {
                 for number in 1..=RECOVERY_CONCURRENCY {
                     AdminIo::emit_admin_event(
                         world.as_ref(),
-                        AdminEvent::VsetRecovered {
-                            vset: VsetId(u64::try_from(number).expect("vset fits")),
+                        AdminEvent::VolumeRecovered {
+                            volume: VolumeId(u64::try_from(number).expect("volume fits")),
                             verdict: blockd_core::protocol::Verdict::Unrestorable,
                         },
                     )
@@ -2412,13 +2427,13 @@ mod tests {
                         .await
                         .expect("restore request");
                     let (call, reply) = request.into_parts();
-                    assert!(matches!(call, AdminCall::RestoreVset { .. }));
+                    assert!(matches!(call, AdminCall::RestoreVolume { .. }));
                     replies.push(reply);
                 }
                 AdminIo::emit_admin_event(
                     world.as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset: queued,
+                    AdminEvent::VolumeRecovered {
+                        volume: queued,
                         verdict: blockd_core::protocol::Verdict::ColdBoot,
                     },
                 )
@@ -2439,11 +2454,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn checkpoint_schedule_coalesces_one_outstanding_request_per_vset() {
+    async fn checkpoint_schedule_coalesces_one_outstanding_request_per_volume() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        world.set_vmstate(vset, 1);
+        let volume = VolumeId(1);
+        world.set_vmstate(volume, 1);
         simulate!(31, {
             let world = Rc::clone(&world);
             async move {
@@ -2474,8 +2489,8 @@ mod tests {
     async fn checkpoint_schedule_drains_an_admitted_request_past_the_horizon() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset = VsetId(1);
-        world.set_vmstate(vset, 1);
+        let volume = VolumeId(1);
+        world.set_vmstate(volume, 1);
         simulate!(36, {
             let world = Rc::clone(&world);
             async move {
@@ -2500,14 +2515,14 @@ mod tests {
     async fn checkpoint_schedule_bounds_global_concurrency_and_refills_fairly() {
         let config = config();
         let world = SimWorld::new(config.host.host, config.blobs, config.store);
-        let vset_count = u16::try_from(CHECKPOINT_CONCURRENCY + 8).expect("vset count fits");
-        for number in 1..=vset_count {
-            world.set_vmstate(VsetId(u64::from(number)), 1);
+        let volume_count = u16::try_from(CHECKPOINT_CONCURRENCY + 8).expect("volume count fits");
+        for number in 1..=volume_count {
+            world.set_vmstate(VolumeId(u64::from(number)), 1);
         }
         simulate!(32, {
             let world = Rc::clone(&world);
             async move {
-                let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 100, vset_count));
+                let schedule = spawn(checkpoint_schedule(Rc::clone(&world), 1, 100, volume_count));
                 let mut replies = Vec::new();
                 for number in 1..=CHECKPOINT_CONCURRENCY {
                     let request = AdminIo::next_admin(world.as_ref())
@@ -2516,8 +2531,8 @@ mod tests {
                     let (call, reply) = request.into_parts();
                     assert!(matches!(
                         call,
-                        AdminCall::Checkpoint { vset, .. }
-                            if vset == VsetId(u64::try_from(number).expect("vset fits"))
+                        AdminCall::Checkpoint { volume, .. }
+                            if volume == VolumeId(u64::try_from(number).expect("volume fits"))
                     ));
                     replies.push(reply);
                 }
@@ -2532,10 +2547,10 @@ mod tests {
                     .expect("checkpoint refill request");
                 assert!(matches!(
                     next.into_parts().0,
-                    AdminCall::Checkpoint { vset, .. }
-                        if vset
-                            == VsetId(
-                                u64::try_from(CHECKPOINT_CONCURRENCY + 1).expect("vset fits")
+                    AdminCall::Checkpoint { volume, .. }
+                        if volume
+                            == VolumeId(
+                                u64::try_from(CHECKPOINT_CONCURRENCY + 1).expect("volume fits")
                             )
                 ));
                 drop(schedule);
@@ -2546,7 +2561,7 @@ mod tests {
     #[test]
     fn horizon_cleanup_restarts_a_host_cancelled_mid_restart() {
         let mut config = config();
-        config.vset_count = 1;
+        config.volume_count = 1;
         config.horizon = millis(100);
         config.faults.crash_at = vec![millis(99)];
         config.faults.restart_delay = (millis(50), millis(50));
@@ -2615,10 +2630,7 @@ mod tests {
     #[test]
     fn resume_oracle_accepts_only_pages_unknown_at_the_checkpoint_boundary() {
         let page = PageId {
-            volume: VolumeId {
-                vset: VsetId(1),
-                idx: VolumeIdx(1),
-            },
+            volume: VolumeId(1),
             page: PageNo(2),
         };
         let expected = page_pattern(page, 3);

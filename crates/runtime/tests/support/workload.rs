@@ -2,11 +2,33 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::protocol::Verdict;
-use blockd_core::types::{PageId, PageNo, VolumeId, VolumeIdx, VsetId};
+use blockd_core::types::{PageId, PageNo, VolumeId};
 use blockd_runtime::{ObjectStore, Runtime, RuntimeConfig};
 use blockd_workload::{Backend, Capability, LogicalPage, Operation, VerifyScope, WorkloadModel};
+use futures_util::future::join_all;
+
+fn logical_volume(root: VolumeId, index: u8) -> VolumeId {
+    VolumeId(root.0 + u64::from(index))
+}
+
+fn volume_configs(
+    root: VolumeId,
+    disk_volumes: u8,
+    pages: u32,
+) -> BTreeMap<VolumeId, VolumeConfig> {
+    (0..=disk_volumes)
+        .map(|index| {
+            let config = if index == 0 {
+                VolumeConfig::memory(pages)
+            } else {
+                VolumeConfig::data(pages)
+            };
+            (logical_volume(root, index), config)
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeWorkloadMetrics {
@@ -32,8 +54,8 @@ pub struct RuntimeLifecycleBackend {
     store: Arc<dyn ObjectStore>,
     runtime: Option<Runtime>,
     passive_runtimes: Vec<Runtime>,
-    vset: VsetId,
-    vset_config: Option<VsetConfig>,
+    volume: VolumeId,
+    volume_configs: BTreeMap<VolumeId, VolumeConfig>,
     metrics: RuntimeWorkloadMetrics,
 }
 
@@ -42,15 +64,15 @@ impl RuntimeLifecycleBackend {
         config: RuntimeConfig,
         store: Arc<dyn ObjectStore>,
         passive_runtimes: Vec<Runtime>,
-        vset: VsetId,
+        volume: VolumeId,
     ) -> Self {
         Self {
             config,
             store,
             runtime: None,
             passive_runtimes,
-            vset,
-            vset_config: None,
+            volume,
+            volume_configs: BTreeMap::new(),
             metrics: RuntimeWorkloadMetrics::default(),
         }
     }
@@ -69,10 +91,7 @@ impl RuntimeLifecycleBackend {
 
     fn page_id(&self, page: LogicalPage) -> PageId {
         PageId {
-            volume: VolumeId {
-                vset: self.vset,
-                idx: VolumeIdx(page.volume),
-            },
+            volume: logical_volume(self.volume, page.volume),
             page: PageNo(page.page),
         }
     }
@@ -80,7 +99,7 @@ impl RuntimeLifecycleBackend {
     async fn verify_page(&self, page: LogicalPage, expected: u64) -> Result<(), String> {
         verify_runtime_page(
             self.runtime(),
-            self.vset,
+            self.page_id(page).volume,
             self.page_id(page),
             page,
             expected,
@@ -115,10 +134,12 @@ impl Backend for RuntimeLifecycleBackend {
             Operation::Create => {
                 let started = Instant::now();
                 let shape = model.shape();
-                let config = VsetConfig::compute(shape.disk_volumes, shape.pages_per_volume);
+                let configs = volume_configs(self.volume, shape.disk_volumes, shape.pages);
                 let runtime = Runtime::new(&self.config, self.store.clone()).await;
-                runtime.create_vset(self.vset, config).await;
-                self.vset_config = Some(config);
+                for (&volume, &config) in &configs {
+                    runtime.create_volume(volume, config).await;
+                }
+                self.volume_configs = configs;
                 self.runtime = Some(runtime);
                 self.metrics.create_time += started.elapsed();
                 self.metrics.creates += 1;
@@ -132,7 +153,9 @@ impl Backend for RuntimeLifecycleBackend {
             Operation::Write { page, value } => {
                 let started = Instant::now();
                 let page_id = self.page_id(page);
-                self.runtime().guest_write(self.vset, page_id, value).await;
+                self.runtime()
+                    .guest_write(page_id.volume, page_id, value)
+                    .await;
                 self.metrics.write_time += started.elapsed();
                 self.metrics.writes += 1;
             }
@@ -140,7 +163,7 @@ impl Backend for RuntimeLifecycleBackend {
                 let started = Instant::now();
                 if !self
                     .runtime()
-                    .guest_sync(self.vset, VolumeIdx(volume))
+                    .guest_sync(logical_volume(self.volume, volume))
                     .await
                 {
                     return Err(format!("sync rejected for volume {volume}"));
@@ -151,9 +174,15 @@ impl Backend for RuntimeLifecycleBackend {
             Operation::Checkpoint => {
                 let started = Instant::now();
                 let expected = self.metrics.checkpoints + 1;
-                let epoch = self.runtime().checkpoint(self.vset).await;
-                if epoch != expected {
-                    return Err(format!("checkpoint epoch {epoch}, expected {expected}"));
+                let epochs = join_all(
+                    self.volume_configs
+                        .keys()
+                        .copied()
+                        .map(|volume| self.runtime().checkpoint(volume)),
+                )
+                .await;
+                if epochs.iter().any(|&epoch| epoch != expected) {
+                    return Err(format!("checkpoint epochs {epochs:?}, expected {expected}"));
                 }
                 self.metrics.checkpoint_time += started.elapsed();
                 self.metrics.checkpoints += 1;
@@ -164,23 +193,25 @@ impl Backend for RuntimeLifecycleBackend {
             }
             Operation::Restore => {
                 let started = Instant::now();
-                let config = self.vset_config.expect("vset was created");
-                let (runtime, immediate) = Runtime::recover(
-                    &self.config,
-                    self.store.clone(),
-                    &BTreeMap::from([(self.vset, config)]),
-                )
-                .await;
+                let (runtime, immediate) =
+                    Runtime::recover(&self.config, self.store.clone(), &self.volume_configs).await;
                 if !immediate.is_empty() {
                     return Err(format!(
                         "recovery unexpectedly completed synchronously: {immediate:?}"
                     ));
                 }
-                let verdict = runtime.wait_recovered(self.vset).await;
-                if !matches!(verdict, Verdict::Resume { .. }) {
-                    return Err(format!(
-                        "restore did not resume the checkpoint: {verdict:?}"
-                    ));
+                for (&volume, config) in &self.volume_configs {
+                    let verdict = runtime.wait_recovered(volume).await;
+                    let expected = if config.is_memory() {
+                        matches!(verdict, Verdict::Resume { .. })
+                    } else {
+                        verdict == Verdict::ColdBoot
+                    };
+                    if !expected {
+                        return Err(format!(
+                            "unexpected restore verdict for {volume:?}: {verdict:?}"
+                        ));
+                    }
                 }
                 self.runtime = Some(runtime);
                 self.metrics.restore_time += started.elapsed();
@@ -202,12 +233,12 @@ impl Backend for RuntimeLifecycleBackend {
 
 async fn verify_runtime_page(
     runtime: &Runtime,
-    vset: VsetId,
+    volume: VolumeId,
     page_id: PageId,
     logical: LogicalPage,
     expected: u64,
 ) -> Result<(), String> {
-    let bytes = runtime.guest_read(vset, page_id).await;
+    let bytes = runtime.guest_read(volume, page_id).await;
     let observed = u64::from_le_bytes(
         bytes[0..8]
             .try_into()
@@ -226,15 +257,15 @@ async fn verify_runtime_page(
 
 pub struct RuntimeDataBackend<'a> {
     runtime: &'a Runtime,
-    vset: VsetId,
+    volume: VolumeId,
     metrics: RuntimeWorkloadMetrics,
 }
 
 impl<'a> RuntimeDataBackend<'a> {
-    pub fn new(runtime: &'a Runtime, vset: VsetId) -> Self {
+    pub fn new(runtime: &'a Runtime, volume: VolumeId) -> Self {
         Self {
             runtime,
-            vset,
+            volume,
             metrics: RuntimeWorkloadMetrics::default(),
         }
     }
@@ -245,16 +276,14 @@ impl<'a> RuntimeDataBackend<'a> {
 
     fn page_id(&self, page: LogicalPage) -> PageId {
         PageId {
-            volume: VolumeId {
-                vset: self.vset,
-                idx: VolumeIdx(page.volume),
-            },
+            volume: logical_volume(self.volume, page.volume),
             page: PageNo(page.page),
         }
     }
 
     async fn verify_page(&self, page: LogicalPage, expected: u64) -> Result<(), String> {
-        let bytes = self.runtime.guest_read(self.vset, self.page_id(page)).await;
+        let page_id = self.page_id(page);
+        let bytes = self.runtime.guest_read(page_id.volume, page_id).await;
         let observed = u64::from_le_bytes(
             bytes[0..8]
                 .try_into()
@@ -291,12 +320,10 @@ impl Backend for RuntimeDataBackend<'_> {
             Operation::Create => {
                 let started = Instant::now();
                 let shape = model.shape();
-                self.runtime
-                    .create_vset(
-                        self.vset,
-                        VsetConfig::compute(shape.disk_volumes, shape.pages_per_volume),
-                    )
-                    .await;
+                for (volume, config) in volume_configs(self.volume, shape.disk_volumes, shape.pages)
+                {
+                    self.runtime.create_volume(volume, config).await;
+                }
                 self.metrics.create_time += started.elapsed();
                 self.metrics.creates += 1;
             }
@@ -309,14 +336,18 @@ impl Backend for RuntimeDataBackend<'_> {
             Operation::Write { page, value } => {
                 let started = Instant::now();
                 self.runtime
-                    .guest_write(self.vset, self.page_id(page), value)
+                    .guest_write(self.page_id(page).volume, self.page_id(page), value)
                     .await;
                 self.metrics.write_time += started.elapsed();
                 self.metrics.writes += 1;
             }
             Operation::Sync { volume } => {
                 let started = Instant::now();
-                if !self.runtime.guest_sync(self.vset, VolumeIdx(volume)).await {
+                if !self
+                    .runtime
+                    .guest_sync(logical_volume(self.volume, volume))
+                    .await
+                {
                     return Err(format!("sync rejected for volume {volume}"));
                 }
                 self.metrics.sync_time += started.elapsed();

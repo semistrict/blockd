@@ -133,6 +133,82 @@ struct MemberRecord {
     certificate: Vec<u8>,
 }
 
+impl MemberRecord {
+    fn encode(&self) -> Vec<u8> {
+        assert!(
+            !self.certificate.is_empty() && self.certificate.len() <= MAX_PEER_CERTIFICATE_BYTES,
+            "peer certificate size"
+        );
+        let certificate_len =
+            u32::try_from(self.certificate.len()).expect("certificate length fits");
+        let mut encoded = Vec::with_capacity(MEMBERSHIP_HEADER_BYTES + self.certificate.len());
+        encoded.extend_from_slice(&MEMBERSHIP_MAGIC.to_le_bytes());
+        match self.endpoint {
+            SocketAddr::V4(endpoint) => {
+                encoded.push(4);
+                encoded.extend_from_slice(&endpoint.port().to_le_bytes());
+                encoded.extend_from_slice(&endpoint.ip().octets());
+                encoded.extend_from_slice(&[0; 12]);
+                encoded.extend_from_slice(&0_u32.to_le_bytes());
+                encoded.extend_from_slice(&0_u32.to_le_bytes());
+            }
+            SocketAddr::V6(endpoint) => {
+                encoded.push(6);
+                encoded.extend_from_slice(&endpoint.port().to_le_bytes());
+                encoded.extend_from_slice(&endpoint.ip().octets());
+                encoded.extend_from_slice(&endpoint.flowinfo().to_le_bytes());
+                encoded.extend_from_slice(&endpoint.scope_id().to_le_bytes());
+            }
+        }
+        encoded.extend_from_slice(&certificate_len.to_le_bytes());
+        encoded.extend_from_slice(&self.certificate);
+        encoded
+    }
+
+    fn decode(encoded: &[u8]) -> Option<Self> {
+        if encoded.len() < MEMBERSHIP_HEADER_BYTES {
+            return None;
+        }
+        let magic = u32::from_le_bytes(encoded[0..4].try_into().ok()?);
+        if magic != MEMBERSHIP_MAGIC {
+            return None;
+        }
+        let family = encoded[4];
+        let port = u16::from_le_bytes(encoded[5..7].try_into().ok()?);
+        if port == 0 {
+            return None;
+        }
+        let address: [u8; 16] = encoded[7..23].try_into().ok()?;
+        let flowinfo = u32::from_le_bytes(encoded[23..27].try_into().ok()?);
+        let scope_id = u32::from_le_bytes(encoded[27..31].try_into().ok()?);
+        let certificate_len =
+            usize::try_from(u32::from_le_bytes(encoded[31..35].try_into().ok()?)).ok()?;
+        if certificate_len == 0
+            || certificate_len > MAX_PEER_CERTIFICATE_BYTES
+            || encoded.len() != MEMBERSHIP_HEADER_BYTES + certificate_len
+        {
+            return None;
+        }
+        let endpoint = match family {
+            4 if address[4..] == [0; 12] && flowinfo == 0 && scope_id == 0 => SocketAddr::new(
+                std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&address[..4]).ok()?).into(),
+                port,
+            ),
+            6 => SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(address),
+                port,
+                flowinfo,
+                scope_id,
+            )),
+            _ => return None,
+        };
+        Some(Self {
+            endpoint,
+            certificate: encoded[MEMBERSHIP_HEADER_BYTES..].to_vec(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PeerTarget {
     endpoint: SocketAddr,
@@ -147,79 +223,6 @@ struct MembershipLeases(Arc<Mutex<BTreeMap<HostId, ObservedLease>>>);
 struct ObservedLease {
     generation: u64,
     renewed_at: Option<Instant>,
-}
-
-fn encode_member(record: &MemberRecord) -> Vec<u8> {
-    assert!(
-        !record.certificate.is_empty() && record.certificate.len() <= MAX_PEER_CERTIFICATE_BYTES,
-        "peer certificate size"
-    );
-    let certificate_len = u32::try_from(record.certificate.len()).expect("certificate length fits");
-    let mut encoded = Vec::with_capacity(MEMBERSHIP_HEADER_BYTES + record.certificate.len());
-    encoded.extend_from_slice(&MEMBERSHIP_MAGIC.to_le_bytes());
-    match record.endpoint {
-        SocketAddr::V4(endpoint) => {
-            encoded.push(4);
-            encoded.extend_from_slice(&endpoint.port().to_le_bytes());
-            encoded.extend_from_slice(&endpoint.ip().octets());
-            encoded.extend_from_slice(&[0; 12]);
-            encoded.extend_from_slice(&0_u32.to_le_bytes());
-            encoded.extend_from_slice(&0_u32.to_le_bytes());
-        }
-        SocketAddr::V6(endpoint) => {
-            encoded.push(6);
-            encoded.extend_from_slice(&endpoint.port().to_le_bytes());
-            encoded.extend_from_slice(&endpoint.ip().octets());
-            encoded.extend_from_slice(&endpoint.flowinfo().to_le_bytes());
-            encoded.extend_from_slice(&endpoint.scope_id().to_le_bytes());
-        }
-    }
-    encoded.extend_from_slice(&certificate_len.to_le_bytes());
-    encoded.extend_from_slice(&record.certificate);
-    encoded
-}
-
-fn decode_member(encoded: &[u8]) -> Option<MemberRecord> {
-    if encoded.len() < MEMBERSHIP_HEADER_BYTES {
-        return None;
-    }
-    let magic = u32::from_le_bytes(encoded[0..4].try_into().ok()?);
-    if magic != MEMBERSHIP_MAGIC {
-        return None;
-    }
-    let family = encoded[4];
-    let port = u16::from_le_bytes(encoded[5..7].try_into().ok()?);
-    if port == 0 {
-        return None;
-    }
-    let address: [u8; 16] = encoded[7..23].try_into().ok()?;
-    let flowinfo = u32::from_le_bytes(encoded[23..27].try_into().ok()?);
-    let scope_id = u32::from_le_bytes(encoded[27..31].try_into().ok()?);
-    let certificate_len =
-        usize::try_from(u32::from_le_bytes(encoded[31..35].try_into().ok()?)).ok()?;
-    if certificate_len == 0
-        || certificate_len > MAX_PEER_CERTIFICATE_BYTES
-        || encoded.len() != MEMBERSHIP_HEADER_BYTES + certificate_len
-    {
-        return None;
-    }
-    let endpoint = match family {
-        4 if address[4..] == [0; 12] && flowinfo == 0 && scope_id == 0 => SocketAddr::new(
-            std::net::Ipv4Addr::from(<[u8; 4]>::try_from(&address[..4]).ok()?).into(),
-            port,
-        ),
-        6 => SocketAddr::V6(std::net::SocketAddrV6::new(
-            std::net::Ipv6Addr::from(address),
-            port,
-            flowinfo,
-            scope_id,
-        )),
-        _ => return None,
-    };
-    Some(MemberRecord {
-        endpoint,
-        certificate: encoded[MEMBERSHIP_HEADER_BYTES..].to_vec(),
-    })
 }
 
 impl PeerTlsConfig {
@@ -241,7 +244,7 @@ impl PeerTlsConfig {
             certificate: certificate.clone(),
         };
         let own_key = peer_membership_key(host);
-        let own_record = Arc::new(encode_member(&member));
+        let own_record = Arc::new(member.encode());
         let generation = Arc::clone(&store)
             .put(own_key.clone(), own_record.as_ref().clone())
             .await?;
@@ -411,7 +414,7 @@ async fn refresh_bucket_membership(
         if encoded.len() > MAX_MEMBERSHIP_RECORD_BYTES {
             continue;
         }
-        let Some(member) = decode_member(&encoded) else {
+        let Some(member) = MemberRecord::decode(&encoded) else {
             continue;
         };
         members.insert(host, (generation, Instant::now(), member));
@@ -492,7 +495,7 @@ const MAX_CONNECTION_AGE: Duration = Duration::from_mins(5);
 const DECODE_OFFLOAD_THRESHOLD: usize = 1024 * 1024;
 
 pub struct PeerNet {
-    peers: Arc<Mutex<BTreeMap<HostId, PeerConnection>>>,
+    connections: ConnectionSet,
     /// Frames dropped on the floor (queue full or peer down) — the demo's
     /// visibility into how hard the retry timers are working.
     pub dropped_sends: Arc<AtomicU64>,
@@ -512,59 +515,91 @@ struct OutboundFrame {
     reconnect: bool,
 }
 
+#[derive(Clone)]
+struct ConnectionSet {
+    peers: Arc<Mutex<BTreeMap<HostId, PeerConnection>>>,
+    self_id: HostId,
+    dropped_sends: Arc<AtomicU64>,
+    tls: Option<PeerTlsConfig>,
+}
+
+struct MembershipRefresher {
+    membership: BucketMembership,
+    identities: PeerIdentities,
+    leases: MembershipLeases,
+    connections: ConnectionSet,
+}
+
+struct Outbound {
+    rx: Receiver<OutboundFrame>,
+    addr: SocketAddr,
+    peer: HostId,
+    connected: Arc<AtomicBool>,
+    dropped_sends: Arc<AtomicU64>,
+    tls: Option<ClientTls>,
+    conn: Option<Box<dyn PeerIo>>,
+    renewal: Option<tokio::task::JoinHandle<Option<Box<dyn PeerIo>>>>,
+}
+
 impl Drop for PeerConnection {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
-fn reconcile_connections(
-    peers: &Mutex<BTreeMap<HostId, PeerConnection>>,
-    self_id: HostId,
-    targets: &BTreeMap<HostId, PeerTarget>,
-    dropped_sends: &Arc<AtomicU64>,
-    tls: Option<&PeerTlsConfig>,
-) {
-    let mut peers = peers.lock().expect("peer connections lock");
-    peers.retain(|host, connection| {
-        targets
-            .get(host)
-            .is_some_and(|target| *host != self_id && *target == connection.target)
-    });
-    for (&peer, target) in targets {
-        if peer == self_id || peers.contains_key(&peer) {
-            continue;
+impl ConnectionSet {
+    fn new(self_id: HostId, dropped_sends: Arc<AtomicU64>, tls: Option<PeerTlsConfig>) -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(BTreeMap::new())),
+            self_id,
+            dropped_sends,
+            tls,
         }
-        let endpoint = target.endpoint;
-        let (sender, receiver) = tokio::sync::mpsc::channel::<OutboundFrame>(SEND_QUEUE);
-        let connected = Arc::new(AtomicBool::new(false));
-        let client_tls = tls.map(|tls| ClientTls {
-            config: tls.client.clone(),
-            identities: tls.certificate_identities.clone(),
-            expected: peer,
+    }
+
+    fn reconcile(&self, targets: &BTreeMap<HostId, PeerTarget>) {
+        let mut peers = self.peers.lock().expect("peer connections lock");
+        peers.retain(|host, connection| {
+            targets
+                .get(host)
+                .is_some_and(|target| *host != self.self_id && *target == connection.target)
         });
-        let task_connected = connected.clone();
-        let dropped = dropped_sends.clone();
-        let task = tokio::spawn(async move {
-            sender_loop(
-                receiver,
-                endpoint,
+        for (&peer, target) in targets {
+            if peer == self.self_id || peers.contains_key(&peer) {
+                continue;
+            }
+            let endpoint = target.endpoint;
+            let (sender, receiver) = tokio::sync::mpsc::channel::<OutboundFrame>(SEND_QUEUE);
+            let connected = Arc::new(AtomicBool::new(false));
+            let client_tls = self.tls.as_ref().map(|tls| ClientTls {
+                config: tls.client.clone(),
+                identities: tls.certificate_identities.clone(),
+                expected: peer,
+            });
+            let task_connected = connected.clone();
+            let dropped = self.dropped_sends.clone();
+            let task = tokio::spawn(async move {
+                Outbound::new(
+                    receiver,
+                    endpoint,
+                    peer,
+                    task_connected,
+                    dropped,
+                    client_tls,
+                )
+                .run()
+                .await;
+            });
+            peers.insert(
                 peer,
-                task_connected,
-                dropped,
-                client_tls,
-            )
-            .await;
-        });
-        peers.insert(
-            peer,
-            PeerConnection {
-                target: target.clone(),
-                sender,
-                connected,
-                task,
-            },
-        );
+                PeerConnection {
+                    target: target.clone(),
+                    sender,
+                    connected,
+                    task,
+                },
+            );
+        }
     }
 }
 
@@ -632,57 +667,39 @@ async fn publish_membership_heartbeat(membership: BucketMembership) {
     }
 }
 
-async fn refresh_bucket_membership_loop(
-    membership: BucketMembership,
-    identities: PeerIdentities,
-    leases: MembershipLeases,
-    peers: Arc<Mutex<BTreeMap<HostId, PeerConnection>>>,
-    self_id: HostId,
-    dropped_sends: Arc<AtomicU64>,
-    tls: PeerTlsConfig,
-) {
-    let mut join_delays = MEMBERSHIP_JOIN_REFRESH_DELAYS.into_iter();
-    let mut last_success = Instant::now();
-    loop {
-        tokio::time::sleep(join_delays.next().unwrap_or(MEMBERSHIP_REFRESH_INTERVAL)).await;
-        let elapsed = last_success.elapsed();
-        if elapsed >= MAX_MEMBERSHIP_STALENESS {
-            identities.replace(BTreeMap::new());
-            reconcile_connections(
-                &peers,
-                self_id,
-                &BTreeMap::new(),
-                &dropped_sends,
-                Some(&tls),
-            );
-        }
-        let refresh_budget = MAX_MEMBERSHIP_STALENESS
-            .checked_sub(elapsed)
-            .unwrap_or(MAX_MEMBERSHIP_STALENESS);
-        match timeout(
-            refresh_budget,
-            refresh_bucket_membership(&membership.store, &identities, &leases),
-        )
-        .await
-        {
-            Ok(Ok(targets)) => {
-                last_success = Instant::now();
-                reconcile_connections(&peers, self_id, &targets, &dropped_sends, Some(&tls));
+impl MembershipRefresher {
+    async fn run(self) {
+        let mut join_delays = MEMBERSHIP_JOIN_REFRESH_DELAYS.into_iter();
+        let mut last_success = Instant::now();
+        loop {
+            tokio::time::sleep(join_delays.next().unwrap_or(MEMBERSHIP_REFRESH_INTERVAL)).await;
+            let elapsed = last_success.elapsed();
+            if elapsed >= MAX_MEMBERSHIP_STALENESS {
+                self.identities.replace(BTreeMap::new());
+                self.connections.reconcile(&BTreeMap::new());
             }
-            Ok(Err(error)) => {
-                tracing::warn!(?error, "failed to refresh peer TLS membership");
+            let refresh_budget = MAX_MEMBERSHIP_STALENESS
+                .checked_sub(elapsed)
+                .unwrap_or(MAX_MEMBERSHIP_STALENESS);
+            match timeout(
+                refresh_budget,
+                refresh_bucket_membership(&self.membership.store, &self.identities, &self.leases),
+            )
+            .await
+            {
+                Ok(Ok(targets)) => {
+                    last_success = Instant::now();
+                    self.connections.reconcile(&targets);
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "failed to refresh peer TLS membership");
+                }
+                Err(_) => tracing::warn!("peer TLS membership refresh timed out"),
             }
-            Err(_) => tracing::warn!("peer TLS membership refresh timed out"),
-        }
-        if last_success.elapsed() >= MAX_MEMBERSHIP_STALENESS {
-            identities.replace(BTreeMap::new());
-            reconcile_connections(
-                &peers,
-                self_id,
-                &BTreeMap::new(),
-                &dropped_sends,
-                Some(&tls),
-            );
+            if last_success.elapsed() >= MAX_MEMBERSHIP_STALENESS {
+                self.identities.replace(BTreeMap::new());
+                self.connections.reconcile(&BTreeMap::new());
+            }
         }
     }
 }
@@ -750,9 +767,9 @@ impl PeerNet {
         deliver: impl Fn(HostId, PeerMsg) + Send + Sync + 'static,
     ) -> Arc<PeerNet> {
         let dropped_sends = Arc::new(AtomicU64::new(0));
-        let peers = Arc::new(Mutex::new(BTreeMap::new()));
+        let connections = ConnectionSet::new(self_id, dropped_sends.clone(), tls.cloned());
         let mut tasks = Vec::new();
-        reconcile_connections(&peers, self_id, initial_targets, &dropped_sends, tls);
+        connections.reconcile(initial_targets);
         let deliver: Arc<Deliver> = Arc::new(deliver);
         let server_tls = tls.map(|tls| ServerTls {
             config: tls.server.clone(),
@@ -762,19 +779,19 @@ impl PeerNet {
             tasks.push(tokio::spawn(publish_membership_heartbeat(
                 tls.membership.clone(),
             )));
-            tasks.push(tokio::spawn(refresh_bucket_membership_loop(
-                tls.membership.clone(),
-                tls.certificate_identities.clone(),
-                tls.membership_leases.clone(),
-                peers.clone(),
-                self_id,
-                dropped_sends.clone(),
-                (*tls).clone(),
-            )));
+            tasks.push(tokio::spawn(
+                MembershipRefresher {
+                    membership: tls.membership.clone(),
+                    identities: tls.certificate_identities.clone(),
+                    leases: tls.membership_leases.clone(),
+                    connections: connections.clone(),
+                }
+                .run(),
+            ));
         }
         tasks.push(tokio::spawn(listener_loop(listener, deliver, server_tls)));
         Arc::new(PeerNet {
-            peers,
+            connections,
             dropped_sends,
             tasks: Mutex::new(tasks),
             authenticated: tls.is_some(),
@@ -789,6 +806,7 @@ impl PeerNet {
     /// unknown peers and full queues drop the frame (retries re-drive).
     pub fn send(&self, self_id: HostId, to: HostId, msg: &PeerMsg) {
         let sender = self
+            .connections
             .peers
             .lock()
             .expect("peer connections lock")
@@ -811,7 +829,8 @@ impl PeerNet {
     }
 
     pub fn connections(&self) -> Vec<(HostId, bool)> {
-        self.peers
+        self.connections
+            .peers
             .lock()
             .expect("peer connections lock")
             .iter()
@@ -835,7 +854,11 @@ impl Drop for PeerNet {
         for task in self.tasks.lock().expect("lock").drain(..) {
             task.abort();
         }
-        self.peers.lock().expect("peer connections lock").clear();
+        self.connections
+            .peers
+            .lock()
+            .expect("peer connections lock")
+            .clear();
     }
 }
 
@@ -846,78 +869,93 @@ trait PeerIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
 impl<T> PeerIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
-async fn sender_loop(
-    mut rx: Receiver<OutboundFrame>,
-    addr: SocketAddr,
-    peer: HostId,
-    connected: Arc<AtomicBool>,
-    dropped_sends: Arc<AtomicU64>,
-    tls: Option<ClientTls>,
-) {
-    let mut conn: Option<Box<dyn PeerIo>> = None;
-    let mut renewal: Option<tokio::task::JoinHandle<Option<Box<dyn PeerIo>>>> = None;
-    loop {
-        if conn.is_none()
-            && let Some(task) = renewal.take()
-        {
-            task.abort();
-        }
-        if let Some(task) = renewal.as_mut() {
-            tokio::select! {
-                renewed = task => {
-                    renewal = None;
-                    if let Ok(Some(stream)) = renewed {
-                        conn = Some(stream);
-                        connected.store(true, Ordering::Relaxed);
-                    }
-                    if conn.is_some() {
-                        renewal = Some(spawn_connection_renewal(addr, tls.clone()));
-                    }
-                    continue;
-                }
-                frame = rx.recv() => {
-                    let Some(frame) = frame else { break };
-                    if frame.reconnect {
-                        if let Some(task) = renewal.take() {
-                            task.abort();
-                        }
-                        conn = connect(addr, tls.as_ref()).await;
-                        connected.store(conn.is_some(), Ordering::Relaxed);
-                        if conn.is_some() {
-                            renewal = Some(spawn_connection_renewal(addr, tls.clone()));
-                        }
-                    }
-                    if !write_peer_frame(&mut conn, &frame.bytes).await {
-                        dropped_sends.fetch_add(1, Ordering::SeqCst);
-                        connected.store(false, Ordering::Relaxed);
-                        tracing::warn!(peer_host = peer.0, %addr, "peer connection lost");
-                        conn = None;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        let Some(frame) = rx.recv().await else { break };
-        if frame.reconnect || conn.is_none() {
-            conn = connect(addr, tls.as_ref()).await;
-            connected.store(conn.is_some(), Ordering::Relaxed);
-            if conn.is_some() {
-                renewal = Some(spawn_connection_renewal(addr, tls.clone()));
-            }
-        }
-        if conn.is_none() {
-            dropped_sends.fetch_add(1, Ordering::SeqCst);
-            continue; // peer unreachable: drop the frame
-        }
-        if !write_peer_frame(&mut conn, &frame.bytes).await {
-            dropped_sends.fetch_add(1, Ordering::SeqCst);
-            connected.store(false, Ordering::Relaxed);
-            tracing::warn!(peer_host = peer.0, %addr, "peer connection lost");
-            conn = None;
+impl Outbound {
+    fn new(
+        rx: Receiver<OutboundFrame>,
+        addr: SocketAddr,
+        peer: HostId,
+        connected: Arc<AtomicBool>,
+        dropped_sends: Arc<AtomicU64>,
+        tls: Option<ClientTls>,
+    ) -> Self {
+        Self {
+            rx,
+            addr,
+            peer,
+            connected,
+            dropped_sends,
+            tls,
+            conn: None,
+            renewal: None,
         }
     }
-    connected.store(false, Ordering::Relaxed);
+
+    async fn run(mut self) {
+        loop {
+            if self.conn.is_none()
+                && let Some(task) = self.renewal.take()
+            {
+                task.abort();
+            }
+            if let Some(task) = self.renewal.as_mut() {
+                tokio::select! {
+                    renewed = task => {
+                        self.renewal = None;
+                        if let Ok(Some(stream)) = renewed {
+                            self.conn = Some(stream);
+                            self.connected.store(true, Ordering::Relaxed);
+                        }
+                        if self.conn.is_some() {
+                            self.renewal = Some(spawn_connection_renewal(self.addr, self.tls.clone()));
+                        }
+                        continue;
+                    }
+                    frame = self.rx.recv() => {
+                        let Some(frame) = frame else { break };
+                        if frame.reconnect {
+                            if let Some(task) = self.renewal.take() {
+                                task.abort();
+                            }
+                            self.conn = connect(self.addr, self.tls.as_ref()).await;
+                            self.connected.store(self.conn.is_some(), Ordering::Relaxed);
+                            if self.conn.is_some() {
+                                self.renewal = Some(spawn_connection_renewal(self.addr, self.tls.clone()));
+                            }
+                        }
+                        if !write_peer_frame(&mut self.conn, &frame.bytes).await {
+                            self.dropped_sends.fetch_add(1, Ordering::SeqCst);
+                            self.connected.store(false, Ordering::Relaxed);
+                            tracing::warn!(peer_host = self.peer.0, addr = %self.addr, "peer connection lost");
+                            self.conn = None;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let Some(frame) = self.rx.recv().await else {
+                break;
+            };
+            if frame.reconnect || self.conn.is_none() {
+                self.conn = connect(self.addr, self.tls.as_ref()).await;
+                self.connected.store(self.conn.is_some(), Ordering::Relaxed);
+                if self.conn.is_some() {
+                    self.renewal = Some(spawn_connection_renewal(self.addr, self.tls.clone()));
+                }
+            }
+            if self.conn.is_none() {
+                self.dropped_sends.fetch_add(1, Ordering::SeqCst);
+                continue; // peer unreachable: drop the frame
+            }
+            if !write_peer_frame(&mut self.conn, &frame.bytes).await {
+                self.dropped_sends.fetch_add(1, Ordering::SeqCst);
+                self.connected.store(false, Ordering::Relaxed);
+                tracing::warn!(peer_host = self.peer.0, addr = %self.addr, "peer connection lost");
+                self.conn = None;
+            }
+        }
+        self.connected.store(false, Ordering::Relaxed);
+    }
 }
 
 fn spawn_connection_renewal(
@@ -1051,7 +1089,7 @@ mod tests {
     use super::*;
     use crate::fakegcs::FakeGcs;
     use crate::{GcsConfig, GcsStore};
-    use blockd_core::types::VsetId;
+    use blockd_core::types::VolumeId;
 
     fn free_addr() -> SocketAddr {
         std::net::TcpListener::bind("127.0.0.1:0")
@@ -1126,7 +1164,7 @@ mod tests {
             .await
             .expect("read member")
             .expect("published member");
-        decode_member(&encoded).expect("valid member record")
+        MemberRecord::decode(&encoded).expect("valid member record")
     }
 
     fn spawn_traffic(net: Arc<PeerNet>, from: HostId, to: HostId) -> tokio::task::JoinHandle<()> {
@@ -1137,7 +1175,7 @@ mod tests {
                     from,
                     to,
                     &PeerMsg::Released {
-                        vset: VsetId(19),
+                        volume: VolumeId(19),
                         release_fence: fence,
                     },
                 );
@@ -1156,7 +1194,7 @@ mod tests {
             loop {
                 store
                     .clone()
-                    .put(peer_membership_key(host), encode_member(&member))
+                    .put(peer_membership_key(host), member.encode())
                     .await
                     .expect("renew test membership");
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1245,7 +1283,7 @@ mod tests {
         }
 
         let message = PeerMsg::Released {
-            vset: VsetId(11),
+            volume: VolumeId(11),
             release_fence: 7,
         };
         let mut received = None;
@@ -1262,7 +1300,7 @@ mod tests {
             HostId(9),
             HostId(1),
             &PeerMsg::Released {
-                vset: VsetId(12),
+                volume: VolumeId(12),
                 release_fence: 8,
             },
         );
@@ -1283,7 +1321,7 @@ mod tests {
         let member = stored_member(&store, HostId(4)).await;
         store
             .clone()
-            .put(peer_membership_key(HostId(4)), encode_member(&member))
+            .put(peer_membership_key(HostId(4)), member.encode())
             .await
             .expect("renew host 4");
         refresh_bucket_membership(
@@ -1295,7 +1333,7 @@ mod tests {
         .expect("observe host 4 renewal");
         store
             .clone()
-            .put(peer_membership_key(HostId(5)), encode_member(&member))
+            .put(peer_membership_key(HostId(5)), member.encode())
             .await
             .expect("publish duplicate");
         refresh_bucket_membership(
@@ -1307,7 +1345,7 @@ mod tests {
         .expect("observe duplicate");
         store
             .clone()
-            .put(peer_membership_key(HostId(5)), encode_member(&member))
+            .put(peer_membership_key(HostId(5)), member.encode())
             .await
             .expect("renew duplicate");
         refresh_bucket_membership(
@@ -1560,7 +1598,7 @@ mod tests {
         assert_ne!(replacement.certificate, old_member.certificate);
         store
             .clone()
-            .put(peer_membership_key(HostId(2)), encode_member(&replacement))
+            .put(peer_membership_key(HostId(2)), replacement.encode())
             .await
             .expect("replace certificate at the same endpoint");
 
@@ -1568,6 +1606,7 @@ mod tests {
             loop {
                 let discovered = node_0
                     .net
+                    .connections
                     .peers
                     .lock()
                     .expect("peer connections lock")
@@ -1613,6 +1652,7 @@ mod tests {
             loop {
                 let endpoint = node_1
                     .net
+                    .connections
                     .peers
                     .lock()
                     .expect("peer connections lock")
@@ -1892,7 +1932,7 @@ mod tests {
             .expect("start source");
 
         let warmup = PeerMsg::ReleasedAck {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             release_fence: 3,
         };
         source.send(HostId(1), HostId(0), &warmup);
@@ -1927,7 +1967,7 @@ mod tests {
             }
         };
         let ack = PeerMsg::ReplicaReleaseAck {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             through: ReplicaCommitInfo {
                 writer_fence: 4,
@@ -1979,8 +2019,8 @@ mod tests {
         expected.extend_from_slice(&[0; 20]);
         expected.extend_from_slice(&3_u32.to_le_bytes());
         expected.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(encode_member(&record), expected);
-        assert_eq!(decode_member(&expected), Some(record));
+        assert_eq!(record.encode(), expected);
+        assert_eq!(MemberRecord::decode(&expected), Some(record));
     }
 
     #[test]
@@ -1994,17 +2034,17 @@ mod tests {
             )),
             certificate: vec![9; 32],
         };
-        let encoded = encode_member(&record);
-        assert_eq!(decode_member(&encoded), Some(record));
+        let encoded = record.encode();
+        assert_eq!(MemberRecord::decode(&encoded), Some(record));
 
         let mut bad_magic = encoded.clone();
         bad_magic[0] ^= 1;
-        assert_eq!(decode_member(&bad_magic), None);
+        assert_eq!(MemberRecord::decode(&bad_magic), None);
         let mut zero_port = encoded.clone();
         zero_port[5..7].copy_from_slice(&0_u16.to_le_bytes());
-        assert_eq!(decode_member(&zero_port), None);
+        assert_eq!(MemberRecord::decode(&zero_port), None);
         let mut trailing = encoded;
         trailing.push(0);
-        assert_eq!(decode_member(&trailing), None);
+        assert_eq!(MemberRecord::decode(&trailing), None);
     }
 }

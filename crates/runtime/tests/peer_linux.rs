@@ -1,6 +1,6 @@
 //! The TCP peer transport on loopback: framing, sender identity, silent
 //! drops before the listener exists, reconnection, corruption handling,
-//! and a segment-sized payload — the transport half of what the migration
+//! and a blx-sized payload — the transport half of what the migration
 //! e2e then exercises end to end.
 
 #![cfg(target_os = "linux")]
@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use blockd_core::protocol::{PeerMsg, PeerRequestId, ReplicaArtifact, ReplicaCommitInfo};
-use blockd_core::types::{HostId, JournalSeq, SegId, VsetId};
+use blockd_core::types::{HostId, JournalSeq, ObjectId, VolumeId};
 use blockd_runtime::{PeerConfig, PeerNet};
 
 /// A bound-then-released ephemeral port: still free momentarily after.
@@ -45,9 +45,9 @@ async fn net(
 }
 
 fn sample_msgs() -> Vec<PeerMsg> {
-    let artifact = ReplicaArtifact::Segment {
+    let artifact = ReplicaArtifact::Blx {
         fence: 4,
-        seg: SegId(8),
+        object: ObjectId(8),
     };
     let info = ReplicaCommitInfo {
         writer_fence: 4,
@@ -56,20 +56,20 @@ fn sample_msgs() -> Vec<PeerMsg> {
     };
     vec![
         PeerMsg::MigrateOffer {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             record: vec![1, 2, 3],
             vmstate: Some(vec![4, 5, 6]),
         },
         PeerMsg::MigrateAccept {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             offer_fence: 11,
         },
         PeerMsg::FetchRange {
             io: PeerRequestId(1),
-            vset: VsetId(7),
+            volume: VolumeId(7),
             replica_assignment_epoch: Some(8),
             fence: 2,
-            seg: SegId(3),
+            object: ObjectId(3),
             offset: 4,
             len: 5,
         },
@@ -78,54 +78,54 @@ fn sample_msgs() -> Vec<PeerMsg> {
             bytes: Some(vec![9; 640]),
         },
         PeerMsg::Released {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             release_fence: 3,
         },
         PeerMsg::ReleasedAck {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             release_fence: 3,
         },
         PeerMsg::ReplicaPut {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             artifact,
             checksum: 0xAABB_CCDD,
             bytes: vec![0x5A; 1024],
         },
         PeerMsg::ReplicaPutAck {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             artifact,
             checksum: 0xAABB_CCDD,
         },
         PeerMsg::ReplicaCommit {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             info,
             required: vec![artifact],
             record: vec![0xC3; 128],
         },
         PeerMsg::ReplicaCommitAck {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             info,
         },
         PeerMsg::ReplicaStatus {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
         },
         PeerMsg::ReplicaStatusReply {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             committed: Some(info),
         },
         PeerMsg::ReplicaRelease {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             through: info,
         },
         PeerMsg::ReplicaReleaseAck {
-            vset: VsetId(7),
+            volume: VolumeId(7),
             assignment_epoch: 2,
             through: info,
         },
@@ -169,7 +169,7 @@ async fn sends_before_the_listener_drop_and_reconnect_works_after() {
         HostId(0),
         HostId(1),
         &PeerMsg::Released {
-            vset: VsetId(1),
+            volume: VolumeId(1),
             release_fence: 3,
         },
     );
@@ -185,7 +185,7 @@ async fn sends_before_the_listener_drop_and_reconnect_works_after() {
             HostId(0),
             HostId(1),
             &PeerMsg::ReleasedAck {
-                vset: VsetId(2),
+                volume: VolumeId(2),
                 release_fence: 4,
             },
         );
@@ -198,7 +198,7 @@ async fn sends_before_the_listener_drop_and_reconnect_works_after() {
     assert_eq!(
         got,
         PeerMsg::ReleasedAck {
-            vset: VsetId(2),
+            volume: VolumeId(2),
             release_fence: 4,
         }
     );
@@ -231,7 +231,7 @@ async fn a_corrupt_frame_closes_its_connection_without_wedging() {
         HostId(0),
         HostId(1),
         &PeerMsg::Released {
-            vset: VsetId(3),
+            volume: VolumeId(3),
             release_fence: 5,
         },
     );
@@ -241,15 +241,15 @@ async fn a_corrupt_frame_closes_its_connection_without_wedging() {
     assert_eq!(
         got,
         PeerMsg::Released {
-            vset: VsetId(3),
+            volume: VolumeId(3),
             release_fence: 5,
         }
     );
 }
 
-/// A segment-sized page payload (8 MiB) crosses intact.
+/// A blx-sized page payload (8 MiB) crosses intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_segment_sized_payload_round_trips() {
+async fn a_blx_sized_payload_round_trips() {
     let addr_a = free_addr();
     let addr_b = free_addr();
     let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]

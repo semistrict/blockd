@@ -8,7 +8,7 @@ use std::time::Duration;
 use blockd_core::engine::{HostState, host_actor_with_state};
 use blockd_core::head::HeadRecord;
 use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::layout;
 use blockd_core::manifest::Manifest;
 use blockd_core::placement::PeerCandidate;
@@ -17,24 +17,24 @@ use blockd_core::replica_recovery::{
     ReplicaResidue, export_replica_recovery, prepare_replica_publication,
     prepare_replica_recovery_claim,
 };
-use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis, page_size};
+use blockd_core::types::{HostId, PageId, PageNo, VolumeId, millis, page_size};
 use blockd_core::world::{Store, StoreError};
 use blockd_exec::channel::{OneReceiver, OneSender, oneshot, unbounded};
 use blockd_exec::inject::{Injector, Lane, injector};
 use blockd_exec::rng::Ppm;
 use blockd_exec::{
-    Either, FaultConfig, Response, SimulationContext, TaskHandle, TaskSet, delay, now, random_u64,
-    select2, spawn,
+    Either, FaultConfig, Response, SimulationContext, TaskHandle, TaskSet, delay, now,
+    random_between, random_hit, random_u64, select2, spawn,
 };
 
-use crate::actor_world::SimWorld;
 use crate::guest::page_pattern;
 use crate::model::{BlobDevConfig, CrashFate, StoreConfig, StoreCounters};
 use crate::peer_transport::{PeerTransport, PeerTransportFaults, PeerTransportStats};
+use crate::world::SimWorld;
 
 type SharedState = Rc<RefCell<HostState>>;
 type StateSlots = Rc<Vec<RefCell<SharedState>>>;
-type GuestSlots = Rc<RefCell<BTreeMap<VsetId, Option<TaskHandle<()>>>>>;
+type GuestSlots = Rc<RefCell<BTreeMap<VolumeId, Option<TaskHandle<()>>>>>;
 type HostCommands = Rc<RefCell<VecDeque<HostCommand>>>;
 #[cfg(test)]
 const CHECKPOINT_CONCURRENCY: usize = crate::checkpoint_schedule::CONCURRENCY;
@@ -62,10 +62,16 @@ pub enum PeerKind {
     ReplicaPutAck = 9,
     ReplicaCommit = 10,
     ReplicaCommitAck = 11,
-    ReplicaStatus = 13,
-    ReplicaStatusReply = 14,
-    ReplicaRelease = 16,
-    ReplicaReleaseAck = 17,
+    ReplicaStatus = 12,
+    ReplicaStatusReply = 13,
+    ReplicaRelease = 15,
+    ReplicaReleaseAck = 16,
+    VnodeAdopt = 18,
+    VnodeAdoptAck = 19,
+    VnodeFetchClosure = 20,
+    VnodeClosure = 21,
+    VnodeCommit = 22,
+    VnodeCommitAck = 23,
 }
 
 #[derive(Clone, Debug)]
@@ -74,8 +80,8 @@ pub struct ClusterConfig {
     pub daemon: HostConfig,
     pub bdev: BlobDevConfig,
     pub store: StoreConfig,
-    pub vset_count: u16,
-    pub vset_config: VsetConfig,
+    pub volume_count: u16,
+    pub volume_config: VolumeConfig,
     pub horizon: u64,
     pub think: (u64, u64),
     pub checkpoint_interval: Option<u64>,
@@ -89,10 +95,9 @@ pub struct ClusterConfig {
     pub peer_link_outages: Vec<(u64, u64, u16, u16)>,
     pub fault_points: Vec<FaultPoint>,
     pub store_outage: Option<(u64, u64)>,
-    pub rot_resume_set_at: Option<u64>,
     pub drop_peer: Option<(PeerKind, u64, u64)>,
     pub race_restore: bool,
-    pub migrate_at: Vec<(u64, VsetId, u16)>,
+    pub migrate_at: Vec<(u64, VolumeId, u16)>,
     pub sabotage: Option<Sabotage>,
     pub guest_sync_share: Option<Ppm>,
 }
@@ -102,7 +107,7 @@ pub struct ClusterReport {
     pub trace_hash: u64,
     pub violations: Vec<String>,
     pub audit_runs: u64,
-    pub audited_vsets: u64,
+    pub audited_volumes: u64,
     pub audited_pages: u64,
     pub completed_ops: u64,
     pub restores: u64,
@@ -112,7 +117,6 @@ pub struct ClusterReport {
     pub migrations: u64,
     pub max_restore_ns: u64,
     pub max_migration_pause_ns: u64,
-    pub prefetch_fills: u64,
     pub peer_drops: u64,
     pub peer_dups: u64,
     pub peer_link_clogs: u64,
@@ -134,7 +138,6 @@ pub struct ClusterReport {
     pub migrations_refused: u64,
     pub hydrate_fills: u64,
     pub store_retries: u64,
-    pub peer_rejected: u64,
     pub nemesis_drops: u64,
     pub wedged_guests: u64,
     pub wedged_hydration: u64,
@@ -148,16 +151,15 @@ pub struct ClusterReport {
     pub replica_logical_bytes: u64,
     pub replica_nonactive_bytes: u64,
     pub replica_replacement_bytes: u64,
-    pub replica_cleanup_rewrite_bytes: u64,
     pub replica_artifact_flushes: u64,
     pub replica_commit_flushes: u64,
     pub replica_rotations: u64,
     pub replica_capacity_backpressure: u64,
-    pub published_segment_bytes: u64,
+    pub published_blx_bytes: u64,
     pub published_live_entry_bytes: u64,
     pub published_dead_entry_bytes: u64,
-    pub published_segment_overhead_bytes: u64,
-    pub segs_compacted: u64,
+    pub published_blx_overhead_bytes: u64,
+    pub blx_files_compacted: u64,
     pub pages_compacted: u64,
     pub store: StoreCounters,
     pub blobs_per_host: Vec<usize>,
@@ -191,16 +193,16 @@ struct MigrationAttempt {
 }
 
 struct Control {
-    placement: BTreeMap<VsetId, u16>,
+    placement: BTreeMap<VolumeId, u16>,
     guests: GuestSlots,
-    guest_state: BTreeMap<VsetId, Rc<GuestState>>,
-    migrations: BTreeMap<VsetId, MigrationAttempt>,
-    uncertain_migrations: BTreeSet<VsetId>,
-    accepted_migrations: BTreeSet<VsetId>,
-    deferred_source_recoveries: BTreeMap<VsetId, (u16, Verdict)>,
-    deferred_destination_recoveries: BTreeMap<VsetId, (u16, Verdict)>,
-    quiescing_guests: BTreeSet<VsetId>,
-    migration_cuts: BTreeSet<VsetId>,
+    guest_state: BTreeMap<VolumeId, Rc<GuestState>>,
+    migrations: BTreeMap<VolumeId, MigrationAttempt>,
+    uncertain_migrations: BTreeSet<VolumeId>,
+    accepted_migrations: BTreeSet<VolumeId>,
+    deferred_source_recoveries: BTreeMap<VolumeId, (u16, Verdict)>,
+    deferred_destination_recoveries: BTreeMap<VolumeId, (u16, Verdict)>,
+    quiescing_guests: BTreeSet<VolumeId>,
+    migration_cuts: BTreeSet<VolumeId>,
     live: Vec<bool>,
     up: Vec<bool>,
     workload_end: Cell<u64>,
@@ -251,8 +253,8 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
             .collect::<Vec<_>>(),
     );
     let guest_slots: GuestSlots = Rc::new(RefCell::new(BTreeMap::new()));
-    let guest_state = (1..=config.vset_count)
-        .map(|number| (VsetId(u64::from(number)), Rc::new(GuestState::default())))
+    let guest_state = (1..=config.volume_count)
+        .map(|number| (VolumeId(u64::from(number)), Rc::new(GuestState::default())))
         .collect();
     let control = Rc::new(RefCell::new(Control {
         placement: BTreeMap::new(),
@@ -444,8 +446,8 @@ async fn run_inner(
         .detach();
     }
 
-    let initial_vsets =
-        create_initial_vsets(Rc::clone(&config), Rc::clone(&worlds), Rc::clone(&control)).await;
+    let initial_volumes =
+        create_initial_volumes(Rc::clone(&config), Rc::clone(&worlds), Rc::clone(&control)).await;
     let workload_end = now().saturating_add(config.horizon);
     control.borrow().workload_end.set(workload_end);
     let simulation_end = workload_end.saturating_add(2 * millis(1_000));
@@ -462,8 +464,8 @@ async fn run_inner(
     let guest_worlds = Rc::clone(&worlds);
     let guest_control = Rc::clone(&control);
     async move {
-        for (vset, host) in initial_vsets {
-            start_guest(vset, host, &guest_control, &guest_worlds, &guest_config);
+        for (volume, host) in initial_volumes {
+            start_guest(volume, host, &guest_control, &guest_worlds, &guest_config);
         }
     }
     .await;
@@ -479,7 +481,7 @@ async fn run_inner(
     {
         let mut control = control.borrow_mut();
         control.report.audit_runs = 1;
-        control.report.audited_vsets = audit.vsets;
+        control.report.audited_volumes = audit.volumes;
         control.report.audited_pages = audit.pages;
         control.report.violations.extend(audit.violations);
     }
@@ -529,9 +531,11 @@ async fn run_inner(
                 .borrow()
                 .borrow()
                 .stats()
-                .vsets
+                .volumes
                 .iter()
-                .filter(|vset| matches!(vset.role, blockd_core::hostmeta::VsetRole::Hydrating))
+                .filter(|volume| {
+                    matches!(volume.role, blockd_core::hostmeta::VolumeRole::Hydrating)
+                })
                 .count()
         })
         .sum();
@@ -549,10 +553,10 @@ async fn run_inner(
     control.report.store_cas_conflicts = conflicts;
     control.report.store = worlds[0].store_metrics();
     (
-        control.report.published_segment_bytes,
+        control.report.published_blx_bytes,
         control.report.published_live_entry_bytes,
         control.report.published_dead_entry_bytes,
-        control.report.published_segment_overhead_bytes,
+        control.report.published_blx_overhead_bytes,
     ) = worlds[0].published_archive_metrics();
     control.report.disk_bitflips = worlds.iter().map(|world| world.bitflips()).sum();
     control.report.blobs_per_host = worlds.iter().map(|world| world.blob_count()).collect();
@@ -565,7 +569,7 @@ async fn run_inner(
 
 #[derive(Default)]
 struct AuditReport {
-    vsets: u64,
+    volumes: u64,
     pages: u64,
     violations: Vec<String>,
 }
@@ -579,18 +583,18 @@ async fn audit_cluster(
 ) -> AuditReport {
     let mut audit = AuditReport::default();
     let store = worlds[0].store_snapshot();
-    for number in 1..=config.vset_count {
-        let vset = VsetId(u64::from(number));
-        let Some(placed) = control.borrow().placement.get(&vset).copied() else {
+    for number in 1..=config.volume_count {
+        let volume = VolumeId(u64::from(number));
+        let Some(placed) = control.borrow().placement.get(&volume).copied() else {
             audit
                 .violations
-                .push(format!("final audit found no placement for {vset:?}"));
+                .push(format!("final audit found no placement for {volume:?}"));
             continue;
         };
         if !control.borrow().live[usize::from(placed)] || !control.borrow().up[usize::from(placed)]
         {
             audit.violations.push(format!(
-                "final audit placement for {vset:?} points at unavailable host {placed}"
+                "final audit placement for {volume:?} points at unavailable host {placed}"
             ));
             continue;
         }
@@ -607,38 +611,40 @@ async fn audit_cluster(
             let state = states[usize::from(host)].borrow();
             let state = state.borrow();
             if state
-                .vsets
-                .get(&vset)
-                .is_some_and(|vset_state| vset_state.ready && vset_state.outbound.is_none())
+                .volumes
+                .get(&volume)
+                .is_some_and(|volume_state| volume_state.ready && volume_state.outbound.is_none())
             {
                 authorities.push(host);
             }
         }
         if authorities.len() > 1 {
             audit.violations.push(format!(
-                "final audit found multiple authorities for {vset:?}: {authorities:?}"
+                "final audit found multiple authorities for {volume:?}: {authorities:?}"
             ));
             continue;
         }
         let lifecycle_in_progress = {
             let control = control.borrow();
-            control.migrations.contains_key(&vset)
-                || control.quiescing_guests.contains(&vset)
-                || control.migration_cuts.contains(&vset)
-                || control.deferred_source_recoveries.contains_key(&vset)
-                || control.deferred_destination_recoveries.contains_key(&vset)
+            control.migrations.contains_key(&volume)
+                || control.quiescing_guests.contains(&volume)
+                || control.migration_cuts.contains(&volume)
+                || control.deferred_source_recoveries.contains_key(&volume)
+                || control
+                    .deferred_destination_recoveries
+                    .contains_key(&volume)
         };
         let Some(&authority) = authorities.first() else {
             if !lifecycle_in_progress {
                 audit.violations.push(format!(
-                    "final audit expected authority {placed} for {vset:?}, found none"
+                    "final audit expected authority {placed} for {volume:?}, found none"
                 ));
             }
             continue;
         };
         if authority != placed && !lifecycle_in_progress {
             audit.violations.push(format!(
-                "final audit expected authority {placed} for {vset:?}, found {authority}"
+                "final audit expected authority {placed} for {volume:?}, found {authority}"
             ));
             continue;
         }
@@ -646,49 +652,47 @@ async fn audit_cluster(
         {
             let state = states[usize::from(authority)].borrow();
             let state = state.borrow();
-            let Some(vset_state) = state.vsets.get(&vset) else {
+            let Some(volume_state) = state.volumes.get(&volume) else {
                 audit.violations.push(format!(
-                    "final audit authority {placed} has no state for {vset:?}"
+                    "final audit authority {placed} has no state for {volume:?}"
                 ));
                 continue;
             };
-            if vset_state.local_covered_through < vset_state.sync_ack_through {
+            if volume_state.local_covered_through < volume_state.sync_ack_through {
                 audit.violations.push(format!(
-                    "final audit found local coverage {} behind acknowledged sync {} for {vset:?}",
-                    vset_state.local_covered_through, vset_state.sync_ack_through
+                    "final audit found local coverage {} behind acknowledged sync {} for {volume:?}",
+                    volume_state.local_covered_through, volume_state.sync_ack_through
                 ));
             }
-            let archived_through = vset_state
+            let archived_through = volume_state
                 .backed
-                .and_then(|pointer| {
-                    store.get(&layout::manifest_key(vset, pointer.fence, pointer.seq))
-                })
-                .and_then(|bytes| Manifest::decode(vset, bytes).ok())
+                .and_then(|pointer| store.get(&pointer.manifest_key(volume)))
+                .and_then(|bytes| Manifest::decode(volume, bytes).ok())
                 .map_or(0, |manifest| manifest.sync_covered_through);
-            let protected_through = vset_state.peer_committed_through.max(archived_through);
-            if protected_through < vset_state.sync_ack_through {
+            let protected_through = volume_state.peer_committed_through.max(archived_through);
+            if protected_through < volume_state.sync_ack_through {
                 audit.violations.push(format!(
-                    "final audit found protected coverage {protected_through} behind acknowledged sync {} for {vset:?}",
-                    vset_state.sync_ack_through
+                    "final audit found protected coverage {protected_through} behind acknowledged sync {} for {volume:?}",
+                    volume_state.sync_ack_through
                 ));
             }
         }
 
-        if let Some(head_bytes) = store.get(&layout::head_key(vset)) {
-            match HeadRecord::decode(vset, head_bytes) {
+        if let Some(head_bytes) = store.get(&layout::head_key(volume)) {
+            match HeadRecord::decode(volume, head_bytes) {
                 Ok(head) => {
                     if head.holder != HostId(placed) {
                         audit.violations.push(format!(
-                            "final audit head for {vset:?} names {:?}, placement names {:?}",
+                            "final audit head for {volume:?} names {:?}, placement names {:?}",
                             head.holder,
                             HostId(placed)
                         ));
                     }
                     if let Some(pointer) = head.manifest {
-                        let key = layout::manifest_key(vset, pointer.fence, pointer.seq);
+                        let key = pointer.manifest_key(volume);
                         match store
                             .get(&key)
-                            .and_then(|bytes| Manifest::decode(vset, bytes).ok())
+                            .and_then(|bytes| Manifest::decode(volume, bytes).ok())
                         {
                             Some(manifest)
                                 if (
@@ -697,26 +701,26 @@ async fn audit_cluster(
                                     manifest.capture_seq,
                                 ) == (pointer.fence, pointer.seq.0, pointer.capture_seq) => {}
                             _ => audit.violations.push(format!(
-                                "final audit could not verify head manifest {key} for {vset:?}"
+                                "final audit could not verify head manifest {key} for {volume:?}"
                             )),
                         }
                     }
                 }
                 Err(_) => audit
                     .violations
-                    .push(format!("final audit could not decode head for {vset:?}")),
+                    .push(format!("final audit could not decode head for {volume:?}")),
             }
         }
 
-        let guest = Rc::clone(&control.borrow().guest_state[&vset]);
+        let guest = Rc::clone(&control.borrow().guest_state[&volume]);
         let world = &worlds[usize::from(authority)];
         let violations_before = audit.violations.len();
         if config.sabotage == Some(Sabotage::EagerHandoffAck) {
-            audit.vsets = audit.vsets.saturating_add(1);
+            audit.volumes = audit.volumes.saturating_add(1);
             continue;
         }
-        for volume in config.vset_config.volumes(vset) {
-            for page_number in 0..config.vset_config.pages_per_volume {
+        for volume in std::iter::once(volume) {
+            for page_number in 0..config.volume_config.pages {
                 let page = PageId {
                     volume,
                     page: PageNo(page_number),
@@ -727,7 +731,7 @@ async fn audit_cluster(
                         Either::First(false) => Some("was rejected"),
                         Either::Second(()) => Some("timed out"),
                     };
-                world.set_vmstate(vset, guest.completed.get());
+                world.set_vmstate(volume, guest.completed.get());
                 if let Some(reason) = fault_failure {
                     audit.violations.push(format!(
                         "final audit fault {reason} for {page:?} on authority {authority}"
@@ -746,7 +750,7 @@ async fn audit_cluster(
             }
         }
         if audit.violations.len() == violations_before {
-            audit.vsets = audit.vsets.saturating_add(1);
+            audit.volumes = audit.volumes.saturating_add(1);
         }
     }
     audit
@@ -794,55 +798,55 @@ fn host_config(config: &ClusterConfig, host: u16) -> HostConfig {
     }
 }
 
-fn vset_config(config: &ClusterConfig, _vset: VsetId) -> blockd_core::journal::VsetConfig {
-    config.vset_config
+fn volume_config(config: &ClusterConfig, _volume: VolumeId) -> blockd_core::journal::VolumeConfig {
+    config.volume_config
 }
 
-async fn create_initial_vsets(
+async fn create_initial_volumes(
     config: Rc<ClusterConfig>,
     worlds: Rc<Vec<Rc<SimWorld>>>,
     control: Rc<RefCell<Control>>,
-) -> Vec<(VsetId, u16)> {
+) -> Vec<(VolumeId, u16)> {
     let mut actors = TaskSet::new();
     let (completed, mut completions) = unbounded();
     let mut active = 0usize;
     let mut next = 1u64;
-    let mut created_vsets = Vec::with_capacity(usize::from(config.vset_count));
-    while next <= u64::from(config.vset_count) || active != 0 {
-        while active < CREATION_CONCURRENCY && next <= u64::from(config.vset_count) {
-            let number = u16::try_from(next).expect("vset number fits");
+    let mut created_volumes = Vec::with_capacity(usize::from(config.volume_count));
+    while next <= u64::from(config.volume_count) || active != 0 {
+        while active < CREATION_CONCURRENCY && next <= u64::from(config.volume_count) {
+            let number = u16::try_from(next).expect("volume number fits");
             next += 1;
-            let vset = VsetId(u64::from(number));
+            let volume = VolumeId(u64::from(number));
             let host = (number - 1) % config.hosts;
-            control.borrow_mut().placement.insert(vset, host);
-            let reply = worlds[usize::from(host)].request_admin(AdminCall::CreateVset {
-                vset,
-                config: vset_config(&config, vset),
+            control.borrow_mut().placement.insert(volume, host);
+            let reply = worlds[usize::from(host)].request_admin(AdminCall::CreateVolume {
+                volume,
+                config: volume_config(&config, volume),
                 from_base: None,
             });
             let completed = completed.clone();
             actors.spawn(async move {
                 let created = matches!(
                     reply.await,
-                    Ok(Ok(AdminSuccess::VsetCreated { vset: created_vset }))
-                        if created_vset == vset
+                    Ok(Ok(AdminSuccess::VolumeCreated { volume: created_volume }))
+                        if created_volume == volume
                 );
-                let _ = completed.send((vset, host, created));
+                let _ = completed.send((volume, host, created));
             });
             active += 1;
         }
         if active != 0 {
-            let (vset, host, created) = completions
+            let (volume, host, created) = completions
                 .recv()
                 .await
                 .expect("initial creation workers remain connected");
-            assert!(created, "initial vset creation failed for {vset:?}");
-            created_vsets.push((vset, host));
+            assert!(created, "initial volume creation failed for {volume:?}");
+            created_volumes.push((volume, host));
             active -= 1;
         }
     }
-    created_vsets.sort_unstable_by_key(|(vset, _)| *vset);
-    created_vsets
+    created_volumes.sort_unstable_by_key(|(volume, _)| *volume);
+    created_volumes
 }
 
 #[allow(clippy::too_many_lines)]
@@ -855,24 +859,24 @@ async fn lifecycle_actor(
 ) {
     while let Some(event) = world.next_admin_event().await {
         match event {
-            AdminEvent::VsetMigratedIn { vset, verdict } => {
+            AdminEvent::VolumeMigratedIn { volume, verdict } => {
                 let attempt = control
                     .borrow()
                     .migrations
-                    .get(&vset)
+                    .get(&volume)
                     .copied()
                     .filter(|attempt| attempt.to == host);
                 if let Some(attempt) = attempt {
-                    discard_deferred_source_recovery(vset, attempt, &control);
+                    discard_deferred_source_recovery(volume, attempt, &control);
                 }
-                let migrated = control.borrow().guest_state[&vset]
+                let migrated = control.borrow().guest_state[&volume]
                     .expected
                     .borrow()
                     .clone();
-                *control.borrow().guest_state[&vset].durable.borrow_mut() = migrated;
+                *control.borrow().guest_state[&volume].durable.borrow_mut() = migrated;
                 let runnable = prepare_recovered(
-                    &control.borrow().guest_state[&vset],
-                    vset,
+                    &control.borrow().guest_state[&volume],
+                    volume,
                     &config,
                     world.as_ref(),
                     verdict,
@@ -880,42 +884,42 @@ async fn lifecycle_actor(
                 {
                     let mut control = control.borrow_mut();
                     if let Some(attempt) = attempt {
-                        control.migrations.remove(&vset);
-                        control.uncertain_migrations.remove(&vset);
-                        control.accepted_migrations.remove(&vset);
-                        control.deferred_destination_recoveries.remove(&vset);
+                        control.migrations.remove(&volume);
+                        control.uncertain_migrations.remove(&volume);
+                        control.accepted_migrations.remove(&volume);
+                        control.deferred_destination_recoveries.remove(&volume);
                         control.report.migrations = control.report.migrations.saturating_add(1);
                         control.report.max_migration_pause_ns = control
                             .report
                             .max_migration_pause_ns
                             .max(migration_pause_ns(attempt, &worlds));
                     }
-                    control.placement.insert(vset, host);
+                    control.placement.insert(volume, host);
                 }
                 if runnable {
-                    start_guest(vset, host, &control, &worlds, &config);
+                    start_guest(volume, host, &control, &worlds, &config);
                 }
             }
-            AdminEvent::VsetRecovered { vset, verdict } => {
+            AdminEvent::VolumeRecovered { volume, verdict } => {
                 let pending_migration = {
                     let control = control.borrow();
-                    control.migrations.get(&vset).copied().filter(|attempt| {
+                    control.migrations.get(&volume).copied().filter(|attempt| {
                         attempt.to == host
                             && world.incarnation() != attempt.to_incarnation
-                            && (control.uncertain_migrations.contains(&vset)
-                                || control.accepted_migrations.contains(&vset))
+                            && (control.uncertain_migrations.contains(&volume)
+                                || control.accepted_migrations.contains(&volume))
                     })
                 };
                 if let Some(attempt) = pending_migration {
                     finalize_destination_migration(
-                        vset, attempt, host, verdict, &control, &worlds, &config,
+                        volume, attempt, host, verdict, &control, &worlds, &config,
                     );
                     continue;
                 }
                 let pending_destination = control
                     .borrow()
                     .migrations
-                    .get(&vset)
+                    .get(&volume)
                     .copied()
                     .is_some_and(|attempt| {
                         attempt.to == host && world.incarnation() != attempt.to_incarnation
@@ -924,25 +928,25 @@ async fn lifecycle_actor(
                     control
                         .borrow_mut()
                         .deferred_destination_recoveries
-                        .insert(vset, (host, verdict));
+                        .insert(volume, (host, verdict));
                     continue;
                 }
                 let returned_to_source = {
                     let control = control.borrow();
-                    control.migrations.get(&vset).copied().filter(|attempt| {
+                    control.migrations.get(&volume).copied().filter(|attempt| {
                         attempt.from == host
                             && world.incarnation() != attempt.from_incarnation
-                            && control.uncertain_migrations.contains(&vset)
+                            && control.uncertain_migrations.contains(&volume)
                     })
                 };
                 if let Some(attempt) = returned_to_source {
                     let mut control = control.borrow_mut();
-                    if control.migrations.get(&vset) == Some(&attempt) {
-                        control.migrations.remove(&vset);
-                        control.uncertain_migrations.remove(&vset);
-                        control.accepted_migrations.remove(&vset);
-                        control.deferred_source_recoveries.remove(&vset);
-                        control.deferred_destination_recoveries.remove(&vset);
+                    if control.migrations.get(&volume) == Some(&attempt) {
+                        control.migrations.remove(&volume);
+                        control.uncertain_migrations.remove(&volume);
+                        control.accepted_migrations.remove(&volume);
+                        control.deferred_source_recoveries.remove(&volume);
+                        control.deferred_destination_recoveries.remove(&volume);
                         control.report.migrations_refused =
                             control.report.migrations_refused.saturating_add(1);
                     }
@@ -950,7 +954,7 @@ async fn lifecycle_actor(
                 let active_migration = control
                     .borrow()
                     .migrations
-                    .get(&vset)
+                    .get(&volume)
                     .copied()
                     .filter(|attempt| attempt.from == host || attempt.to == host);
                 if let Some(attempt) = active_migration {
@@ -962,7 +966,7 @@ async fn lifecycle_actor(
                         control
                             .borrow_mut()
                             .deferred_source_recoveries
-                            .insert(vset, (host, verdict));
+                            .insert(volume, (host, verdict));
                     }
                     continue;
                 }
@@ -970,7 +974,7 @@ async fn lifecycle_actor(
                     control
                         .borrow()
                         .placement
-                        .get(&vset)
+                        .get(&volume)
                         .is_some_and(|&placed| {
                             placed != host && control.borrow().live[usize::from(placed)]
                         });
@@ -980,13 +984,13 @@ async fn lifecycle_actor(
                             .borrow_mut()
                             .report
                             .violations
-                            .push(format!("two runners recovered for {vset:?}"));
+                            .push(format!("two runners recovered for {volume:?}"));
                     }
                     continue;
                 }
                 let runnable = prepare_recovered(
-                    &control.borrow().guest_state[&vset],
-                    vset,
+                    &control.borrow().guest_state[&volume],
+                    volume,
                     &config,
                     world.as_ref(),
                     verdict,
@@ -995,11 +999,11 @@ async fn lifecycle_actor(
                     let mut control = control.borrow_mut();
                     control.report.recoveries = control.report.recoveries.saturating_add(1);
                     if runnable {
-                        control.placement.insert(vset, host);
+                        control.placement.insert(volume, host);
                     }
                 }
                 if runnable {
-                    start_guest(vset, host, &control, &worlds, &config);
+                    start_guest(volume, host, &control, &worlds, &config);
                 }
             }
         }
@@ -1014,7 +1018,7 @@ struct RestoreTarget {
 
 async fn restore_completion(
     mut target: RestoreTarget,
-    vset: VsetId,
+    volume: VolumeId,
     sent: u64,
     mut reply: Response<AdminResult>,
     control: Rc<RefCell<Control>>,
@@ -1036,7 +1040,7 @@ async fn restore_completion(
             let control = control.borrow();
             let already_restored = control
                 .placement
-                .get(&vset)
+                .get(&volume)
                 .is_some_and(|&host| control.live[usize::from(host)]);
             (!already_restored).then(|| {
                 (0..config.hosts)
@@ -1051,15 +1055,15 @@ async fn restore_completion(
             host,
             incarnation: worlds[usize::from(host)].incarnation(),
         };
-        reply = worlds[usize::from(host)].request_admin(AdminCall::RestoreVset { vset });
+        reply = worlds[usize::from(host)].request_admin(AdminCall::RestoreVolume { volume });
     };
     let Ok(reply) = reply else {
         let mut control = control.borrow_mut();
         control.report.claims_lost = control.report.claims_lost.saturating_add(1);
         return;
     };
-    let Ok(AdminSuccess::VsetRestored {
-        vset: restored,
+    let Ok(AdminSuccess::VolumeRestored {
+        volume: restored,
         verdict,
         ..
     }) = reply
@@ -1070,22 +1074,22 @@ async fn restore_completion(
         }
         return;
     };
-    if restored != vset {
+    if restored != volume {
         control.borrow_mut().report.violations.push(format!(
-            "restore reply changed vset from {vset:?} to {restored:?}"
+            "restore reply changed volume from {volume:?} to {restored:?}"
         ));
         return;
     }
     let runnable = prepare_recovered(
-        &control.borrow().guest_state[&vset],
-        vset,
+        &control.borrow().guest_state[&volume],
+        volume,
         &config,
         worlds[usize::from(target.host)].as_ref(),
         verdict,
     );
     {
         let mut control = control.borrow_mut();
-        control.placement.insert(vset, target.host);
+        control.placement.insert(volume, target.host);
         control.report.restores = control.report.restores.saturating_add(1);
         control.report.loss_bound_verified = control.report.loss_bound_verified.saturating_add(1);
         control.report.max_restore_ns = control
@@ -1094,7 +1098,7 @@ async fn restore_completion(
             .max(now().saturating_sub(sent));
     }
     if runnable {
-        start_guest(vset, target.host, &control, &worlds, &config);
+        start_guest(volume, target.host, &control, &worlds, &config);
     }
 }
 
@@ -1109,7 +1113,7 @@ impl Drop for MigrationCompletionSignal {
 }
 
 async fn migration_completion(
-    vset: VsetId,
+    volume: VolumeId,
     attempt: MigrationAttempt,
     reply: Response<AdminResult>,
     completed: OneSender<()>,
@@ -1121,21 +1125,21 @@ async fn migration_completion(
     let result = reply.await;
     let succeeded = matches!(
         &result,
-        Ok(Ok(AdminSuccess::MigratedOut { vset: migrated })) if *migrated == vset
+        Ok(Ok(AdminSuccess::MigratedOut { volume: migrated })) if *migrated == volume
     );
     if succeeded {
         let deferred = {
             let mut control = control.borrow_mut();
-            if control.migrations.get(&vset) == Some(&attempt) {
-                control.accepted_migrations.insert(vset);
-                control.deferred_destination_recoveries.remove(&vset)
+            if control.migrations.get(&volume) == Some(&attempt) {
+                control.accepted_migrations.insert(volume);
+                control.deferred_destination_recoveries.remove(&volume)
             } else {
                 None
             }
         };
         if let Some((host, verdict)) = deferred {
             finalize_destination_migration(
-                vset, attempt, host, verdict, &control, &worlds, &config,
+                volume, attempt, host, verdict, &control, &worlds, &config,
             );
         }
         return;
@@ -1143,22 +1147,22 @@ async fn migration_completion(
     if result.is_err() {
         // Source cancellation is ambiguous: the destination may already have
         // durably accepted the handoff. Keep the attempt until recovery tells
-        // us which side owns the vset.
+        // us which side owns the volume.
         let (deferred_destination, deferred_source) = {
             let mut control = control.borrow_mut();
-            if control.migrations.get(&vset) == Some(&attempt) {
-                if let Some(destination) = control.deferred_destination_recoveries.remove(&vset) {
-                    control.uncertain_migrations.insert(vset);
+            if control.migrations.get(&volume) == Some(&attempt) {
+                if let Some(destination) = control.deferred_destination_recoveries.remove(&volume) {
+                    control.uncertain_migrations.insert(volume);
                     (Some(destination), None)
-                } else if let Some(source) = control.deferred_source_recoveries.remove(&vset) {
-                    control.migrations.remove(&vset);
-                    control.uncertain_migrations.remove(&vset);
-                    control.accepted_migrations.remove(&vset);
+                } else if let Some(source) = control.deferred_source_recoveries.remove(&volume) {
+                    control.migrations.remove(&volume);
+                    control.uncertain_migrations.remove(&volume);
+                    control.accepted_migrations.remove(&volume);
                     control.report.migrations_refused =
                         control.report.migrations_refused.saturating_add(1);
                     (None, Some(source))
                 } else {
-                    control.uncertain_migrations.insert(vset);
+                    control.uncertain_migrations.insert(volume);
                     (None, None)
                 }
             } else {
@@ -1167,11 +1171,11 @@ async fn migration_completion(
         };
         if let Some((host, verdict)) = deferred_destination {
             finalize_destination_migration(
-                vset, attempt, host, verdict, &control, &worlds, &config,
+                volume, attempt, host, verdict, &control, &worlds, &config,
             );
         } else if deferred_source.is_some() {
             restart_source_after_migration_refusal(
-                vset,
+                volume,
                 attempt,
                 deferred_source,
                 &control,
@@ -1183,20 +1187,20 @@ async fn migration_completion(
     }
     let (removed, deferred_recovery) = {
         let mut control = control.borrow_mut();
-        if control.migrations.get(&vset) == Some(&attempt) {
-            control.migrations.remove(&vset);
-            control.uncertain_migrations.remove(&vset);
-            control.accepted_migrations.remove(&vset);
-            control.deferred_destination_recoveries.remove(&vset);
+        if control.migrations.get(&volume) == Some(&attempt) {
+            control.migrations.remove(&volume);
+            control.uncertain_migrations.remove(&volume);
+            control.accepted_migrations.remove(&volume);
+            control.deferred_destination_recoveries.remove(&volume);
             control.report.migrations_refused = control.report.migrations_refused.saturating_add(1);
-            (true, control.deferred_source_recoveries.remove(&vset))
+            (true, control.deferred_source_recoveries.remove(&volume))
         } else {
             (false, None)
         }
     };
     if removed {
         restart_source_after_migration_refusal(
-            vset,
+            volume,
             attempt,
             deferred_recovery,
             &control,
@@ -1207,7 +1211,7 @@ async fn migration_completion(
 }
 
 fn restart_source_after_migration_refusal(
-    vset: VsetId,
+    volume: VolumeId,
     attempt: MigrationAttempt,
     deferred_recovery: Option<(u16, Verdict)>,
     control: &Rc<RefCell<Control>>,
@@ -1216,7 +1220,8 @@ fn restart_source_after_migration_refusal(
 ) {
     let source_ready = {
         let control = control.borrow();
-        control.placement.get(&vset) == Some(&attempt.from) && control.up[usize::from(attempt.from)]
+        control.placement.get(&volume) == Some(&attempt.from)
+            && control.up[usize::from(attempt.from)]
     };
     let source_reconciled = worlds[usize::from(attempt.from)].incarnation()
         == attempt.from_incarnation
@@ -1227,8 +1232,8 @@ fn restart_source_after_migration_refusal(
     let runnable = deferred_recovery.is_none_or(|(host, verdict)| {
         debug_assert_eq!(host, attempt.from);
         let runnable = prepare_recovered(
-            &control.borrow().guest_state[&vset],
-            vset,
+            &control.borrow().guest_state[&volume],
+            volume,
             config,
             worlds[usize::from(host)].as_ref(),
             verdict,
@@ -1238,47 +1243,47 @@ fn restart_source_after_migration_refusal(
         runnable
     });
     if runnable {
-        start_guest(vset, attempt.from, control, worlds, config);
+        start_guest(volume, attempt.from, control, worlds, config);
     }
 }
 
 fn start_guest(
-    vset: VsetId,
+    volume: VolumeId,
     host: u16,
     control: &Rc<RefCell<Control>>,
     worlds: &Rc<Vec<Rc<SimWorld>>>,
     config: &Rc<ClusterConfig>,
 ) {
-    cancel_guest(vset, control);
+    cancel_guest(volume, control);
     {
         let mut control = control.borrow_mut();
-        control.quiescing_guests.remove(&vset);
-        control.migration_cuts.remove(&vset);
+        control.quiescing_guests.remove(&volume);
+        control.migration_cuts.remove(&volume);
     }
-    let guest_state = Rc::clone(&control.borrow().guest_state[&vset]);
-    worlds[usize::from(host)].set_vmstate(vset, guest_state.completed.get());
+    let guest_state = Rc::clone(&control.borrow().guest_state[&volume]);
+    worlds[usize::from(host)].set_vmstate(volume, guest_state.completed.get());
     let guest = spawn(guest_actor(
         Rc::clone(&worlds[usize::from(host)]),
         guest_state,
         Rc::clone(control),
-        vset,
+        volume,
         Rc::clone(config),
     ));
     control
         .borrow()
         .guests
         .borrow_mut()
-        .insert(vset, Some(guest));
+        .insert(volume, Some(guest));
 }
 
-fn cancel_guest(vset: VsetId, control: &Rc<RefCell<Control>>) {
-    if let Some(Some(mut guest)) = control.borrow().guests.borrow_mut().remove(&vset) {
+fn cancel_guest(volume: VolumeId, control: &Rc<RefCell<Control>>) {
+    if let Some(Some(mut guest)) = control.borrow().guests.borrow_mut().remove(&volume) {
         guest.cancel();
     }
 }
 
 fn apply_deferred_source_recovery(
-    vset: VsetId,
+    volume: VolumeId,
     attempt: MigrationAttempt,
     control: &Rc<RefCell<Control>>,
     worlds: &[Rc<SimWorld>],
@@ -1287,11 +1292,11 @@ fn apply_deferred_source_recovery(
     let deferred = control
         .borrow_mut()
         .deferred_source_recoveries
-        .remove(&vset)?;
+        .remove(&volume)?;
     debug_assert_eq!(deferred.0, attempt.from);
     let runnable = prepare_recovered(
-        &control.borrow().guest_state[&vset],
-        vset,
+        &control.borrow().guest_state[&volume],
+        volume,
         config,
         worlds[usize::from(attempt.from)].as_ref(),
         deferred.1,
@@ -1302,19 +1307,19 @@ fn apply_deferred_source_recovery(
 }
 
 fn discard_deferred_source_recovery(
-    vset: VsetId,
+    volume: VolumeId,
     attempt: MigrationAttempt,
     control: &Rc<RefCell<Control>>,
 ) {
     let mut control = control.borrow_mut();
-    if let Some((host, _)) = control.deferred_source_recoveries.remove(&vset) {
+    if let Some((host, _)) = control.deferred_source_recoveries.remove(&volume) {
         debug_assert_eq!(host, attempt.from);
         control.report.recoveries = control.report.recoveries.saturating_add(1);
     }
 }
 
 fn finalize_destination_migration(
-    vset: VsetId,
+    volume: VolumeId,
     attempt: MigrationAttempt,
     host: u16,
     verdict: Verdict,
@@ -1322,29 +1327,29 @@ fn finalize_destination_migration(
     worlds: &Rc<Vec<Rc<SimWorld>>>,
     config: &Rc<ClusterConfig>,
 ) {
-    if attempt.to != host || control.borrow().migrations.get(&vset) != Some(&attempt) {
+    if attempt.to != host || control.borrow().migrations.get(&volume) != Some(&attempt) {
         return;
     }
-    discard_deferred_source_recovery(vset, attempt, control);
-    let migrated = control.borrow().guest_state[&vset]
+    discard_deferred_source_recovery(volume, attempt, control);
+    let migrated = control.borrow().guest_state[&volume]
         .expected
         .borrow()
         .clone();
-    *control.borrow().guest_state[&vset].durable.borrow_mut() = migrated;
+    *control.borrow().guest_state[&volume].durable.borrow_mut() = migrated;
     let runnable = prepare_recovered(
-        &control.borrow().guest_state[&vset],
-        vset,
+        &control.borrow().guest_state[&volume],
+        volume,
         config,
         worlds[usize::from(host)].as_ref(),
         verdict,
     );
     {
         let mut control = control.borrow_mut();
-        control.migrations.remove(&vset);
-        control.uncertain_migrations.remove(&vset);
-        control.accepted_migrations.remove(&vset);
-        control.deferred_destination_recoveries.remove(&vset);
-        control.placement.insert(vset, host);
+        control.migrations.remove(&volume);
+        control.uncertain_migrations.remove(&volume);
+        control.accepted_migrations.remove(&volume);
+        control.deferred_destination_recoveries.remove(&volume);
+        control.placement.insert(volume, host);
         control.report.migrations = control.report.migrations.saturating_add(1);
         control.report.max_migration_pause_ns = control
             .report
@@ -1352,22 +1357,22 @@ fn finalize_destination_migration(
             .max(migration_pause_ns(attempt, worlds));
     }
     if runnable {
-        start_guest(vset, host, control, worlds, config);
+        start_guest(volume, host, control, worlds, config);
     }
 }
 
 fn prepare_recovered(
     state: &GuestState,
-    vset: VsetId,
+    volume: VolumeId,
     config: &ClusterConfig,
     world: &SimWorld,
     verdict: Verdict,
 ) -> bool {
-    world.reset_guest_memory(vset);
+    world.reset_guest_memory(volume);
     match verdict {
         Verdict::Resume { vmstate, .. } => {
             state.completed.set(vmstate);
-            if let Some(snapshot) = world.checkpoint_snapshots(vset, vmstate).last() {
+            if let Some(snapshot) = world.checkpoint_snapshots(volume, vmstate).last() {
                 state.expected.borrow_mut().clone_from(&snapshot.pages);
                 *state.durable.borrow_mut() = snapshot
                     .pages
@@ -1381,13 +1386,16 @@ fn prepare_recovered(
         }
         Verdict::ColdBoot => {
             state.completed.set(0);
-            let cold = state
-                .durable
-                .borrow()
-                .iter()
-                .filter(|(page, _)| page.volume.idx.0 != 0)
-                .map(|(page, bytes)| (*page, bytes.clone()))
-                .collect::<BTreeMap<_, _>>();
+            let cold = if config.volume_config.is_memory() {
+                BTreeMap::new()
+            } else {
+                state
+                    .durable
+                    .borrow()
+                    .iter()
+                    .map(|(page, bytes)| (*page, bytes.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
             state.expected.borrow_mut().clone_from(&cold);
             *state.durable.borrow_mut() = cold;
         }
@@ -1395,18 +1403,14 @@ fn prepare_recovered(
             state
                 .violations
                 .borrow_mut()
-                .push(format!("vset {vset:?} became unrestorable"));
+                .push(format!("volume {volume:?} became unrestorable"));
             return false;
         }
     }
-    *state.recovering.borrow_mut() = config
-        .vset_config
-        .volumes(vset)
-        .flat_map(|volume| {
-            (0..config.vset_config.pages_per_volume).map(move |page| PageId {
-                volume,
-                page: PageNo(page),
-            })
+    *state.recovering.borrow_mut() = (0..config.volume_config.pages)
+        .map(|page| PageId {
+            volume,
+            page: PageNo(page),
         })
         .collect();
     true
@@ -1417,16 +1421,16 @@ async fn guest_actor(
     world: Rc<SimWorld>,
     state: Rc<GuestState>,
     control: Rc<RefCell<Control>>,
-    vset: VsetId,
+    volume: VolumeId,
     config: Rc<ClusterConfig>,
 ) {
-    let mut next_req = (vset.0 << 48) | 1;
+    let mut next_req = (volume.0 << 48) | 1;
     loop {
-        if control.borrow().quiescing_guests.contains(&vset) {
+        if control.borrow().quiescing_guests.contains(&volume) {
             return;
         }
         delay(random_between(config.think.0, config.think.1)).await;
-        if control.borrow().quiescing_guests.contains(&vset) {
+        if control.borrow().quiescing_guests.contains(&volume) {
             return;
         }
         if now() > control.borrow().workload_end.get() {
@@ -1434,17 +1438,8 @@ async fn guest_actor(
         }
         let sync = config
             .guest_sync_share
-            .map_or_else(|| random_u64() % 100 >= 85, hit);
+            .map_or_else(|| random_u64() % 100 >= 85, random_hit);
         if sync {
-            let volume = VolumeId {
-                vset,
-                idx: VolumeIdx(
-                    1 + u8::try_from(
-                        random_u64() % u64::from(config.vset_config.disk_volumes.max(1)),
-                    )
-                    .expect("volume index fits"),
-                ),
-            };
             let req = ReqId(next_req);
             next_req = next_req.checked_add(1).expect("guest request overflow");
             let started = now();
@@ -1458,19 +1453,21 @@ async fn guest_actor(
                 .borrow_mut()
                 .sync_latencies
                 .push(now().saturating_sub(started));
-            let current = state.expected.borrow();
-            let mut durable = state.durable.borrow_mut();
-            durable.retain(|page, _| page.volume != volume);
-            durable.extend(
-                current
-                    .iter()
-                    .filter(|(page, _)| page.volume == volume)
-                    .map(|(page, bytes)| (*page, bytes.clone())),
-            );
-            finish_operation(&world, &state, &control, vset);
+            if !config.volume_config.is_memory() {
+                let current = state.expected.borrow();
+                let mut durable = state.durable.borrow_mut();
+                durable.retain(|page, _| page.volume != volume);
+                durable.extend(
+                    current
+                        .iter()
+                        .filter(|(page, _)| page.volume == volume)
+                        .map(|(page, bytes)| (*page, bytes.clone())),
+                );
+            }
+            finish_operation(&world, &state, &control, volume);
             continue;
         }
-        let page = choose_page(&config, vset);
+        let page = choose_page(&config, volume);
         let write = random_u64() % 100 < 60;
         if !world.fault(page, write).await {
             let mut control = control.borrow_mut();
@@ -1515,7 +1512,7 @@ async fn guest_actor(
                 return;
             }
         }
-        finish_operation(&world, &state, &control, vset);
+        finish_operation(&world, &state, &control, volume);
     }
 }
 
@@ -1559,11 +1556,11 @@ fn finish_operation(
     world: &SimWorld,
     state: &GuestState,
     control: &RefCell<Control>,
-    vset: VsetId,
+    volume: VolumeId,
 ) {
-    if control.borrow().migration_cuts.contains(&vset) {
+    if control.borrow().migration_cuts.contains(&volume) {
         state.violations.borrow_mut().push(format!(
-            "guest operation completed after the migration cut for {vset:?}"
+            "guest operation completed after the migration cut for {volume:?}"
         ));
     }
     let completed = state.completed.get().saturating_add(1);
@@ -1571,18 +1568,14 @@ fn finish_operation(
     state
         .total_completed
         .set(state.total_completed.get().saturating_add(1));
-    world.set_vmstate(vset, completed);
+    world.set_vmstate(volume, completed);
 }
 
-fn choose_page(config: &ClusterConfig, vset: VsetId) -> PageId {
-    let idx = VolumeIdx(
-        u8::try_from(random_u64() % (u64::from(config.vset_config.disk_volumes) + 1))
-            .expect("volume index fits"),
-    );
+fn choose_page(config: &ClusterConfig, volume: VolumeId) -> PageId {
     PageId {
-        volume: VolumeId { vset, idx },
+        volume,
         page: PageNo(
-            u32::try_from(random_u64() % u64::from(config.vset_config.pages_per_volume))
+            u32::try_from(random_u64() % u64::from(config.volume_config.pages))
                 .expect("page number fits"),
         ),
     }
@@ -1621,10 +1614,10 @@ fn spawn_schedules(
         ))
         .detach();
     }
-    for &(at, vset, to) in &config.migrate_at {
+    for &(at, volume, to) in &config.migrate_at {
         spawn(at_migrate(
             at,
-            vset,
+            volume,
             to,
             Rc::clone(config),
             Rc::clone(&worlds),
@@ -1650,14 +1643,6 @@ fn spawn_schedules(
             world.set_store_outage(true);
             delay(end.saturating_sub(begin)).await;
             world.set_store_outage(false);
-        })
-        .detach();
-    }
-    if let Some(at) = config.rot_resume_set_at {
-        let world = Rc::clone(&worlds[0]);
-        spawn(async move {
-            delay(at).await;
-            let _ = world.rot_store_suffix("/rs");
         })
         .detach();
     }
@@ -1731,10 +1716,10 @@ async fn crash_host(
         .borrow()
         .placement
         .iter()
-        .filter_map(|(&vset, &placed)| (placed == host).then_some(vset))
+        .filter_map(|(&volume, &placed)| (placed == host).then_some(volume))
         .collect::<Vec<_>>();
-    for vset in affected {
-        cancel_guest(vset, control);
+    for volume in affected {
+        cancel_guest(volume, control);
     }
     control
         .borrow_mut()
@@ -1789,23 +1774,23 @@ async fn at_kill(
         .borrow()
         .placement
         .iter()
-        .filter_map(|(&vset, &placed)| (placed == host).then_some(vset))
+        .filter_map(|(&volume, &placed)| (placed == host).then_some(volume))
         .collect::<Vec<_>>();
     let orphaned_at = now();
     let mut restore_tasks = TaskSet::new();
     let (restore_completed, mut restore_completions) = unbounded();
     let mut restores_active = 0usize;
-    for vset in affected {
-        cancel_guest(vset, &control);
-        if !promote_orphan(host, vset, &config, &worlds, &control).await {
+    for volume in affected {
+        cancel_guest(volume, &control);
+        if !promote_orphan(host, volume, &config, &worlds, &control).await {
             control
                 .borrow_mut()
                 .report
                 .violations
-                .push(format!("unable to promote orphan {vset:?}"));
+                .push(format!("unable to promote orphan {volume:?}"));
             continue;
         }
-        prepare_backed_loss(&control.borrow().guest_state[&vset], vset, &worlds[0]);
+        prepare_backed_loss(&control.borrow().guest_state[&volume], volume, &worlds[0]);
         let candidates = (0..config.hosts)
             .filter(|&candidate| candidate != host && control.borrow().live[usize::from(candidate)])
             .take(if config.race_restore { 2 } else { 1 })
@@ -1819,7 +1804,7 @@ async fn at_kill(
             }
             let candidate_incarnation = worlds[usize::from(candidate)].incarnation();
             let reply =
-                worlds[usize::from(candidate)].request_admin(AdminCall::RestoreVset { vset });
+                worlds[usize::from(candidate)].request_admin(AdminCall::RestoreVolume { volume });
             let control = Rc::clone(&control);
             let worlds = Rc::clone(&worlds);
             let config = Rc::clone(&config);
@@ -1830,7 +1815,7 @@ async fn at_kill(
                         host: candidate,
                         incarnation: candidate_incarnation,
                     },
-                    vset,
+                    volume,
                     orphaned_at,
                     reply,
                     control,
@@ -1854,15 +1839,15 @@ async fn at_kill(
 #[allow(clippy::too_many_lines)]
 async fn promote_orphan(
     source: u16,
-    vset: VsetId,
+    volume: VolumeId,
     config: &ClusterConfig,
     worlds: &[Rc<SimWorld>],
     control: &Rc<RefCell<Control>>,
 ) -> bool {
     let (observed_version, head) = loop {
-        match Store::get(worlds[0].as_ref(), &layout::head_key(vset)).await {
+        match Store::get(worlds[0].as_ref(), &layout::head_key(volume)).await {
             Ok(Some((version, bytes))) => {
-                let Ok(head) = HeadRecord::decode(vset, &bytes) else {
+                let Ok(head) = HeadRecord::decode(volume, &bytes) else {
                     return false;
                 };
                 break (version, head);
@@ -1900,11 +1885,11 @@ async fn promote_orphan(
         for (name, bytes) in world.durable_blobs() {
             if let Some(layout::BlobName::ReplicaSpool {
                 source: found_source,
-                vset: found_vset,
+                volume: found_volume,
                 assignment_epoch,
                 generation,
             }) = layout::parse_blob(&name)
-                && (found_source, found_vset) == (HostId(source), vset)
+                && (found_source, found_volume) == (HostId(source), volume)
                 && (allowed.contains(&(peer, assignment_epoch))
                     || head
                         .stash
@@ -1937,7 +1922,7 @@ async fn promote_orphan(
     } else {
         match export_replica_recovery(
             HostId(source),
-            vset,
+            volume,
             observed_version,
             &head,
             &residues,
@@ -1953,7 +1938,7 @@ async fn promote_orphan(
 
     let Some(export) = export else {
         let retired = HeadRecord {
-            vset,
+            volume,
             holder: HostId(source),
             fence: head.fence,
             manifest: head.manifest,
@@ -1963,7 +1948,7 @@ async fn promote_orphan(
         return loop {
             match Store::put_cas(
                 worlds[0].as_ref(),
-                layout::head_key(vset),
+                layout::head_key(volume),
                 Some(observed_version),
                 retired.encode(),
             )
@@ -1981,7 +1966,7 @@ async fn promote_orphan(
     let writer_fence = loop {
         match Store::put_cas(
             worlds[0].as_ref(),
-            layout::head_key(vset),
+            layout::head_key(volume),
             Some(claim.expected_version),
             claim.head.encode(),
         )
@@ -1995,7 +1980,7 @@ async fn promote_orphan(
         }
     };
     let Ok(publication) =
-        prepare_replica_publication(vset, HostId(source), writer_fence, &claim.head, &export)
+        prepare_replica_publication(volume, HostId(source), writer_fence, &claim.head, &export)
     else {
         return false;
     };
@@ -2013,7 +1998,7 @@ async fn promote_orphan(
     loop {
         match Store::put_cas(
             worlds[0].as_ref(),
-            layout::head_key(vset),
+            layout::head_key(volume),
             Some(writer_fence),
             publication.head.encode(),
         )
@@ -2028,13 +2013,13 @@ async fn promote_orphan(
     }
 }
 
-fn prepare_backed_loss(state: &GuestState, vset: VsetId, world: &SimWorld) {
+fn prepare_backed_loss(state: &GuestState, volume: VolumeId, world: &SimWorld) {
     let capture_seq = world
-        .store_bytes(&blockd_core::layout::head_key(vset))
-        .and_then(|bytes| blockd_core::head::HeadRecord::decode(vset, &bytes).ok())
+        .store_bytes(&blockd_core::layout::head_key(volume))
+        .and_then(|bytes| blockd_core::head::HeadRecord::decode(volume, &bytes).ok())
         .and_then(|head| head.manifest)
         .map_or(0, |manifest| manifest.capture_seq);
-    if let Some(snapshot) = world.capture_snapshot(vset, capture_seq) {
+    if let Some(snapshot) = world.capture_snapshot(volume, capture_seq) {
         state.expected.borrow_mut().clone_from(&snapshot.pages);
         *state.durable.borrow_mut() = snapshot
             .pages
@@ -2047,14 +2032,14 @@ fn prepare_backed_loss(state: &GuestState, vset: VsetId, world: &SimWorld) {
 
 async fn at_migrate(
     at: u64,
-    vset: VsetId,
+    volume: VolumeId,
     to: u16,
     config: Rc<ClusterConfig>,
     worlds: Rc<Vec<Rc<SimWorld>>>,
     control: Rc<RefCell<Control>>,
 ) {
     delay(at).await;
-    start_migration(vset, to, &worlds, &control, &config).await;
+    start_migration(volume, to, &worlds, &control, &config).await;
 }
 
 enum QuiescingCleanup {
@@ -2069,7 +2054,7 @@ struct QuiescingMigrationGuard {
 
 impl QuiescingMigrationGuard {
     fn new(
-        vset: VsetId,
+        volume: VolumeId,
         attempt: MigrationAttempt,
         control: &Rc<RefCell<Control>>,
         worlds: &Rc<Vec<Rc<SimWorld>>>,
@@ -2081,7 +2066,7 @@ impl QuiescingMigrationGuard {
         let config = Rc::clone(config);
         spawn(async move {
             if matches!(commands.recv().await, Some(QuiescingCleanup::Rollback)) {
-                rollback_quiescing_migration(vset, attempt, &control, &worlds, &config);
+                rollback_quiescing_migration(volume, attempt, &control, &worlds, &config);
             }
         })
         .detach();
@@ -2108,7 +2093,7 @@ impl Drop for QuiescingMigrationGuard {
 }
 
 fn rollback_quiescing_migration(
-    vset: VsetId,
+    volume: VolumeId,
     attempt: MigrationAttempt,
     control: &Rc<RefCell<Control>>,
     worlds: &Rc<Vec<Rc<SimWorld>>>,
@@ -2116,50 +2101,50 @@ fn rollback_quiescing_migration(
 ) {
     let (source_up, original_incarnation, deferred_recovery) = {
         let mut control = control.borrow_mut();
-        if control.migrations.get(&vset) != Some(&attempt) {
+        if control.migrations.get(&volume) != Some(&attempt) {
             return;
         }
-        control.migrations.remove(&vset);
-        control.quiescing_guests.remove(&vset);
-        control.uncertain_migrations.remove(&vset);
-        control.accepted_migrations.remove(&vset);
-        control.deferred_destination_recoveries.remove(&vset);
+        control.migrations.remove(&volume);
+        control.quiescing_guests.remove(&volume);
+        control.uncertain_migrations.remove(&volume);
+        control.accepted_migrations.remove(&volume);
+        control.deferred_destination_recoveries.remove(&volume);
         (
             control.up[usize::from(attempt.from)]
-                && control.placement.get(&vset) == Some(&attempt.from),
+                && control.placement.get(&volume) == Some(&attempt.from),
             worlds[usize::from(attempt.from)].incarnation() == attempt.from_incarnation,
-            control.deferred_source_recoveries.contains_key(&vset),
+            control.deferred_source_recoveries.contains_key(&volume),
         )
     };
     if source_up && (original_incarnation || deferred_recovery) {
-        let runnable =
-            apply_deferred_source_recovery(vset, attempt, control, worlds, config).unwrap_or(true);
+        let runnable = apply_deferred_source_recovery(volume, attempt, control, worlds, config)
+            .unwrap_or(true);
         if runnable {
-            start_guest(vset, attempt.from, control, worlds, config);
+            start_guest(volume, attempt.from, control, worlds, config);
         }
     }
 }
 
 async fn start_migration(
-    vset: VsetId,
+    volume: VolumeId,
     to: u16,
     worlds: &Rc<Vec<Rc<SimWorld>>>,
     control: &Rc<RefCell<Control>>,
     config: &Rc<ClusterConfig>,
 ) -> Option<OneReceiver<()>> {
-    let &from = control.borrow().placement.get(&vset)?;
+    let &from = control.borrow().placement.get(&volume)?;
     let unavailable = {
         let control = control.borrow();
         let guest_active = control
             .guests
             .borrow()
-            .get(&vset)
+            .get(&volume)
             .is_some_and(Option::is_some);
         !control.up[usize::from(from)]
             || !control.live[usize::from(to)]
             || !control.up[usize::from(to)]
             || !guest_active
-            || control.migrations.contains_key(&vset)
+            || control.migrations.contains_key(&volume)
     };
     if from == to || unavailable {
         return None;
@@ -2173,17 +2158,17 @@ async fn start_migration(
     };
     {
         let mut control = control.borrow_mut();
-        control.quiescing_guests.insert(vset);
-        control.uncertain_migrations.remove(&vset);
-        control.accepted_migrations.remove(&vset);
-        control.deferred_source_recoveries.remove(&vset);
-        control.deferred_destination_recoveries.remove(&vset);
-        control.migrations.insert(vset, attempt);
+        control.quiescing_guests.insert(volume);
+        control.uncertain_migrations.remove(&volume);
+        control.accepted_migrations.remove(&volume);
+        control.deferred_source_recoveries.remove(&volume);
+        control.deferred_destination_recoveries.remove(&volume);
+        control.migrations.insert(volume, attempt);
     }
-    let quiescing = QuiescingMigrationGuard::new(vset, attempt, control, worlds, config);
+    let quiescing = QuiescingMigrationGuard::new(volume, attempt, control, worlds, config);
     let guest = {
         let control = control.borrow();
-        let removed = control.guests.borrow_mut().remove(&vset);
+        let removed = control.guests.borrow_mut().remove(&volume);
         removed.flatten()
     };
     if let Some(guest) = guest {
@@ -2195,24 +2180,24 @@ async fn start_migration(
             && control.up[usize::from(to)]
             && worlds[usize::from(from)].incarnation() == attempt.from_incarnation
             && worlds[usize::from(to)].incarnation() == attempt.to_incarnation
-            && control.placement.get(&vset) == Some(&from)
-            && control.migrations.get(&vset) == Some(&attempt)
+            && control.placement.get(&volume) == Some(&from)
+            && control.migrations.get(&volume) == Some(&attempt)
     };
     if !can_submit {
-        rollback_quiescing_migration(vset, attempt, control, worlds, config);
+        rollback_quiescing_migration(volume, attempt, control, worlds, config);
         quiescing.disarm();
         return None;
     }
-    let guest_state = Rc::clone(&control.borrow().guest_state[&vset]);
-    worlds[usize::from(from)].set_vmstate(vset, guest_state.completed.get());
-    control.borrow_mut().migration_cuts.insert(vset);
+    let guest_state = Rc::clone(&control.borrow().guest_state[&volume]);
+    worlds[usize::from(from)].set_vmstate(volume, guest_state.completed.get());
+    control.borrow_mut().migration_cuts.insert(volume);
     let reply = worlds[usize::from(from)].request_admin(AdminCall::MigrateOut {
-        vset,
+        volume,
         to: HostId(to),
     });
     let (completed, completion) = oneshot();
     spawn(migration_completion(
-        vset,
+        volume,
         attempt,
         reply,
         completed,
@@ -2236,19 +2221,19 @@ async fn checkpoint_schedule(
         horizon,
         1,
         || control.borrow().placement.keys().copied().collect(),
-        |vset, retry| {
+        |volume, retry| {
             let host = {
                 let control = control.borrow();
-                control.placement.get(&vset).copied().filter(|host| {
+                control.placement.get(&volume).copied().filter(|host| {
                     control.up[usize::from(*host)]
                         && control
                             .guests
                             .borrow()
-                            .get(&vset)
+                            .get(&volume)
                             .is_some_and(Option::is_some)
                 })
             }?;
-            Some(worlds[usize::from(host)].request_admin(AdminCall::Checkpoint { retry, vset }))
+            Some(worlds[usize::from(host)].request_admin(AdminCall::Checkpoint { retry, volume }))
         },
     )
     .await;
@@ -2294,8 +2279,8 @@ async fn random_migrations(
         )
         .await
         {
-            Either::First(Some(vset)) => {
-                active.remove(&vset);
+            Either::First(Some(volume)) => {
+                active.remove(&volume);
                 continue;
             }
             Either::First(None) => return,
@@ -2315,24 +2300,24 @@ async fn random_migrations(
             .borrow()
             .placement
             .iter()
-            .filter_map(|(&vset, &host)| {
+            .filter_map(|(&volume, &host)| {
                 let control = control.borrow();
-                (!active.contains(&vset)
+                (!active.contains(&volume)
                     && control.up[usize::from(host)]
                     && control
                         .guests
                         .borrow()
-                        .get(&vset)
+                        .get(&volume)
                         .is_some_and(Option::is_some))
-                .then_some(vset)
+                .then_some(volume)
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             continue;
         }
-        let vset = candidates
-            [usize::try_from(random_u64() % candidates.len() as u64).expect("vset index fits")];
-        let from = control.borrow().placement[&vset];
+        let volume = candidates
+            [usize::try_from(random_u64() % candidates.len() as u64).expect("volume index fits")];
+        let from = control.borrow().placement[&volume];
         let destinations = (0..config.hosts)
             .filter(|&host| {
                 host != from
@@ -2345,16 +2330,17 @@ async fn random_migrations(
         }
         let to = destinations
             [usize::try_from(random_u64() % destinations.len() as u64).expect("host index fits")];
-        assert!(active.insert(vset));
+        assert!(active.insert(volume));
         let worlds = Rc::clone(&worlds);
         let control = Rc::clone(&control);
         let config = Rc::clone(&config);
         let completed = completed.clone();
         actors.spawn(async move {
-            if let Some(completion) = start_migration(vset, to, &worlds, &control, &config).await {
+            if let Some(completion) = start_migration(volume, to, &worlds, &control, &config).await
+            {
                 let _ = completion.await;
             }
-            let _ = completed.send(vset);
+            let _ = completed.send(volume);
         });
     }
 }
@@ -2371,10 +2357,8 @@ fn record_fates(report: &mut ClusterReport, fates: &[(String, CrashFate)]) {
 
 fn summarize_counters(report: &mut ClusterReport, counters: &[Counters]) {
     let sum = |read: fn(&Counters) -> u64| counters.iter().map(read).sum();
-    report.prefetch_fills = sum(|value| value.prefetch_fills);
     report.hydrate_fills = sum(|value| value.hydrate_fills);
     report.store_retries = sum(|value| value.store_retries);
-    report.peer_rejected = sum(|value| value.peer_rejected);
     report.wedged_guests = sum(|value| value.wedged_guests);
     report.wedged_hydration = sum(|value| value.wedged_hydration);
     report.wedged_outbound = sum(|value| value.wedged_outbound);
@@ -2385,12 +2369,11 @@ fn summarize_counters(report: &mut ClusterReport, counters: &[Counters]) {
     report.replica_logical_bytes = sum(|value| value.replica_logical_bytes);
     report.replica_nonactive_bytes = sum(|value| value.replica_nonactive_bytes);
     report.replica_replacement_bytes = sum(|value| value.replica_replacement_bytes);
-    report.replica_cleanup_rewrite_bytes = sum(|value| value.replica_cleanup_rewrite_bytes);
     report.replica_artifact_flushes = sum(|value| value.replica_artifact_flushes);
     report.replica_commit_flushes = sum(|value| value.replica_commit_flushes);
     report.replica_rotations = sum(|value| value.replica_rotations);
     report.replica_capacity_backpressure = sum(|value| value.replica_capacity_backpressure);
-    report.segs_compacted = sum(|value| value.segs_compacted);
+    report.blx_files_compacted = sum(|value| value.blx_files_compacted);
     report.pages_compacted = sum(|value| value.pages_compacted);
 }
 
@@ -2409,21 +2392,12 @@ fn summarize_latencies(report: &mut ClusterReport, latencies: &[u64]) {
     report.sync_latency_max_ns = latencies.last().copied().unwrap_or(0);
 }
 
-fn random_between(low: u64, high: u64) -> u64 {
-    assert!(low <= high);
-    low + random_u64() % (high - low + 1)
-}
-
-fn hit(probability: Ppm) -> bool {
-    random_u64() % 1_000_000 < u64::from(probability.0)
-}
-
 #[cfg(test)]
 mod tests {
     use std::future::pending;
 
     use blockd_core::protocol::{AdminError, AdminEvent};
-    use blockd_core::types::{Epoch, VolumeIdx};
+    use blockd_core::types::Epoch;
     use blockd_core::world::AdminIo;
     use blockd_exec::{delay, request, spawn, timeout, yield_now};
 
@@ -2441,17 +2415,17 @@ mod tests {
         }};
     }
 
-    fn control(vset_count: u64, hosts: u16) -> Rc<RefCell<Control>> {
+    fn control(volume_count: u64, hosts: u16) -> Rc<RefCell<Control>> {
         let guests = Rc::new(RefCell::new(BTreeMap::new()));
         let mut placement = BTreeMap::new();
         let mut guest_state = BTreeMap::new();
-        for number in 1..=vset_count {
-            let vset = VsetId(number);
-            placement.insert(vset, 0);
-            guest_state.insert(vset, Rc::new(GuestState::default()));
+        for number in 1..=volume_count {
+            let volume = VolumeId(number);
+            placement.insert(volume, 0);
+            guest_state.insert(volume, Rc::new(GuestState::default()));
             guests
                 .borrow_mut()
-                .insert(vset, Some(spawn(pending::<()>())));
+                .insert(volume, Some(spawn(pending::<()>())));
         }
         Rc::new(RefCell::new(Control {
             placement,
@@ -2473,12 +2447,12 @@ mod tests {
         }))
     }
 
-    fn unplaced_control(vset_count: u64, hosts: u16) -> Rc<RefCell<Control>> {
+    fn unplaced_control(volume_count: u64, hosts: u16) -> Rc<RefCell<Control>> {
         Rc::new(RefCell::new(Control {
             placement: BTreeMap::new(),
             guests: Rc::new(RefCell::new(BTreeMap::new())),
-            guest_state: (1..=vset_count)
-                .map(|number| (VsetId(number), Rc::new(GuestState::default())))
+            guest_state: (1..=volume_count)
+                .map(|number| (VolumeId(number), Rc::new(GuestState::default())))
                 .collect(),
             migrations: BTreeMap::new(),
             uncertain_migrations: BTreeSet::new(),
@@ -2500,7 +2474,7 @@ mod tests {
     async fn initial_creation_requests_are_bounded() {
         let mut config = crate::presets::migration_chaos();
         config.hosts = 1;
-        config.vset_count = u16::try_from(CREATION_CONCURRENCY + 1).expect("limit fits");
+        config.volume_count = u16::try_from(CREATION_CONCURRENCY + 1).expect("limit fits");
         let worlds = SimWorld::cluster(config.hosts, config.bdev, config.store);
         let worlds = Rc::new(worlds);
         simulate!(107, {
@@ -2510,8 +2484,8 @@ mod tests {
                 let control = Rc::new(RefCell::new(Control {
                     placement: BTreeMap::new(),
                     guests: Rc::new(RefCell::new(BTreeMap::new())),
-                    guest_state: (1..=config.vset_count)
-                        .map(|number| (VsetId(u64::from(number)), Rc::new(GuestState::default())))
+                    guest_state: (1..=config.volume_count)
+                        .map(|number| (VolumeId(u64::from(number)), Rc::new(GuestState::default())))
                         .collect(),
                     migrations: BTreeMap::new(),
                     uncertain_migrations: BTreeSet::new(),
@@ -2527,7 +2501,7 @@ mod tests {
                     sync_latencies: Vec::new(),
                     retired_counters: Vec::new(),
                 }));
-                let schedule = spawn(create_initial_vsets(
+                let schedule = spawn(create_initial_volumes(
                     Rc::clone(&config),
                     Rc::clone(&worlds),
                     control,
@@ -2553,36 +2527,36 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn initial_creation_waits_for_every_configured_vset() {
+    async fn initial_creation_waits_for_every_configured_volume() {
         let mut config = crate::presets::migration_chaos();
         config.hosts = 1;
-        config.vset_count = u16::try_from(CREATION_CONCURRENCY + 1).expect("limit fits");
+        config.volume_count = u16::try_from(CREATION_CONCURRENCY + 1).expect("limit fits");
         let worlds = SimWorld::cluster(config.hosts, config.bdev, config.store);
         let worlds = Rc::new(worlds);
         simulate!(109, {
             let worlds = Rc::clone(&worlds);
             let config = Rc::new(config);
             async move {
-                let control = unplaced_control(u64::from(config.vset_count), config.hosts);
+                let control = unplaced_control(u64::from(config.volume_count), config.hosts);
                 let responder = spawn({
                     let world = Rc::clone(&worlds[0]);
                     let control = Rc::clone(&control);
-                    let count = config.vset_count;
+                    let count = config.volume_count;
                     async move {
                         for _ in 0..count {
                             let request = AdminIo::next_admin(world.as_ref())
                                 .await
                                 .expect("create request");
                             let (call, mut reply) = request.into_parts();
-                            let AdminCall::CreateVset { vset, .. } = call else {
+                            let AdminCall::CreateVolume { volume, .. } = call else {
                                 panic!("unexpected initial request: {call:?}");
                             };
                             assert!(control.borrow().guests.borrow().is_empty());
-                            let _ = reply.send(Ok(AdminSuccess::VsetCreated { vset }));
+                            let _ = reply.send(Ok(AdminSuccess::VolumeCreated { volume }));
                         }
                     }
                 });
-                let created = create_initial_vsets(
+                let created = create_initial_volumes(
                     Rc::clone(&config),
                     Rc::clone(&worlds),
                     Rc::clone(&control),
@@ -2591,15 +2565,15 @@ mod tests {
                 responder.await.expect("responder completes");
                 assert_eq!(
                     control.borrow().placement.len(),
-                    usize::from(config.vset_count)
+                    usize::from(config.volume_count)
                 );
                 assert!(control.borrow().guests.borrow().is_empty());
-                for (vset, host) in created {
-                    start_guest(vset, host, &control, &worlds, &config);
+                for (volume, host) in created {
+                    start_guest(volume, host, &control, &worlds, &config);
                 }
                 assert_eq!(
                     control.borrow().guests.borrow().len(),
-                    usize::from(config.vset_count)
+                    usize::from(config.volume_count)
                 );
             }
         });
@@ -2611,12 +2585,12 @@ mod tests {
         let worlds = SimWorld::cluster(config.hosts, config.bdev, config.store);
         let worlds = Rc::new(worlds);
         let control = unplaced_control(1, config.hosts);
-        let vset = VsetId(1);
+        let volume = VolumeId(1);
         let candidate = 1;
         let (reply, result) = request(());
         reply
-            .reply(Ok(AdminSuccess::VsetRestored {
-                vset,
+            .reply(Ok(AdminSuccess::VolumeRestored {
+                volume,
                 verdict: Verdict::ColdBoot,
             }))
             .expect("restore completion remains live");
@@ -2634,7 +2608,7 @@ mod tests {
                         host: candidate,
                         incarnation: 0,
                     },
-                    vset,
+                    volume,
                     0,
                     result,
                     Rc::clone(&control),
@@ -2645,10 +2619,10 @@ mod tests {
                     .await
                     .expect("restore retried on live host");
                 let (call, mut reply) = retry.into_parts();
-                assert_eq!(call, AdminCall::RestoreVset { vset });
+                assert_eq!(call, AdminCall::RestoreVolume { volume });
                 reply
-                    .send(Ok(AdminSuccess::VsetRestored {
-                        vset,
+                    .send(Ok(AdminSuccess::VolumeRestored {
+                        volume,
                         verdict: Verdict::ColdBoot,
                     }))
                     .expect("retry remains live");
@@ -2656,7 +2630,7 @@ mod tests {
             }
         });
 
-        assert_eq!(control.borrow().placement.get(&vset), Some(&0));
+        assert_eq!(control.borrow().placement.get(&volume), Some(&0));
         assert_eq!(control.borrow().report.restores, 1);
     }
 
@@ -2665,7 +2639,7 @@ mod tests {
         let config = Rc::new(crate::presets::migration_chaos());
         let worlds = SimWorld::cluster(config.hosts, config.bdev, config.store);
         let worlds = Rc::new(worlds);
-        let vset = VsetId(1);
+        let volume = VolumeId(1);
         simulate!(112, {
             let worlds = Rc::clone(&worlds);
             let config = Rc::clone(&config);
@@ -2682,14 +2656,14 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     worlds[1].as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: Verdict::ColdBoot,
                     },
                 )
                 .await;
                 delay(1).await;
-                assert_eq!(control.borrow().placement.get(&vset), Some(&1));
+                assert_eq!(control.borrow().placement.get(&volume), Some(&1));
                 drop(lifecycle);
             }
         });
@@ -2761,7 +2735,7 @@ mod tests {
 
                 assert_eq!(
                     control.borrow().quiescing_guests,
-                    BTreeSet::from([VsetId(1), VsetId(2)])
+                    BTreeSet::from([VolumeId(1), VolumeId(2)])
                 );
                 drop(schedule);
             }
@@ -2778,30 +2752,30 @@ mod tests {
             let worlds = Rc::clone(&worlds);
             let config = Rc::new(config);
             async move {
-                let vset = VsetId(1);
+                let volume = VolumeId(1);
                 let control = control(1, config.hosts);
                 let mut migration = spawn({
                     let control = Rc::clone(&control);
                     let worlds = Rc::clone(&worlds);
                     let config = Rc::clone(&config);
-                    async move { start_migration(vset, 1, &worlds, &control, &config).await }
+                    async move { start_migration(volume, 1, &worlds, &control, &config).await }
                 });
                 delay(1).await;
-                assert!(control.borrow().quiescing_guests.contains(&vset));
-                assert!(control.borrow().migrations.contains_key(&vset));
+                assert!(control.borrow().quiescing_guests.contains(&volume));
+                assert!(control.borrow().migrations.contains_key(&volume));
 
                 migration.cancel();
                 delay(0).await;
 
-                assert!(!control.borrow().quiescing_guests.contains(&vset));
-                assert!(!control.borrow().migrations.contains_key(&vset));
-                assert_eq!(control.borrow().placement.get(&vset), Some(&0));
+                assert!(!control.borrow().quiescing_guests.contains(&volume));
+                assert!(!control.borrow().migrations.contains_key(&volume));
+                assert_eq!(control.borrow().placement.get(&volume), Some(&0));
                 assert!(
                     control
                         .borrow()
                         .guests
                         .borrow()
-                        .get(&vset)
+                        .get(&volume)
                         .is_some_and(Option::is_some)
                 );
             }
@@ -2818,12 +2792,9 @@ mod tests {
             let worlds = Rc::clone(&worlds);
             let config = Rc::new(config);
             async move {
-                let vset = VsetId(1);
+                let volume = VolumeId(1);
                 let page = PageId {
-                    volume: VolumeId {
-                        vset,
-                        idx: VolumeIdx(0),
-                    },
+                    volume,
                     page: PageNo(0),
                 };
                 let bytes = page_pattern(page, 7);
@@ -2837,16 +2808,16 @@ mod tests {
                 };
                 worlds[usize::from(attempt.from)].advance_incarnation();
                 {
-                    let state = Rc::clone(&control.borrow().guest_state[&vset]);
+                    let state = Rc::clone(&control.borrow().guest_state[&volume]);
                     state.completed.set(7);
                     state.expected.borrow_mut().insert(page, bytes.clone());
                     state.durable.borrow_mut().insert(page, bytes.clone());
                     let mut control = control.borrow_mut();
-                    control.placement.insert(vset, 1);
-                    control.migrations.insert(vset, attempt);
+                    control.placement.insert(volume, 1);
+                    control.migrations.insert(volume, attempt);
                     control
                         .deferred_source_recoveries
-                        .insert(vset, (1, Verdict::ColdBoot));
+                        .insert(volume, (1, Verdict::ColdBoot));
                 }
                 worlds[0].advance_incarnation();
                 let lifecycle = spawn(lifecycle_actor(
@@ -2858,8 +2829,8 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     worlds[0].as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: Verdict::Resume {
                             epoch: Epoch(1),
                             vmstate: 7,
@@ -2868,21 +2839,21 @@ mod tests {
                 )
                 .await;
                 delay(1).await;
-                assert_eq!(control.borrow().migrations.get(&vset), Some(&attempt));
+                assert_eq!(control.borrow().migrations.get(&volume), Some(&attempt));
                 assert!(
                     control
                         .borrow()
                         .deferred_destination_recoveries
-                        .contains_key(&vset)
+                        .contains_key(&volume)
                 );
 
                 let (reply, result) = request(());
                 reply
-                    .reply(Ok(AdminSuccess::MigratedOut { vset }))
+                    .reply(Ok(AdminSuccess::MigratedOut { volume }))
                     .expect("completion receiver alive");
                 let (completed, _completion) = oneshot();
                 migration_completion(
-                    vset,
+                    volume,
                     attempt,
                     result,
                     completed,
@@ -2892,19 +2863,19 @@ mod tests {
                 )
                 .await;
 
-                let state = Rc::clone(&control.borrow().guest_state[&vset]);
+                let state = Rc::clone(&control.borrow().guest_state[&volume]);
                 assert_eq!(state.completed.get(), 7);
                 assert_eq!(state.expected.borrow().get(&page), Some(&bytes));
                 assert_eq!(state.durable.borrow().get(&page), Some(&bytes));
                 assert_eq!(control.borrow().report.recoveries, 1);
                 assert_eq!(control.borrow().report.migrations, 1);
-                assert_eq!(control.borrow().placement.get(&vset), Some(&0));
-                assert!(!control.borrow().migrations.contains_key(&vset));
+                assert_eq!(control.borrow().placement.get(&volume), Some(&0));
+                assert!(!control.borrow().migrations.contains_key(&volume));
                 assert!(
                     !control
                         .borrow()
                         .deferred_destination_recoveries
-                        .contains_key(&vset)
+                        .contains_key(&volume)
                 );
                 drop(lifecycle);
             }
@@ -2921,7 +2892,7 @@ mod tests {
             let worlds = Rc::clone(&worlds);
             let config = Rc::new(config);
             async move {
-                let vset = VsetId(1);
+                let volume = VolumeId(1);
                 let control = control(1, config.hosts);
                 let attempt = MigrationAttempt {
                     from: 1,
@@ -2933,18 +2904,18 @@ mod tests {
                 worlds[usize::from(attempt.from)].advance_incarnation();
                 {
                     let mut control = control.borrow_mut();
-                    control.placement.insert(vset, attempt.from);
-                    control.migrations.insert(vset, attempt);
+                    control.placement.insert(volume, attempt.from);
+                    control.migrations.insert(volume, attempt);
                     control
                         .deferred_source_recoveries
-                        .insert(vset, (attempt.from, Verdict::ColdBoot));
+                        .insert(volume, (attempt.from, Verdict::ColdBoot));
                 }
                 let (reply, result) = request::<_, AdminResult>(());
                 drop(reply);
                 let (completed, _completion) = oneshot();
 
                 migration_completion(
-                    vset,
+                    volume,
                     attempt,
                     result,
                     completed,
@@ -2954,13 +2925,13 @@ mod tests {
                 )
                 .await;
 
-                assert!(!control.borrow().migrations.contains_key(&vset));
-                assert!(!control.borrow().uncertain_migrations.contains(&vset));
+                assert!(!control.borrow().migrations.contains_key(&volume));
+                assert!(!control.borrow().uncertain_migrations.contains(&volume));
                 assert!(
                     !control
                         .borrow()
                         .deferred_source_recoveries
-                        .contains_key(&vset)
+                        .contains_key(&volume)
                 );
                 assert_eq!(control.borrow().report.migrations_refused, 1);
                 assert_eq!(control.borrow().report.recoveries, 1);
@@ -2969,7 +2940,7 @@ mod tests {
                         .borrow()
                         .guests
                         .borrow()
-                        .get(&vset)
+                        .get(&volume)
                         .is_some_and(Option::is_some)
                 );
             }
@@ -2986,7 +2957,7 @@ mod tests {
             let worlds = Rc::clone(&worlds);
             let config = Rc::new(config);
             async move {
-                let vset = VsetId(1);
+                let volume = VolumeId(1);
                 let control = control(1, config.hosts);
                 let attempt = MigrationAttempt {
                     from: 1,
@@ -2997,8 +2968,8 @@ mod tests {
                 };
                 {
                     let mut control = control.borrow_mut();
-                    control.placement.insert(vset, attempt.from);
-                    control.migrations.insert(vset, attempt);
+                    control.placement.insert(volume, attempt.from);
+                    control.migrations.insert(volume, attempt);
                 }
                 let lifecycle = spawn(lifecycle_actor(
                     attempt.from,
@@ -3009,8 +2980,8 @@ mod tests {
                 ));
                 AdminIo::emit_admin_event(
                     worlds[usize::from(attempt.from)].as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: Verdict::ColdBoot,
                     },
                 )
@@ -3020,14 +2991,14 @@ mod tests {
                     !control
                         .borrow()
                         .deferred_source_recoveries
-                        .contains_key(&vset)
+                        .contains_key(&volume)
                 );
 
                 let (reply, result) = request::<_, AdminResult>(());
                 drop(reply);
                 let (completed, _completion) = oneshot();
                 migration_completion(
-                    vset,
+                    volume,
                     attempt,
                     result,
                     completed,
@@ -3037,19 +3008,19 @@ mod tests {
                 )
                 .await;
 
-                assert_eq!(control.borrow().migrations.get(&vset), Some(&attempt));
-                assert!(control.borrow().uncertain_migrations.contains(&vset));
+                assert_eq!(control.borrow().migrations.get(&volume), Some(&attempt));
+                assert!(control.borrow().uncertain_migrations.contains(&volume));
                 AdminIo::emit_admin_event(
                     worlds[usize::from(attempt.from)].as_ref(),
-                    AdminEvent::VsetRecovered {
-                        vset,
+                    AdminEvent::VolumeRecovered {
+                        volume,
                         verdict: Verdict::ColdBoot,
                     },
                 )
                 .await;
                 delay(1).await;
-                assert_eq!(control.borrow().migrations.get(&vset), Some(&attempt));
-                assert!(control.borrow().uncertain_migrations.contains(&vset));
+                assert_eq!(control.borrow().migrations.get(&volume), Some(&attempt));
+                assert!(control.borrow().uncertain_migrations.contains(&volume));
                 drop(lifecycle);
             }
         });
@@ -3066,7 +3037,7 @@ mod tests {
             let worlds = Rc::clone(&worlds);
             let config = Rc::clone(&config);
             async move {
-                let vset = VsetId(1);
+                let volume = VolumeId(1);
                 let control = control(1, config.hosts);
                 let attempt = MigrationAttempt {
                     from: 1,
@@ -3077,32 +3048,32 @@ mod tests {
                 };
                 {
                     let mut control = control.borrow_mut();
-                    control.placement.insert(vset, attempt.from);
+                    control.placement.insert(volume, attempt.from);
                     control.up[usize::from(attempt.from)] = false;
-                    control.guests.borrow_mut().insert(vset, None);
+                    control.guests.borrow_mut().insert(volume, None);
                 }
 
                 restart_source_after_migration_refusal(
-                    vset, attempt, None, &control, &worlds, &config,
+                    volume, attempt, None, &control, &worlds, &config,
                 );
-                assert!(control.borrow().guests.borrow()[&vset].is_none());
+                assert!(control.borrow().guests.borrow()[&volume].is_none());
 
                 control.borrow_mut().up[usize::from(attempt.from)] = true;
                 worlds[usize::from(attempt.from)].advance_incarnation();
                 restart_source_after_migration_refusal(
-                    vset, attempt, None, &control, &worlds, &config,
+                    volume, attempt, None, &control, &worlds, &config,
                 );
-                assert!(control.borrow().guests.borrow()[&vset].is_none());
+                assert!(control.borrow().guests.borrow()[&volume].is_none());
 
                 restart_source_after_migration_refusal(
-                    vset,
+                    volume,
                     attempt,
                     Some((attempt.from, Verdict::ColdBoot)),
                     &control,
                     &worlds,
                     &config,
                 );
-                assert!(control.borrow().guests.borrow()[&vset].is_some());
+                assert!(control.borrow().guests.borrow()[&volume].is_some());
             }
         });
     }
@@ -3117,23 +3088,23 @@ mod tests {
             let worlds = Rc::clone(&worlds);
             let config = Rc::new(config);
             async move {
-                let vset = VsetId(1);
+                let volume = VolumeId(1);
                 let control = control(1, config.hosts);
                 control
                     .borrow()
                     .guests
                     .borrow_mut()
-                    .insert(vset, Some(spawn(delay(10))));
+                    .insert(volume, Some(spawn(delay(10))));
                 let migration = spawn({
                     let worlds = Rc::clone(&worlds);
                     let control = Rc::clone(&control);
                     let config = Rc::clone(&config);
-                    async move { start_migration(vset, 1, &worlds, &control, &config).await }
+                    async move { start_migration(volume, 1, &worlds, &control, &config).await }
                 });
                 delay(1).await;
                 worlds[0].advance_incarnation();
                 control.borrow_mut().deferred_source_recoveries.insert(
-                    vset,
+                    volume,
                     (
                         0,
                         Verdict::Resume {
@@ -3144,27 +3115,27 @@ mod tests {
                 );
 
                 assert!(migration.await.expect("migration task completes").is_none());
-                assert!(!control.borrow().quiescing_guests.contains(&vset));
+                assert!(!control.borrow().quiescing_guests.contains(&volume));
                 assert!(
                     control
                         .borrow()
                         .guests
                         .borrow()
-                        .get(&vset)
+                        .get(&volume)
                         .is_some_and(Option::is_some)
                 );
                 assert!(
                     !control
                         .borrow()
                         .deferred_source_recoveries
-                        .contains_key(&vset)
+                        .contains_key(&volume)
                 );
             }
         });
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cluster_checkpoint_schedule_coalesces_each_vset() {
+    async fn cluster_checkpoint_schedule_coalesces_each_volume() {
         let config = crate::presets::migration_chaos();
         let worlds = SimWorld::cluster(1, config.bdev, config.store);
         let worlds = Rc::new(worlds);
@@ -3191,7 +3162,7 @@ mod tests {
                     second.into_parts().0,
                     AdminCall::Checkpoint {
                         retry: ReqId(2),
-                        vset: VsetId(1),
+                        volume: VolumeId(1),
                     }
                 );
                 drop(schedule);
@@ -3249,8 +3220,8 @@ mod tests {
                     let (call, reply) = request.into_parts();
                     assert!(matches!(
                         call,
-                        AdminCall::Checkpoint { vset, .. }
-                            if vset == VsetId(u64::try_from(number).expect("vset fits"))
+                        AdminCall::Checkpoint { volume, .. }
+                            if volume == VolumeId(u64::try_from(number).expect("volume fits"))
                     ));
                     replies.push(reply);
                 }
@@ -3265,10 +3236,10 @@ mod tests {
                     .expect("checkpoint refill request");
                 assert!(matches!(
                     next.into_parts().0,
-                    AdminCall::Checkpoint { vset, .. }
-                        if vset
-                            == VsetId(
-                                u64::try_from(CHECKPOINT_CONCURRENCY + 1).expect("vset fits")
+                    AdminCall::Checkpoint { volume, .. }
+                        if volume
+                            == VolumeId(
+                                u64::try_from(CHECKPOINT_CONCURRENCY + 1).expect("volume fits")
                             )
                 ));
                 drop(schedule);

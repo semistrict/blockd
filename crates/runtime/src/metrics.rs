@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use blockd_core::types::VsetId;
+use blockd_core::types::VolumeId;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn detailed_profile_metrics_enabled() -> bool {
@@ -98,7 +98,7 @@ pub struct LatencySeries {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FaultLatency {
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub source: &'static str,
     pub histogram: HistogramSnapshot,
 }

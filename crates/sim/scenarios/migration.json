@@ -5,7 +5,8 @@
   "description": "Migrations overlap host crashes, lossy peers, duplicate delivery, and a store outage.",
   "kind": "cluster",
   "topology": {
-    "vset_count": 4
+    "volume_count": 4,
+    "volume_kind": "memory"
   },
   "nemeses": {
     "restart_delay": { "min": "50ms", "max": "200ms" },

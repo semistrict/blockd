@@ -6,43 +6,47 @@ use blockd_exec::channel::{OneReceiver, OneSender, oneshot};
 use blockd_exec::inject::{Injector, Lane, injector};
 use blockd_exec::{join2, spawn, yield_now};
 
-use super::state::{CaptureKind, CaptureLease, DrainState, MutationOwner, SharedHost, VsetState};
+use super::ctx::{HostCtx, VolumeCtx};
+use super::state::{CaptureKind, CaptureLease, DrainState, MutationOwner, SharedHost, VolumeState};
 use super::{cleanup_local, store_retry};
 use crate::blx::{
-    BlockKey, BlockSpace, EntryKind, NamespaceKind, open_footer, open_object, replace_state_block,
+    BlockKey, BlockSpace, BlxFooter, BlxObject, EntryKind, NamespaceKind, replace_state_block,
     state_contribution,
 };
 use crate::format::checksum64;
-use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetConfig, VsetKind};
+use crate::journal::{JournalRecord, MigrationSource, RecordKind, VolumeConfig};
 use crate::layout;
-use crate::manifest::ObjectRef;
+use crate::manifest::{ObjectIdentity, ObjectRef};
+use crate::page_file::{PageBatchBuilder, PageFileLoc, open_entry, scan_page_file};
 use crate::protocol::{AdminError, AdminResult, AdminSuccess, ReqId};
-use crate::segment::{PageLoc, SegmentBatchBuilder, open_entry, scan_segment};
-use crate::types::{Gen, JournalSeq, PageId, SegId, VsetId};
+use crate::types::{Gen, JournalSeq, ObjectId, PageId, VolumeId};
 use crate::world::{AdminIo, Blobs, GuestMem, GuestPause, Store};
 
 const DRAIN_PAGES_PER_POLL: usize = 64;
 const ROLL_THRESHOLD: usize = 256;
 const COMPACT_BATCH: usize = 8;
 
-type PageMap = BTreeMap<PageId, (Gen, crate::segment::PageLoc)>;
+type PageMap = BTreeMap<PageId, (Gen, crate::page_file::PageFileLoc)>;
 
-pub(super) fn recovery_files(vset: &VsetState) -> Vec<ObjectRef> {
-    let mut needed_segments = vset
+pub(super) fn recovery_files(volume: &VolumeState) -> Vec<ObjectRef> {
+    let mut needed_blx = volume
         .page_locs
-        .values()
-        .filter_map(|(_, location)| (location.base == 0).then_some((location.fence, location.seg)))
-        .collect::<BTreeSet<_>>();
-    needed_segments.extend(vset.tombstone_segments.iter().copied());
-    needed_segments.extend(vset.vmm_segments.iter().copied());
-
-    let needed_batches = vset
-        .segment_refs
         .iter()
-        .filter(|(segment, _)| needed_segments.contains(segment))
+        .filter_map(|(page, (_, location))| {
+            (location.base == 0).then_some(location.identity(page.volume))
+        })
+        .collect::<BTreeSet<_>>();
+    needed_blx.extend(volume.tombstone_blx_files.iter().copied());
+    needed_blx.extend(volume.vmm_blx_files.iter().copied());
+
+    let needed_batches = volume
+        .blx_refs
+        .iter()
+        .filter(|(blx, _)| needed_blx.contains(blx))
         .map(|(_, file)| (file.identity.writer_fence, file.batch_id))
         .collect::<BTreeSet<_>>();
-    vset.segment_refs
+    volume
+        .blx_refs
         .values()
         .filter(|file| needed_batches.contains(&(file.identity.writer_fence, file.batch_id)))
         .copied()
@@ -56,19 +60,18 @@ pub(super) fn recovery_files(vset: &VsetState) -> Vec<ObjectRef> {
 async fn reset_archived_non_data<W: Store>(
     state: &SharedHost,
     world: &W,
-    vset: VsetId,
+    volume: VolumeId,
 ) -> Option<()> {
-    let (incarnation, retry, objects, cached) = {
+    let (incarnation, objects, cached) = {
         let host = state.borrow();
-        let vset_state = host.vsets.get(&vset)?;
-        if vset_state.archived_non_data_reset {
+        let volume_state = host.volumes.get(&volume)?;
+        if volume_state.archived_non_data_reset {
             return Some(());
         }
         (
-            vset_state.incarnation,
-            host.config.backup_retry,
-            vset_state.archive_objects.clone(),
-            vset_state.archive_footers.clone(),
+            volume_state.incarnation,
+            volume_state.archive_objects.clone(),
+            volume_state.archive_footers.clone(),
         )
     };
     let mut footers = cached;
@@ -85,12 +88,11 @@ async fn reset_archived_non_data<W: Store>(
             &object.identity.store_key(),
             u64::from(object.footer_offset),
             u64::from(object.footer_length),
-            retry,
         )
         .await
         .ok()??
         .1;
-        let footer = open_footer(&bytes).ok()?;
+        let footer = BlxFooter::open(&bytes).ok()?;
         let valid = footer.entries.first().is_some_and(|entry| {
             entry.key == object.first_key
                 && footer
@@ -114,8 +116,8 @@ async fn reset_archived_non_data<W: Store>(
         let Some(footer) = footers.get(&object.identity) else {
             continue;
         };
-        let own = object.identity.namespace_kind == NamespaceKind::Vset
-            && object.identity.namespace_id == vset.0;
+        let own = object.identity.namespace_kind == NamespaceKind::Volume
+            && object.identity.namespace_id == volume.0;
         for entry in footer
             .entries
             .iter()
@@ -134,24 +136,24 @@ async fn reset_archived_non_data<W: Store>(
     }
 
     let mut host = state.borrow_mut();
-    let vset_state = host
-        .vsets
-        .get_mut(&vset)
-        .filter(|vset_state| vset_state.incarnation == incarnation)?;
-    if vset_state.archived_non_data_reset {
+    let volume_state = host
+        .volumes
+        .get_mut(&volume)
+        .filter(|volume_state| volume_state.incarnation == incarnation)?;
+    if volume_state.archived_non_data_reset {
         return Some(());
     }
     for (key, (entry, _, _)) in winners {
-        vset_state.next_gen = vset_state
+        volume_state.next_gen = volume_state
             .next_gen
             .max(entry.generation.0.saturating_add(1));
         if entry.kind == EntryKind::Data {
-            vset_state.state_checksum ^=
+            volume_state.state_checksum ^=
                 state_contribution(key, entry.generation, entry.value_checksum);
         }
     }
-    vset_state.archive_footers = footers;
-    vset_state.archived_non_data_reset = true;
+    volume_state.archive_footers = footers;
+    volume_state.archived_non_data_reset = true;
     Some(())
 }
 
@@ -176,35 +178,35 @@ enum CheckpointDecision {
     },
 }
 
-fn reserve_checkpoint(state: &SharedHost, req: ReqId, vset: VsetId) -> CheckpointDecision {
+fn reserve_checkpoint(state: &SharedHost, req: ReqId, volume: VolumeId) -> CheckpointDecision {
     let mut host = state.borrow_mut();
-    let Some(vset_state) = host.vsets.get_mut(&vset) else {
+    let Some(volume_state) = host.volumes.get_mut(&volume) else {
         return CheckpointDecision::Missing;
     };
-    if !vset_state.ready || vset_state.config.kind != crate::journal::VsetKind::Compute {
+    if !volume_state.ready {
         return CheckpointDecision::Invalid;
     }
-    if let Some(&epoch) = vset_state.checkpoint_results.get(&req) {
+    if let Some(&epoch) = volume_state.checkpoint_results.get(&req) {
         return CheckpointDecision::Existing(epoch);
     }
-    if vset_state.operations.migration_running() {
+    if volume_state.operations.migration_running() {
         return CheckpointDecision::Invalid;
     }
-    if vset_state.operations.mutation_blocked() {
+    if volume_state.operations.mutation_blocked() {
         let (wake, wait) = oneshot();
-        vset_state.mutation_waiters.push(wake);
+        volume_state.mutation_waiters.push(wake);
         return CheckpointDecision::Busy(wait);
     }
 
-    let epoch = crate::types::Epoch(vset_state.epoch.0 + 1);
+    let epoch = crate::types::Epoch(volume_state.epoch.0 + 1);
     assert!(
-        vset_state
+        volume_state
             .operations
             .try_start_mutation(MutationOwner::Capture(CaptureKind::Checkpoint))
     );
     let (cleanup, protections) = oneshot();
     CheckpointDecision::Reserved {
-        incarnation: vset_state.incarnation,
+        incarnation: volume_state.incarnation,
         epoch,
         cleanup,
         protections,
@@ -220,7 +222,7 @@ pub(super) struct PausedGuest<W: GuestMem + AdminIo + 'static> {
 struct PauseTracker<W: GuestMem + AdminIo + 'static> {
     state: SharedHost,
     world: Rc<W>,
-    vset: VsetId,
+    volume: VolumeId,
     incarnation: u64,
     pause: GuestPause,
     active: Rc<Cell<bool>>,
@@ -231,7 +233,7 @@ impl<W: GuestMem + AdminIo + 'static> Clone for PauseTracker<W> {
         Self {
             state: Rc::clone(&self.state),
             world: Rc::clone(&self.world),
-            vset: self.vset,
+            volume: self.volume,
             incarnation: self.incarnation,
             pause: self.pause.clone(),
             active: Rc::clone(&self.active),
@@ -247,16 +249,16 @@ impl<W: GuestMem + AdminIo + 'static> PauseTracker<W> {
         let current = self
             .state
             .borrow()
-            .vsets
-            .get(&self.vset)
-            .is_some_and(|vset| {
-                vset.incarnation == self.incarnation && vset.operations.guest_resume_pending()
+            .volumes
+            .get(&self.volume)
+            .is_some_and(|volume| {
+                volume.incarnation == self.incarnation && volume.operations.guest_resume_pending()
             });
         if !current {
             self.active.set(false);
             return true;
         }
-        let resumed = GuestMem::resume(self.world.as_ref(), self.vset, Some(self.pause.clone()))
+        let resumed = GuestMem::resume(self.world.as_ref(), self.volume, Some(self.pause.clone()))
             .await
             .is_ok();
         if self.active.replace(false) {
@@ -279,17 +281,17 @@ impl<W: GuestMem + AdminIo + 'static> PauseTracker<W> {
     fn finish_pending(&self) {
         let waiters = {
             let mut host = self.state.borrow_mut();
-            let Some(vset) = host
-                .vsets
-                .get_mut(&self.vset)
-                .filter(|vset| vset.incarnation == self.incarnation)
+            let Some(volume) = host
+                .volumes
+                .get_mut(&self.volume)
+                .filter(|volume| volume.incarnation == self.incarnation)
             else {
                 return;
             };
-            vset.operations.finish_guest_resume();
-            std::mem::take(&mut vset.mutation_waiters)
+            volume.operations.finish_guest_resume();
+            std::mem::take(&mut volume.mutation_waiters)
         };
-        self.state.borrow_mut().schedule_vset(self.vset);
+        self.state.borrow_mut().schedule_volume(self.volume);
         for waiter in waiters {
             let _ = waiter.send(());
         }
@@ -297,10 +299,40 @@ impl<W: GuestMem + AdminIo + 'static> PauseTracker<W> {
 }
 
 impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
+    async fn acquire(
+        state: &SharedHost,
+        world: &Rc<W>,
+        volume: VolumeId,
+        incarnation: u64,
+        protections: OneReceiver<Vec<PageId>>,
+    ) -> Option<Self> {
+        let Ok(pause) = GuestMem::pause(world.as_ref(), volume).await else {
+            state.borrow_mut().fail("guest pause failed");
+            return None;
+        };
+        let Some(paused) = Self::new(
+            state,
+            world,
+            volume,
+            incarnation,
+            pause.clone(),
+            protections,
+        ) else {
+            if GuestMem::resume(world.as_ref(), volume, Some(pause))
+                .await
+                .is_err()
+            {
+                state.borrow_mut().fail("stale capture guest resume failed");
+            }
+            return None;
+        };
+        Some(paused)
+    }
+
     fn new(
         state: &SharedHost,
         world: &Rc<W>,
-        vset: VsetId,
+        volume: VolumeId,
         incarnation: u64,
         pause: GuestPause,
         protections: OneReceiver<Vec<PageId>>,
@@ -308,18 +340,18 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
         let active = Rc::new(Cell::new(true));
         {
             let mut host = state.borrow_mut();
-            let vset_state = host
-                .vsets
-                .get_mut(&vset)
-                .filter(|vset_state| vset_state.incarnation == incarnation)?;
-            if !vset_state.operations.start_guest_resume() {
+            let volume_state = host
+                .volumes
+                .get_mut(&volume)
+                .filter(|volume_state| volume_state.incarnation == incarnation)?;
+            if !volume_state.operations.start_guest_resume() {
                 return None;
             }
         }
         let tracker = PauseTracker {
             state: Rc::clone(state),
             world: Rc::clone(world),
-            vset,
+            volume,
             incarnation,
             pause,
             active,
@@ -361,6 +393,10 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
         self.tracker.clone()
     }
 
+    fn pause(&self) -> &GuestPause {
+        &self.tracker.pause
+    }
+
     pub(super) async fn resume(mut self) -> bool {
         let _ = self.cancel.push(Lane::Critical, ());
         match self.cleanup_done.take() {
@@ -372,7 +408,7 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
     pub(super) async fn commit(&mut self) -> bool {
         let committed = GuestMem::commit_pause(
             self.tracker.world.as_ref(),
-            self.tracker.vset,
+            self.tracker.volume,
             self.tracker.pause.clone(),
         )
         .await
@@ -399,47 +435,43 @@ impl<W: GuestMem + AdminIo + 'static> Drop for PausedGuest<W> {
 }
 
 struct CompactionRescue {
-    victim: (u64, SegId),
-    entries: Vec<(PageId, Gen, PageLoc, Vec<u8>)>,
+    victim: (u64, ObjectId),
+    entries: Vec<(PageId, Gen, PageFileLoc, Vec<u8>)>,
 }
 
-/// Verify and decompress the live entries of the sparsest local segments.
+/// Verify and decompress the live entries of the sparsest local BLX files.
 /// The serving map is rechecked when the capture reserves its cut, so reads
 /// that race a newer capture are harmless stale work.
 async fn prepare_compaction<W: Blobs>(
     state: &SharedHost,
     world: &W,
-    vset: VsetId,
+    volume: VolumeId,
 ) -> Vec<CompactionRescue> {
     let candidates = {
         let host = state.borrow();
-        let Some(vset_state) = host.vsets.get(&vset).filter(|state| state.ready) else {
+        let Some(volume_state) = host.volumes.get(&volume).filter(|state| state.ready) else {
             return Vec::new();
         };
-        if vset_state.outbound.is_some()
-            || vset_state.operations.migration_running()
-            || vset_state.page_locs.len() < ROLL_THRESHOLD
+        if volume_state.outbound.is_some()
+            || volume_state.operations.migration_running()
+            || volume_state.page_locs.len() < ROLL_THRESHOLD
         {
             return Vec::new();
         }
-        let mut live_by_segment = BTreeMap::<(u64, SegId), u64>::new();
-        for (_, location) in vset_state.page_locs.values() {
+        let mut live_by_blx = BTreeMap::<ObjectIdentity, u64>::new();
+        for (_, location) in volume_state.page_locs.values() {
             if location.base == 0 {
-                *live_by_segment
-                    .entry((location.fence, location.seg))
-                    .or_default() += u64::from(location.len);
+                *live_by_blx.entry(location.identity(volume)).or_default() +=
+                    u64::from(location.len);
             }
         }
-        let mut candidates = vset_state
-            .segment_blobs
+        let mut candidates = volume_state
+            .blx_blobs
             .iter()
-            .filter_map(|&(fence, segment, size)| {
-                let live = live_by_segment.get(&(fence, segment)).copied().unwrap_or(0);
-                (live > 0 && live.saturating_mul(2) <= size).then_some((
-                    live.saturating_mul(1_000_000) / size,
-                    fence,
-                    segment,
-                ))
+            .filter_map(|&(identity, size)| {
+                let live = live_by_blx.get(&identity).copied().unwrap_or(0);
+                (live > 0 && live.saturating_mul(2) <= size)
+                    .then_some((live.saturating_mul(1_000_000) / size, identity))
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable();
@@ -448,29 +480,31 @@ async fn prepare_compaction<W: Blobs>(
     };
 
     let mut rescues = Vec::new();
-    for (_, fence, segment) in candidates {
+    for (_, identity) in candidates {
+        let fence = identity.writer_fence;
+        let blx = ObjectId(identity.object_id);
         let expected = {
             let host = state.borrow();
-            let Some(vset_state) = host.vsets.get(&vset) else {
+            let Some(volume_state) = host.volumes.get(&volume) else {
                 break;
             };
-            vset_state
+            volume_state
                 .page_locs
                 .iter()
                 .filter(|(_, (_, location))| {
-                    location.base == 0 && (location.fence, location.seg) == (fence, segment)
+                    location.base == 0 && (location.fence, location.object) == (fence, blx)
                 })
                 .map(|(&page, &entry)| (page, entry))
                 .collect::<BTreeMap<_, _>>()
         };
-        let name = layout::segment_blob(vset, fence, segment);
+        let name = layout::blx_blob(volume, fence, blx);
         let Ok(Some(bytes)) = Blobs::read(world, &name).await else {
             continue;
         };
-        let Ok((owner, blob_fence, blob_segment, entries)) = scan_segment(&bytes) else {
+        let Ok((owner, blob_fence, blob_object, entries)) = scan_page_file(&bytes) else {
             continue;
         };
-        if (owner, blob_fence, blob_segment) != (vset, fence, segment) {
+        if (owner, blob_fence, blob_object) != (volume, fence, blx) {
             continue;
         }
         let mut decoded = Vec::new();
@@ -485,7 +519,7 @@ async fn prepare_compaction<W: Blobs>(
                 damaged = true;
                 break;
             };
-            let Ok((decoded_page, decoded_generation, raw)) = open_entry(vset, frame) else {
+            let Ok((decoded_page, decoded_generation, raw)) = open_entry(volume, frame) else {
                 damaged = true;
                 break;
             };
@@ -500,7 +534,7 @@ async fn prepare_compaction<W: Blobs>(
         }
         if !damaged && decoded.len() == expected.len() {
             rescues.push(CompactionRescue {
-                victim: (fence, segment),
+                victim: (fence, blx),
                 entries: decoded,
             });
         }
@@ -508,7 +542,7 @@ async fn prepare_compaction<W: Blobs>(
     rescues
 }
 
-fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
+fn initial_record(config: VolumeConfig, fence: u64) -> JournalRecord {
     JournalRecord {
         config,
         seq: JournalSeq(0),
@@ -518,7 +552,7 @@ fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
         sync_covered_through: 0,
         post_state_checksum: 0,
         files: Vec::new(),
-        overlay: BTreeMap::new(),
+        runtime_page_index: BTreeMap::new(),
         migrated_from: None,
     }
 }
@@ -526,37 +560,37 @@ fn initial_record(config: VsetConfig, fence: u64) -> JournalRecord {
 pub(super) async fn finish_creation<W: Blobs>(
     state: SharedHost,
     world: &W,
-    vset: VsetId,
+    volume: VolumeId,
     incarnation: u64,
 ) -> bool {
     let Some((config, fence)) = state
         .borrow()
-        .vsets
-        .get(&vset)
+        .volumes
+        .get(&volume)
         .filter(|state| state.incarnation == incarnation)
         .map(|state| (state.config, state.fence))
     else {
         return false;
     };
     let record = initial_record(config, fence);
-    if !write_record_copies(&state, world, vset, &record, &BTreeMap::new()).await {
+    if !write_record_copies(&state, world, volume, &record, &BTreeMap::new()).await {
         return false;
     }
     {
         let mut host = state.borrow_mut();
-        let Some(vset_state) = host
-            .vsets
-            .get_mut(&vset)
+        let Some(volume_state) = host
+            .volumes
+            .get_mut(&volume)
             .filter(|state| state.incarnation == incarnation)
         else {
             return false;
         };
-        vset_state.ready = true;
-        vset_state.next_seq = 1;
-        vset_state.best_record = Some(record.clone());
-        vset_state.record_writes.insert(record.seq, (fence, 0));
+        volume_state.ready = true;
+        volume_state.next_seq = 1;
+        volume_state.best_record = Some(record.clone());
+        volume_state.record_writes.insert(record.seq, (fence, 0));
         host.counters.records_written += 1;
-        host.schedule_vset(vset);
+        host.schedule_volume(volume);
     }
     true
 }
@@ -564,103 +598,141 @@ pub(super) async fn finish_creation<W: Blobs>(
 pub async fn capture_local<W>(
     state: SharedHost,
     world: Rc<W>,
-    vset: VsetId,
+    volume: VolumeId,
 ) -> Option<JournalRecord>
 where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
-    capture_record(state, world, vset, None, None, None).await
+    HostCtx::new(state, world).volume(volume).capture().await
 }
 
 pub async fn checkpoint_local<W>(
     state: SharedHost,
     world: Rc<W>,
     req: ReqId,
-    vset: VsetId,
+    volume: VolumeId,
 ) -> Option<AdminResult>
 where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
-    let (incarnation, epoch, lease, protections) = loop {
-        match reserve_checkpoint(&state, req, vset) {
-            CheckpointDecision::Missing | CheckpointDecision::Invalid => {
-                return Some(Err(AdminError::Rejected));
-            }
-            CheckpointDecision::Existing(epoch) => {
-                return Some(Ok(AdminSuccess::CheckpointDone { vset, epoch }));
-            }
-            CheckpointDecision::Busy(wait) => {
-                let _ = wait.await;
-            }
-            CheckpointDecision::Reserved {
-                incarnation,
-                epoch,
-                cleanup,
-                protections,
-            } => {
-                break (
+    HostCtx::new(state, world)
+        .volume(volume)
+        .checkpoint(req)
+        .await
+}
+
+impl<W> VolumeCtx<W>
+where
+    W: Blobs + Store + GuestMem + AdminIo + 'static,
+{
+    pub(super) async fn capture(&self) -> Option<JournalRecord> {
+        capture_record(
+            Rc::clone(self.host().state()),
+            Rc::clone(self.host().world()),
+            self.id(),
+            CaptureKind::Writeback,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn checkpoint(&self, req: ReqId) -> Option<AdminResult> {
+        let state = Rc::clone(self.host().state());
+        let world = Rc::clone(self.host().world());
+        let volume = self.id();
+        let kind = {
+            let host = state.borrow();
+            let volume_state = host.volumes.get(&volume)?;
+            volume_state.config.kind
+        };
+
+        let (incarnation, epoch, lease, protections) = loop {
+            match reserve_checkpoint(&state, req, volume) {
+                CheckpointDecision::Missing | CheckpointDecision::Invalid => {
+                    return Some(Err(AdminError::Rejected));
+                }
+                CheckpointDecision::Existing(epoch) => {
+                    return Some(Ok(AdminSuccess::CheckpointDone { volume, epoch }));
+                }
+                CheckpointDecision::Busy(wait) => {
+                    let _ = wait.await;
+                }
+                CheckpointDecision::Reserved {
                     incarnation,
                     epoch,
-                    CaptureLease::new(
-                        &state,
-                        vset,
-                        incarnation,
-                        MutationOwner::Capture(CaptureKind::Checkpoint),
-                        cleanup,
-                    ),
+                    cleanup,
                     protections,
-                );
+                } => {
+                    break (
+                        incarnation,
+                        epoch,
+                        CaptureLease::new(
+                            &state,
+                            volume,
+                            incarnation,
+                            MutationOwner::Capture(CaptureKind::Checkpoint),
+                            cleanup,
+                        ),
+                        protections,
+                    );
+                }
             }
+        };
+        if kind == crate::journal::VolumeKind::Data {
+            let captured = capture_record(
+                Rc::clone(&state),
+                Rc::clone(&world),
+                volume,
+                CaptureKind::Checkpoint,
+                None,
+                Some((incarnation, lease)),
+                None,
+            )
+            .await?;
+            let mut host = state.borrow_mut();
+            let volume_state = host
+                .volumes
+                .get_mut(&volume)
+                .filter(|volume_state| volume_state.incarnation == incarnation)?;
+            volume_state.epoch = epoch;
+            volume_state.pinned = Some(captured);
+            volume_state.checkpoint_results.insert(req, epoch);
+            host.counters.checkpoints_done = host.counters.checkpoints_done.saturating_add(1);
+            return Some(Ok(AdminSuccess::CheckpointDone { volume, epoch }));
         }
-    };
-    let Ok(pause) = GuestMem::pause(world.as_ref(), vset).await else {
-        state.borrow_mut().fail("guest pause failed");
-        return None;
-    };
-    let Some(paused) = PausedGuest::new(
-        &state,
-        &world,
-        vset,
-        incarnation,
-        pause.clone(),
-        protections,
-    ) else {
-        if GuestMem::resume(world.as_ref(), vset, Some(pause))
-            .await
-            .is_err()
-        {
-            state
-                .borrow_mut()
-                .fail("stale checkpoint guest resume failed");
+        let paused = PausedGuest::acquire(&state, &world, volume, incarnation, protections).await?;
+        let checkpoint = Checkpoint {
+            req: Some(req),
+            epoch,
+            vmstate: paused.pause().vmstate,
+            vmstate_bytes: paused.pause().vmstate_bytes.clone(),
+        };
+        let captured = capture_record(
+            Rc::clone(&state),
+            Rc::clone(&world),
+            volume,
+            CaptureKind::Checkpoint,
+            Some(checkpoint),
+            Some((incarnation, lease)),
+            Some(paused.tracker()),
+        )
+        .await;
+        if !paused.resume().await {
+            return None;
         }
-        return None;
-    };
-    let checkpoint = Checkpoint {
-        req: Some(req),
-        epoch,
-        vmstate: pause.vmstate,
-        vmstate_bytes: pause.vmstate_bytes.clone(),
-    };
-    let captured = capture_record(
-        Rc::clone(&state),
-        Rc::clone(&world),
-        vset,
-        Some(checkpoint),
-        Some((incarnation, lease)),
-        Some(paused.tracker()),
-    )
-    .await;
-    if !paused.resume().await {
-        return None;
+        captured.map(|_| Ok(AdminSuccess::CheckpointDone { volume, epoch }))
     }
-    captured.map(|_| Ok(AdminSuccess::CheckpointDone { vset, epoch }))
 }
 
 #[allow(clippy::too_many_lines)]
 async fn capture_record<W>(
     state: SharedHost,
     world: Rc<W>,
-    vset: VsetId,
+    volume: VolumeId,
+    capture_kind: CaptureKind,
     checkpoint: Option<Checkpoint>,
     reservation: Option<(u64, CaptureLease)>,
     resumed: Option<PauseTracker<W>>,
@@ -670,24 +742,15 @@ where
 {
     let pre_reserved = reservation.is_some();
     let reserved_incarnation = reservation.as_ref().map(|(incarnation, _)| *incarnation);
-    let capture_kind = checkpoint
-        .as_ref()
-        .map_or(CaptureKind::Writeback, |checkpoint| {
-            if checkpoint.req.is_some() {
-                CaptureKind::Checkpoint
-            } else {
-                CaptureKind::Migration
-            }
-        });
     let capture_owner = MutationOwner::Capture(capture_kind);
-    reset_archived_non_data(&state, world.as_ref(), vset).await?;
+    reset_archived_non_data(&state, world.as_ref(), volume).await?;
     let complete_memory_snapshot = checkpoint.is_some()
         && state
             .borrow()
-            .vsets
-            .get(&vset)
-            .is_some_and(|vset_state| !vset_state.archived_memory_usable);
-    let prepared_compaction = prepare_compaction(&state, world.as_ref(), vset).await;
+            .volumes
+            .get(&volume)
+            .is_some_and(|volume_state| !volume_state.archived_memory_usable);
+    let prepared_compaction = prepare_compaction(&state, world.as_ref(), volume).await;
     let (
         incarnation,
         seq,
@@ -696,15 +759,15 @@ where
         pages,
         flushed_pages,
         protect,
-        first_seg,
+        first_object,
         compact_victims,
         pending_tombstones,
     ) = {
         let mut host = state.borrow_mut();
-        let vset_state = host.vsets.get(&vset)?;
+        let volume_state = host.volumes.get(&volume)?;
         let flush_set = host
             .cache
-            .unstable_pages_of(vset)
+            .unstable_pages_of(volume)
             .into_iter()
             .collect::<BTreeSet<_>>();
         let mut rescues = Vec::new();
@@ -715,9 +778,9 @@ where
                 .iter()
                 .map(|(page, generation, location, _)| (*page, (*generation, *location)))
                 .collect::<BTreeMap<_, _>>();
-            let all_live_covered = vset_state.page_locs.iter().all(|(page, entry)| {
+            let all_live_covered = volume_state.page_locs.iter().all(|(page, entry)| {
                 let location = entry.1;
-                (location.base != 0 || (location.fence, location.seg) != prepared.victim)
+                (location.base != 0 || (location.fence, location.object) != prepared.victim)
                     || flush_set.contains(page)
                     || prepared_pages.get(page) == Some(entry)
             });
@@ -726,84 +789,80 @@ where
             }
             for (page, generation, location, bytes) in prepared.entries {
                 if !flush_set.contains(&page)
-                    && vset_state.page_locs.get(&page) == Some(&(generation, location))
+                    && volume_state.page_locs.get(&page) == Some(&(generation, location))
                 {
                     rescues.push((page, bytes));
                 }
             }
             compact_victims.insert(prepared.victim);
         }
-        let needs_commit = host.cache.has_dirty_of(vset)
+        let needs_commit = host.cache.has_dirty_of(volume)
             || !compact_victims.is_empty()
-            || !vset_state.pending_tombstones.is_empty()
-            || vset_state
+            || !volume_state.pending_tombstones.is_empty()
+            || volume_state
                 .pending_syncs
                 .iter()
-                .any(|sync| sync.barrier > vset_state.local_covered_through);
-        if !vset_state.ready
+                .any(|sync| sync.barrier > volume_state.local_covered_through);
+        if !volume_state.ready
             || (!pre_reserved
-                && (vset_state.operations.mutation_blocked()
-                    || vset_state.operations.migration_running()
+                && (volume_state.operations.mutation_blocked()
+                    || volume_state.operations.migration_running()
                     || !needs_commit))
             || reserved_incarnation.is_some_and(|incarnation| {
-                vset_state.incarnation != incarnation
-                    || vset_state.operations.mutation_owner() != Some(capture_owner)
+                volume_state.incarnation != incarnation
+                    || volume_state.operations.mutation_owner() != Some(capture_owner)
             })
         {
             return None;
         }
-        let incarnation = vset_state.incarnation;
-        let flushed_pages = host.cache.unstable_pages_of(vset);
+        let incarnation = volume_state.incarnation;
+        let flushed_pages = host.cache.unstable_pages_of(volume);
         let mut pages = flushed_pages.iter().copied().collect::<BTreeSet<_>>();
         if complete_memory_snapshot {
-            let memory = crate::types::VolumeId {
-                vset,
-                idx: crate::types::VolumeIdx(0),
-            };
-            pages.extend((0..vset_state.config.pages_per_volume).map(|page| PageId {
-                volume: memory,
+            pages.extend((0..volume_state.config.pages).map(|page| PageId {
+                volume,
                 page: crate::types::PageNo(page),
             }));
         }
         let pages = pages.into_iter().collect::<Vec<_>>();
-        let protect = host.cache.dirty_pages_of(vset);
-        let (seq, capture_seq, first_seg, fence, pending_tombstones) = {
-            let vset_state = host.vsets.get_mut(&vset).expect("just observed");
-            let seq = JournalSeq(vset_state.next_seq);
-            vset_state.next_seq += 1;
-            let capture_seq = vset_state.mutation_seq;
-            let first_seg = SegId(vset_state.next_seg);
-            vset_state.next_seg = vset_state
-                .next_seg
+        let protect = host.cache.dirty_pages_of(volume);
+        let (seq, capture_seq, first_object, fence, pending_tombstones) = {
+            let volume_state = host.volumes.get_mut(&volume).expect("just observed");
+            let seq = JournalSeq(volume_state.next_seq);
+            volume_state.next_seq += 1;
+            let capture_seq = volume_state.mutation_seq;
+            let first_object = ObjectId(volume_state.next_object_id);
+            volume_state.next_object_id = volume_state
+                .next_object_id
                 .checked_add(
                     u64::try_from(
-                        pages.len() + rescues.len() + vset_state.pending_tombstones.len(),
+                        pages.len() + rescues.len() + volume_state.pending_tombstones.len(),
                     )
                     .expect("entry count fits u64"),
                 )
-                .expect("segment id overflow");
+                .expect("blx id overflow");
             let mut unread = BTreeMap::new();
             for &page in &pages {
-                unread.insert(page, Gen(vset_state.next_gen));
-                vset_state.next_gen += 1;
+                unread.insert(page, Gen(volume_state.next_gen));
+                volume_state.next_gen += 1;
             }
             if !pre_reserved {
-                assert!(vset_state.operations.try_start_mutation(capture_owner));
+                assert!(volume_state.operations.try_start_mutation(capture_owner));
             }
-            vset_state.operations.begin_drain(DrainState {
+            volume_state.operations.begin_drain(DrainState {
                 unread,
                 copied_on_fault: BTreeMap::new(),
                 armed: pages.clone(),
                 rescues: rescues
                     .into_iter()
                     .map(|(page, bytes)| {
-                        let generation = Gen(vset_state.next_gen);
-                        vset_state.next_gen += 1;
+                        let generation = Gen(volume_state.next_gen);
+                        volume_state.next_gen += 1;
                         (page, generation, bytes)
                     })
                     .collect(),
             });
-            let pending_keys = vset_state
+            let pending_keys = volume_state
                 .pending_tombstones
                 .iter()
                 .copied()
@@ -813,8 +872,8 @@ where
                 let generation = if key.space == crate::blx::BlockSpace::Vmm {
                     Gen(seq.0)
                 } else {
-                    let generation = Gen(vset_state.next_gen);
-                    vset_state.next_gen += 1;
+                    let generation = Gen(volume_state.next_gen);
+                    volume_state.next_gen += 1;
                     generation
                 };
                 pending_tombstones.push((key, generation));
@@ -822,8 +881,8 @@ where
             (
                 seq,
                 capture_seq,
-                first_seg,
-                vset_state.fence,
+                first_object,
+                volume_state.fence,
                 pending_tombstones,
             )
         };
@@ -838,7 +897,7 @@ where
             pages,
             flushed_pages,
             protect,
-            first_seg,
+            first_object,
             compact_victims,
             pending_tombstones,
         )
@@ -865,17 +924,17 @@ where
                 }
                 let waiters = {
                     let mut host = cleanup_state.borrow_mut();
-                    let Some(vset_state) = host
-                        .vsets
-                        .get_mut(&vset)
-                        .filter(|vset_state| vset_state.incarnation == incarnation)
+                    let Some(volume_state) = host
+                        .volumes
+                        .get_mut(&volume)
+                        .filter(|volume_state| volume_state.incarnation == incarnation)
                     else {
                         return;
                     };
-                    vset_state.operations.finish_mutation(capture_owner);
-                    let waiters = std::mem::take(&mut vset_state.mutation_waiters);
+                    volume_state.operations.finish_mutation(capture_owner);
+                    let waiters = std::mem::take(&mut volume_state.mutation_waiters);
                     host.wake_pressure_waiter();
-                    host.schedule_vset(vset);
+                    host.schedule_volume(volume);
                     waiters
                 };
                 for waiter in waiters {
@@ -885,7 +944,7 @@ where
             .detach();
             CaptureLease::new_with_serialized_cleanup(
                 &state,
-                vset,
+                volume,
                 incarnation,
                 capture_owner,
                 cleanup,
@@ -911,10 +970,10 @@ where
         let observed = GuestMem::read_page(world.as_ref(), page).await;
         let captured = {
             let mut host = state.borrow_mut();
-            host.vsets
-                .get_mut(&vset)
+            host.volumes
+                .get_mut(&volume)
                 .filter(|state| state.incarnation == incarnation)
-                .and_then(|vset_state| vset_state.operations.drain_mut())
+                .and_then(|volume_state| volume_state.operations.drain_mut())
                 .and_then(|drain| match drain.unread.remove(&page) {
                     Some(generation) => Some((generation, observed)),
                     None => drain.copied_on_fault.remove(&page),
@@ -942,11 +1001,11 @@ where
     let mut batch_pages = captured_pages;
     let rescues = {
         let mut host = state.borrow_mut();
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
+        let volume_state = host
+            .volumes
+            .get_mut(&volume)
             .filter(|state| state.incarnation == incarnation)?;
-        std::mem::take(&mut vset_state.operations.drain_mut()?.rescues)
+        std::mem::take(&mut volume_state.operations.drain_mut()?.rescues)
     };
     for (index, rescued) in rescues.into_iter().enumerate() {
         batch_pages.push(rescued);
@@ -955,16 +1014,16 @@ where
         }
     }
 
-    let (pre_state_checksum, post_state_checksum, block_checksums) = {
+    let (kind, pre_state_checksum, post_state_checksum, block_checksums) = {
         let host = state.borrow();
-        let vset_state = host.vsets.get(&vset)?;
-        let mut checksum = vset_state.state_checksum;
-        let mut blocks = vset_state.block_checksums.clone();
+        let volume_state = host.volumes.get(&volume)?;
+        let mut checksum = volume_state.state_checksum;
+        let mut blocks = volume_state.block_checksums.clone();
         for (page, generation, bytes) in &batch_pages {
             replace_state_block(
                 &mut checksum,
                 &mut blocks,
-                BlockKey::from_page(VsetKind::Compute, *page),
+                BlockKey::from_page(volume_state.config.kind, *page),
                 Some((*generation, checksum64(bytes))),
             );
         }
@@ -986,13 +1045,18 @@ where
                 );
             }
         }
-        (vset_state.state_checksum, checksum, blocks)
+        (
+            volume_state.config.kind,
+            volume_state.state_checksum,
+            checksum,
+            blocks,
+        )
     };
-    let mut builder = SegmentBatchBuilder::new_for_record_with_checksums(
-        VsetKind::Compute,
-        vset,
+    let mut builder = PageBatchBuilder::new_with_checksums(
+        kind,
+        volume,
         fence,
-        first_seg,
+        first_object,
         seq.0,
         pre_state_checksum,
         post_state_checksum,
@@ -1003,17 +1067,17 @@ where
     for &(key, generation) in &pending_tombstones {
         if key.space == crate::blx::BlockSpace::Vmm {
             builder.add_vmm_tombstone(key.block, generation);
-        } else if let Some(page) = key.to_page(VsetKind::Compute, vset) {
+        } else if let Some(page) = key.to_page(kind, volume) {
             builder
                 .try_add_tombstone(page, generation)
-                .expect("reserved segment IDs cover pending tombstones");
+                .expect("reserved blx IDs cover pending tombstones");
         }
     }
     if let Some(checkpoint) = checkpoint.as_ref() {
         let old_vmm_blocks = state
             .borrow()
-            .vsets
-            .get(&vset)?
+            .volumes
+            .get(&volume)?
             .block_checksums
             .keys()
             .filter(|key| key.space == crate::blx::BlockSpace::Vmm)
@@ -1031,10 +1095,10 @@ where
         builder.add_vmm_snapshot(Gen(seq.0), &checkpoint.vmstate_bytes);
     }
 
-    let segment_blobs = builder.finish();
+    let blx_blobs = builder.finish();
     let flushed_pages = flushed_pages.into_iter().collect::<BTreeSet<_>>();
-    for (segment, bytes, entries) in &segment_blobs {
-        let name = layout::segment_blob(vset, fence, *segment);
+    for (blx, bytes, entries) in &blx_blobs {
+        let name = layout::blx_blob(volume, fence, *blx);
         if !state
             .borrow_mut()
             .try_reserve_blob(name.clone(), bytes.len() as u64)
@@ -1045,39 +1109,38 @@ where
             .await
             .is_err()
         {
-            state.borrow_mut().fail("local segment write failed");
+            state.borrow_mut().fail("local blx write failed");
             return None;
         }
         let mut host = state.borrow_mut();
         host.record_blob(name, bytes.len() as u64);
         {
-            let vset_state = host
-                .vsets
-                .get_mut(&vset)
+            let volume_state = host
+                .volumes
+                .get_mut(&volume)
                 .filter(|state| state.incarnation == incarnation)?;
             for &(page, generation, location) in entries {
-                vset_state.page_locs.insert(page, (generation, location));
-                if let Some(drain) = vset_state.operations.drain_mut() {
+                volume_state.page_locs.insert(page, (generation, location));
+                if let Some(drain) = volume_state.operations.drain_mut() {
                     drain.armed.retain(|armed| *armed != page);
                 }
             }
-            vset_state
-                .segment_blobs
-                .push((fence, *segment, bytes.len() as u64));
-            let object = open_object(bytes).ok()?;
-            vset_state
-                .segment_refs
-                .insert((fence, *segment), ObjectRef::from_blx(&object));
+            let identity = ObjectIdentity::volume(volume, fence, blx.0);
+            volume_state.blx_blobs.push((identity, bytes.len() as u64));
+            let object = BlxObject::open(bytes).ok()?;
+            volume_state
+                .blx_refs
+                .insert(identity, ObjectRef::from_blx(&object));
             if object
                 .footer
                 .entries
                 .iter()
                 .any(|entry| entry.kind == crate::blx::EntryKind::Tombstone)
             {
-                vset_state.tombstone_segments.insert((fence, *segment));
+                volume_state.tombstone_blx_files.insert(identity);
             }
-            vset_state.state_checksum = post_state_checksum;
-            vset_state.block_checksums.clone_from(&block_checksums);
+            volume_state.state_checksum = post_state_checksum;
+            volume_state.block_checksums.clone_from(&block_checksums);
         }
         for &(page, _, _) in entries {
             if flushed_pages.contains(&page) {
@@ -1088,39 +1151,49 @@ where
     }
     if checkpoint.is_some() {
         let mut host = state.borrow_mut();
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
+        let volume_state = host
+            .volumes
+            .get_mut(&volume)
             .filter(|state| state.incarnation == incarnation)?;
-        vset_state.vmm_segments = segment_blobs
+        volume_state.vmm_blx_files = blx_blobs
             .iter()
-            .map(|(segment, _, _)| (fence, *segment))
+            .map(|(blx, _, _)| ObjectIdentity::volume(volume, fence, blx.0))
             .collect();
     }
 
     let record_overlay: PageMap = {
         let host = state.borrow();
-        let vset_state = host
-            .vsets
-            .get(&vset)
+        let volume_state = host
+            .volumes
+            .get(&volume)
             .filter(|state| state.incarnation == incarnation)?;
-        vset_state.page_locs.clone()
+        if capture_kind == CaptureKind::Migration
+            || volume_state.peer_source.is_some()
+            || volume_state
+                .page_locs
+                .values()
+                .any(|(_, location)| location.base != 0)
+        {
+            volume_state.page_locs.clone()
+        } else {
+            BTreeMap::new()
+        }
     };
 
     let record = {
         let mut host = state.borrow_mut();
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
+        let volume_state = host
+            .volumes
+            .get_mut(&volume)
             .filter(|state| state.incarnation == incarnation)?;
-        let covered = vset_state
+        let covered = volume_state
             .pending_syncs
             .iter()
             .filter(|sync| sync.barrier <= capture_seq)
             .map(|sync| sync.barrier)
-            .fold(vset_state.local_covered_through, u64::max);
+            .fold(volume_state.local_covered_through, u64::max);
         JournalRecord {
-            config: vset_state.config,
+            config: volume_state.config,
             seq,
             fence,
             kind: checkpoint
@@ -1133,16 +1206,16 @@ where
             capture_seq,
             sync_covered_through: covered,
             post_state_checksum,
-            files: recovery_files(vset_state),
-            overlay: record_overlay,
-            migrated_from: vset_state.peer_source.map(|host| MigrationSource {
+            files: recovery_files(volume_state),
+            runtime_page_index: record_overlay,
+            migrated_from: volume_state.peer_source.map(|host| MigrationSource {
                 host,
-                offer_fence: vset_state.peer_source_offer_fence,
+                offer_fence: volume_state.peer_source_offer_fence,
             }),
         }
     };
     let wrote_record =
-        write_record_copies(&state, world.as_ref(), vset, &record, &block_checksums).await;
+        write_record_copies(&state, world.as_ref(), volume, &record, &block_checksums).await;
     if !wrote_record {
         state.borrow_mut().fail("local journal write failed");
         return None;
@@ -1150,54 +1223,56 @@ where
 
     let (syncs, waiters) = {
         let mut host = state.borrow_mut();
-        let vset_state = host
-            .vsets
-            .get_mut(&vset)
+        let volume_state = host
+            .volumes
+            .get_mut(&volume)
             .filter(|state| state.incarnation == incarnation)?;
-        vset_state.best_record = Some(record.clone());
+        volume_state.best_record = Some(record.clone());
         if complete_memory_snapshot {
-            vset_state.archived_memory_usable = true;
+            volume_state.archived_memory_usable = true;
         }
         for (key, _) in &pending_tombstones {
-            vset_state.pending_tombstones.remove(key);
+            volume_state.pending_tombstones.remove(key);
         }
-        if let Some((segment, _, _)) = segment_blobs.last() {
-            vset_state.next_seg = vset_state.next_seg.max(segment.0.saturating_add(1));
+        if let Some((blx, _, _)) = blx_blobs.last() {
+            volume_state.next_object_id = volume_state.next_object_id.max(blx.0.saturating_add(1));
         }
-        vset_state.local_covered_through = record.sync_covered_through;
+        volume_state.local_covered_through = record.sync_covered_through;
         let mut completed = Vec::new();
-        let pending = std::mem::take(&mut vset_state.pending_syncs);
+        let pending = std::mem::take(&mut volume_state.pending_syncs);
         for sync in pending {
-            if sync.barrier <= vset_state.sync_ack_through {
+            if sync.barrier <= volume_state.sync_ack_through {
                 completed.push(sync);
             } else {
-                vset_state.pending_syncs.push(sync);
+                volume_state.pending_syncs.push(sync);
             }
         }
-        vset_state
+        volume_state
             .record_writes
             .insert(record.seq, (fence, record.sync_covered_through));
-        vset_state.record_segments.insert(
+        volume_state.record_blx_files.insert(
             record.seq,
-            segment_blobs
+            blx_blobs
                 .iter()
-                .map(|(segment, _, _)| (fence, *segment))
+                .map(|(blx, _, _)| ObjectIdentity::volume(volume, fence, blx.0))
                 .collect(),
         );
-        vset_state.operations.finish_mutation(capture_owner);
-        let waiters = std::mem::take(&mut vset_state.mutation_waiters);
+        volume_state.operations.finish_mutation(capture_owner);
+        let waiters = std::mem::take(&mut volume_state.mutation_waiters);
         if let Some(checkpoint) = checkpoint.as_ref() {
-            vset_state.epoch = checkpoint.epoch;
-            vset_state.pinned = Some(record.clone());
+            volume_state.epoch = checkpoint.epoch;
+            volume_state.pinned = Some(record.clone());
             if let Some(req) = checkpoint.req {
-                vset_state.checkpoint_results.insert(req, checkpoint.epoch);
+                volume_state
+                    .checkpoint_results
+                    .insert(req, checkpoint.epoch);
             }
         }
         host.counters.records_written += 1;
         host.counters.pages_flushed += pages.len() as u64;
-        host.counters.segs_compacted += compact_victims.len() as u64;
+        host.counters.blx_files_compacted += compact_victims.len() as u64;
         host.counters.pages_compacted += u64::try_from(
-            segment_blobs
+            blx_blobs
                 .iter()
                 .flat_map(|(_, _, entries)| entries)
                 .filter(|(page, _, _)| !flushed_pages.contains(page))
@@ -1215,7 +1290,7 @@ where
     for sync in syncs {
         sync.resolve(true);
     }
-    if cleanup_local(Rc::clone(&state), world.as_ref(), vset, incarnation)
+    if cleanup_local(Rc::clone(&state), world.as_ref(), volume, incarnation)
         .await
         .is_err()
     {
@@ -1228,7 +1303,7 @@ where
 pub(super) async fn capture_migration<W>(
     state: SharedHost,
     world: Rc<W>,
-    vset: VsetId,
+    volume: VolumeId,
 ) -> Option<(JournalRecord, PausedGuest<W>, Vec<u8>)>
 where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
@@ -1246,22 +1321,23 @@ where
         }
         let reserved = {
             let mut host = state.borrow_mut();
-            let vset_state = host.vsets.get_mut(&vset)?;
-            if !vset_state.ready || vset_state.config.kind != crate::journal::VsetKind::Compute {
+            let volume_state = host.volumes.get_mut(&volume)?;
+            if !volume_state.ready || volume_state.config.kind != crate::journal::VolumeKind::Memory
+            {
                 Decision::Invalid
-            } else if vset_state.operations.mutation_blocked() {
+            } else if volume_state.operations.mutation_blocked() {
                 let (wake, wait) = oneshot();
-                vset_state.mutation_waiters.push(wake);
+                volume_state.mutation_waiters.push(wake);
                 Decision::Busy(wait)
             } else {
-                let epoch = crate::types::Epoch(vset_state.epoch.0 + 1);
+                let epoch = crate::types::Epoch(volume_state.epoch.0 + 1);
                 assert!(
-                    vset_state
+                    volume_state
                         .operations
                         .try_start_mutation(MutationOwner::Capture(CaptureKind::Migration))
                 );
                 let (cleanup, protections) = oneshot();
-                Decision::Reserved(vset_state.incarnation, epoch, cleanup, protections)
+                Decision::Reserved(volume_state.incarnation, epoch, cleanup, protections)
             }
         };
         match reserved {
@@ -1275,7 +1351,7 @@ where
                     epoch,
                     CaptureLease::new(
                         &state,
-                        vset,
+                        volume,
                         incarnation,
                         MutationOwner::Capture(CaptureKind::Migration),
                         cleanup,
@@ -1285,44 +1361,26 @@ where
             }
         }
     };
-    let Ok(pause) = GuestMem::pause(world.as_ref(), vset).await else {
-        state.borrow_mut().fail("guest pause failed");
-        return None;
-    };
-    let Some(paused) = PausedGuest::new(
-        &state,
-        &world,
-        vset,
-        incarnation,
-        pause.clone(),
-        protections,
-    ) else {
-        if GuestMem::resume(world.as_ref(), vset, Some(pause))
-            .await
-            .is_err()
-        {
-            state
-                .borrow_mut()
-                .fail("stale migration guest resume failed");
-        }
-        return None;
-    };
+    let paused = PausedGuest::acquire(&state, &world, volume, incarnation, protections).await?;
+    let vmstate = paused.pause().vmstate;
+    let vmstate_bytes = paused.pause().vmstate_bytes.clone();
     let record = capture_record(
         Rc::clone(&state),
         Rc::clone(&world),
-        vset,
+        volume,
+        CaptureKind::Migration,
         Some(Checkpoint {
             req: None,
             epoch,
-            vmstate: pause.vmstate,
-            vmstate_bytes: pause.vmstate_bytes.clone(),
+            vmstate,
+            vmstate_bytes: vmstate_bytes.clone(),
         }),
         Some((incarnation, lease)),
         None,
     )
     .await;
     if let Some(record) = record {
-        Some((record, paused, pause.vmstate_bytes))
+        Some((record, paused, vmstate_bytes))
     } else {
         let _ = paused.resume().await;
         None
@@ -1332,7 +1390,7 @@ where
 pub(super) async fn write_record_copies<W: Blobs>(
     state: &SharedHost,
     world: &W,
-    vset: VsetId,
+    volume: VolumeId,
     record: &JournalRecord,
     block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
 ) -> bool {
@@ -1341,22 +1399,22 @@ pub(super) async fn write_record_copies<W: Blobs>(
     // temporary lookup index in both local journal copies until hydration has
     // made the cut wholly local.
     let bytes = if record.migrated_from.is_some() {
-        record.encode_migration_with_checksums(vset, block_checksums)
+        record.encode_migration_with_checksums(volume, block_checksums)
     } else {
-        record.encode(vset)
+        record.encode(volume)
     };
-    write_encoded_record_copies(state, world, vset, record, bytes).await
+    write_encoded_record_copies(state, world, volume, record, bytes).await
 }
 
 async fn write_encoded_record_copies<W: Blobs>(
     state: &SharedHost,
     world: &W,
-    vset: VsetId,
+    volume: VolumeId,
     record: &JournalRecord,
     bytes: Vec<u8>,
 ) -> bool {
-    let primary_name = layout::journal_blob(vset, record.fence, record.seq);
-    let mirror_name = layout::journal_mirror_blob(vset, record.fence, record.seq);
+    let primary_name = layout::journal_blob(volume, record.fence, record.seq);
+    let mirror_name = layout::journal_mirror_blob(volume, record.fence, record.seq);
     let len = bytes.len() as u64;
     let (had_primary, had_mirror) = {
         let mut host = state.borrow_mut();

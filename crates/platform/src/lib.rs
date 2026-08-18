@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 /// The system's native base-page size.
 ///
-/// Every blockd page uses this size: memory, cache, capture, segments, wire
+/// Every blockd page uses this size: memory, cache, capture, BLX files, wire
 /// transfers, and simulation. Persisted records carry the value and reject a
 /// restore on a host with an incompatible page size.
 pub fn page_size() -> usize {

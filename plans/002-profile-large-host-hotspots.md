@@ -17,7 +17,7 @@
 ## Status
 
 - **Status**: IN PROGRESS — retained Lima runtime/UFFD core scaling,
-  measured-phase CPU, shared-base, 256-vset, hotspot, and instrumentation gates
+  measured-phase CPU, shared-base, 256-volume, hotspot, and instrumentation gates
   are complete; long-duration, real-VM, hardware-counter, NUMA, pressure, and
   lifecycle tiers remain
 - **Priority**: P1
@@ -52,10 +52,10 @@ plan. It is acceptable for the decision to be “do not parallelize fault work.�
 Two independent parameters are mandatory throughout the harness and artifact
 schema:
 
-- `vset_count`: the total live vsets in the measured phase;
+- `volume_count`: the total live volumes in the measured phase;
 - `fork_provenance`: a reproducible lineage description containing topology,
   root count, maximum generation, branching parameters, and the seed or explicit
-  parent relation used to derive every vset.
+  parent relation used to derive every volume.
 
 Do not infer provenance from creation order during analysis. Record the parent
 of each fork so results can be regrouped by root, generation, sibling cohort,
@@ -80,7 +80,7 @@ and degree of shared ancestry.
   fault actors, while `crates/runtime/src/actor_host.rs:310-318` currently awaits
   one blocking `FaultWork` item before receiving the next.
 - `crates/runtime/tests/loop_interference_linux.rs` demonstrates severe
-  interference at its largest noisy-vset scale, but it cannot identify the
+  interference at its largest noisy-volume scale, but it cannot identify the
   responsible resource. Treat it as a symptom and regression profile, not proof
   of a particular fix.
 - `crates/runtime/src/loopstats.rs` records aggregate poll and world-operation
@@ -105,7 +105,7 @@ Every benchmark invocation writes to a new, caller-supplied artifact directory
 and refuses to overwrite it. The package must contain:
 
 1. `manifest.json`: revision, dirty-tree state, exact command, workload seed,
-   runtime configuration, `vset_count`, serialized `fork_provenance`,
+   runtime configuration, `volume_count`, serialized `fork_provenance`,
    repetition, start/end time, and artifact schema.
 2. `machine.json`: CPU model and topology, NUMA layout, RAM, kernel, Rust
    toolchain, CPU governor, allowed CPUs, swap state, filesystem and mount
@@ -119,7 +119,7 @@ and refuses to overwrite it. The package must contain:
    task exits, I/O errors, guest crashes, and cleanup results.
 6. `summary.csv`: one row per scenario/scale/repetition containing throughput,
    p50/p90/p99/p99.9/max latency where sample size permits, stage delays, CPU,
-   queue depth/age, I/O, correctness status, vset count, root count, maximum
+   queue depth/age, I/O, correctness status, volume count, root count, maximum
    generation, and provenance topology.
 7. `report.md`: plots or compact tables, ranked hotspots, limitations, and the
    decision gate outcome.
@@ -183,11 +183,11 @@ block statistics are required.
 
 ## Workload matrix
 
-Use a staged ramp. Start at 64 guests/vsets, then 256 and 1,024. Attempt 5,000
+Use a staged ramp. Start at 64 guests/volumes, then 256 and 1,024. Attempt 5,000
 and 10,000 only when memory, file-descriptor, process, thermal, and storage
 headroom remain safe. If full Firecracker process scale is not practical at a
 tier, keep two results separate: a real-VM tier at the largest stable scale and
-a runtime-only userfaultfd tier at the target logical-vset scale. Never present
+a runtime-only userfaultfd tier at the target logical-volume scale. Never present
 the latter as real-VM capacity.
 
 Each retained measurement has a warmup phase, a 15-minute minimum steady phase,
@@ -197,8 +197,8 @@ lifecycle scenarios that cycle slowly.
 
 At every practical scale, run these provenance shapes as a separate matrix axis:
 
-- `independent`: every vset has its own root and no shared ancestry;
-- `star`: one root with all other vsets forked directly from it;
+- `independent`: every volume has its own root and no shared ancestry;
+- `star`: one root with all other volumes forked directly from it;
 - `balanced`: fixed branching factor and enough generations to reach the target
   count, recording the partially filled final generation;
 - `chain`: one descendant per generation, capped at a safe supported lineage
@@ -208,13 +208,13 @@ At every practical scale, run these provenance shapes as a separate matrix axis:
 
 The real-VM tier may omit a shape that exceeds a documented product or kernel
 limit, but the omission must be explicit. Hold access volume and hot-set size
-constant both per-vset and per-root in separate sub-runs: per-vset normalization
+constant both per-volume and per-root in separate sub-runs: per-volume normalization
 shows total load scaling, while per-root normalization isolates the effect of
 increased sharing without silently multiplying work.
 
 ### Scenario A: steady shared fleet
 
-- Many mostly idle guests/vsets, with a controlled hot subset.
+- Many mostly idle guests/volumes, with a controlled hot subset.
 - Zipf-like or trace-derived hot/cold page locality instead of uniform random
   access.
 - Read/write proportions based on an explicit target deployment assumption.
@@ -240,7 +240,7 @@ increased sharing without silently multiplying work.
   evidence plus process-level proportional/resident memory measurements.
 - Purpose: stress the exact case that prevents naive cache or memory-map
   sharding while measuring copy, mapping, NUMA, and userfaultfd costs.
-- Run all supported provenance shapes at matching `vset_count`; this is the
+- Run all supported provenance shapes at matching `volume_count`; this is the
   primary comparison for whether lineage shape changes CPU hotspots.
 
 ### Scenario D: cold restore and refault
@@ -294,7 +294,7 @@ idle worker/core capacity suggests dispatch serialization; saturated bandwidth
 or storage with low queue wait argues against adding CPU concurrency.
 
 For each CPU-count result, compare hotspot stacks and counter shares across both
-`vset_count` and `fork_provenance`. Report stacks whose share changes by at least
+`volume_count` and `fork_provenance`. Report stacks whose share changes by at least
 five percentage points, newly appearing stacks, and stacks that stay constant
 while throughput changes. This separates costs driven by the number of actors
 from costs driven by shared ancestry, cache reuse, mapping reuse, or divergent
@@ -393,8 +393,8 @@ writes.
    test binaries and artifacts so their CPU profiles cannot be conflated.
 2. Represent scenarios and scale tiers in explicit configuration recorded in
    the manifest.
-3. Require `vset_count` and a validated `fork_provenance` configuration. Build
-   and persist the explicit vset-to-parent relation before the measured phase;
+3. Require `volume_count` and a validated `fork_provenance` configuration. Build
+   and persist the explicit volume-to-parent relation before the measured phase;
    reject cycles, missing parents, duplicate IDs, count mismatches, and lineage
    deeper than configured safety limits.
 4. Add fixed seeds, warmup/steady/drain phases, correctness verification, and
@@ -457,8 +457,8 @@ writes.
 
 1. Generate per-scenario scaling curves and latency/queue/CPU tables from raw
    artifacts.
-2. Produce two hotspot comparisons: scaling `vset_count` at fixed provenance,
-   and changing provenance at fixed `vset_count` and normalized work. Attribute
+2. Produce two hotspot comparisons: scaling `volume_count` at fixed provenance,
+   and changing provenance at fixed `volume_count` and normalized work. Attribute
    differences to root count, generation, sibling cohort, and shared-ancestry
    depth only when the recorded parent graph supports that attribution.
 3. Rank hotspots by their association with target-load p99 and by consumed CPU,
@@ -480,15 +480,15 @@ performance promise.
 ### Write a fault-work concurrency plan only if
 
 - enqueue-to-dequeue or blocking submission delay grows materially with load;
-- blocking service remains parallelizable by operation/vset semantics;
+- blocking service remains parallelizable by operation/volume semantics;
 - actor-thread utilization, source I/O, storage, and memory bandwidth do not
   already explain the plateau;
 - multiple physical cores remain available at the target load; and
 - the fork-sharing scenario exhibits the same bottleneck without requiring
   cache or mapping sharding.
 
-The new plan must name which CPU work would overlap and preserve per-page/vset
-ordering, multi-vset write-protect completion, barriers, cancellation semantics,
+The new plan must name which CPU work would overlap and preserve per-page/volume
+ordering, multi-volume write-protect completion, barriers, cancellation semantics,
 and shared mappings.
 
 ### Prefer actor-loop work if
@@ -567,7 +567,7 @@ decision gates without assuming the result.
 - Instrumentation overhead is measured and at or below 5%.
 - Scenarios A through G have at least one valid realistic-host tier; B, C, and E
   include the CPU scaling matrix.
-- Results are parameterized by both vset count and recorded fork provenance, and
+- Results are parameterized by both volume count and recorded fork provenance, and
   the report compares CPU hotspots along each axis while holding the other fixed.
 - The largest attempted tier and the reason for stopping are reported honestly.
 - Fork/cache/mapping sharing is verified rather than assumed.

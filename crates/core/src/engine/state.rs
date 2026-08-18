@@ -8,25 +8,48 @@ use blockd_exec::channel::{OneSender, UnboundedSender};
 use crate::authority::{AuthorityProof, PlacementRecord, VnodeId};
 use crate::blx::{BlxFooter, NamespaceKind};
 use crate::cache::Cache;
-use crate::head::ManifestPtr;
+use crate::head::{HeadRecord, ManifestPtr, RetiredStash, StashAssignment};
 use crate::hostmeta::{
-    Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVsetMetrics, VsetOperations,
-    VsetRole, VsetStats,
+    Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVolumeMetrics, VolumeOperations,
+    VolumeRole, VolumeStats,
 };
-use crate::journal::{JournalRecord, VsetConfig};
+use crate::journal::{JournalRecord, VolumeConfig};
 use crate::manifest::{BaseRef, ObjectIdentity, ObjectRef};
-use crate::segment::PageLoc;
-use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, SegId, VsetId};
+use crate::page_file::PageFileLoc;
+use crate::protocol::ReplicaCommitInfo;
+use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, VolumeId};
 
 use super::HostFatal;
 use super::peer_client::PeerClient;
 
 pub type SharedHost = Rc<RefCell<HostState>>;
 
+pub(crate) struct AuthorityLease {
+    pub(crate) session: Option<u64>,
+    pub(crate) host_epoch: u64,
+    pub(crate) serving: bool,
+    pub(crate) last_poll: u64,
+    pub(crate) placement: Option<PlacementRecord>,
+    pub(crate) active_vnodes: BTreeMap<VnodeId, AuthorityProof>,
+}
+
+impl AuthorityLease {
+    fn new(serving: bool) -> Self {
+        Self {
+            session: None,
+            host_epoch: 0,
+            serving,
+            last_poll: 0,
+            placement: None,
+            active_vnodes: BTreeMap::new(),
+        }
+    }
+}
+
 pub struct HostState {
     pub config: HostConfig,
     pub cache: Cache,
-    pub vsets: BTreeMap<VsetId, VsetState>,
+    pub volumes: BTreeMap<VolumeId, VolumeState>,
     pub counters: Counters,
     pub blob_sizes: BTreeMap<String, u64>,
     pub disk_reclaim_requested: bool,
@@ -34,19 +57,14 @@ pub struct HostState {
     pub filling_pages: BTreeSet<PageId>,
     pub page_fill_waiters: BTreeMap<PageId, Vec<OneSender<bool>>>,
     pub(super) peer_client: PeerClient,
-    pub inbound_migrations: BTreeSet<VsetId>,
+    pub inbound_migrations: BTreeSet<VolumeId>,
     pub replicas: BTreeMap<ReplicaKey, ReplicaState>,
-    pub replica_latest_epoch: BTreeMap<(HostId, VsetId), u64>,
-    pub replica_releases: Vec<(HostId, VsetId, u64, crate::protocol::ReplicaCommitInfo)>,
-    pub(crate) authority_session: Option<u64>,
-    pub(crate) authority_host_epoch: u64,
-    pub(crate) authority_serving: bool,
-    pub(crate) authority_last_poll: u64,
-    pub(crate) authority_placement: Option<PlacementRecord>,
-    pub(crate) active_vnodes: BTreeMap<VnodeId, AuthorityProof>,
-    scheduled_vsets: BTreeSet<VsetId>,
-    scheduled_cursor: Option<VsetId>,
-    disk_reclaim_scan_cursor: Option<VsetId>,
+    pub replica_latest_epoch: BTreeMap<(HostId, VolumeId), u64>,
+    pub replica_releases: Vec<(HostId, VolumeId, u64, crate::protocol::ReplicaCommitInfo)>,
+    pub(crate) authority: AuthorityLease,
+    scheduled_volumes: BTreeSet<VolumeId>,
+    scheduled_cursor: Option<VolumeId>,
+    disk_reclaim_scan_cursor: Option<VolumeId>,
     disk_reclaim_scan_remaining: usize,
     fatal: Option<OneSender<HostFatal>>,
     next_incarnation: u64,
@@ -67,28 +85,24 @@ impl HostState {
             .as_ref()
             .and_then(|placement| placement.authority)
             .is_none();
+        let peer_client = PeerClient::for_host(config.backup_retry);
         Self {
             cache: Cache::new(config.cache_pages),
             config,
-            vsets: BTreeMap::new(),
+            volumes: BTreeMap::new(),
             counters: Counters::default(),
             blob_sizes: BTreeMap::new(),
             disk_reclaim_requested: false,
             pressure_waiters: VecDeque::new(),
             filling_pages: BTreeSet::new(),
             page_fill_waiters: BTreeMap::new(),
-            peer_client: PeerClient::default(),
+            peer_client,
             inbound_migrations: BTreeSet::new(),
             replicas: BTreeMap::new(),
             replica_latest_epoch: BTreeMap::new(),
             replica_releases: Vec::new(),
-            authority_session: None,
-            authority_host_epoch: 0,
-            authority_serving,
-            authority_last_poll: 0,
-            authority_placement: None,
-            active_vnodes: BTreeMap::new(),
-            scheduled_vsets: BTreeSet::new(),
+            authority: AuthorityLease::new(authority_serving),
+            scheduled_volumes: BTreeSet::new(),
             scheduled_cursor: None,
             disk_reclaim_scan_cursor: None,
             disk_reclaim_scan_remaining: 0,
@@ -98,14 +112,14 @@ impl HostState {
     }
 
     pub fn authority_serving(&self) -> bool {
-        self.authority_serving
+        self.authority.serving
     }
 
     pub fn authority_session(&self) -> Option<u64> {
-        self.authority_session
+        self.authority.session
     }
 
-    pub fn vset_authorized(&self, vset: VsetId) -> bool {
+    pub fn volume_authorized(&self, volume: VolumeId) -> bool {
         let authority_enabled = self
             .config
             .replica_placement
@@ -113,13 +127,95 @@ impl HostState {
             .and_then(|placement| placement.authority)
             .is_some();
         if !authority_enabled {
-            return self.authority_serving;
+            return self.authority.serving;
         }
-        self.authority_serving
-            && self
-                .authority_placement
-                .as_ref()
-                .is_some_and(|placement| self.active_vnodes.contains_key(&placement.vnode(vset)))
+        self.authority.serving
+            && self.authority.placement.as_ref().is_some_and(|placement| {
+                self.authority
+                    .active_vnodes
+                    .contains_key(&placement.vnode(volume))
+            })
+    }
+
+    pub(super) fn volume_at(&self, volume: VolumeId, incarnation: u64) -> Option<&VolumeState> {
+        self.volumes
+            .get(&volume)
+            .filter(|state| state.incarnation == incarnation)
+    }
+
+    pub(super) fn volume_at_mut(
+        &mut self,
+        volume: VolumeId,
+        incarnation: u64,
+    ) -> Option<&mut VolumeState> {
+        self.volumes
+            .get_mut(&volume)
+            .filter(|state| state.incarnation == incarnation)
+    }
+
+    pub(super) fn finish_primary_commit(
+        &mut self,
+        volume: VolumeId,
+        incarnation: u64,
+        info: ReplicaCommitInfo,
+        record: JournalRecord,
+    ) -> Vec<PendingSync> {
+        let authority_serving = self.volume_authorized(volume);
+        let Some(volume_state) = self.volume_at_mut(volume, incarnation) else {
+            return Vec::new();
+        };
+        if volume_state
+            .peer_committed
+            .is_none_or(|committed| info >= committed)
+        {
+            volume_state.peer_committed = Some(info);
+            volume_state.peer_committed_record = Some(record);
+        }
+        volume_state.peer_committed_through = volume_state
+            .peer_committed_through
+            .max(info.sync_covered_through);
+        if !authority_serving {
+            return Vec::new();
+        }
+        volume_state.sync_ack_through =
+            volume_state.sync_ack_through.max(info.sync_covered_through);
+        let pending = std::mem::take(&mut volume_state.pending_syncs);
+        let (completed, waiting): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|sync| sync.barrier <= volume_state.sync_ack_through);
+        volume_state.pending_syncs = waiting;
+        self.counters.syncs_acked += completed.len() as u64;
+        self.schedule_volume(volume);
+        completed
+    }
+
+    pub(super) fn adopt_assignment(
+        &mut self,
+        volume: VolumeId,
+        incarnation: u64,
+        version: u64,
+        assignment: StashAssignment,
+        retired_stashes: Vec<RetiredStash>,
+    ) -> bool {
+        let Some(volume_state) = self.volume_at_mut(volume, incarnation) else {
+            return false;
+        };
+        volume_state.adopt_assignment(version, assignment, retired_stashes);
+        true
+    }
+
+    pub(super) fn adopt_assignment_from_head(
+        &mut self,
+        volume: VolumeId,
+        incarnation: u64,
+        version: u64,
+        head: HeadRecord,
+    ) -> bool {
+        let Some(volume_state) = self.volume_at_mut(volume, incarnation) else {
+            return false;
+        };
+        volume_state.adopt_assignment_from_head(version, head);
+        true
     }
 
     pub(crate) fn install_fatal_signal(&mut self, signal: OneSender<HostFatal>) {
@@ -139,12 +235,12 @@ impl HostState {
         }
     }
 
-    pub fn insert_fresh(&mut self, vset: VsetId, config: VsetConfig) -> u64 {
+    pub fn insert_fresh(&mut self, volume: VolumeId, config: VolumeConfig) -> u64 {
         let incarnation = self.allocate_incarnation();
         let previous = self
-            .vsets
-            .insert(vset, VsetState::fresh(config, incarnation));
-        assert!(previous.is_none(), "duplicate vset insertion");
+            .volumes
+            .insert(volume, VolumeState::fresh(config, incarnation));
+        assert!(previous.is_none(), "duplicate volume insertion");
         incarnation
     }
 
@@ -153,28 +249,28 @@ impl HostState {
         self.next_incarnation = self
             .next_incarnation
             .checked_add(1)
-            .expect("vset incarnation overflow");
+            .expect("volume incarnation overflow");
         incarnation
     }
 
-    pub(crate) fn schedule_vset(&mut self, vset: VsetId) {
-        if self.vsets.contains_key(&vset) {
-            self.scheduled_vsets.insert(vset);
+    pub(crate) fn schedule_volume(&mut self, volume: VolumeId) {
+        if self.volumes.contains_key(&volume) {
+            self.scheduled_volumes.insert(volume);
         }
     }
 
-    pub(crate) fn take_scheduled_vsets(&mut self, limit: usize) -> Vec<VsetId> {
+    pub(crate) fn take_scheduled_volumes(&mut self, limit: usize) -> Vec<VolumeId> {
         use std::ops::Bound::{Excluded, Unbounded};
 
         let selected = if let Some(cursor) = self.scheduled_cursor {
-            self.scheduled_vsets
+            self.scheduled_volumes
                 .range((Excluded(cursor), Unbounded))
-                .chain(self.scheduled_vsets.range(..=cursor))
+                .chain(self.scheduled_volumes.range(..=cursor))
                 .take(limit)
                 .copied()
                 .collect::<Vec<_>>()
         } else {
-            self.scheduled_vsets
+            self.scheduled_volumes
                 .iter()
                 .take(limit)
                 .copied()
@@ -183,17 +279,17 @@ impl HostState {
         if let Some(last) = selected.last() {
             self.scheduled_cursor = Some(*last);
         }
-        for vset in &selected {
-            self.scheduled_vsets.remove(vset);
+        for volume in &selected {
+            self.scheduled_volumes.remove(volume);
         }
         selected
     }
 
-    pub(crate) fn scheduled_vset_count(&self) -> usize {
-        self.scheduled_vsets.len()
+    pub(crate) fn scheduled_volume_count(&self) -> usize {
+        self.scheduled_volumes.len()
     }
 
-    pub(crate) fn take_disk_reclaim_scan_vsets(&mut self, limit: usize) -> Vec<VsetId> {
+    pub(crate) fn take_disk_reclaim_scan_volumes(&mut self, limit: usize) -> Vec<VolumeId> {
         use std::ops::Bound::{Excluded, Unbounded};
 
         if !self.disk_reclaim_requested {
@@ -202,14 +298,14 @@ impl HostState {
         }
         let limit = limit.min(self.disk_reclaim_scan_remaining);
         let selected = if let Some(cursor) = self.disk_reclaim_scan_cursor {
-            self.vsets
+            self.volumes
                 .range((Excluded(cursor), Unbounded))
-                .chain(self.vsets.range(..=cursor))
+                .chain(self.volumes.range(..=cursor))
                 .take(limit)
-                .map(|(&vset, _)| vset)
+                .map(|(&volume, _)| volume)
                 .collect::<Vec<_>>()
         } else {
-            self.vsets.keys().take(limit).copied().collect::<Vec<_>>()
+            self.volumes.keys().take(limit).copied().collect::<Vec<_>>()
         };
         if let Some(last) = selected.last() {
             self.disk_reclaim_scan_cursor = Some(*last);
@@ -226,7 +322,7 @@ impl HostState {
     fn request_disk_reclaim(&mut self) {
         if !self.disk_reclaim_requested {
             self.disk_reclaim_scan_cursor = None;
-            self.disk_reclaim_scan_remaining = self.vsets.len();
+            self.disk_reclaim_scan_remaining = self.volumes.len();
         }
         self.disk_reclaim_requested = true;
     }
@@ -252,11 +348,11 @@ impl HostState {
         let filling = self
             .filling_pages
             .iter()
-            .map(|page| page.volume.vset)
+            .map(|page| page.volume)
             .collect::<BTreeSet<_>>();
-        for (&vset, state) in &mut self.vsets {
+        for (&volume, state) in &mut self.volumes {
             watch(
-                filling.contains(&vset),
+                filling.contains(&volume),
                 state.wedge.fills,
                 &mut state.wedge.fills_seen,
                 &mut state.wedge.parked_ticks,
@@ -286,16 +382,20 @@ impl HostState {
         self.blob_sizes.insert(name, bytes);
     }
 
-    pub(crate) fn local_artifact_fences(&self, vset: VsetId) -> BTreeSet<u64> {
+    pub(crate) fn local_artifact_fences(&self, volume: VolumeId) -> BTreeSet<u64> {
         self.blob_sizes
             .keys()
             .filter_map(|name| match crate::layout::parse_blob(name)? {
                 crate::layout::BlobName::Journal {
-                    vset: found, fence, ..
+                    volume: found,
+                    fence,
+                    ..
                 }
-                | crate::layout::BlobName::Segment {
-                    vset: found, fence, ..
-                } if found == vset => Some(fence),
+                | crate::layout::BlobName::Blx {
+                    volume: found,
+                    fence,
+                    ..
+                } if found == volume => Some(fence),
                 _ => None,
             })
             .collect()
@@ -421,14 +521,15 @@ impl HostState {
         }
     }
 
-    pub fn seg_space(&self) -> (u64, u64) {
-        self.vsets.values().fold((0, 0), |(live, local), vset| {
+    pub fn blx_space(&self) -> (u64, u64) {
+        self.volumes.values().fold((0, 0), |(live, local), volume| {
             (
-                live.saturating_add(vset.live_segment_bytes()),
+                live.saturating_add(volume.live_blx_bytes()),
                 local.saturating_add(
-                    vset.segment_blobs
+                    volume
+                        .blx_blobs
                         .iter()
-                        .map(|&(_, _, bytes)| bytes)
+                        .map(|&(_, bytes)| bytes)
                         .sum::<u64>(),
                 ),
             )
@@ -437,23 +538,23 @@ impl HostState {
 
     #[allow(clippy::too_many_lines)]
     pub fn stats(&self) -> DaemonStats {
-        let vsets = self
-            .vsets
+        let volumes = self
+            .volumes
             .iter()
-            .map(|(&vset, state)| {
+            .map(|(&volume, state)| {
                 let hydrating = state.peer_source.is_some();
                 let role = if state.outbound.is_some() {
-                    VsetRole::Outbound
+                    VolumeRole::Outbound
                 } else if hydrating {
-                    VsetRole::Hydrating
+                    VolumeRole::Hydrating
                 } else if state.ready {
-                    VsetRole::Serving
+                    VolumeRole::Serving
                 } else {
-                    VsetRole::Initializing
+                    VolumeRole::Initializing
                 };
                 let mut operations = 0;
                 if state.operations.mutation_owner().is_some() {
-                    operations |= VsetOperations::CAPTURE;
+                    operations |= VolumeOperations::CAPTURE;
                 }
                 if matches!(
                     state.operations.mutation_owner(),
@@ -461,13 +562,13 @@ impl HostState {
                         CaptureKind::Checkpoint | CaptureKind::Migration
                     ))
                 ) {
-                    operations |= VsetOperations::CHECKPOINT;
+                    operations |= VolumeOperations::CHECKPOINT;
                 }
-                if state.operations.publication_owner().is_some() {
-                    operations |= VsetOperations::BACKUP;
+                if state.operations.publication_running() {
+                    operations |= VolumeOperations::BACKUP;
                 }
                 if hydrating {
-                    operations |= VsetOperations::HYDRATION;
+                    operations |= VolumeOperations::HYDRATION;
                 }
                 let best = state
                     .best_record
@@ -483,33 +584,31 @@ impl HostState {
                 } else {
                     0
                 };
-                VsetStats {
-                    vset,
+                VolumeStats {
+                    volume,
                     role,
                     fence: state.fence,
-                    dirty_pages: self.cache.dirty_pages_of(vset).len(),
-                    unstable_pages: self.cache.unstable_pages_of(vset).len(),
+                    dirty_pages: self.cache.dirty_pages_of(volume).len(),
+                    unstable_pages: self.cache.unstable_pages_of(volume).len(),
                     pending_syncs: state.pending_syncs.len(),
                     hydration_remaining_pages,
                     archive_lag_captures: Some(best.saturating_sub(backed)),
                     archive_lag_bytes: Some(state.backup_lag_bytes()),
-                    operations: VsetOperations(operations),
-                    live_segment_bytes: state.live_segment_bytes(),
-                    local_segment_bytes: state
-                        .segment_blobs
-                        .iter()
-                        .map(|&(_, _, bytes)| bytes)
-                        .sum(),
+                    operations: VolumeOperations(operations),
+                    live_blx_bytes: state.live_blx_bytes(),
+                    local_blx_bytes: state.blx_blobs.iter().map(|&(_, bytes)| bytes).sum(),
                 }
             })
             .collect::<Vec<_>>();
-        let (live_segment_bytes, local_segment_bytes) =
-            vsets.iter().fold((0_u64, 0_u64), |(live, local), vset| {
-                (
-                    live.saturating_add(vset.live_segment_bytes),
-                    local.saturating_add(vset.local_segment_bytes),
-                )
-            });
+        let (live_blx_bytes, local_blx_bytes) =
+            volumes
+                .iter()
+                .fold((0_u64, 0_u64), |(live, local), volume| {
+                    (
+                        live.saturating_add(volume.live_blx_bytes),
+                        local.saturating_add(volume.local_blx_bytes),
+                    )
+                });
         DaemonStats {
             cache_capacity_pages: self.cache.capacity(),
             resident_pages: self.cache.resident_count(),
@@ -521,19 +620,19 @@ impl HostState {
             local_blob_bytes: self.blob_sizes.values().sum(),
             disk_capacity_bytes: self.config.disk_capacity,
             disk_headroom_bytes: self.config.disk_headroom,
-            live_segment_bytes,
-            local_segment_bytes,
-            vsets,
+            live_blx_bytes,
+            local_blx_bytes,
+            volumes,
         }
     }
 
-    pub fn replica_metrics(&self) -> Vec<ReplicaVsetMetrics> {
-        self.vsets
+    pub fn replica_metrics(&self) -> Vec<ReplicaVolumeMetrics> {
+        self.volumes
             .iter()
-            .map(|(&vset, state)| {
+            .map(|(&volume, state)| {
                 let store_published_through = state.backed.map_or(0, |head| head.capture_seq);
-                ReplicaVsetMetrics {
-                    vset,
+                ReplicaVolumeMetrics {
+                    volume,
                     active_peer: state.stash_assignment.map(|stash| stash.active_peer),
                     transition_peer: state
                         .stash_assignment
@@ -551,7 +650,7 @@ impl HostState {
                     queued_releases: self
                         .replica_releases
                         .iter()
-                        .filter(|(_, release_vset, _, _)| *release_vset == vset)
+                        .filter(|(_, release_volume, _, _)| *release_volume == volume)
                         .count(),
                 }
             })
@@ -563,7 +662,7 @@ impl HostState {
             .iter()
             .map(|(key, replica)| ReplicaSpoolMetrics {
                 source: key.source,
-                vset: key.vset,
+                volume: key.volume,
                 assignment_epoch: key.assignment_epoch,
                 stored_bytes: replica.bytes,
                 host_capacity_bytes: self.config.archive.spool_capacity_bytes,
@@ -581,7 +680,7 @@ impl HostState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReplicaKey {
     pub source: HostId,
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub assignment_epoch: u64,
 }
 
@@ -656,22 +755,18 @@ struct MutationOperation {
     drain: Option<DrainState>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PublicationOwner {
-    Direct,
-}
-
 #[derive(Default)]
-pub struct VsetOperationState {
+#[allow(clippy::struct_excessive_bools)]
+pub struct VolumeOperationState {
     mutation: Option<MutationOperation>,
     migration: bool,
     guest_resume_pending: bool,
-    publication: Option<PublicationOwner>,
+    publication: bool,
     replication: bool,
     recovery: Option<crate::protocol::Verdict>,
 }
 
-impl VsetOperationState {
+impl VolumeOperationState {
     pub(super) fn mutation_owner(&self) -> Option<MutationOwner> {
         self.mutation.as_ref().map(|operation| operation.owner)
     }
@@ -757,21 +852,19 @@ impl VsetOperationState {
         self.guest_resume_pending
     }
 
-    pub(super) fn try_start_publication(&mut self, owner: PublicationOwner) -> bool {
-        if self.publication.is_some() {
+    pub(super) fn try_start_publication(&mut self) -> bool {
+        if self.publication {
             return false;
         }
-        self.publication = Some(owner);
+        self.publication = true;
         true
     }
 
-    pub(super) fn finish_publication(&mut self, owner: PublicationOwner) {
-        if self.publication == Some(owner) {
-            self.publication = None;
-        }
+    pub(super) fn finish_publication(&mut self) {
+        self.publication = false;
     }
 
-    pub(super) fn publication_owner(&self) -> Option<PublicationOwner> {
+    pub(super) fn publication_running(&self) -> bool {
         self.publication
     }
 
@@ -798,7 +891,7 @@ impl VsetOperationState {
     pub(super) fn set_recovery(&mut self, verdict: crate::protocol::Verdict) {
         assert!(
             self.recovery.replace(verdict).is_none(),
-            "one startup recovery verdict per vset"
+            "one startup recovery verdict per volume"
         );
     }
 
@@ -846,9 +939,9 @@ impl Drop for PendingSync {
     }
 }
 
-pub struct VsetState {
+pub struct VolumeState {
     pub incarnation: u64,
-    pub config: VsetConfig,
+    pub config: VolumeConfig,
     pub fence: u64,
     pub ready: bool,
     pub epoch: Epoch,
@@ -860,15 +953,15 @@ pub struct VsetState {
     /// Deletion markers that must be written before a later journal can
     /// retain a mixed batch containing values discarded by cold boot.
     pub pending_tombstones: BTreeSet<crate::blx::BlockKey>,
-    pub page_locs: BTreeMap<PageId, (Gen, PageLoc)>,
+    pub page_locs: BTreeMap<PageId, (Gen, PageFileLoc)>,
     pub next_gen: u64,
     pub next_seq: u64,
-    pub next_seg: u64,
+    pub next_object_id: u64,
     pub best_record: Option<JournalRecord>,
     pub local_covered_through: u64,
     pub sync_ack_through: u64,
     pub pending_syncs: Vec<PendingSync>,
-    pub operations: VsetOperationState,
+    pub operations: VolumeOperationState,
     pub mutation_waiters: Vec<OneSender<()>>,
     pub checkpoint_results: BTreeMap<crate::protocol::ReqId, Epoch>,
     pub pinned: Option<JournalRecord>,
@@ -876,13 +969,13 @@ pub struct VsetState {
     /// Every local BLX file written as part of a journal record. This keeps
     /// files that contain only tombstones reachable even though they have no
     /// live page location.
-    pub record_segments: BTreeMap<JournalSeq, BTreeSet<(u64, SegId)>>,
-    pub segment_blobs: Vec<(u64, SegId, u64)>,
-    pub segment_refs: BTreeMap<(u64, SegId), ObjectRef>,
+    pub record_blx_files: BTreeMap<JournalSeq, BTreeSet<ObjectIdentity>>,
+    pub blx_blobs: Vec<(ObjectIdentity, u64)>,
+    pub blx_refs: BTreeMap<ObjectIdentity, ObjectRef>,
     /// The complete local BLX batch that carries the newest resumable VMM
     /// snapshot. It remains in every later recovery closure until replaced by
     /// another checkpoint.
-    pub vmm_segments: BTreeSet<(u64, SegId)>,
+    pub vmm_blx_files: BTreeSet<ObjectIdentity>,
     pub head_version: Option<u64>,
     pub backed: Option<ManifestPtr>,
     pub archive_base: Option<BaseRef>,
@@ -900,18 +993,19 @@ pub struct VsetState {
     pub archived_non_data_reset: bool,
     /// Local BLX files containing deletion markers remain part of the
     /// unpublished change set until the archive has published them.
-    pub tombstone_segments: BTreeSet<(u64, SegId)>,
-    pub backed_segments: BTreeSet<(u64, SegId)>,
+    pub tombstone_blx_files: BTreeSet<ObjectIdentity>,
+    pub backed_blx_files: BTreeSet<ObjectIdentity>,
     /// Local files held stable while the primary is sending one exact cut to
     /// its passive. Captures may continue concurrently, so the newest record
     /// alone is not enough to protect this older closure from cleanup.
-    pub replicating_segments: BTreeSet<(u64, SegId)>,
-    pub publishing_segments: BTreeSet<(u64, SegId)>,
+    pub replicating_blx_files: BTreeSet<ObjectIdentity>,
+    pub publishing_blx_files: BTreeSet<ObjectIdentity>,
     pub store_manifests: BTreeSet<(u64, JournalSeq)>,
     pub outbound: Option<HostId>,
     pub peer_source: Option<HostId>,
     pub peer_source_offer_fence: Option<u64>,
     pub hydration_waiters: Vec<OneSender<bool>>,
+    pub publication_waiters: Vec<OneSender<()>>,
     pub stash_assignment: Option<crate::head::StashAssignment>,
     pub retired_stashes: Vec<crate::head::RetiredStash>,
     pub peer_committed: Option<crate::protocol::ReplicaCommitInfo>,
@@ -921,8 +1015,8 @@ pub struct VsetState {
     pub wedge: WedgeState,
 }
 
-impl VsetState {
-    pub(crate) fn fresh(config: VsetConfig, incarnation: u64) -> Self {
+impl VolumeState {
+    pub(crate) fn fresh(config: VolumeConfig, incarnation: u64) -> Self {
         Self {
             incarnation,
             config,
@@ -936,20 +1030,20 @@ impl VsetState {
             page_locs: BTreeMap::new(),
             next_gen: 0,
             next_seq: 0,
-            next_seg: 0,
+            next_object_id: 0,
             best_record: None,
             local_covered_through: 0,
             sync_ack_through: 0,
             pending_syncs: Vec::new(),
-            operations: VsetOperationState::default(),
+            operations: VolumeOperationState::default(),
             mutation_waiters: Vec::new(),
             checkpoint_results: BTreeMap::new(),
             pinned: None,
             record_writes: BTreeMap::new(),
-            record_segments: BTreeMap::new(),
-            segment_blobs: Vec::new(),
-            segment_refs: BTreeMap::new(),
-            vmm_segments: BTreeSet::new(),
+            record_blx_files: BTreeMap::new(),
+            blx_blobs: Vec::new(),
+            blx_refs: BTreeMap::new(),
+            vmm_blx_files: BTreeSet::new(),
             head_version: None,
             backed: None,
             archive_base: None,
@@ -958,15 +1052,16 @@ impl VsetState {
             archive_resolved_pages: BTreeSet::new(),
             archived_memory_usable: true,
             archived_non_data_reset: true,
-            tombstone_segments: BTreeSet::new(),
-            backed_segments: BTreeSet::new(),
-            replicating_segments: BTreeSet::new(),
-            publishing_segments: BTreeSet::new(),
+            tombstone_blx_files: BTreeSet::new(),
+            backed_blx_files: BTreeSet::new(),
+            replicating_blx_files: BTreeSet::new(),
+            publishing_blx_files: BTreeSet::new(),
             store_manifests: BTreeSet::new(),
             outbound: None,
             peer_source: None,
             peer_source_offer_fence: None,
             hydration_waiters: Vec::new(),
+            publication_waiters: Vec::new(),
             stash_assignment: None,
             retired_stashes: Vec::new(),
             peer_committed: None,
@@ -977,7 +1072,87 @@ impl VsetState {
         }
     }
 
-    fn live_segment_bytes(&self) -> u64 {
+    pub(super) fn install_archive_closure(
+        &mut self,
+        volume: VolumeId,
+        objects: &[ObjectRef],
+        base: Option<BaseRef>,
+    ) {
+        self.archive_objects = objects.to_vec();
+        self.archive_base = base;
+        self.archive_footers.clear();
+        self.archive_resolved_pages.clear();
+        self.backed_blx_files = objects
+            .iter()
+            .filter(|object| {
+                object.identity.namespace_kind == NamespaceKind::Volume
+                    && object.identity.namespace_id == volume.0
+            })
+            .map(|object| object.identity)
+            .collect();
+    }
+
+    pub(super) fn retention_closure(
+        &self,
+    ) -> (BTreeSet<(u64, JournalSeq)>, BTreeSet<ObjectIdentity>) {
+        let mut records = BTreeSet::new();
+        let mut blx_files = BTreeSet::new();
+        for record in [
+            self.best_record.as_ref(),
+            self.pinned.as_ref(),
+            self.peer_committed_record.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            records.insert((record.fence, record.seq));
+            blx_files.extend(record.files.iter().filter_map(|file| {
+                (file.identity.namespace_kind == NamespaceKind::Volume).then_some(file.identity)
+            }));
+            if let Some(written) = self.record_blx_files.get(&record.seq) {
+                blx_files.extend(written);
+            }
+            blx_files.extend(
+                record
+                    .runtime_page_index
+                    .iter()
+                    .filter(|(_, (_, location))| location.base == 0)
+                    .map(|(page, (_, location))| location.identity(page.volume)),
+            );
+        }
+        (records, blx_files)
+    }
+
+    pub(super) fn adopt_assignment(
+        &mut self,
+        version: u64,
+        assignment: StashAssignment,
+        retired_stashes: Vec<RetiredStash>,
+    ) {
+        if self.stash_assignment != Some(assignment) {
+            // Exact commit information belongs to the peer/assignment that
+            // acknowledged it. The primary may archive only a cut acknowledged
+            // by the current assignment.
+            self.peer_committed = None;
+            self.peer_committed_record = None;
+        }
+        self.head_version = Some(version);
+        self.stash_assignment = Some(assignment);
+        self.retired_stashes = retired_stashes;
+    }
+
+    pub(super) fn adopt_assignment_from_head(&mut self, version: u64, head: HeadRecord) {
+        if self.stash_assignment != head.stash {
+            self.peer_committed = None;
+            self.peer_committed_record = None;
+        }
+        self.head_version = Some(version);
+        self.backed = head.manifest;
+        self.stash_assignment = head.stash;
+        self.retired_stashes = head.retired_stashes;
+    }
+
+    fn live_blx_bytes(&self) -> u64 {
         self.page_locs
             .values()
             .filter(|(_, location)| location.base == 0)
@@ -992,14 +1167,14 @@ impl VsetState {
         let pending = record
             .files
             .iter()
-            .filter(|file| file.identity.namespace_kind == NamespaceKind::Vset)
-            .map(|file| (file.identity.writer_fence, SegId(file.identity.object_id)))
-            .filter(|segment| !self.backed_segments.contains(segment))
+            .filter(|file| file.identity.namespace_kind == NamespaceKind::Volume)
+            .map(|file| file.identity)
+            .filter(|identity| !self.backed_blx_files.contains(identity))
             .collect::<BTreeSet<_>>();
-        self.segment_blobs
+        self.blx_blobs
             .iter()
-            .filter(|(fence, segment, _)| pending.contains(&(*fence, *segment)))
-            .map(|(_, _, bytes)| *bytes)
+            .filter(|(identity, _)| pending.contains(identity))
+            .map(|(_, bytes)| *bytes)
             .sum()
     }
 }
@@ -1051,7 +1226,7 @@ fn wake_page_fill(state: &SharedHost, page: PageId, success: bool) {
 
 pub struct CaptureLease {
     state: SharedHost,
-    vset: VsetId,
+    volume: VolumeId,
     incarnation: u64,
     owner: MutationOwner,
     cleanup: Option<OneSender<Vec<PageId>>>,
@@ -1062,14 +1237,14 @@ pub struct CaptureLease {
 impl CaptureLease {
     pub fn new(
         state: &SharedHost,
-        vset: VsetId,
+        volume: VolumeId,
         incarnation: u64,
         owner: MutationOwner,
         cleanup: OneSender<Vec<PageId>>,
     ) -> Self {
         Self {
             state: Rc::clone(state),
-            vset,
+            volume,
             incarnation,
             owner,
             cleanup: Some(cleanup),
@@ -1080,14 +1255,14 @@ impl CaptureLease {
 
     pub fn new_with_serialized_cleanup(
         state: &SharedHost,
-        vset: VsetId,
+        volume: VolumeId,
         incarnation: u64,
         owner: MutationOwner,
         cleanup: OneSender<Vec<PageId>>,
     ) -> Self {
         Self {
             state: Rc::clone(state),
-            vset,
+            volume,
             incarnation,
             owner,
             cleanup: Some(cleanup),
@@ -1102,7 +1277,7 @@ impl CaptureLease {
         } else if let Some(cleanup) = self.cleanup.take() {
             let _ = cleanup.send(Vec::new());
         }
-        self.state.borrow_mut().schedule_vset(self.vset);
+        self.state.borrow_mut().schedule_volume(self.volume);
         self.active = false;
     }
 }
@@ -1113,10 +1288,10 @@ impl Drop for CaptureLease {
             return;
         }
         let mut host = self.state.borrow_mut();
-        let Some(vset) = host
-            .vsets
-            .get_mut(&self.vset)
-            .filter(|vset| vset.incarnation == self.incarnation)
+        let Some(volume) = host
+            .volumes
+            .get_mut(&self.volume)
+            .filter(|volume| volume.incarnation == self.incarnation)
         else {
             drop(host);
             if let Some(cleanup) = self.cleanup.take() {
@@ -1125,12 +1300,14 @@ impl Drop for CaptureLease {
             return;
         };
         let armed = if self.cleanup_finishes_mutation {
-            vset.operations
+            volume
+                .operations
                 .drain_mut()
                 .map(|drain| std::mem::take(&mut drain.armed))
                 .unwrap_or_default()
         } else {
-            vset.operations
+            volume
+                .operations
                 .finish_mutation(self.owner)
                 .map(|drain| drain.armed)
                 .unwrap_or_default()
@@ -1138,7 +1315,7 @@ impl Drop for CaptureLease {
         let waiters = if self.cleanup_finishes_mutation {
             Vec::new()
         } else {
-            std::mem::take(&mut vset.mutation_waiters)
+            std::mem::take(&mut volume.mutation_waiters)
         };
         for &page in &armed {
             host.cache.end_flush(page);
@@ -1155,7 +1332,7 @@ impl Drop for CaptureLease {
             let _ = waiter.send(());
         }
         if !self.cleanup_finishes_mutation {
-            self.state.borrow_mut().schedule_vset(self.vset);
+            self.state.borrow_mut().schedule_volume(self.volume);
         }
     }
 }
@@ -1185,11 +1362,11 @@ impl Drop for CacheReservation {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureKind, MutationOwner, PublicationOwner, VsetOperationState};
+    use super::{CaptureKind, MutationOwner, VolumeOperationState};
 
     #[test]
     fn typed_operation_slots_reject_overlapping_owners() {
-        let mut operations = VsetOperationState::default();
+        let mut operations = VolumeOperationState::default();
 
         assert!(operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Writeback)));
         assert!(!operations.try_start_mutation(MutationOwner::Hydration));
@@ -1226,13 +1403,10 @@ mod tests {
         assert!(operations.try_start_mutation(MutationOwner::Capture(CaptureKind::Writeback)));
         operations.finish_mutation(MutationOwner::Capture(CaptureKind::Writeback));
 
-        assert!(operations.try_start_publication(PublicationOwner::Direct));
-        assert!(!operations.try_start_publication(PublicationOwner::Direct));
-        assert_eq!(
-            operations.publication_owner(),
-            Some(PublicationOwner::Direct)
-        );
-        operations.finish_publication(PublicationOwner::Direct);
-        assert!(operations.publication_owner().is_none());
+        assert!(operations.try_start_publication());
+        assert!(!operations.try_start_publication());
+        assert!(operations.publication_running());
+        operations.finish_publication();
+        assert!(!operations.publication_running());
     }
 }

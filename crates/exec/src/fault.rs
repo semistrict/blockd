@@ -17,7 +17,6 @@ pub enum FaultPoint {
     CrashPeerAfterCommitBeforeAck = 7,
     CrashPrimaryAfterAckBeforeSyncOk = 8,
     CrashPrimaryAfterSyncOk = 9,
-    CrashPrimaryAfterHeadBeforeRelease = 11,
     CrashPrimaryBeforeTransitionCas = 12,
     CrashPrimaryAfterSeedBeforeActiveCas = 13,
     CrashPrimaryAfterActiveCasBeforeCommit = 14,
@@ -40,14 +39,6 @@ impl FaultConfig {
             enabled: BTreeSet::new(),
             forced: BTreeMap::new(),
             probability: Ppm::NEVER,
-        }
-    }
-
-    pub fn randomized(points: impl IntoIterator<Item = FaultPoint>, probability: Ppm) -> Self {
-        Self {
-            enabled: points.into_iter().collect(),
-            forced: BTreeMap::new(),
-            probability,
         }
     }
 

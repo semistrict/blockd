@@ -2,7 +2,7 @@
   "extends": ["single-host-base"],
   "schema": 1,
   "name": "nvme-pressure-backed",
-  "description": "Backed segments are reclaimed under bounded NVMe pressure without killing a guest.",
+  "description": "Backed blx_files are reclaimed under bounded NVMe pressure without killing a guest.",
   "kind": "single-host",
   "daemon": {
     "cache_pages": 24,
@@ -10,7 +10,7 @@
     "disk_headroom_bytes": { "uniform": { "min": 49152, "max": 81920 } }
   },
   "topology": {
-    "vset_count": 1
+    "volume_count": 1
   },
   "coverage": [
     { "metric": "nvme-reclaim", "label": "NVMe reclaim" },

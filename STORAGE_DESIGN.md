@@ -1,9 +1,10 @@
-# Unified vset storage design
+# Individual volume storage design
 
-Status: draft
+Status: current
 
-This document defines how blockd stores VM memory, VM disks, and VMM state. It
-replaces the current page maps, map leaves, and segments.
+This document defines the current storage model for memory volumes, data
+volumes, and VMM state. Exact byte encodings live with their implementations
+and byte-pinned tests in `crates/core`; this document keeps only behavioral rationale.
 
 ## Glossary
 
@@ -11,20 +12,20 @@ The document uses the following storage-specific terms:
 
 | Term | Meaning |
 |---|---|
-| **Archive** | The durable copy of a vset in object storage. |
+| **Archive** | The durable copy of a volume in object storage. |
 | **Archive batch** | One group of recent changes that the primary combines and uploads together. |
 | **Archive sequence** | A number that increases every time a manifest is published, including publications that only change file layout. |
-| **Attach** | Open an archived vset so it can be read or restored. Attach reads metadata but does not download all page data. |
+| **Attach** | Open an archived volume so it can be read or restored. Attach reads metadata but does not download all page data. |
 | **Base** | A saved state that one or more forks share without copying its page data. |
 | **Base root** | A small, fixed-size record that makes a kept base discoverable and points to its base manifest. |
 | **Block** | The smallest piece of data stored and fetched independently. It is normally one operating-system memory page. |
-| **Block key** | The fixed-size address of a block: which kind of data it belongs to, which disk it belongs to, and its block number. |
+| **Block key** | The fixed-size address of a block within one volume: its data space and block number. |
 | **`.blx` file** | A read-only file containing compressed block values, deletion markers, and an index. The document sometimes calls it a data file. |
 | **Capture sequence** | The number of the guest state represented by a manifest. Compaction does not change it. |
-| **Checkpoint epoch** | The VM checkpoint number returned to callers and used when resuming an exact whole-VM state. |
-| **Checksum** | A value computed from stored bytes or visible vset state. A mismatch means the data is corrupt or the wrong pieces were combined. CRC32C checks stored bytes; the state checksum checks the assembled vset state. |
+| **Checkpoint epoch** | The memory-volume checkpoint number returned to callers and used when resuming memory with its VMM state. |
+| **Checksum** | A value computed from stored bytes or visible volume state. A mismatch means the data is corrupt or the wrong pieces were combined. CRC32C checks stored bytes; the state checksum checks the assembled volume state. |
 | **Compare-and-swap (CAS)** | Change a small record only if it still has the value or object-store version that the writer previously read. This prevents an old owner from replacing a newer owner's state. |
-| **Complete file list** | A reusable snapshot listing every `.blx` file owned by a vset when the snapshot was written. The manifest records later additions and removals. |
+| **Complete file list** | A reusable snapshot listing every `.blx` file owned by a volume when the snapshot was written. The manifest records later additions and removals. |
 | **Compaction** | Read several existing `.blx` files, keep the newest value for each block, write fewer replacement files, and then stop referencing the old files. |
 | **Conditional create** | Create an object only if its key does not already exist. Uploaded files are never overwritten. |
 | **Durable** | Confirmed written to storage that is expected to survive a process or host crash. |
@@ -33,38 +34,37 @@ The document uses the following storage-specific terms:
 | **Fixed-size / fixed-width** | A field or record that always occupies the same number of bytes. |
 | **Footer** | The index at the end of a `.blx` file. It says which blocks are in the file and where each block's bytes are. |
 | **Flush to durable storage** | Ask the operating system to write buffered bytes to the storage device and wait for confirmation before continuing. |
-| **Fork** | A new vset that reads unchanged blocks from a base and stores only its own later changes. |
+| **Fork** | A new volume that reads unchanged blocks from a base and stores only its own later changes. |
 | **Frame** | One encoded record with a type marker, byte length, checksum, and payload. |
-| **Garbage collection (GC)** | Delete uploaded objects that no current vset, kept base, or in-progress publication needs. |
+| **Garbage collection (GC)** | Delete uploaded objects that no current volume, kept base, or in-progress publication needs. |
 | **Generation** | The write number stored with a block value. The highest generation is the newest value. |
 | **Guest sync** | A guest request that requires all earlier accepted disk writes to be durable before the request is acknowledged. |
-| **Head** | The small per-vset record that names the current manifest and the host allowed to publish the next one. |
+| **Head** | The small per-volume record that names the current manifest and the host allowed to publish the next one. |
 | **Journal** | The ordered local record of recent changes on the primary and passive before those changes are archived. |
 | **Journal sequence** | A number that identifies one exact local journal record. It does not change when compaction republishes the same state in a different file layout. |
 | **KiB / MiB** | 1,024 bytes / 1,048,576 bytes. |
 | **Local checkpoint** | A recovery point saved on the primary's local storage. It is not protected until copied to the passive and not archived until published to object storage. |
-| **Lazy restore** | Start a vset from metadata and fetch each data block only when it is first needed. |
+| **Lazy restore** | Start a volume from metadata and fetch each data block only when it is first needed. |
 | **LZ4** | The compression method used independently for each stored block. |
-| **Manifest** | The current description of an archived vset: recovery information, an optional base, a complete-file-list pointer, and file-list changes. It contains no page data. |
+| **Manifest** | The current description of an archived volume: recovery information, an optional base, a complete-file-list pointer, and file-list changes. It contains no page data. |
 | **Metadata** | Descriptive information such as file references, sizes, checksums, and recovery mode. It is not VM memory or disk contents. |
-| **Namespace** | The vset or imported base that originally created an object. It is part of the object's permanent identity. |
+| **Namespace** | The volume or imported base that originally created an object. It is part of the object's permanent identity. |
 | **Object identity / object reference** | An identity names one uploaded object. A reference also records enough size, range, index, and checksum information to read and verify it. |
 | **Object storage** | The bucket holding named, read-only objects. `GET` reads an object or byte range; `PUT` uploads one. |
 | **Passive** | The one other host that durably stores recent changes replicated by the primary. It does not upload the archive. |
-| **Primary** | The host currently running or serving the vset. It replicates recent changes to the passive and uploads archive batches. |
+| **Primary** | The host currently running or serving the volume. It replicates recent changes to the passive and uploads archive batches. |
 | **Protected cut / protected frontier** | A point in the journal that is durable on both the primary and passive. The frontier is the newest such point. |
-| **Publish** | Make an uploaded manifest current by changing the vset's head with CAS. Uploading files alone does not publish them. |
+| **Publish** | Make an uploaded manifest current by changing the volume's head with CAS. Uploading files alone does not publish them. |
 | **Range read** | Read only a selected byte range from an object instead of downloading the whole object. |
-| **Recovery kind** | Whether an archived state can resume a VM exactly or start it normally from saved disks. |
+| **Recovery kind** | Whether an archived memory volume can resume with VMM state or a block volume attaches for cold boot. |
 | **Recovery point** | One complete saved state that recovery is allowed to use. |
-| **Resume set** | A best-effort hint listing blocks likely to be needed immediately when a VM resumes. Correctness does not depend on it. |
 | **Stash** | The passive's durable storage for replicated recent changes. The head records which passive owns the active stash and a bounded list of old stashes still being retired. |
 | **Sync watermark** | The newest guest sync included in an archived recovery point. |
 | **Tombstone** | A stored deletion marker. It prevents an older value of the same block from becoming visible again. |
 | **Trailer** | The fixed-size final bytes of a `.blx` file. They say where the footer is. |
 | **Virtual machine (VM)** | A guest computer run by blockd. |
 | **VMM state** | The saved state of the virtual machine monitor: virtual CPUs and emulated devices, separate from guest memory and disks. |
-| **vset** | A VM's memory, disks, and VMM state saved and restored together. |
+| **Volume** | One independently identified guest-memory or block-device address space. A memory volume may carry matching VMM state. |
 | **Wire integer (`u8`, `u16`, `u32`, `u64`)** | An unsigned integer stored in exactly 1, 2, 4, or 8 bytes. |
 | **Writer fence** | A number assigned when a host becomes primary. It is included in uploaded object names so a former primary cannot collide with the current primary's objects. |
 
@@ -89,7 +89,7 @@ combines them into an archive batch.
 
 The requirements document still controls. In plain terms:
 
-- a whole vset is saved or restored together;
+- every lifecycle and storage operation addresses exactly one volume;
 - guest sync is protected on the primary and exactly one active passive before
   acknowledgement;
 - upload to object storage happens later and does not delay guest writes;
@@ -139,34 +139,23 @@ old-format reader, conversion path, or format negotiation.
 ## 2. How blocks are addressed
 
 Every stored block has the same kind of address, whether it came from VM
-memory, a disk, or VMM state:
-
-```text
-BlockKey {
-    space:  u8,
-    volume: u8,
-    reserved: u16,
-    block:  u32,
-}
-```
-
-`space` says what kind of data this is. `volume` selects a particular disk.
-`block` is the block number within that space and volume.
-`reserved` is unused and must be zero.
+memory, a disk, or VMM state. The volume is carried by the enclosing file and
+manifest identity; within that volume, a block key contains only its space and
+block number. The exact encoding is defined and pinned in `blx.rs`.
 
 Keys are sorted into fixed file partitions. The block-number range comes
 first, followed by a small group of nearby memory, disk, and VMM
 namespaces. This means a small VM cut normally remains one `.blx` file, while a
 large cut splits at stable boundaries. Files from later cuts use the same
 boundaries, so compaction can handle one bounded partition at a time instead
-of loading the whole vset.
+of loading the whole volume.
 
 The spaces are:
 
 | Space | Contents |
 |---|---|
 | `0` | compute memory |
-| `1` | compute disk pages; `volume` selects the disk |
+| `1` | data-volume pages |
 | `2` | VMM state split into blocks; the manifest records its visible byte length |
 
 The block size is the host process's operating-system page size. Every data
@@ -175,7 +164,7 @@ the saved state. If the final VMM-state block is only partly used, the unused
 bytes are stored as zero and the manifest records how many bytes are actually
 visible.
 
-This one address format lets all vset types use the same data-file reader and
+This one address format lets all volume types use the same data-file reader and
 writer. Manifests and other control records remain separate from page data.
 
 ## 3. Read-only `.blx` files
@@ -196,24 +185,8 @@ The writer starts a new file at about 32 MiB. This leaves room below the
 
 ### 3.2 Layout
 
-```text
-header frame
-entry frame 0
-entry frame 1
-...
-entry frame N-1
-footer frame
-trailer
-```
-
-The header, each entry, and the footer are each stored as a frame:
-
-```text
-magic u32 | payload_len u32 | crc32c u32 | payload
-```
-
-Integers use the fixed sizes shown in the layouts and store the lowest byte
-first. There is exactly one valid byte encoding. A reader rejects extra bytes,
+The file has a header, framed entries, a footer, and a trailer. Integers use
+one canonical little-endian encoding. A reader rejects extra bytes,
 unknown record types, duplicate or unsorted keys, incorrect lengths, and
 nonzero reserved fields.
 
@@ -224,29 +197,8 @@ file.
 
 ### 3.3 Header
 
-The header identifies the file and the state change it belongs to:
-
-```text
-BlxHeader {
-    format:             u16,
-    block_size:         u32,
-    namespace_kind:     u8,   // vset or imported-base origin
-    namespace_id:       u64,
-    writer_fence:       u64,
-    object_id:          u64,
-    min_seq:            u64,
-    max_seq:            u64,
-    batch_id:           u64,
-    chunk_index:        u32,
-    chunk_count:        u32,
-    entry_count:        u32,
-    first_key:          BlockKey,
-    last_key:           BlockKey,
-    pre_state_checksum: u64,
-    post_state_checksum:u64,
-}
-```
-
+The header identifies the volume namespace, writer fence, object, batch,
+sequence range, block size, key range, and before-and-after state checksums.
 One archive batch or compaction may be too large for one file. In that case it
 is split into numbered files. Every file records the total file count and its
 own number. Their key ranges may not overlap. A manifest either includes every
@@ -254,27 +206,11 @@ file in the batch or rejects the batch as incomplete.
 
 ### 3.4 Entries
 
-An entry is one of:
-
-```text
-Data {
-    key: BlockKey,
-    generation: u64,
-    raw_len: u32,
-    stored_len: u32,
-    lz4_block: [u8; stored_len],
-}
-
-Tombstone {
-    key: BlockKey,
-    generation: u64,
-}
-```
-
-Each entry has its own frame and checksum, so reading one block requires
+An entry is either compressed block data or a deletion marker. Each entry has
+its own frame and checksum, so reading one block requires
 reading and decompressing only that entry. A deletion marker is a real newest
 value: it stops the search and says the older block is gone. Corrupt or missing
-data is never treated as a deletion. A block outside the vset's valid size
+data is never treated as a deletion. A block outside the volume's valid size
 reads as zero; a block that should exist but cannot be verified is an error.
 
 The first format stores one deletion marker per affected block. A future format
@@ -283,19 +219,8 @@ large file truncations make the individual markers too expensive.
 
 ### 3.5 Footer
 
-The footer is a sorted exact index:
-
-```text
-FooterEntry {
-    key:           BlockKey,
-    offset:        u32,
-    length:        u32,
-    generation:    u64,
-    kind:          u8,  // data or tombstone
-    value_checksum:u64, // checksum of the uncompressed data; zero for a tombstone
-}
-```
-
+The footer is a sorted exact index containing each block's byte range,
+generation, entry kind, and uncompressed-value checksum.
 The footer lets the reader quickly find one block and the exact byte range to
 fetch. Because a file never changes, its footer may remain cached. Each file
 reference also records the first and last block key, so the reader can skip
@@ -339,7 +264,7 @@ Compaction starts only when the file-overlap limit is reached, not after every
 new archive write. It processes one fixed file partition at a time and drops
 each input file after merging it into that partition's in-memory block map.
 Memory use therefore depends on one partition's maximum number of blocks, not
-on the vset's size or the number of archive writes accumulated during an
+on the volume's size or the number of archive writes accumulated during an
 object-store outage.
 
 A deletion marker can be removed only when no remaining file and no base can
@@ -360,153 +285,40 @@ The head points directly to the current manifest. The manifest points to one
 read-only complete file list and contains the net file-list changes since that
 list was written. It never points to an older manifest.
 
-For example:
-
-```text
-complete file list: A B C
-manifest additions: D
-manifest removals:  B
-current files:      A C D
-```
-
-If the next archive adds `E`, the new manifest contains additions `D E` and
-removal `B`. It does not point to the previous manifest. When the additions and
-removals are about to make the manifest larger than 256 KiB, the primary writes
-a new complete list containing `A C D E`; the new manifest then has empty
-additions and removals.
-
-Attaching an ordinary vset requires:
-
-```text
-head GET -> current manifest GET -> complete file list GET
-```
-
-A fork additionally fetches its one read-only base manifest. The child's
-complete list and base manifest can be fetched in parallel:
-
-```text
-head GET -> child manifest GET -> child complete list GET
-                                -> base manifest GET
-```
-
+Each manifest carries the net additions and removals relative to its complete
+list. When those changes approach the manifest limit, the primary writes a new
+complete list and resets both change sets. Attaching an ordinary volume reads
+the head, current manifest, and complete list. A fork additionally reads its
+one read-only base manifest, in parallel with the child's complete list.
 The number of reads does not grow as more archive batches are written. A new
-fork with no files of its own does not need a complete-list read. Reading the
-optional resume set can improve startup speed but is never required for a
-correct restore.
+fork with no files of its own does not need a complete-list read.
 
 ### 5.2 Manifest contents
 
-The following layouts define the exact bytes. The prose after each layout
-explains what they mean.
-
 The manifest stores recovery information, pointers to the base and complete
-file list, and the changes to that list:
-
-```text
-Manifest {
-    format:                 u16,
-    vset:                   u64,
-    writer_fence:           u64,
-    journal_seq:            u64,
-    archive_seq:            u64,
-    capture_seq:            u64,
-    sync_covered_through:   u64,
-    recovery_kind:          u8,   // whole, disk-only
-    checkpoint_epoch:       u64,
-    block_size:             u32,
-    vset_config:            VsetConfig,
-    vmstate_logical_length: u64,
-    base:                   OptionalBaseRef,
-    complete_list:          OptionalFileListRef,
-    post_state_checksum:    u64,
-    metadata_checksum:      u64,
-    added_count:            u32,
-    added:                  [ObjectRef; added_count],
-    removed_count:          u32,
-    removed:                [ObjectIdentity; removed_count],
-}
-```
-
-`vset_config` describes the VM shape needed to interpret its block keys.
+file list, and the changes to that list. Its canonical encoding is defined and
+byte-pinned beside `manifest.rs`.
+`volume_config` records whether this is a memory or data volume and its block count.
 `journal_seq` identifies the exact local record whose state is published.
 `archive_seq` independently identifies this particular metadata publication.
 The remaining names correspond to terms in the glossary.
 
-The complete file list is a separate read-only record:
-
-```text
-CompleteFileList {
-    format:       u16,
-    vset:         u64,
-    writer_fence: u64,
-    list_id:      u64,
-    object_count: u32,
-    objects:      [ObjectRef; object_count],
-    checksum:     u64,
-}
-```
-
-`objects` lists every data file owned by this vset when the list was written,
+The complete file list is a separate read-only record.
+`objects` lists every data file owned by this volume when the list was written,
 sorted by identity. It does not repeat files supplied by the base. `added` and
 `removed` describe the difference between that list and the current state. If
 a file was added and later removed, it disappears from both arrays. In plain
 terms, start with the complete list, take out `removed`, and put in `added`.
 
-This record points to the complete file list. A new fork may have no such list:
+The complete-list reference is optional because a new fork may own no files.
+When absent, `removed` must be empty,
+and `added` is the complete set of files owned by the volume.
 
-```text
-OptionalFileListRef {
-    present:      u8,
-    writer_fence: u64,
-    list_id:      u64,
-    checksum:     u64,
-}
-```
+The optional base reference names and verifies one base manifest. That base
+manifest directly lists all of its files and does not point to another base.
 
-When `present` is zero, every other field is zero. `removed` must then be empty,
-and `added` is the complete set of files owned by the vset.
-
-`OptionalBaseRef` is fixed-width even when absent:
-
-```text
-OptionalBaseRef {
-    present:                    u8,
-    base_id:                    u64,
-    base_manifest_id:           u64,
-    base_manifest_checksum:     u64,
-    base_post_state_checksum:   u64,
-}
-```
-
-When `present` is zero, every other field is zero. When it is one, these fields
-name and verify the base manifest. That base manifest directly lists all of
-its files; it does not point to another base.
-
-An `ObjectRef` is the information needed to locate, filter, and verify one
-`.blx` file. The object-store key is built from its identity fields:
-
-```text
-ObjectRef {
-    namespace_kind: u8,
-    namespace_id:   u64,
-    writer_fence:   u64,
-    object_id:      u64,
-    min_seq:        u64,
-    max_seq:        u64,
-    batch_id:       u64,
-    chunk_index:    u32,
-    chunk_count:    u32,
-    first_key:      BlockKey,
-    last_key:       BlockKey,
-    pre_state_checksum:u64,
-    post_state_checksum:u64,
-    size:           u32,
-    footer_offset:  u32,
-    footer_length:  u32,
-    object_checksum:u64,
-}
-```
-
+An `ObjectRef` contains the information needed to locate, filter, and verify
+one `.blx` file. The object-store key is built from its identity fields.
 An `ObjectIdentity` contains only `namespace_kind`, `namespace_id`,
 `writer_fence`, and `object_id`. It is therefore smaller than a full reference.
 A removal must name a file in the complete list. The same identity cannot be
@@ -529,14 +341,14 @@ manifest currently named by the head.
 
 ### 5.3 Recovery kinds
 
-- A **whole** VM manifest contains matching memory, disks, and VMM state from
-  one capture. The VM can continue from that exact state.
-- A **disk-only** VM manifest contains disks through the recorded guest sync,
-  but no usable memory or VMM state. The VM starts normally from those disks.
-A disk-only archive may still reference older memory files because a running
-VM or later compaction may need them. Those files do not make that recovery
-point resumable. The `recovery_kind` field alone decides which recovery action
-is allowed.
+- A **memory-resumable** manifest contains one memory volume and matching VMM
+  state from one capture. The VM can continue from that exact state.
+- A **block/cold-boot** manifest contains one block volume through its recorded
+  guest sync. It attaches to a normally booting VM and contains no memory or
+  VMM state.
+
+No manifest contains multiple volumes. The `recovery_kind` field decides the
+recovery action for the volume it describes.
 
 ### 5.4 Manifest generation
 
@@ -562,7 +374,7 @@ Publication order is:
 2. verify the new files and, when resetting the change list, upload and verify the
    new complete file list;
 3. upload the new manifest without allowing overwrite;
-4. change the vset head with CAS so it points to the new manifest; and
+4. change the volume head with CAS so it points to the new manifest; and
 5. allow the older archive inputs to be deleted only after GC can see the new
    head.
 
@@ -572,42 +384,20 @@ so this publication is discarded and can never become current.
 
 ## 6. The head and protection against former primaries
 
-Each vset has one small head record. It says which host is primary and which
-manifest is current. It can be changed only with CAS:
-
-```text
-Head {
-    vset:                 u64,
-    holder:               u16, // current primary host
-    writer_fence:         u64, // identity of the current ownership period
-    manifest_fence:       u64, // writer fence used by the current manifest
-    manifest_journal_seq: u64, // exact journal state represented
-    manifest_seq:         u64, // archive sequence of the current manifest
-    manifest_checksum:    u64, // verifies the current manifest
-    stash_assignment:     StashAssignment,
-    bounded_retired_stash:RetiredStash,
-}
-```
+Each volume has one small head record. It names the current holder, writer
+fence, current manifest, active stash assignment, and bounded retired-stash
+history. It can be changed only with CAS.
 
 When a host successfully becomes primary, the object store gives the updated
 head a new version. That version becomes the new writer fence. The primary
 keeps using that fence in every uploaded name until ownership changes again.
 
-Object-store names are built from numeric identities:
-
-```text
-v/<vset>/head
-v/<vset>/m/<writer-fence>-<archive-seq>.manifest
-v/<vset>/f/<writer-fence>-<list-id>.files
-v/<origin-vset>/o/<writer-fence>-<object-id>.blx
-b/<base>/root
-b/<base>/m/<manifest-id>.manifest
-```
-
+Object-store names are built canonically from numeric identities by
+`layout.rs`.
 Every data file, complete file list, and manifest is created without allowing
 overwrite. The writer fence gives each primary different names. The head CAS
 ensures that only the current primary can make a manifest visible. A manifest
-may safely point to a file created by another vset because uploaded files never
+may safely point to a file created by another volume because uploaded files never
 change.
 
 ## 7. Primary and passive journals
@@ -626,7 +416,7 @@ journal record; archival work must not substitute the primary's newer live
 checksum. The journal record is committed only after every file it names has
 been flushed to durable local storage.
 
-The amount of work depends on the number of changed pages, not the total vset
+The amount of work depends on the number of changed pages, not the total volume
 size. The host keeps an in-memory list of local files and their first and last
 block keys. Cached footers provide exact block locations. There is no durable
 entry mapping every page to a file.
@@ -714,8 +504,7 @@ object storage. Uploaded files never change, so a verified footer or block may
 stay cached until the cache removes it.
 
 The per-block file limit bounds the number of footers checked. A fork adds at
-most one base search. Before resuming a VM, the host may read the resume-set
-blocks and footers in advance, but correctness does not depend on that hint.
+most one base search.
 
 ## 9. Bases and forks
 
@@ -727,7 +516,7 @@ lists every data file needed for that point. It never points to another base.
 
 If the selected point is already archived, keeping it writes only metadata:
 the primary writes a base manifest containing direct references to the
-existing vset and base files, then creates the base root without allowing
+existing volume and base files, then creates the base root without allowing
 overwrite.
 
 If the selected point contains unarchived changes, the primary first archives
@@ -745,7 +534,7 @@ read or rewrite the page bytes in those files.
 Creating a fork writes only fixed-size metadata:
 
 1. read and verify the base root;
-2. create the new vset head and assign its passive;
+2. create the new volume head and assign its passive;
 3. create the fork's manifest containing the base-manifest pointer, recovery
    metadata, no complete file list, and empty change arrays; and
 4. publish that manifest by changing the fork's head with CAS.
@@ -778,11 +567,11 @@ copy per fork.
 
 GC considers only objects in the bucket. It begins with:
 
-- every vset head and its current manifest;
+- every volume head and its current manifest;
 - every kept base root and its base manifest; and
 - every durable record describing a publication that is still in progress.
 
-From each vset manifest, GC keeps its complete file list, every current `.blx`
+From each volume manifest, GC keeps its complete file list, every current `.blx`
 file, and its base manifest if it has one. From each base manifest, GC keeps
 every `.blx` file named there. GC never follows old manifests and never follows
 more than one base pointer.
@@ -798,7 +587,7 @@ read a head, base root, or manifest, it refuses to delete anything that record
 might protect.
 
 Only an explicit base-and-fork relationship shares files. Equal data in
-unrelated vsets is not combined, because doing so could reveal that two
+unrelated volumes is not combined, because doing so could reveal that two
 different users store the same content.
 
 ## 11. Recovery and failure rules
@@ -837,44 +626,28 @@ If a footer or block entry is corrupt, the reader tries another permitted copy.
 If no copy provides verified bytes, recovery fails. Missing data that should
 exist is never silently returned as zero.
 
-## 12. Object layout example
+## 12. Object namespace
 
-For vset `7`, writer fence `12`, and base `90`:
+Volume heads, manifests, complete lists, and `.blx` files occupy the volume
+namespace; retained roots and manifests occupy the base namespace. A base
+manifest may reference volume files directly. A fork stores the base-manifest
+identity in its own manifest and creates no copied base objects.
 
-```text
-cluster/placement
-hosts/0007/session
+## 13. Storage properties
 
-v/0000000000000007/head
-v/0000000000000007/m/000000000000000c-0000000000000042.manifest
-v/0000000000000007/f/000000000000000c-0000000000000003.files
-v/0000000000000007/o/000000000000000c-0000000000000011.blx
-v/0000000000000007/o/000000000000000c-0000000000000012.blx
-v/0000000000000007/rs
-
-b/000000000000005a/root
-b/000000000000005a/m/0000000000000001.manifest
-```
-
-The base manifest may reference the two vset files above directly. A fork of
-base `90` stores the base-manifest identity in its own manifest; it does not
-create `b/90/o/...` copies.
-
-## 13. Removed current-format concepts
-
-This design removes:
+The current design has none of the following:
 
 - the durable map from every page to its exact storage location;
 - splitting that map into separate leaf records;
 - storing small map updates inside other records;
 - copying the whole page map into the archive journal;
 - copying existing page data when creating a base;
-- compaction rules tied to the old segment format;
+- compaction rules tied to a deleted data-file format;
 - archive packs that require every page location to be rewritten; and
-- the rule that a vset may reference files only under its own object-store
+- the rule that a volume may reference files only under its own object-store
   prefix.
 
-It keeps these useful properties:
+It provides these properties:
 
 - every record has one exact byte encoding and its own checksum;
 - each block is compressed and verified independently;
@@ -886,9 +659,9 @@ It keeps these useful properties:
 - restore fetches blocks only when needed and may read likely startup blocks
   in advance.
 
-## 14. Required tests
+## 14. Verification requirements
 
-The replacement is complete only when all of these tests exist and pass:
+The storage model requires all of these tests to exist and pass:
 
 1. Tests that compare the exact expected bytes for every stored record and
    every part of a `.blx` file.
@@ -905,12 +678,12 @@ The replacement is complete only when all of these tests exist and pass:
    reads and that unmodified blocks remain shared.
 8. Base-deletion tests proving existing children retain data while new forks
    are rejected.
-9. Attach tests proving that an ordinary vset needs three required object-store
+9. Attach tests proving that an ordinary volume needs three required object-store
    reads and a fork needs four; a new fork with no files of its own needs three.
 10. Measurements of worst-case block-read cost with the maximum permitted
     number of candidate files, both with empty and populated caches.
 11. Tests of manifest size, complete-file-list reset, and attach time at the
-    largest supported vset size and with widely scattered writes.
+    largest supported volume size and with widely scattered writes.
 12. Simulations of primary loss, passive loss, object-storage outage,
     interrupted compaction, uploads by a former primary, GC races, migration,
     and repeated fork, keep, and delete operations.
@@ -929,7 +702,7 @@ empty to 256 KiB, the average manifest upload is about 128 KiB.
 
 When the manifest would exceed 256 KiB, the primary also uploads a new complete
 file list. Each live file costs 109 bytes in that list, plus a small fixed
-header. A vset with 10,000 live files therefore has a complete list of about
+header. A volume with 10,000 live files therefore has a complete list of about
 1.04 MiB. The primary reuses that list until another 256 KiB of file-list
 changes accumulates.
 

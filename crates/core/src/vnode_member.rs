@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::authority::{AuthorityProof, PlacementRecord, VnodeAuthority};
 use crate::format::{Dec, DecodeError, Enc, FRAME_HEADER, crc32c, open_frame, seal_frame};
-use crate::types::{HostId, VsetId};
+use crate::types::{HostId, VolumeId};
 use crate::{
     journal::JournalRecord,
     protocol::ReplicaArtifact,
@@ -24,7 +24,7 @@ const MAX_CLOSURES: u32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProtectedClosureRef {
-    pub vset: VsetId,
+    pub volume: VolumeId,
     pub sequence: u64,
     pub checksum: u32,
     pub len: u32,
@@ -37,8 +37,8 @@ pub struct VnodeRecoveryClosure {
 }
 
 impl VnodeRecoveryClosure {
-    pub fn encode(&self, vset: VsetId) -> Result<Vec<u8>, DecodeError> {
-        self.validate(vset)?;
+    pub fn encode(&self, volume: VolumeId) -> Result<Vec<u8>, DecodeError> {
+        self.validate(volume)?;
         let mut e = Enc::new();
         e.u16(FORMAT_VERSION);
         e.u32(u32::try_from(self.record.len()).map_err(|_| DecodeError)?);
@@ -52,7 +52,7 @@ impl VnodeRecoveryClosure {
         Ok(seal_frame(MAGIC_VNODE_CLOSURE, &e.finish()))
     }
 
-    pub fn decode(vset: VsetId, bytes: &[u8]) -> Result<Self, DecodeError> {
+    pub fn decode(volume: VolumeId, bytes: &[u8]) -> Result<Self, DecodeError> {
         let payload = open_frame(MAGIC_VNODE_CLOSURE, bytes)?;
         let mut d = Dec::new(payload);
         if d.u16()? != FORMAT_VERSION {
@@ -72,16 +72,16 @@ impl VnodeRecoveryClosure {
         }
         d.finish()?;
         let closure = Self { record, artifacts };
-        closure.validate(vset)?;
+        closure.validate(volume)?;
         Ok(closure)
     }
 
-    fn validate(&self, vset: VsetId) -> Result<(), DecodeError> {
-        JournalRecord::decode(vset, &self.record).map_err(|_| DecodeError)?;
+    fn validate(&self, volume: VolumeId) -> Result<(), DecodeError> {
+        JournalRecord::decode(volume, &self.record).map_err(|_| DecodeError)?;
         let mut previous = None;
         for (artifact, bytes) in &self.artifacts {
             if previous.is_some_and(|previous| previous >= *artifact)
-                || verify_replica_artifact(vset, *artifact, bytes).is_err()
+                || verify_replica_artifact(volume, *artifact, bytes).is_err()
             {
                 return Err(DecodeError);
             }
@@ -114,19 +114,19 @@ impl VnodeMemberRecord {
         for closure in &self.closures {
             if closure.sequence == 0
                 || closure.len == 0
-                || placement.vnode(closure.vset) != self.authority.vnode
-                || previous.is_some_and(|vset| vset >= closure.vset)
+                || placement.vnode(closure.volume) != self.authority.vnode
+                || previous.is_some_and(|volume| volume >= closure.volume)
             {
                 return Err(DecodeError);
             }
-            previous = Some(closure.vset);
+            previous = Some(closure.volume);
         }
         Ok(())
     }
 
-    pub fn closure(&self, vset: VsetId) -> Option<ProtectedClosureRef> {
+    pub fn closure(&self, volume: VolumeId) -> Option<ProtectedClosureRef> {
         self.closures
-            .binary_search_by_key(&vset, |closure| closure.vset)
+            .binary_search_by_key(&volume, |closure| closure.volume)
             .ok()
             .map(|index| self.closures[index])
     }
@@ -140,7 +140,7 @@ impl VnodeMemberRecord {
         self.validate(placement)?;
         authority.validate(placement)?;
         if authority != self.authority
-            || placement.vnode(closure.vset) != authority.vnode
+            || placement.vnode(closure.volume) != authority.vnode
             || closure.sequence == 0
             || closure.len == 0
         {
@@ -148,7 +148,7 @@ impl VnodeMemberRecord {
         }
         match self
             .closures
-            .binary_search_by_key(&closure.vset, |existing| existing.vset)
+            .binary_search_by_key(&closure.volume, |existing| existing.volume)
         {
             Ok(index) => {
                 let current = self.closures[index];
@@ -196,7 +196,7 @@ impl VnodeMemberRecord {
         e.bytes(&authority);
         e.u32(u32::try_from(self.closures.len()).expect("closure count fits"));
         for closure in &self.closures {
-            e.u64(closure.vset.0);
+            e.u64(closure.volume.0);
             e.u64(closure.sequence);
             e.u32(closure.checksum);
             e.u32(closure.len);
@@ -219,7 +219,7 @@ impl VnodeMemberRecord {
         let mut closures = Vec::with_capacity(usize::try_from(count).map_err(|_| DecodeError)?);
         for _ in 0..count {
             closures.push(ProtectedClosureRef {
-                vset: VsetId(d.u64()?),
+                volume: VolumeId(d.u64()?),
                 sequence: d.u64()?,
                 checksum: d.u32()?,
                 len: d.u32()?,
@@ -270,12 +270,12 @@ pub struct AdoptionReceipt {
 }
 
 /// Validate that receipts durably cover every voting set and return the
-/// highest protected closure reported for each vset.
+/// highest protected closure reported for each volume.
 pub fn adoption_quorum(
     placement: &PlacementRecord,
     proof: AuthorityProof,
     receipts: &[AdoptionReceipt],
-) -> Result<BTreeMap<VsetId, ProtectedClosureRef>, DecodeError> {
+) -> Result<BTreeMap<VolumeId, ProtectedClosureRef>, DecodeError> {
     proof.authority.validate(placement)?;
     let vnode = placement
         .placement(proof.authority.vnode)
@@ -290,18 +290,18 @@ pub fn adoption_quorum(
             return Err(DecodeError);
         }
         for closure in &receipt.closures {
-            if placement.vnode(closure.vset) != proof.authority.vnode
+            if placement.vnode(closure.volume) != proof.authority.vnode
                 || closure.sequence == 0
                 || closure.len == 0
             {
                 return Err(DecodeError);
             }
-            match highest.get(&closure.vset).copied() {
+            match highest.get(&closure.volume).copied() {
                 None => {
-                    highest.insert(closure.vset, *closure);
+                    highest.insert(closure.volume, *closure);
                 }
                 Some(current) if closure.sequence > current.sequence => {
-                    highest.insert(closure.vset, *closure);
+                    highest.insert(closure.volume, *closure);
                 }
                 Some(current) if closure.sequence == current.sequence && *closure != current => {
                     return Err(DecodeError);
@@ -321,9 +321,9 @@ pub fn adoption_quorum(
     Ok(highest)
 }
 
-pub fn closure_ref(vset: VsetId, sequence: u64, bytes: &[u8]) -> Option<ProtectedClosureRef> {
+pub fn closure_ref(volume: VolumeId, sequence: u64, bytes: &[u8]) -> Option<ProtectedClosureRef> {
     Some(ProtectedClosureRef {
-        vset,
+        volume,
         sequence,
         checksum: crc32c(bytes),
         len: u32::try_from(bytes.len()).ok()?,
@@ -365,7 +365,7 @@ mod tests {
     fn member_record_roundtrips_and_rejects_damage() {
         let placement = placement(None);
         let mut record = VnodeMemberRecord::new(authority(1, HostId(1)));
-        let closure = closure_ref(VsetId(7), 9, b"protected").expect("closure");
+        let closure = closure_ref(VolumeId(7), 9, b"protected").expect("closure");
         record
             .commit(&placement, authority(1, HostId(1)), closure)
             .expect("commit");
@@ -401,7 +401,7 @@ mod tests {
                 .commit(
                     &placement,
                     old,
-                    closure_ref(VsetId(7), 1, b"old").expect("closure")
+                    closure_ref(VolumeId(7), 1, b"old").expect("closure")
                 )
                 .is_err()
         );

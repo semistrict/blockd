@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use blockd_core::hostmeta::{Counters, HostConfig};
-use blockd_core::journal::VsetConfig;
+use blockd_core::journal::VolumeConfig;
 use blockd_core::types::{HostId, millis};
 use blockd_exec::rng::Ppm;
 use blockd_sim::harness::{FaultPlan, HarnessConfig, RunReport, run, run_capture_profile};
@@ -14,12 +14,12 @@ use blockd_sim::model::{BlobDevConfig, StoreConfig};
 
 const DRAIN_PAGES_PER_POLL: u64 = 64;
 
-fn config(vsets: u16, pages: u32) -> HarnessConfig {
+fn config(volumes: u16, pages: u32) -> HarnessConfig {
     HarnessConfig {
         host: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
             host: HostId(0),
-            cache_pages: usize::from(vsets)
+            cache_pages: usize::from(volumes)
                 .saturating_mul(pages as usize)
                 .saturating_mul(2)
                 .max(1_024),
@@ -46,8 +46,8 @@ fn config(vsets: u16, pages: u32) -> HarnessConfig {
             latency_max: 1,
             ns_per_byte: 0,
         },
-        vset_count: vsets,
-        vset: VsetConfig::compute(1, pages),
+        volume_count: volumes,
+        volume: VolumeConfig::data(pages),
         horizon: millis(15),
         think: (50_000, 50_000),
         sync_share: Some(Ppm(20_000)),
@@ -79,7 +79,7 @@ fn assert_paths_ran(report: &RunReport) {
 }
 
 #[test]
-fn profile_huge_vset_capture_stall() {
+fn profile_huge_volume_capture_stall() {
     let full = std::env::var_os("BLOCKD_PERF_FULL").is_some();
     let dirty_pages = if full { 300_000 } else { 10_000 };
     let mut profile = config(1, dirty_pages);
@@ -103,19 +103,19 @@ fn profile_huge_vset_capture_stall() {
 
 #[test]
 fn profile_actor_poll_ceiling() {
-    for vsets in [1_u16, 100, 300] {
+    for volumes in [1_u16, 100, 300] {
         let started = Instant::now();
-        let report = run(11, config(vsets, 256));
+        let report = run(11, config(volumes, 256));
         let wall = started.elapsed();
         assert_paths_ran(&report);
         assert!(
             report.counters.wp_faults > 0,
             "no write-protect faults happened"
         );
-        assert!(report.completed_ops > u64::from(vsets));
+        assert!(report.completed_ops > u64::from(volumes));
         let mean_poll_ns = wall.as_nanos() / u128::from(report.actor_polls);
         eprintln!(
-            "actor profile: {vsets:>3} vsets, {} ops, {} polls, {wall:.1?}, mean {mean_poll_ns}ns/poll",
+            "actor profile: {volumes:>3} volumes, {} ops, {} polls, {wall:.1?}, mean {mean_poll_ns}ns/poll",
             report.completed_ops, report.actor_polls
         );
         assert!(
