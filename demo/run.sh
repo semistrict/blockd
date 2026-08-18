@@ -81,10 +81,10 @@ R=$(post "$API0/vm/$VM/migrate?to=1")
 show "source: snapshot+publish $(field "$R" snapshot_ms)ms, vset handoff $(field "$R" handoff_ms)ms"
 for _ in $(seq 1 150); do
   S=$(get "$API1/status")
-  grep -q "\"id\":$VM,\"state\":\"running\"" <<<"$S" && break
+  grep -q "\"id\":$VM,.*\"state\":\"running\"" <<<"$S" && break
   sleep 0.5
 done
-grep -q "\"id\":$VM,\"state\":\"running\"" <<<"$S" || { echo "MIGRATION NEVER LANDED"; exit 1; }
+grep -q "\"id\":$VM,.*\"state\":\"running\"" <<<"$S" || { echo "MIGRATION NEVER LANDED"; exit 1; }
 R=$(post "$API1/vm/$VM/verify")
 show "vset verifies ON HOST 1: ok=$(field "$R" ok) at burst $(field "$R" burst)"
 post "$API1/vm/$VM/work?bursts=1" >/dev/null
