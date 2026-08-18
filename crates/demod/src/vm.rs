@@ -136,6 +136,7 @@ impl Demod {
             blob_dir: cfg.blob_dir.clone(),
             peer: Some(PeerConfig {
                 listen: cfg.peer_listen,
+                advertise: cfg.peer_listen,
             }),
         };
         let rt = Runtime::new(&runtime_config, store.clone()).await;

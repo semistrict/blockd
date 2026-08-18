@@ -33,7 +33,7 @@ impl Default for ArchivePolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaPlacementConfig {
     pub membership_epoch: u64,
     pub local_failure_domain: u16,

@@ -48,6 +48,10 @@ impl AuthorityLease {
 
 pub struct HostState {
     pub config: HostConfig,
+    /// Older live-membership snapshots still referenced by existing stash
+    /// assignments. Membership changes are additive here; head CAS remains
+    /// the authority for moving an individual volume to a new candidate.
+    pub replica_placement_history: Vec<crate::hostmeta::ReplicaPlacementConfig>,
     pub cache: Cache,
     pub volumes: BTreeMap<VolumeId, VolumeState>,
     pub counters: Counters,
@@ -89,6 +93,7 @@ impl HostState {
         Self {
             cache: Cache::new(config.cache_pages),
             config,
+            replica_placement_history: Vec::new(),
             volumes: BTreeMap::new(),
             counters: Counters::default(),
             blob_sizes: BTreeMap::new(),

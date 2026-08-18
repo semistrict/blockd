@@ -116,6 +116,7 @@ pub(crate) fn three_host_runtime_config(
         blob_dir,
         peer: Some(PeerConfig {
             listen: addresses[usize::from(host)],
+            advertise: addresses[usize::from(host)],
         }),
     }
 }

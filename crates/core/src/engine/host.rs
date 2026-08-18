@@ -424,14 +424,41 @@ impl<W: HostWorld> HostCtx<W> {
 
     async fn handle_admin(self, request: crate::world::AdminRequest) {
         let (call, mut reply) = request.into_parts();
-        if !self.state().borrow().authority_serving()
-            || admin_volume(call)
-                .is_some_and(|volume| !self.state().borrow().volume_authorized(volume))
+        if !matches!(call, AdminCall::UpdateReplicaPlacement { .. })
+            && (!self.state().borrow().authority_serving()
+                || admin_volume(&call)
+                    .is_some_and(|volume| !self.state().borrow().volume_authorized(volume)))
         {
             let _ = reply.send(Err(crate::protocol::AdminError::Unavailable));
             return;
         }
         let response = match call {
+            AdminCall::UpdateReplicaPlacement { placement } => {
+                let mut host = self.state().borrow_mut();
+                let valid = placement.membership_epoch > 0
+                    && (placement.roster.is_empty()
+                        || placement.roster.iter().any(|candidate| {
+                            candidate.host == host.config.host
+                                && candidate.weight > 0
+                                && !candidate.drained
+                        }))
+                    && placement
+                        .roster
+                        .windows(2)
+                        .all(|pair| pair[0].host < pair[1].host);
+                if !valid {
+                    Some(Err(crate::protocol::AdminError::Rejected))
+                } else if host.config.replica_placement.as_ref() == Some(&placement) {
+                    Some(Ok(crate::protocol::AdminSuccess::ReplicaPlacementUpdated))
+                } else {
+                    if let Some(previous) = host.config.replica_placement.replace(placement)
+                        && !host.replica_placement_history.contains(&previous)
+                    {
+                        host.replica_placement_history.push(previous);
+                    }
+                    Some(Ok(crate::protocol::AdminSuccess::ReplicaPlacementUpdated))
+                }
+            }
             AdminCall::CreateVolume {
                 volume,
                 config,
@@ -478,14 +505,14 @@ async fn handle_admin<W: HostWorld>(
     HostCtx::new(state, world).handle_admin(request).await;
 }
 
-fn admin_volume(call: AdminCall) -> Option<crate::types::VolumeId> {
+fn admin_volume(call: &AdminCall) -> Option<crate::types::VolumeId> {
     match call {
         AdminCall::CreateVolume { volume, .. }
         | AdminCall::KeepBase { volume, .. }
         | AdminCall::Checkpoint { volume, .. }
         | AdminCall::RestoreVolume { volume }
-        | AdminCall::MigrateOut { volume, .. } => Some(volume),
-        AdminCall::DeleteBase { .. } => None,
+        | AdminCall::MigrateOut { volume, .. } => Some(*volume),
+        AdminCall::DeleteBase { .. } | AdminCall::UpdateReplicaPlacement { .. } => None,
     }
 }
 

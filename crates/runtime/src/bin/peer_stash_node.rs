@@ -113,6 +113,7 @@ mod linux {
             blob_dir: config.blob_dir.clone(),
             peer: Some(PeerConfig {
                 listen: config.peer_listen,
+                advertise: config.peer_listen,
             }),
         }
     }

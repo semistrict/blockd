@@ -34,6 +34,18 @@ pub fn placement_key() -> String {
     "cluster/placement".to_owned()
 }
 
+pub fn cluster_metadata_key() -> String {
+    "cluster/metadata".to_owned()
+}
+
+pub fn node_claim_prefix() -> String {
+    "cluster/nodes/".to_owned()
+}
+
+pub fn node_claim_key(host: HostId) -> String {
+    format!("{}{:04x}.claim", node_claim_prefix(), host.0)
+}
+
 pub fn peer_membership_prefix() -> String {
     "cluster/tls/public-keys/".to_owned()
 }

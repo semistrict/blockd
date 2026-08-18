@@ -38,12 +38,14 @@ use crate::store::ObjectStore;
 
 /// What the transport does with a verified inbound message.
 type Deliver = dyn Fn(HostId, PeerMsg) + Send + Sync;
+type MembershipChanged = dyn Fn(Vec<HostId>) + Send + Sync;
 
 #[derive(Clone, Debug)]
 pub struct PeerConfig {
-    /// Reachable cluster-internal endpoint. The daemon binds it and publishes
-    /// it with its generated certificate for discovery by every other node.
+    /// Local socket to bind. This may use an unspecified address.
     pub listen: SocketAddr,
+    /// Reachable cluster-internal endpoint published for other nodes.
+    pub advertise: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -528,6 +530,8 @@ struct MembershipRefresher {
     identities: PeerIdentities,
     leases: MembershipLeases,
     connections: ConnectionSet,
+    changed: Arc<MembershipChanged>,
+    last_members: Vec<HostId>,
 }
 
 struct Outbound {
@@ -668,7 +672,7 @@ async fn publish_membership_heartbeat(membership: BucketMembership) {
 }
 
 impl MembershipRefresher {
-    async fn run(self) {
+    async fn run(mut self) {
         let mut join_delays = MEMBERSHIP_JOIN_REFRESH_DELAYS.into_iter();
         let mut last_success = Instant::now();
         loop {
@@ -677,6 +681,10 @@ impl MembershipRefresher {
             if elapsed >= MAX_MEMBERSHIP_STALENESS {
                 self.identities.replace(BTreeMap::new());
                 self.connections.reconcile(&BTreeMap::new());
+                if !self.last_members.is_empty() {
+                    (self.changed)(Vec::new());
+                    self.last_members.clear();
+                }
             }
             let refresh_budget = MAX_MEMBERSHIP_STALENESS
                 .checked_sub(elapsed)
@@ -690,6 +698,11 @@ impl MembershipRefresher {
                 Ok(Ok(targets)) => {
                     last_success = Instant::now();
                     self.connections.reconcile(&targets);
+                    let members = targets.keys().copied().collect::<Vec<_>>();
+                    if members != self.last_members {
+                        (self.changed)(members.clone());
+                        self.last_members = members;
+                    }
                 }
                 Ok(Err(error)) => {
                     tracing::warn!(?error, "failed to refresh peer TLS membership");
@@ -699,6 +712,10 @@ impl MembershipRefresher {
             if last_success.elapsed() >= MAX_MEMBERSHIP_STALENESS {
                 self.identities.replace(BTreeMap::new());
                 self.connections.reconcile(&BTreeMap::new());
+                if !self.last_members.is_empty() {
+                    (self.changed)(Vec::new());
+                    self.last_members.clear();
+                }
             }
         }
     }
@@ -714,23 +731,42 @@ impl PeerNet {
         store: Arc<dyn ObjectStore>,
         deliver: impl Fn(HostId, PeerMsg) + Send + Sync + 'static,
     ) -> std::io::Result<Arc<PeerNet>> {
-        if config.listen.port() == 0 || config.listen.ip().is_unspecified() {
+        Self::start_with_membership(config, self_id, store, deliver, |_| {}).await
+    }
+
+    /// Start peer discovery and report each distinct live membership snapshot.
+    /// The callback runs on the network runtime and must not block.
+    pub async fn start_with_membership(
+        config: &PeerConfig,
+        self_id: HostId,
+        store: Arc<dyn ObjectStore>,
+        deliver: impl Fn(HostId, PeerMsg) + Send + Sync + 'static,
+        membership_changed: impl Fn(Vec<HostId>) + Send + Sync + 'static,
+    ) -> std::io::Result<Arc<PeerNet>> {
+        if config.listen.port() == 0
+            || config.advertise.port() == 0
+            || config.advertise.ip().is_unspecified()
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "peer listen endpoint must be directly reachable",
+                "peer listen port and reachable advertised endpoint are required",
             ));
         }
         let listener = TcpListener::bind(config.listen).await?;
-        let tls = PeerTlsConfig::generate_in_object_store(store, self_id, config.listen)
+        let tls = PeerTlsConfig::generate_in_object_store(store, self_id, config.advertise)
             .await
             .expect("publish peer TLS identity");
         let initial_targets = tls.initial_targets.clone();
+        let membership_changed = Arc::new(membership_changed) as Arc<MembershipChanged>;
+        let initial_members = initial_targets.keys().copied().collect::<Vec<_>>();
+        membership_changed(initial_members.clone());
         Ok(Self::start_configured(
             listener,
             self_id,
             &initial_targets,
             Some(&tls),
             deliver,
+            Some((&membership_changed, &initial_members)),
         ))
     }
 
@@ -755,7 +791,7 @@ impl PeerNet {
             })
             .collect();
         Ok(Self::start_configured(
-            listener, self_id, &targets, None, deliver,
+            listener, self_id, &targets, None, deliver, None,
         ))
     }
 
@@ -765,6 +801,7 @@ impl PeerNet {
         initial_targets: &BTreeMap<HostId, PeerTarget>,
         tls: Option<&PeerTlsConfig>,
         deliver: impl Fn(HostId, PeerMsg) + Send + Sync + 'static,
+        membership_changed: Option<(&Arc<MembershipChanged>, &[HostId])>,
     ) -> Arc<PeerNet> {
         let dropped_sends = Arc::new(AtomicU64::new(0));
         let connections = ConnectionSet::new(self_id, dropped_sends.clone(), tls.cloned());
@@ -785,6 +822,16 @@ impl PeerNet {
                     identities: tls.certificate_identities.clone(),
                     leases: tls.membership_leases.clone(),
                     connections: connections.clone(),
+                    changed: membership_changed
+                        .as_ref()
+                        .expect("TLS membership callback")
+                        .0
+                        .clone(),
+                    last_members: membership_changed
+                        .as_ref()
+                        .expect("TLS membership callback")
+                        .1
+                        .to_vec(),
                 }
                 .run(),
             ));
@@ -1143,6 +1190,7 @@ mod tests {
         let net = PeerNet::start(
             &PeerConfig {
                 listen: addresses[&host],
+                advertise: addresses[&host],
             },
             host,
             store,
@@ -1256,6 +1304,7 @@ mod tests {
         let _b = PeerNet::start(
             &PeerConfig {
                 listen: addresses[1],
+                advertise: addresses[1],
             },
             HostId(1),
             store.clone(),
@@ -1268,6 +1317,7 @@ mod tests {
         let a = PeerNet::start(
             &PeerConfig {
                 listen: addresses[0],
+                advertise: addresses[0],
             },
             HostId(0),
             store.clone(),
@@ -1518,6 +1568,77 @@ mod tests {
         steady.abort();
         after_restart.abort();
         toward_restarting.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quick_restart_renews_membership_without_a_roster_gap() {
+        let (_fake, store) = fake_store().await;
+        let mut addresses = addresses(2);
+        let snapshots = Arc::new(Mutex::new(Vec::<Vec<HostId>>::new()));
+        let observed_snapshots = Arc::clone(&snapshots);
+        let deliveries = DeliveryCounts::default();
+        let delivered = deliveries.clone();
+        let observer = PeerNet::start_with_membership(
+            &PeerConfig {
+                listen: addresses[&HostId(0)],
+                advertise: addresses[&HostId(0)],
+            },
+            HostId(0),
+            store.clone(),
+            move |from, _| delivered.record(from),
+            move |members| {
+                observed_snapshots
+                    .lock()
+                    .expect("membership snapshots lock")
+                    .push(members);
+            },
+        )
+        .await
+        .expect("start observer");
+        let restarting = start_node(HostId(1), &addresses, store.clone()).await;
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if snapshots
+                    .lock()
+                    .expect("membership snapshots lock")
+                    .iter()
+                    .any(|members| members.contains(&HostId(1)))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restarting host admitted");
+        let old_member = stored_member(&store, HostId(1)).await;
+        let admitted_at = snapshots
+            .lock()
+            .expect("membership snapshots lock")
+            .iter()
+            .position(|members| members.contains(&HostId(1)))
+            .expect("admission snapshot");
+
+        drop(restarting);
+        addresses.insert(HostId(1), free_addr());
+        let restarted = start_node(HostId(1), &addresses, store.clone()).await;
+        let new_member = stored_member(&store, HostId(1)).await;
+        assert_ne!(old_member.certificate, new_member.certificate);
+
+        let traffic = spawn_traffic(restarted.net.clone(), HostId(1), HostId(0));
+        wait_for_count(&deliveries, HostId(1), 3).await;
+
+        let roster_history = snapshots.lock().expect("membership snapshots lock").clone();
+        assert!(
+            roster_history[admitted_at..]
+                .iter()
+                .all(|members| members.contains(&HostId(1))),
+            "quick restart must not remove the host from membership: {roster_history:?}"
+        );
+
+        traffic.abort();
+        drop(observer);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1912,9 +2033,11 @@ mod tests {
         let addresses = addresses(2);
         let config_a = PeerConfig {
             listen: addresses[&HostId(0)],
+            advertise: addresses[&HostId(0)],
         };
         let config_b = PeerConfig {
             listen: addresses[&HostId(1)],
+            advertise: addresses[&HostId(1)],
         };
         let (first_send, mut first_receive) = tokio::sync::mpsc::unbounded_channel();
         let first = PeerNet::start_plaintext(

@@ -244,8 +244,14 @@ async fn migration_moves_a_worked_volume_between_real_runtimes_over_tcp() {
         .run_until(async {
             let addr_a = free_addr();
             let addr_b = free_addr();
-            let peer_a = PeerConfig { listen: addr_a };
-            let peer_b = PeerConfig { listen: addr_b };
+            let peer_a = PeerConfig {
+                listen: addr_a,
+                advertise: addr_a,
+            };
+            let peer_b = PeerConfig {
+                listen: addr_b,
+                advertise: addr_b,
+            };
             let test_gcs = support::test_gcs("migrate").await;
             let store = test_gcs.store.clone();
             let a = Runtime::new(&runtime_config("host-a", 0, peer_a), store.clone()).await;

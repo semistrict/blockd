@@ -32,7 +32,10 @@ async fn net(
     peers: BTreeMap<HostId, SocketAddr>,
 ) -> (Arc<PeerNet>, Receiver<(HostId, PeerMsg)>) {
     let (tx, rx) = channel();
-    let config = PeerConfig { listen };
+    let config = PeerConfig {
+        listen,
+        advertise: listen,
+    };
     // The net must know its own roster identity: sender state is seeded
     // for every OTHER roster member, and `connections()` reports exactly
     // those — a bogus self id would leak the host itself into the list.

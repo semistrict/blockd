@@ -11,6 +11,7 @@
 mod actor_host;
 mod blobscan;
 mod capacity;
+pub mod cluster;
 pub mod fakegcs;
 #[cfg(target_os = "linux")]
 pub mod fc;

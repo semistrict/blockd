@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 
 use blockd_core::engine::{HostFatal, HostState, host_actor_with_state};
 use blockd_core::hostmeta::{
-    Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics, ReplicaVolumeMetrics, VolumeOperations,
+    Counters, DaemonStats, HostConfig, ReplicaPlacementConfig, ReplicaSpoolMetrics,
+    ReplicaVolumeMetrics, VolumeOperations,
 };
 use blockd_core::journal::{VolumeConfig, VolumeKind};
+use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{
     AdminCall, AdminEvent, AdminResult, AdminSuccess, PeerMsg, ReqId, Verdict,
 };
@@ -41,6 +43,17 @@ pub struct RuntimeConfig {
     pub daemon: HostConfig,
     pub blob_dir: PathBuf,
     pub peer: Option<PeerConfig>,
+}
+
+fn live_membership_epoch(members: &[HostId]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for member in members {
+        for byte in member.0.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash.max(1)
 }
 
 fn assert_peer_stash_transport(config: VolumeConfig, authenticated: bool) {
@@ -1704,15 +1717,41 @@ impl Runtime {
         let runtime_store = RuntimeStore::new(store);
         let actor_config = config.daemon.clone();
         let peer_input = inputs.peers.clone();
+        let placement_input = inputs.admin.clone();
+        let placement_host = actor_config.host;
+        let placement_authority = actor_config
+            .replica_placement
+            .as_ref()
+            .and_then(|placement| placement.authority);
         let peers = match config.peer.clone() {
             Some(peer_config) => Some(
-                PeerNet::start(
+                PeerNet::start_with_membership(
                     &peer_config,
                     actor_config.host,
                     peer_store,
                     move |from, message| {
                         let lane = peer_lane(&message);
                         let _ = peer_input.push(lane, (from, message));
+                    },
+                    move |members| {
+                        let roster = members
+                            .iter()
+                            .map(|member| PeerCandidate {
+                                host: *member,
+                                weight: 1,
+                                failure_domain: member.0,
+                                drained: false,
+                            })
+                            .collect();
+                        let placement = ReplicaPlacementConfig {
+                            membership_epoch: live_membership_epoch(&members),
+                            local_failure_domain: placement_host.0,
+                            roster,
+                            authority: placement_authority,
+                        };
+                        let (update, _reply) =
+                            request(AdminCall::UpdateReplicaPlacement { placement });
+                        let _ = placement_input.push(Lane::Background, update);
                     },
                 )
                 .await

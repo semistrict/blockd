@@ -220,8 +220,14 @@ impl PeerMsg {
 /// In-process administrative call. Completion is routed by its owned reply
 /// promise; only checkpoint retains a request identity for durable retry
 /// idempotency.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AdminCall {
+    /// Replace the live replica-placement roster. The actor retains prior
+    /// rosters so assignments made before a membership change remain
+    /// authorized while their fenced transition completes.
+    UpdateReplicaPlacement {
+        placement: crate::hostmeta::ReplicaPlacementConfig,
+    },
     CreateVolume {
         volume: VolumeId,
         config: VolumeConfig,
@@ -250,6 +256,7 @@ pub enum AdminCall {
 /// Successful completion of an in-process administrative operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdminSuccess {
+    ReplicaPlacementUpdated,
     VolumeCreated { volume: VolumeId },
     CheckpointDone { volume: VolumeId, epoch: Epoch },
     VolumeRestored { volume: VolumeId, verdict: Verdict },

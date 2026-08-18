@@ -65,28 +65,32 @@ impl<'a, W> ReplicaInbox<'a, W> {
         }
         let authorized = {
             let host = self.state.borrow();
-            let Some(placement) = &host.config.replica_placement else {
-                return false;
-            };
-            let Some(source_domain) = placement
-                .roster
-                .iter()
-                .find(|candidate| candidate.host == source)
-                .map(|candidate| candidate.failure_domain)
-            else {
-                return false;
-            };
             let Ok(index) = usize::try_from(assignment_epoch - 1) else {
                 return false;
             };
-            let candidates = rank_stash_candidates(
-                placement.membership_epoch,
-                source,
-                source_domain,
-                volume,
-                &placement.roster,
-            );
-            !candidates.is_empty() && candidates[index % candidates.len()] == host.config.host
+            host.config
+                .replica_placement
+                .iter()
+                .chain(host.replica_placement_history.iter())
+                .any(|placement| {
+                    let Some(source_domain) = placement
+                        .roster
+                        .iter()
+                        .find(|candidate| candidate.host == source)
+                        .map(|candidate| candidate.failure_domain)
+                    else {
+                        return false;
+                    };
+                    let candidates = rank_stash_candidates(
+                        placement.membership_epoch,
+                        source,
+                        source_domain,
+                        volume,
+                        &placement.roster,
+                    );
+                    !candidates.is_empty()
+                        && candidates[index % candidates.len()] == host.config.host
+                })
         };
         if !authorized {
             return false;

@@ -520,6 +520,44 @@ impl AdminIo for ModelWorld {
 }
 
 #[tokio::test(start_paused = true)]
+async fn live_membership_update_becomes_current_and_retains_prior_authorization() {
+    simulate!(27, async move {
+        let initial = test_replica_placement(HostId(1)).expect("initial placement");
+        let config = DaemonConfig {
+            archive: Default::default(),
+            host: HostId(1),
+            cache_pages: 4,
+            writeback_interval: 5,
+            backup_retry: 5,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: Some(initial.clone()),
+        };
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        let world = Rc::new(ModelWorld::default());
+        let mut updated = initial.clone();
+        updated.membership_epoch = 2;
+        updated.roster.push(crate::placement::PeerCandidate {
+            host: HostId(7),
+            weight: 1,
+            failure_domain: 7,
+            drained: false,
+        });
+        updated.roster.sort_by_key(|candidate| candidate.host);
+        let (update, reply) = request(AdminCall::UpdateReplicaPlacement {
+            placement: updated.clone(),
+        });
+        handle_admin(Rc::clone(&state), world, update).await;
+
+        assert_eq!(reply.await, Ok(Ok(AdminSuccess::ReplicaPlacementUpdated)));
+        let host = state.borrow();
+        assert_eq!(host.config.replica_placement.as_ref(), Some(&updated));
+        assert_eq!(host.replica_placement_history, [initial]);
+    });
+}
+
+#[tokio::test(start_paused = true)]
 async fn child_fatal_signal_reaches_the_root_and_stops_the_actor_tree() {
     simulate!(9, async move {
         let config = DaemonConfig {

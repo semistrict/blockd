@@ -37,7 +37,7 @@ reqwest = { workspace = true, features = ["hickory-dns", "http2", "rustls"] }
 rcgen = { version = "0.14.7", default-features = false, features = ["ring"] }
 rustix = { version = "0.38.44", features = ["fs"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26.4"
 
 [dev-dependencies]
