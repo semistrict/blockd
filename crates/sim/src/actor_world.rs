@@ -1070,9 +1070,18 @@ impl SimWorld {
                 .entry(page)
                 .or_default()
                 .push(send);
+            let wp = {
+                let memory = self.memory.borrow();
+                write && memory.pages.contains_key(&page) && memory.protected.contains(&page)
+            };
             if !paused
                 && self.faults_inflight.borrow_mut().insert(page)
-                && !self.faults.send(GuestFault { page, write })
+                && !self.faults.send(GuestFault {
+                    page,
+                    write,
+                    wp,
+                    minor: false,
+                })
             {
                 self.faults_inflight.borrow_mut().remove(&page);
                 return false;
@@ -2737,7 +2746,12 @@ mod tests {
             },
             page: blockd_core::types::PageNo(3),
         };
-        assert!(world.faults.send(GuestFault { page, write: false }));
+        assert!(world.faults.send(GuestFault {
+            page,
+            write: false,
+            wp: false,
+            minor: false,
+        }));
         let (sync, _reply) = request(GuestSync {
             req: ReqId(7),
             volume: page.volume,

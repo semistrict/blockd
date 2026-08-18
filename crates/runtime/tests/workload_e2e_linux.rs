@@ -83,8 +83,13 @@ async fn checked_in_checkpoint_recovery_matches_deterministic_simulation() {
             sim_config.faults = blockd_sim::harness::FaultPlan::none();
             sim_config.faults.rot_records_at.clear();
             sim_config.faults.crash_at.clear();
-            let simulated = blockd_sim::harness::run_workload(0x53_53, sim_config, spec.clone())
-                .expect("simulated workload");
+            let simulated_spec = spec.clone();
+            let simulated = tokio::task::spawn_blocking(move || {
+                blockd_sim::harness::run_workload(0x53_53, sim_config, simulated_spec)
+            })
+            .await
+            .expect("simulation worker")
+            .expect("simulated workload");
 
             let (roots, [primary, passive_b, passive_c], gcs) =
                 durable_runtime_configs("workload-recovery").await;

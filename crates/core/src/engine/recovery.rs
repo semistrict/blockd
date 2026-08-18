@@ -209,6 +209,7 @@ pub async fn recover_local<W: Blobs>(
         recovered.block_checksums = block_checksums;
         recovered.state_checksum = state_checksum;
         recovered.archived_memory_usable = !matches!(verdict, Verdict::ColdBoot);
+        recovered.archived_non_data_reset = true;
         recovered.pending_tombstones = pending_tombstones;
         recovered.vmm_segments = vmm_segments;
         if let Verdict::Resume { epoch, .. } = verdict {

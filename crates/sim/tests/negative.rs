@@ -20,6 +20,7 @@ fn base_config() -> HarnessConfig {
             wedge_ticks: 25,
             replica_placement: None,
         },
+        passive_disk_capacity: None,
         blobs: BlobDevConfig::nvme(),
         store: StoreConfig::gcs(),
         vset_count: 2,

@@ -12,7 +12,7 @@ use crate::layout;
 use crate::manifest::ObjectRef;
 use crate::segment::{PageLoc, open_entry};
 use crate::types::{Gen, PageId, VsetId, page_size};
-use crate::world::{Blobs, FillSource, GuestMem, Peers, Store};
+use crate::world::{Blobs, FillSource, GuestFault, GuestMem, Peers, Store};
 
 #[derive(Clone, Copy)]
 struct FetchPlan {
@@ -22,10 +22,16 @@ struct FetchPlan {
     retry_delay: u64,
 }
 
-pub async fn serve_fault<W>(state: SharedHost, world: Rc<W>, page: PageId, write: bool)
+pub async fn serve_fault<W>(state: SharedHost, world: Rc<W>, fault: GuestFault)
 where
     W: Blobs + Store + Peers + GuestMem + 'static,
 {
+    let GuestFault {
+        page,
+        write,
+        wp,
+        minor,
+    } = fault;
     let incarnation = {
         let mut host = state.borrow_mut();
         if let Some(vset) = host.vsets.get(&page.volume.vset) {
@@ -48,9 +54,37 @@ where
 
     let resident = state.borrow().cache.is_resident(page);
     if resident {
-        serve_resident_fault(&state, world.as_ref(), page, write, incarnation).await;
+        if minor {
+            serve_resident_minor(&state, world.as_ref(), page, incarnation).await;
+        } else {
+            serve_resident_fault(&state, world.as_ref(), page, write, incarnation).await;
+        }
     } else {
-        serve_missing_fault(state, world, page, write, incarnation).await;
+        serve_missing_fault(state, world, page, write, wp, incarnation).await;
+    }
+}
+
+async fn serve_resident_minor<W: GuestMem>(
+    state: &SharedHost,
+    world: &W,
+    page: PageId,
+    incarnation: u64,
+) {
+    let writable = {
+        let host = state.borrow();
+        let valid = host
+            .vsets
+            .get(&page.volume.vset)
+            .is_some_and(|vset| vset.incarnation == incarnation && vset.ready);
+        valid
+            .then(|| host.cache.is_dirty(page))
+            .filter(|_| host.cache.is_resident(page))
+    };
+    let Some(writable) = writable else {
+        return;
+    };
+    if GuestMem::remap(world, page, writable).await.is_err() {
+        state.borrow_mut().fail("resident guest page remap failed");
     }
 }
 
@@ -125,6 +159,7 @@ async fn serve_missing_fault<W>(
     world: Rc<W>,
     page: PageId,
     write: bool,
+    write_protected: bool,
     incarnation: u64,
 ) where
     W: Blobs + Store + Peers + GuestMem + 'static,
@@ -143,6 +178,7 @@ async fn serve_missing_fault<W>(
         },
         Wait(blockd_exec::channel::OneReceiver<()>),
         Filling(blockd_exec::channel::OneReceiver<bool>),
+        InvalidWriteProtect,
         Gone,
     }
 
@@ -185,6 +221,8 @@ async fn serve_missing_fault<W>(
                         memory,
                         victim: None,
                     }
+                } else if write_protected && shared.is_none() {
+                    Slot::InvalidWriteProtect
                 } else if let Some(victim) = host.cache.reserve_slot() {
                     host.filling_pages.insert(page);
                     if let Some(share) = shared {
@@ -242,10 +280,13 @@ async fn serve_missing_fault<W>(
                         .expect("validated vset")
                         .mutation_seq += 1;
                     host.counters.guest_pages_dirtied += 1;
+                    if write_protected {
+                        host.counters.wp_faults += 1;
+                    }
                     host.schedule_vset(page.volume.vset);
                     host.wake_pressure_waiter();
                 }
-                {
+                if !write_protected {
                     let mut host = state.borrow_mut();
                     host.counters.shared_fills += 1;
                     host.vsets
@@ -257,11 +298,17 @@ async fn serve_missing_fault<W>(
                 if let Some(reservation) = reservation {
                     reservation.commit();
                 }
-                if GuestMem::fill_shared(world.as_ref(), page, share, None, write)
-                    .await
-                    .is_err()
-                {
-                    state.borrow_mut().fail("guest shared-page fill failed");
+                let result = if write_protected {
+                    GuestMem::unprotect(world.as_ref(), page).await
+                } else {
+                    GuestMem::fill_shared(world.as_ref(), page, share, None, write).await
+                };
+                if result.is_err() {
+                    state.borrow_mut().fail(if write_protected {
+                        "guest page unprotect failed"
+                    } else {
+                        "guest shared-page fill failed"
+                    });
                     return;
                 }
                 fill_lease.finish(true);
@@ -275,6 +322,14 @@ async fn serve_missing_fault<W>(
             }
             Slot::Filling(wait) => {
                 let _ = wait.await;
+                return;
+            }
+            Slot::InvalidWriteProtect => {
+                state.borrow_mut().counters.faults_unservable += 1;
+                let _ = GuestMem::fail(world.as_ref(), page).await;
+                state
+                    .borrow_mut()
+                    .fail("write-protect fault on an unmapped page");
                 return;
             }
             Slot::Gone => return,

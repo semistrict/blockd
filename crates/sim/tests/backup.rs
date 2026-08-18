@@ -24,6 +24,7 @@ fn base_config() -> HarnessConfig {
             wedge_ticks: 25,
             replica_placement: None,
         },
+        passive_disk_capacity: None,
         blobs: BlobDevConfig::nvme(),
         store: StoreConfig::gcs(),
         vset_count: 2,
@@ -204,6 +205,7 @@ fn nvme_pressure_reclaims_backed_segments_and_never_corrupts() {
     config.host.cache_pages = 24;
     config.host.disk_capacity = Some(16 * page_size() as u64);
     config.host.disk_headroom = 4 * page_size() as u64;
+    config.passive_disk_capacity = Some(u64::MAX);
     let report = run(14, config);
     assert_clean(&report);
     assert_eq!(report.guest_deaths, 0);

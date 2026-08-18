@@ -6,9 +6,12 @@ use blockd_exec::channel::{OneReceiver, OneSender, oneshot};
 use blockd_exec::inject::{Injector, Lane, injector};
 use blockd_exec::{join2, spawn, yield_now};
 
-use super::cleanup_local;
 use super::state::{CaptureKind, CaptureLease, DrainState, MutationOwner, SharedHost, VsetState};
-use crate::blx::{BlockKey, open_object, replace_state_block};
+use super::{cleanup_local, store_retry};
+use crate::blx::{
+    BlockKey, BlockSpace, EntryKind, NamespaceKind, open_footer, open_object, replace_state_block,
+    state_contribution,
+};
 use crate::format::checksum64;
 use crate::journal::{JournalRecord, MigrationSource, RecordKind, VsetConfig, VsetKind};
 use crate::layout;
@@ -44,6 +47,112 @@ pub(super) fn recovery_files(vset: &VsetState) -> Vec<ObjectRef> {
         .filter(|file| needed_batches.contains(&(file.identity.writer_fence, file.batch_id)))
         .copied()
         .collect()
+}
+
+/// Cold boot discards the archived memory and VMM state without eagerly
+/// reading archive footers during restore. Before the next local capture,
+/// materialize just those footer entries once so their checksum contributions
+/// can be removed and all later generations can supersede them.
+async fn reset_archived_non_data<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+) -> Option<()> {
+    let (incarnation, retry, objects, cached) = {
+        let host = state.borrow();
+        let vset_state = host.vsets.get(&vset)?;
+        if vset_state.archived_non_data_reset {
+            return Some(());
+        }
+        (
+            vset_state.incarnation,
+            host.config.backup_retry,
+            vset_state.archive_objects.clone(),
+            vset_state.archive_footers.clone(),
+        )
+    };
+    let mut footers = cached;
+    for object in &objects {
+        if object.first_key.space == BlockSpace::Data && object.last_key.space == BlockSpace::Data {
+            continue;
+        }
+        if footers.contains_key(&object.identity) {
+            continue;
+        }
+        let bytes = store_retry::get_range(
+            state,
+            world,
+            &object.identity.store_key(),
+            u64::from(object.footer_offset),
+            u64::from(object.footer_length),
+            retry,
+        )
+        .await
+        .ok()??
+        .1;
+        let footer = open_footer(&bytes).ok()?;
+        let valid = footer.entries.first().is_some_and(|entry| {
+            entry.key == object.first_key
+                && footer
+                    .entries
+                    .last()
+                    .is_some_and(|last| last.key == object.last_key)
+        }) && footer.entries.iter().all(|entry| {
+            entry
+                .offset
+                .checked_add(entry.length)
+                .is_some_and(|end| end <= object.footer_offset)
+        });
+        if !valid {
+            return None;
+        }
+        footers.insert(object.identity, footer);
+    }
+
+    let mut winners = BTreeMap::new();
+    for object in &objects {
+        let Some(footer) = footers.get(&object.identity) else {
+            continue;
+        };
+        let own = object.identity.namespace_kind == NamespaceKind::Vset
+            && object.identity.namespace_id == vset.0;
+        for entry in footer
+            .entries
+            .iter()
+            .filter(|entry| entry.key.space != BlockSpace::Data)
+        {
+            let replace = winners.get(&entry.key).is_none_or(
+                |(old_entry, old_own, old_object): &(crate::blx::FooterEntry, bool, ObjectRef)| {
+                    (entry.generation, own, object.identity)
+                        > (old_entry.generation, *old_own, old_object.identity)
+                },
+            );
+            if replace {
+                winners.insert(entry.key, (*entry, own, *object));
+            }
+        }
+    }
+
+    let mut host = state.borrow_mut();
+    let vset_state = host
+        .vsets
+        .get_mut(&vset)
+        .filter(|vset_state| vset_state.incarnation == incarnation)?;
+    if vset_state.archived_non_data_reset {
+        return Some(());
+    }
+    for (key, (entry, _, _)) in winners {
+        vset_state.next_gen = vset_state
+            .next_gen
+            .max(entry.generation.0.saturating_add(1));
+        if entry.kind == EntryKind::Data {
+            vset_state.state_checksum ^=
+                state_contribution(key, entry.generation, entry.value_checksum);
+        }
+    }
+    vset_state.archive_footers = footers;
+    vset_state.archived_non_data_reset = true;
+    Some(())
 }
 
 #[derive(Clone)]
@@ -571,6 +680,13 @@ where
             }
         });
     let capture_owner = MutationOwner::Capture(capture_kind);
+    reset_archived_non_data(&state, world.as_ref(), vset).await?;
+    let complete_memory_snapshot = checkpoint.is_some()
+        && state
+            .borrow()
+            .vsets
+            .get(&vset)
+            .is_some_and(|vset_state| !vset_state.archived_memory_usable);
     let prepared_compaction = prepare_compaction(&state, world.as_ref(), vset).await;
     let (
         incarnation,
@@ -578,6 +694,7 @@ where
         capture_seq,
         fence,
         pages,
+        flushed_pages,
         protect,
         first_seg,
         compact_victims,
@@ -636,7 +753,19 @@ where
             return None;
         }
         let incarnation = vset_state.incarnation;
-        let pages = host.cache.unstable_pages_of(vset);
+        let flushed_pages = host.cache.unstable_pages_of(vset);
+        let mut pages = flushed_pages.iter().copied().collect::<BTreeSet<_>>();
+        if complete_memory_snapshot {
+            let memory = crate::types::VolumeId {
+                vset,
+                idx: crate::types::VolumeIdx(0),
+            };
+            pages.extend((0..vset_state.config.pages_per_volume).map(|page| PageId {
+                volume: memory,
+                page: crate::types::PageNo(page),
+            }));
+        }
+        let pages = pages.into_iter().collect::<Vec<_>>();
         let protect = host.cache.dirty_pages_of(vset);
         let (seq, capture_seq, first_seg, fence, pending_tombstones) = {
             let vset_state = host.vsets.get_mut(&vset).expect("just observed");
@@ -698,7 +827,7 @@ where
                 pending_tombstones,
             )
         };
-        for &page in &pages {
+        for &page in &flushed_pages {
             host.cache.begin_flush(page);
         }
         (
@@ -707,6 +836,7 @@ where
             capture_seq,
             fence,
             pages,
+            flushed_pages,
             protect,
             first_seg,
             compact_victims,
@@ -902,7 +1032,7 @@ where
     }
 
     let segment_blobs = builder.finish();
-    let flushed_pages = pages.iter().copied().collect::<BTreeSet<_>>();
+    let flushed_pages = flushed_pages.into_iter().collect::<BTreeSet<_>>();
     for (segment, bytes, entries) in &segment_blobs {
         let name = layout::segment_blob(vset, fence, *segment);
         if !state
@@ -1025,6 +1155,9 @@ where
             .get_mut(&vset)
             .filter(|state| state.incarnation == incarnation)?;
         vset_state.best_record = Some(record.clone());
+        if complete_memory_snapshot {
+            vset_state.archived_memory_usable = true;
+        }
         for (key, _) in &pending_tombstones {
             vset_state.pending_tombstones.remove(key);
         }

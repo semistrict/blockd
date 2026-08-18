@@ -290,6 +290,14 @@ mod tests {
         let published = HeadRecord::decode(vset, &head_bytes).expect("head");
         assert_eq!(published.holder, HostId(2));
         assert_eq!(published.manifest.expect("manifest").fence, 2);
+        assert_eq!(published.stash, None);
+        assert_eq!(published.retired_stashes.len(), 1);
+        assert_eq!(published.retired_stashes[0].peer, export.source_peer);
+        assert_eq!(
+            published.retired_stashes[0].assignment_epoch,
+            export.assignment_epoch
+        );
+        assert_eq!(published.retired_stashes[0].through, export.info);
         assert!(
             target
                 .join(layout::journal_blob(vset, 2, record.seq))

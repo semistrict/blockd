@@ -937,12 +937,14 @@ fn aggregate_histograms<'a>(
             buckets: vec![0; LATENCY_BUCKETS_NS.len()],
             count: 0,
             sum_ns: 0,
+            max_ns: 0,
         });
         for (total, value) in entry.buckets.iter_mut().zip(&histogram.buckets) {
             *total += value;
         }
         entry.count += histogram.count;
         entry.sum_ns += histogram.sum_ns;
+        entry.max_ns = entry.max_ns.max(histogram.max_ns);
     }
     aggregate
 }
@@ -1206,6 +1208,7 @@ mod tests {
                     buckets: vec![1; LATENCY_BUCKETS_NS.len()],
                     count: 1,
                     sum_ns: 5_000,
+                    max_ns: 5_000,
                 },
             }],
             operation_latency: Vec::new(),
@@ -1265,6 +1268,7 @@ mod tests {
                     buckets: vec![1; LATENCY_BUCKETS_NS.len()],
                     count: 1,
                     sum_ns: 1_000_000_000,
+                    max_ns: 1_000_000_000,
                 },
             },
             FaultLatency {
@@ -1274,6 +1278,7 @@ mod tests {
                     buckets: vec![2; LATENCY_BUCKETS_NS.len()],
                     count: 2,
                     sum_ns: 2_000_000_000,
+                    max_ns: 1_000_000_000,
                 },
             },
         ];

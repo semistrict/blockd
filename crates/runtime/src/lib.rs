@@ -24,7 +24,7 @@ mod store;
 pub mod world;
 
 #[cfg(target_os = "linux")]
-pub use actor_host::{Runtime, RuntimeConfig};
+pub use actor_host::{GuestAccess, GuestOperation, Runtime, RuntimeConfig};
 pub use blobscan::scan_blob_dir;
 pub use capacity::{
     CapacityController, CapacityInputs, CapacityReason, CapacitySignal, CapacityState,
@@ -33,7 +33,8 @@ pub use gcs::{GcsConfig, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
 pub use loopstats::LoopStats;
 pub use metrics::{
-    AtomicHistogram, FaultLatency, HistogramSnapshot, LATENCY_BUCKETS_NS, LatencySeries,
+    AtomicHistogram, FaultLatency, FaultReaderMetrics, FaultWorkMetrics, HistogramSnapshot,
+    LATENCY_BUCKETS_NS, LatencySeries, TimingSeries,
 };
 pub use peer::{PeerConfig, PeerNet};
 pub use replica_recovery::{

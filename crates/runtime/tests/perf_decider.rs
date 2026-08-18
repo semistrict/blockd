@@ -30,6 +30,7 @@ fn config(vsets: u16, pages: u32) -> HarnessConfig {
             wedge_ticks: 500,
             replica_placement: None,
         },
+        passive_disk_capacity: None,
         blobs: BlobDevConfig {
             read_latency_min: 1,
             read_latency_max: 1,

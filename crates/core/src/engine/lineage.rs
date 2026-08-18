@@ -254,6 +254,7 @@ where
         vset_state.mutation_seq = base_manifest.capture_seq;
         vset_state.state_checksum = base_manifest.post_state_checksum;
         vset_state.archived_memory_usable = !matches!(verdict, Verdict::ColdBoot);
+        vset_state.archived_non_data_reset = !matches!(verdict, Verdict::ColdBoot);
         vset_state.archive_base = Some(root.as_base_ref());
         vset_state
             .archive_objects

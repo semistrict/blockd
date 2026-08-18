@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -87,9 +88,13 @@ async fn durable_cluster(
 }
 
 fn page(volume: u8, number: u32) -> PageId {
+    vset_page(VSET, volume, number)
+}
+
+fn vset_page(vset: VsetId, volume: u8, number: u32) -> PageId {
     PageId {
         volume: VolumeId {
-            vset: VSET,
+            vset,
             idx: VolumeIdx(volume),
         },
         page: PageNo(number),
@@ -97,8 +102,157 @@ fn page(volume: u8, number: u32) -> PageId {
 }
 
 async fn read_word(runtime: &Runtime, page: PageId) -> u64 {
-    let bytes = runtime.guest_read(VSET, page).await;
+    let bytes = runtime.guest_read(page.volume.vset, page).await;
     u64::from_ne_bytes(bytes[..8].try_into().expect("word"))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forked_shared_page_read_then_write_diverges_and_refaults() {
+    support::local(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (_addresses, roots, _gcs, mut runtimes) = durable_cluster("fork-write", 8).await;
+            let primary = runtimes[0].take().expect("primary");
+            let config = VsetConfig::compute(1, 32);
+            let child = VsetId(2);
+            let inherited = vset_page(VSET, 1, 0);
+            let child_page = vset_page(child, 1, 0);
+            let parent_value = 0x1111_2222_3333_4444;
+            let child_value = 0xaaaa_bbbb_cccc_dddd;
+
+            primary.create_vset(VSET, config).await;
+            primary.guest_write(VSET, inherited, parent_value).await;
+            assert_eq!(primary.checkpoint(VSET).await, 1);
+            primary.keep_base(VSET, 700).await;
+            assert!(matches!(
+                primary.fork_vset(child, config, 700).await,
+                Verdict::Resume { .. }
+            ));
+
+            assert_eq!(read_word(&primary, child_page).await, parent_value);
+            primary.guest_write(child, child_page, child_value).await;
+            assert_eq!(read_word(&primary, inherited).await, parent_value);
+            assert_eq!(read_word(&primary, child_page).await, child_value);
+            assert_eq!(primary.checkpoint(child).await, 1);
+
+            for number in 1..24 {
+                primary
+                    .guest_write(child, vset_page(child, 1, number), u64::from(number))
+                    .await;
+                if number % 4 == 0 {
+                    assert!(primary.guest_sync(child, VolumeIdx(1)).await);
+                }
+            }
+            assert!(primary.guest_sync(child, VolumeIdx(1)).await);
+            assert_eq!(read_word(&primary, inherited).await, parent_value);
+            assert_eq!(read_word(&primary, child_page).await, child_value);
+            assert!(primary.incidents().is_empty());
+
+            drop(primary);
+            drop(runtimes);
+            for root in roots {
+                std::fs::remove_dir_all(root).expect("cleanup root");
+            }
+        })
+        .await
+        .expect("fork read-write regression completed");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persistent_guest_page_read_refaults_after_backing_eviction() {
+    support::local(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (_addresses, roots, _gcs, mut runtimes) =
+                durable_cluster("persistent-page-refault", 1).await;
+            let primary = runtimes[0].take().expect("primary");
+            let config = VsetConfig::compute(1, 4);
+            let evicted = page(1, 0);
+            let replacement = page(1, 1);
+            let expected = 0x1234_5678_9abc_def0;
+
+            primary.create_vset(VSET, config).await;
+            primary.guest_write(VSET, evicted, expected).await;
+            assert!(primary.guest_sync(VSET, VolumeIdx(1)).await);
+
+            // With a one-page cache, faulting this page must evict and punch
+            // the durable first page's backing before the persistent access.
+            primary
+                .guest_write(VSET, replacement, 0xfedc_ba98_7654_3210)
+                .await;
+
+            let guest = primary.guest_access(VSET);
+            let bytes = tokio::task::spawn_blocking(move || {
+                let operation = guest.try_begin().expect("guest operation starts");
+                operation.read_page(evicted)
+            })
+            .await
+            .expect("guest read worker");
+            assert_eq!(
+                u64::from_ne_bytes(bytes[..8].try_into().expect("word")),
+                expected
+            );
+            assert!(primary.incidents().is_empty());
+
+            drop(primary);
+            drop(runtimes);
+            for root in roots {
+                std::fs::remove_dir_all(root).expect("cleanup root");
+            }
+        })
+        .await
+        .expect("persistent guest page refault completed");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn four_vsets_complete_concurrent_cold_faults_with_balanced_delivery() {
+    support::local(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (_addresses, roots, _gcs, mut runtimes) =
+                durable_cluster("fault-progress", 2_048).await;
+            let primary = Arc::new(runtimes[0].take().expect("primary"));
+            let config = VsetConfig::compute(1, 256);
+            for number in 1..=4 {
+                primary.create_vset(VsetId(number), config).await;
+            }
+
+            let mut workers = tokio::task::JoinSet::new();
+            for number in 1..=4 {
+                let runtime = Arc::clone(&primary);
+                workers.spawn(async move {
+                    let vset = VsetId(number);
+                    for page_number in 0..256 {
+                        let page = vset_page(vset, 1, page_number);
+                        let value = (number << 32) | u64::from(page_number);
+                        runtime.guest_write(vset, page, value).await;
+                        assert_eq!(read_word(&runtime, page).await, value);
+                    }
+                });
+            }
+            while let Some(result) = workers.join_next().await {
+                result.expect("cold-fault worker");
+            }
+
+            let reader = primary.fault_reader_metrics();
+            assert_eq!(reader.readers_started, 4);
+            assert_eq!(reader.readers_exited, 0);
+            assert_eq!(reader.events_read, reader.events_injected);
+            assert_eq!(reader.terminal_errors, 0);
+            assert_eq!(reader.injection_failures, 0);
+            assert!(primary.incidents().is_empty());
+
+            drop(primary);
+            drop(runtimes);
+            for root in roots {
+                std::fs::remove_dir_all(root).expect("cleanup root");
+            }
+        })
+        .await
+        .expect("concurrent cold faults completed");
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -252,6 +406,9 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         &support::three_host_runtime_config(2, roots[2].clone(), addresses),
         store.clone(),
     ).await;
+    for runtime in [&a, &b, &c] {
+        support::wait_for_peer_membership(runtime, 2).await;
+    }
     let config = VsetConfig {
         kind: blockd_core::journal::VsetKind::Compute,
         disk_volumes: 1,
@@ -345,13 +502,30 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         }
         assert!(
             Instant::now() < deadline,
-            "peer spool was not released: passive={:?} spools={:?} connections={:?} dropped={} incidents={:?}",
+            "peer spool was not released: passive={:?} passive_counters={:?} passive_connections={:?} passive_dropped={} spools={:?} recovered_replica={:?} recovered_counters={:?} connections={:?} dropped={} incidents={:?}",
             if active == HostId(1) {
                 b.replica_spool_metrics()
             } else {
                 c.replica_spool_metrics()
             },
+            if active == HostId(1) {
+                b.counters()
+            } else {
+                c.counters()
+            },
+            if active == HostId(1) {
+                b.peer_connections()
+            } else {
+                c.peer_connections()
+            },
+            if active == HostId(1) {
+                b.peer_dropped_sends()
+            } else {
+                c.peer_dropped_sends()
+            },
             spool_files(active_root, HostId(0), VSET),
+            recovered.replica_metrics(),
+            recovered.counters(),
             recovered.peer_connections(),
             recovered.peer_dropped_sends(),
             recovered.incidents(),
@@ -411,6 +585,9 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             disk_volumes: 1,
             pages_per_volume: 8,
         };
+        for runtime in &runtimes {
+            support::wait_for_peer_membership(runtime.as_ref().expect("runtime"), 2).await;
+        }
         let primary = runtimes[0].as_ref().expect("primary");
         primary.create_vset(VSET, config).await;
         let (_, initial_head_bytes) = store
@@ -525,14 +702,35 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
                 .as_ref()
                 .expect("replacement runtime")
                 .counters();
+            let release_head = store
+                .clone()
+                .get(layout::head_key(VSET))
+                .await
+                .expect("release head get")
+                .and_then(|(_, bytes)| HeadRecord::decode(VSET, &bytes).ok());
+            let release_cleared = release_head.as_ref().is_some_and(|head| {
+                    head.retired_stashes.iter().all(|retired| {
+                        (retired.peer, retired.assignment_epoch)
+                            != (replacement, export.assignment_epoch)
+                    })
+                });
             if spool_files(replacement_root, HostId(0), VSET).is_empty()
                 && replacement_counters.replica_unlinks > 0
+                && release_cleared
             {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "replacement spool was not released"
+                "replacement release did not finish: spools={:?} replacement_counters={:?} head={:?} recovered_counters={:?} recovered_replica={:?} connections={:?} dropped={} incidents={:?}",
+                spool_files(replacement_root, HostId(0), VSET),
+                replacement_counters,
+                release_head,
+                recovered.counters(),
+                recovered.replica_metrics(),
+                recovered.peer_connections(),
+                recovered.peer_dropped_sends(),
+                recovered.incidents(),
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -542,6 +740,17 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             .counters();
         assert!(replacement_counters.replica_unlinks > 0);
         assert_eq!(replacement_counters.replica_cleanup_rewrite_bytes, 0);
+        let (_, released_head_bytes) = store
+            .clone()
+            .get(layout::head_key(VSET))
+            .await
+            .expect("released head get")
+            .expect("released head");
+        let released_head =
+            HeadRecord::decode(VSET, &released_head_bytes).expect("valid released head");
+        assert!(released_head.retired_stashes.iter().all(|retired| {
+            (retired.peer, retired.assignment_epoch) != (replacement, export.assignment_epoch)
+        }));
         assert!(recovered.incidents().is_empty());
 
         drop(recovered);

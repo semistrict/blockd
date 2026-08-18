@@ -4,13 +4,13 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::journal::VsetConfig;
+use blockd_core::layout;
 use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, VolumeIdx, VsetId, millis};
@@ -188,7 +188,7 @@ impl Backend for MigrationBackend<'_> {
     }
 }
 
-fn files_under(dir: &std::path::Path) -> usize {
+fn primary_files_under(base: &std::path::Path, dir: &std::path::Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -196,7 +196,18 @@ fn files_under(dir: &std::path::Path) -> usize {
         .flatten()
         .map(|e| {
             let path = e.path();
-            if path.is_dir() { files_under(&path) } else { 1 }
+            if path.is_dir() {
+                primary_files_under(base, &path)
+            } else {
+                usize::from(
+                    path.strip_prefix(base)
+                        .ok()
+                        .and_then(|relative| {
+                            layout::parse_blob(relative.to_string_lossy().as_ref())
+                        })
+                        .is_none_or(|blob| !matches!(blob, layout::BlobName::ReplicaSpool { .. })),
+                )
+            }
         })
         .sum()
 }
@@ -204,7 +215,8 @@ fn files_under(dir: &std::path::Path) -> usize {
 /// A worked vset moves from host A to host B over TCP: verdict
 /// resumes on B, the same workload continues there, EVERY disk byte
 /// verifies on B (demand fetches over the wire), hydration drains the
-/// tail, the source releases and reclaims to zero blobs.
+/// tail, and the source releases and reclaims all primary-local blobs. The
+/// former source may immediately hold a passive spool for the new primary.
 #[tokio::test(flavor = "current_thread")]
 async fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
     tokio::task::LocalSet::new()
@@ -234,10 +246,12 @@ async fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
             assert_eq!(backend.migrations, outcome.migrations);
 
             // Hydration drains the tail without the guest's help; the destination
-            // releases the source, and the source reclaims the vset to NOTHING.
+            // releases the source, and the source reclaims every primary-local
+            // file. A replica spool for the new primary is independent passive
+            // durability and must survive this cleanup.
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
-                let blobs = files_under(a.blob_dir());
+                let blobs = primary_files_under(a.blob_dir(), a.blob_dir());
                 if blobs == 0 {
                     break;
                 }
@@ -263,16 +277,23 @@ async fn migration_moves_a_worked_vset_between_real_runtimes_over_tcp() {
             assert_eq!(b.incidents(), Vec::<String>::new());
             // The wire really carried the drain. Foreground demand may win the race
             // with background hydration, so either path is valid post-copy progress.
-            let peer_faults = b
-                .fault_latency()
-                .into_iter()
-                .filter(|series| series.vset == VSET && series.source == "peer")
-                .map(|series| series.histogram.count)
-                .sum::<u64>();
-            assert!(
-                b.counters().hydrate_fills + peer_faults > 0,
-                "no post-copy page crossed the peer wire"
-            );
+            let observation_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let peer_faults = b
+                    .fault_latency()
+                    .into_iter()
+                    .filter(|series| series.vset == VSET && series.source == "peer")
+                    .map(|series| series.histogram.count)
+                    .sum::<u64>();
+                if b.counters().hydrate_fills + peer_faults > 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < observation_deadline,
+                    "no post-copy page crossed the peer wire"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert!(
                 test_gcs.fake.request_count() > 0,
                 "migration must retain the store recovery path"

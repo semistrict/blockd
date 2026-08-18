@@ -70,6 +70,10 @@ impl From<StoreFault> for StoreError {
 pub struct GuestFault {
     pub page: PageId,
     pub write: bool,
+    /// The kernel trapped a write to an already-mapped write-protected page.
+    pub wp: bool,
+    /// The backing shmem page exists but is not mapped in this guest view.
+    pub minor: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +175,13 @@ pub trait GuestMem {
         bytes: Option<Vec<u8>>,
         writable: bool,
     ) -> Result<(), GuestMemoryError>;
+    /// Continue a minor fault for a page whose shared backing is already
+    /// resident. Production can remap it without copying; deterministic
+    /// worlds use the equivalent read-and-fill default.
+    async fn remap(&self, page: PageId, writable: bool) -> Result<(), GuestMemoryError> {
+        let bytes = self.read_page(page).await;
+        self.fill(page, bytes, writable, FillSource::Local).await
+    }
     async fn fail(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn unprotect(&self, page: PageId) -> Result<(), GuestMemoryError>;
     async fn evict(&self, page: PageId) -> Result<(), GuestMemoryError>;

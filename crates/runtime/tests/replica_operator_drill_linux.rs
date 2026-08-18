@@ -55,6 +55,9 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
             let a = Runtime::new(&configs[0], store(&endpoint, &prefix)).await;
             let b = Runtime::new(&configs[1], store(&endpoint, &prefix)).await;
             let c = Runtime::new(&configs[2], store(&endpoint, &prefix)).await;
+            for runtime in [&a, &b, &c] {
+                support::wait_for_peer_membership(runtime, 2).await;
+            }
             let vset_config = VsetConfig {
                 kind: blockd_core::journal::VsetKind::Compute,
                 disk_volumes: 1,

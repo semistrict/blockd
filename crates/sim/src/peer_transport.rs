@@ -20,7 +20,7 @@ const PEER_PORT: u16 = 1738;
 const SEND_QUEUE: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_secs(10_000);
 const CONNECTION_LINGER: Duration = Duration::new(100, 1_000_000);
-const MAX_IN_FLIGHT: usize = 64;
+pub(crate) const MAX_IN_FLIGHT: usize = 64;
 
 pub struct PeerTransport {
     self_id: HostId,

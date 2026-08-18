@@ -435,6 +435,7 @@ impl Scenario {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(HarnessConfig {
             host: common.daemon,
+            passive_disk_capacity: None,
             blobs: common.bdev,
             store: common.store,
             vset_count: common.vset_count,

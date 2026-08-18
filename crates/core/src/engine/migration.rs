@@ -1625,6 +1625,7 @@ where
                     .pending_tombstones
                     .clone_from(&vset_state.pending_tombstones);
                 staged.archived_memory_usable = vset_state.archived_memory_usable;
+                staged.archived_non_data_reset = vset_state.archived_non_data_reset;
                 staged.segment_refs = vset_state.segment_refs.clone();
                 staged.vmm_segments.clone_from(&vset_state.vmm_segments);
                 staged

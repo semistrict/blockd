@@ -291,7 +291,7 @@ where
                         fence,
                         manifest: head.manifest,
                         stash: Some(stash),
-                        retired_stashes: Vec::new(),
+                        retired_stashes: head.retired_stashes.clone(),
                     };
                     match Store::put_cas(
                         world.as_ref(),
@@ -331,7 +331,9 @@ where
                                         .insert((manifest.fence, manifest.seq));
                                 }
                                 vset_state.stash_assignment = upgraded.stash;
-                                vset_state.retired_stashes.clear();
+                                vset_state
+                                    .retired_stashes
+                                    .clone_from(&upgraded.retired_stashes);
                                 if vset_state.outbound.is_some() {
                                     None
                                 } else {

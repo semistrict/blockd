@@ -162,35 +162,119 @@ where
                             (retired.peer, retired.assignment_epoch, retired.through)
                                 == (from, assignment_epoch, through)
                         })
-                        .map(|retired| {
-                            (
-                                vset_state.incarnation,
-                                vset_state.stash_assignment,
-                                retired,
-                                vset_state
-                                    .retired_stashes
-                                    .iter()
-                                    .copied()
-                                    .filter(|entry| *entry != retired)
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
+                        .map(|retired| (vset_state.incarnation, retired))
                 })
             };
-            if let Some((incarnation, Some(assignment), _retired, remaining)) = retired {
-                let _ = cas_assignment(
-                    &state,
-                    world,
-                    vset,
-                    incarnation,
-                    assignment,
-                    remaining,
-                    None,
-                )
-                .await;
+            if let Some((incarnation, retired)) = retired {
+                let _ = remove_retired_stash(&state, world, vset, incarnation, retired).await;
             }
         }
         _ => unreachable!("non-replica message"),
+    }
+}
+
+async fn remove_retired_stash<W>(
+    state: &SharedHost,
+    world: &W,
+    vset: VsetId,
+    incarnation: u64,
+    retired: RetiredStash,
+) -> bool
+where
+    W: Store + AdminIo,
+{
+    let retry = state.borrow().config.backup_retry;
+    loop {
+        let Some((expected, head)) = (|| {
+            let host = state.borrow();
+            let vset_state = host
+                .vsets
+                .get(&vset)
+                .filter(|vset_state| vset_state.incarnation == incarnation)?;
+            if !vset_state.retired_stashes.contains(&retired) {
+                return Some((None, None));
+            }
+            let remaining = vset_state
+                .retired_stashes
+                .iter()
+                .copied()
+                .filter(|entry| *entry != retired)
+                .collect();
+            Some((
+                Some(vset_state.head_version?),
+                Some(HeadRecord {
+                    vset,
+                    holder: host.config.host,
+                    fence: vset_state.fence,
+                    manifest: vset_state.backed,
+                    stash: vset_state.stash_assignment,
+                    retired_stashes: remaining,
+                }),
+            ))
+        })() else {
+            return false;
+        };
+        let (Some(expected), Some(head)) = (expected, head) else {
+            return true;
+        };
+        let result =
+            Store::put_cas(world, layout::head_key(vset), Some(expected), head.encode()).await;
+        if let Ok(version) = result
+            && !fault_point(FaultPoint::StoreUnknownResult)
+        {
+            let mut host = state.borrow_mut();
+            let Some(vset_state) = host
+                .vsets
+                .get_mut(&vset)
+                .filter(|vset_state| vset_state.incarnation == incarnation)
+            else {
+                return false;
+            };
+            vset_state.head_version = Some(version);
+            vset_state.retired_stashes.clone_from(&head.retired_stashes);
+            return true;
+        }
+        if matches!(result, Err(StoreError::TooLarge)) {
+            return false;
+        }
+        state.borrow_mut().counters.store_retries += 1;
+        let (version, bytes) = loop {
+            match Store::get(world, &layout::head_key(vset)).await {
+                Ok(Some(found)) => break found,
+                Err(StoreError::Fault(crate::protocol::StoreFault::Unavailable)) => {
+                    delay(retry).await;
+                }
+                Ok(None)
+                | Err(
+                    StoreError::TooLarge
+                    | StoreError::Fault(crate::protocol::StoreFault::CasConflict { .. }),
+                ) => return false,
+            }
+        };
+        let Ok(found) = HeadRecord::decode(vset, &bytes) else {
+            return false;
+        };
+        let local = state.borrow().config.host;
+        let Some(fence) = state
+            .borrow()
+            .vsets
+            .get(&vset)
+            .filter(|vset_state| vset_state.incarnation == incarnation)
+            .map(|vset_state| vset_state.fence)
+        else {
+            return false;
+        };
+        if found.holder != local || found.fence != fence {
+            state.borrow_mut().fail("replica release cleanup fenced");
+            return false;
+        }
+        let removed = !found.retired_stashes.contains(&retired);
+        if !adopt_assignment_from_head(state, vset, incarnation, version, found) {
+            return false;
+        }
+        if removed {
+            return true;
+        }
     }
 }
 

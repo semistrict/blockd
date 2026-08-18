@@ -503,7 +503,13 @@ impl HostState {
                 }
             })
             .collect::<Vec<_>>();
-        let (live_segment_bytes, local_segment_bytes) = self.seg_space();
+        let (live_segment_bytes, local_segment_bytes) =
+            vsets.iter().fold((0_u64, 0_u64), |(live, local), vset| {
+                (
+                    live.saturating_add(vset.live_segment_bytes),
+                    local.saturating_add(vset.local_segment_bytes),
+                )
+            });
         DaemonStats {
             cache_capacity_pages: self.cache.capacity(),
             resident_pages: self.cache.resident_count(),
@@ -889,6 +895,9 @@ pub struct VsetState {
     /// A running VM may refault archived memory, but a VM recovered by cold
     /// boot must never see memory from before that boot.
     pub archived_memory_usable: bool,
+    /// Whether the pre-cold-boot memory and VMM checksum contributions have
+    /// been removed from the running logical state.
+    pub archived_non_data_reset: bool,
     /// Local BLX files containing deletion markers remain part of the
     /// unpublished change set until the archive has published them.
     pub tombstone_segments: BTreeSet<(u64, SegId)>,
@@ -948,6 +957,7 @@ impl VsetState {
             archive_footers: BTreeMap::new(),
             archive_resolved_pages: BTreeSet::new(),
             archived_memory_usable: true,
+            archived_non_data_reset: true,
             tombstone_segments: BTreeSet::new(),
             backed_segments: BTreeSet::new(),
             replicating_segments: BTreeSet::new(),

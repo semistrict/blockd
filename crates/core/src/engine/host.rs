@@ -197,17 +197,29 @@ fn work_ready(host: &super::HostState, vset: crate::types::VsetId) -> Vec<Schedu
             seq: record.seq,
             sync_covered_through: record.sync_covered_through,
         };
-        vset_state.peer_committed.is_none_or(|committed| {
+        let published_covers = vset_state.peer_published.is_some_and(|published| {
             (
-                committed.writer_fence,
-                committed.seq,
-                committed.sync_covered_through,
-            ) < (
+                published.writer_fence,
+                published.seq,
+                published.sync_covered_through,
+            ) >= (
                 required.writer_fence,
                 required.seq,
                 required.sync_covered_through,
             )
-        })
+        });
+        !published_covers
+            && vset_state.peer_committed.is_none_or(|committed| {
+                (
+                    committed.writer_fence,
+                    committed.seq,
+                    committed.sync_covered_through,
+                ) < (
+                    required.writer_fence,
+                    required.seq,
+                    required.sync_covered_through,
+                )
+            })
     });
     if vset_state.ready
         && !vset_state.operations.replication_running()
@@ -473,11 +485,14 @@ async fn fault_source<W: HostWorld>(state: SharedHost, world: Rc<W>) {
     let (completed, mut completions) = unbounded();
     let mut active = 0usize;
     loop {
+        while completions.try_recv().is_ok() {
+            active = active.checked_sub(1).expect("fault child completed");
+        }
         if active == FAULT_CONCURRENCY {
             if completions.recv().await.is_none() {
                 return;
             }
-            active -= 1;
+            active = active.checked_sub(1).expect("fault child completed");
             continue;
         }
         let Some(fault) = GuestMem::next_fault(world.as_ref()).await else {
@@ -488,7 +503,7 @@ async fn fault_source<W: HostWorld>(state: SharedHost, world: Rc<W>) {
         let completed = completed.clone();
         faults.spawn(async move {
             if state.borrow().vset_authorized(fault.page.volume.vset) {
-                serve_fault(state, world, fault.page, fault.write).await;
+                serve_fault(state, world, fault).await;
             } else {
                 let _ = GuestMem::fail(world.as_ref(), fault.page).await;
             }
@@ -783,6 +798,7 @@ mod tests {
         peer_outbox: RefCell<Vec<(HostId, PeerMsg)>>,
         peer_send_delay: Cell<u64>,
         unprotected: RefCell<Vec<PageId>>,
+        remapped: RefCell<Vec<(PageId, bool)>>,
         writes_after_unprotect: RefCell<BTreeMap<PageId, Vec<u8>>>,
         host_failures: RefCell<Vec<HostFatal>>,
     }
@@ -1069,6 +1085,11 @@ mod tests {
             }
             let bytes = self.shared_pages.borrow()[&share].clone();
             self.memory.borrow_mut().insert(page, bytes);
+            Ok(())
+        }
+
+        async fn remap(&self, page: PageId, writable: bool) -> Result<(), GuestMemoryError> {
+            self.remapped.borrow_mut().push((page, writable));
             Ok(())
         }
 
@@ -1670,6 +1691,8 @@ mod tests {
                             page: PageNo(0),
                         },
                         write: false,
+                        wp: false,
+                        minor: false,
                     });
                 }
             }
@@ -2346,6 +2369,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn published_record_is_not_replicated_again_until_local_state_advances() {
+        let vset = VsetId(129);
+        let config = VsetConfig::compute(1, 8);
+        let mut host = HostState::new(DaemonConfig {
+            archive: Default::default(),
+            host: HostId(1),
+            cache_pages: 4,
+            writeback_interval: 1_000,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            replica_placement: test_replica_placement(HostId(1)),
+        });
+        host.insert_fresh(vset, config);
+        let record = JournalRecord {
+            config,
+            seq: crate::types::JournalSeq(1),
+            fence: 4,
+            kind: RecordKind::Commit,
+            capture_seq: 1,
+            sync_covered_through: 1,
+            post_state_checksum: 0,
+            files: Vec::new(),
+            overlay: BTreeMap::new(),
+            migrated_from: None,
+        };
+        let vset_state = host.vsets.get_mut(&vset).expect("inserted vset");
+        vset_state.ready = true;
+        vset_state.stash_assignment = Some(StashAssignment {
+            assignment_epoch: 1,
+            active_peer: TEST_PASSIVE,
+            active_assignment_epoch: 1,
+            transition_peer: None,
+            membership_epoch: 1,
+        });
+        vset_state.best_record = Some(record.clone());
+        vset_state.peer_published = Some(ReplicaCommitInfo {
+            writer_fence: record.fence,
+            seq: record.seq,
+            sync_covered_through: record.sync_covered_through,
+        });
+        assert!(
+            work_ready(&host, vset)
+                .iter()
+                .all(|work| !matches!(work, super::ScheduledWork::Replicate))
+        );
+
+        let mut newer = record;
+        newer.seq = crate::types::JournalSeq(2);
+        newer.capture_seq = 2;
+        newer.sync_covered_through = 2;
+        host.vsets
+            .get_mut(&vset)
+            .expect("inserted vset")
+            .best_record = Some(newer);
+        assert!(
+            work_ready(&host, vset)
+                .iter()
+                .any(|work| matches!(work, super::ScheduledWork::Replicate))
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn startup_reconciliation_is_bounded_and_emits_in_vset_order() {
         simulate!(95, async move {
@@ -2434,10 +2521,12 @@ mod tests {
                 [Ok(AdminSuccess::VsetCreated { vset })]
             );
 
-            world
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: true });
+            world.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: true,
+                wp: false,
+                minor: false,
+            });
             blockd_exec::advance_to(7).await;
             let expected = vec![0x5a; page_size()];
             world.memory.borrow_mut().insert(page, expected.clone());
@@ -2447,12 +2536,22 @@ mod tests {
             });
             blockd_exec::advance_to(19).await;
             assert_eq!(*world.sync_ok.borrow(), [ReqId(2)]);
-            world
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: false });
-            blockd_exec::advance_to(19).await;
+            world.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: false,
+                wp: false,
+                minor: true,
+            });
+            let remap_deadline = blockd_exec::now().saturating_add(20);
+            while world.remapped.borrow().is_empty() {
+                assert!(
+                    blockd_exec::now() < remap_deadline,
+                    "resident minor fault was not remapped before its bounded deadline"
+                );
+                blockd_exec::advance_to(blockd_exec::now().saturating_add(1)).await;
+            }
             assert!(world.unprotected.borrow().is_empty());
+            assert_eq!(*world.remapped.borrow(), [(page, false)]);
 
             let capture_deadline = blockd_exec::now().saturating_add(40);
             while actor_state.borrow().vsets[&vset]
@@ -2471,10 +2570,12 @@ mod tests {
                 .borrow_mut()
                 .insert(page, checkpoint_expected.clone());
             let prior_unprotects = world.unprotected.borrow().len();
-            world
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: true });
+            world.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: true,
+                wp: true,
+                minor: false,
+            });
             let fault_deadline = blockd_exec::now().saturating_add(20);
             while world.unprotected.borrow().len() == prior_unprotects {
                 assert!(
@@ -2728,10 +2829,12 @@ mod tests {
                 Some(expected_peer_publication),
                 "recovery must retain the published commit needed to release replica state"
             );
-            world
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: false });
+            world.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: false,
+                wp: false,
+                minor: false,
+            });
             blockd_exec::advance_to(352).await;
             assert_eq!(world.memory.borrow().get(&page), Some(&checkpoint_expected));
 
@@ -2903,13 +3006,21 @@ mod tests {
                 },
                 page: PageNo(7),
             };
-            world.faults.borrow_mut().extend(
-                pages
-                    .iter()
-                    .copied()
-                    .chain([memory_page])
-                    .map(|page| GuestFault { page, write: true }),
-            );
+            world
+                .faults
+                .borrow_mut()
+                .extend(
+                    pages
+                        .iter()
+                        .copied()
+                        .chain([memory_page])
+                        .map(|page| GuestFault {
+                            page,
+                            write: true,
+                            wp: false,
+                            minor: false,
+                        }),
+                );
             blockd_exec::advance_to(7).await;
             for (number, &page) in pages.iter().enumerate() {
                 world.memory.borrow_mut().insert(
@@ -3010,6 +3121,8 @@ mod tests {
             world.faults.borrow_mut().push_back(GuestFault {
                 page: faulted,
                 write: false,
+                wp: false,
+                minor: false,
             });
             blockd_exec::advance_to(110).await;
             assert!(world.blobs.borrow().is_empty());
@@ -3023,6 +3136,8 @@ mod tests {
             world.faults.borrow_mut().push_back(GuestFault {
                 page: memory_page,
                 write: false,
+                wp: false,
+                minor: false,
             });
             blockd_exec::advance_to(115).await;
             assert_eq!(
@@ -3200,6 +3315,8 @@ mod tests {
             world.faults.borrow_mut().push_back(GuestFault {
                 page: source_page,
                 write: true,
+                wp: false,
+                minor: false,
             });
             blockd_exec::advance_to(7).await;
             let expected = vec![0xa7; page_size()];
@@ -3261,6 +3378,8 @@ mod tests {
             world.faults.borrow_mut().push_back(GuestFault {
                 page: fork_page,
                 write: false,
+                wp: false,
+                minor: false,
             });
             blockd_exec::advance_to(26).await;
             assert_eq!(world.memory.borrow().get(&fork_page), Some(&expected));
@@ -3268,17 +3387,16 @@ mod tests {
 
             world.faults.borrow_mut().push_back(GuestFault {
                 page: fork_page,
-                write: false,
-            });
-            blockd_exec::advance_to(27).await;
-            world.faults.borrow_mut().push_back(GuestFault {
-                page: fork_page,
                 write: true,
+                wp: true,
+                minor: false,
             });
             blockd_exec::advance_to(28).await;
             assert_eq!(world.memory.borrow().get(&fork_page), Some(&expected));
             assert!(state.borrow().cache.is_dirty(fork_page));
-            assert_eq!(state.borrow().counters.shared_fills, 3);
+            assert_eq!(&*world.unprotected.borrow(), &[fork_page]);
+            assert_eq!(state.borrow().counters.shared_fills, 1);
+            assert_eq!(state.borrow().counters.wp_faults, 1);
 
             world
                 .admin
@@ -3344,10 +3462,12 @@ mod tests {
                 Rc::clone(&destination),
             ));
             blockd_exec::advance_to(5).await;
-            source
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: true });
+            source.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: true,
+                wp: false,
+                minor: false,
+            });
             blockd_exec::advance_to(8).await;
             let expected = vec![0xc4; page_size()];
             source.memory.borrow_mut().insert(page, expected.clone());
@@ -3419,10 +3539,12 @@ mod tests {
                     .borrow()
                     .contains(&Ok(AdminSuccess::MigratedOut { vset }))
             );
-            destination
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: false });
+            destination.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: false,
+                wp: false,
+                minor: false,
+            });
             for _ in 0..20 {
                 blockd_exec::advance_to(tick).await;
                 tick += 4;
@@ -4324,10 +4446,12 @@ mod tests {
             };
             let actor = spawn(host_actor(config.clone(), Rc::clone(&world)));
             blockd_exec::advance_to(4).await;
-            world
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: true });
+            world.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: true,
+                wp: false,
+                minor: false,
+            });
             blockd_exec::advance_to(7).await;
             world
                 .memory
@@ -4575,10 +4699,12 @@ mod tests {
             let primary_actor = spawn(host_actor(config(primary_host, 1), Rc::clone(&primary)));
             let passive_actor = spawn(host_actor(config(passive_host, 2), Rc::clone(&passive)));
             blockd_exec::advance_to(4).await;
-            primary
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: true });
+            primary.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: true,
+                wp: false,
+                minor: false,
+            });
             blockd_exec::advance_to(7).await;
             primary
                 .memory
@@ -4717,10 +4843,12 @@ mod tests {
                 Rc::clone(&replacement),
             ));
             blockd_exec::advance_to(5).await;
-            primary
-                .faults
-                .borrow_mut()
-                .push_back(GuestFault { page, write: true });
+            primary.faults.borrow_mut().push_back(GuestFault {
+                page,
+                write: true,
+                wp: false,
+                minor: false,
+            });
             blockd_exec::advance_to(7).await;
             primary
                 .memory

@@ -320,6 +320,12 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
         .rng_seed(seed)
         .simulation_duration(duration)
         .tick_duration(tick)
+        // Frame-scoped peer links may have one bounded connection wave from
+        // every other host. Turmoil's smaller default backlog panics instead
+        // of applying backpressure when that valid wave arrives together.
+        .tcp_capacity(
+            usize::from(config.hosts).saturating_mul(crate::peer_transport::MAX_IN_FLIGHT),
+        )
         .min_message_latency(Duration::from_secs(1))
         .max_message_latency(Duration::from_secs(100))
         .fail_rate(fail_rate);

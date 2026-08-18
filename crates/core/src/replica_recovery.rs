@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::blx::{BatchMeta, NamespaceKind, compact_objects, open_object};
-use crate::head::{HeadRecord, ManifestPtr};
+use crate::head::{HeadRecord, ManifestPtr, RetiredStash};
 use crate::journal::JournalRecord;
 use crate::layout;
 use crate::manifest::{CompleteFileList, Manifest, ObjectRef};
@@ -200,6 +200,11 @@ pub fn prepare_replica_publication(
     claimed_head: &HeadRecord,
     export: &ReplicaExport,
 ) -> Result<ReplicaPublication, ReplicaRecoveryError> {
+    let recovered_stash = RetiredStash {
+        peer: export.source_peer,
+        assignment_epoch: export.assignment_epoch,
+        through: export.info,
+    };
     let export = refence_replica_export(vset, export, writer_fence)?;
     let (record, record_bytes) = publication_record(vset, writer_fence, &export)?;
     let (store_objects, manifest) =
@@ -210,7 +215,10 @@ pub fn prepare_replica_publication(
     head.fence = writer_fence;
     head.manifest = Some(manifest);
     head.stash = None;
-    head.retired_stashes.clear();
+    // Publication makes the recovered passive copy redundant, but its exact
+    // identity must remain durable until a restarted holder sends and
+    // acknowledges ReplicaRelease.
+    head.retired_stashes = vec![recovered_stash];
     Ok(ReplicaPublication {
         export,
         store_objects,

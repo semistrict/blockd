@@ -31,6 +31,9 @@ use crate::peer_transport::{PeerTransport, PeerTransportFaults, PeerTransportSta
 #[derive(Clone, Debug)]
 pub struct ActorHarnessConfig {
     pub host: HostConfig,
+    /// Optional capacity override for the passive host. When absent, the
+    /// passive inherits the primary's device capacity.
+    pub passive_disk_capacity: Option<u64>,
     pub blobs: BlobDevConfig,
     pub store: StoreConfig,
     pub vset_count: u16,
@@ -211,10 +214,11 @@ impl HarnessPair {
         config.host.replica_placement = harness_placement(primary, passive);
         let [primary_world, passive_world] =
             SimWorld::pair([primary, passive], config.blobs, config.store);
-        let passive_state = Rc::new(RefCell::new(HostState::new(harness_passive_config(
-            &config.host,
-            passive,
-        ))));
+        let mut passive_config = harness_passive_config(&config.host, passive);
+        if let Some(capacity) = config.passive_disk_capacity {
+            passive_config.disk_capacity = Some(capacity);
+        }
+        let passive_state = Rc::new(RefCell::new(HostState::new(passive_config)));
         Self {
             primary,
             passive,
@@ -1832,6 +1836,7 @@ mod tests {
                 wedge_ticks: 0,
                 replica_placement: None,
             },
+            passive_disk_capacity: None,
             blobs: BlobDevConfig {
                 read_latency_min: 100,
                 read_latency_max: 500,

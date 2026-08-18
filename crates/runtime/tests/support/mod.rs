@@ -2,17 +2,40 @@ use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
 use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
 use blockd_core::types::millis;
 use blockd_runtime::fakegcs::{FakeGcs, FakeGcsServer};
-use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, RuntimeConfig};
+use blockd_runtime::{GcsConfig, GcsStore, PeerConfig, Runtime, RuntimeConfig};
 
 #[allow(dead_code)]
 pub(crate) async fn local<F: Future>(future: F) -> F::Output {
+    // These tests exercise process-global and kernel-backed runtime state
+    // through !Send local tasks. Keep separate harness threads from driving
+    // independent LocalSets through that state at the same time.
+    static LOCAL_RUNTIME: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let runtime = LOCAL_RUNTIME.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _guard = runtime.lock().await;
     tokio::task::LocalSet::new().run_until(future).await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn wait_for_peer_membership(runtime: &Runtime, expected: usize) {
+    let converged = tokio::time::timeout(Duration::from_secs(15), async {
+        while runtime.peer_connections().len() != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        converged.is_ok(),
+        "peer membership did not converge: {:?}",
+        runtime.peer_connections()
+    );
 }
 
 #[allow(dead_code)]

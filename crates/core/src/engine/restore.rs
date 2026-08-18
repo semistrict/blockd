@@ -69,6 +69,7 @@ where
         restored.mutation_seq = record.capture_seq;
         restored.state_checksum = state_checksum;
         restored.archived_memory_usable = !matches!(verdict, Verdict::ColdBoot);
+        restored.archived_non_data_reset = !matches!(verdict, Verdict::ColdBoot);
         if let Some(loaded) = vmstate {
             restored.block_checksums.extend(loaded.block_checksums);
         }

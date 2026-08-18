@@ -502,9 +502,14 @@ pub struct PeerNet {
 
 struct PeerConnection {
     target: PeerTarget,
-    sender: Sender<Vec<u8>>,
+    sender: Sender<OutboundFrame>,
     connected: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+}
+
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    reconnect: bool,
 }
 
 impl Drop for PeerConnection {
@@ -531,7 +536,7 @@ fn reconcile_connections(
             continue;
         }
         let endpoint = target.endpoint;
-        let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(SEND_QUEUE);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<OutboundFrame>(SEND_QUEUE);
         let connected = Arc::new(AtomicBool::new(false));
         let client_tls = tls.map(|tls| ClientTls {
             config: tls.client.clone(),
@@ -793,7 +798,13 @@ impl PeerNet {
             self.dropped_sends.fetch_add(1, Ordering::SeqCst);
             return;
         };
-        let frame = encode_peer(self_id, msg);
+        let frame = OutboundFrame {
+            bytes: encode_peer(self_id, msg),
+            // Replica release is rare and may be initiated by a restarted
+            // primary. Its acknowledgement must not remain on an otherwise
+            // healthy-looking connection to the prior process instance.
+            reconnect: matches!(msg, PeerMsg::ReplicaReleaseAck { .. }),
+        };
         if let Err(TrySendError::Full(_) | TrySendError::Closed(_)) = sender.try_send(frame) {
             self.dropped_sends.fetch_add(1, Ordering::SeqCst);
         }
@@ -836,7 +847,7 @@ trait PeerIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T> PeerIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
 async fn sender_loop(
-    mut rx: Receiver<Vec<u8>>,
+    mut rx: Receiver<OutboundFrame>,
     addr: SocketAddr,
     peer: HostId,
     connected: Arc<AtomicBool>,
@@ -866,7 +877,17 @@ async fn sender_loop(
                 }
                 frame = rx.recv() => {
                     let Some(frame) = frame else { break };
-                    if !write_peer_frame(&mut conn, &frame).await {
+                    if frame.reconnect {
+                        if let Some(task) = renewal.take() {
+                            task.abort();
+                        }
+                        conn = connect(addr, tls.as_ref()).await;
+                        connected.store(conn.is_some(), Ordering::Relaxed);
+                        if conn.is_some() {
+                            renewal = Some(spawn_connection_renewal(addr, tls.clone()));
+                        }
+                    }
+                    if !write_peer_frame(&mut conn, &frame.bytes).await {
                         dropped_sends.fetch_add(1, Ordering::SeqCst);
                         connected.store(false, Ordering::Relaxed);
                         tracing::warn!(peer_host = peer.0, %addr, "peer connection lost");
@@ -878,7 +899,7 @@ async fn sender_loop(
         }
 
         let Some(frame) = rx.recv().await else { break };
-        if conn.is_none() {
+        if frame.reconnect || conn.is_none() {
             conn = connect(addr, tls.as_ref()).await;
             connected.store(conn.is_some(), Ordering::Relaxed);
             if conn.is_some() {
@@ -889,7 +910,7 @@ async fn sender_loop(
             dropped_sends.fetch_add(1, Ordering::SeqCst);
             continue; // peer unreachable: drop the frame
         }
-        if !write_peer_frame(&mut conn, &frame).await {
+        if !write_peer_frame(&mut conn, &frame.bytes).await {
             dropped_sends.fetch_add(1, Ordering::SeqCst);
             connected.store(false, Ordering::Relaxed);
             tracing::warn!(peer_host = peer.0, %addr, "peer connection lost");
@@ -1841,6 +1862,90 @@ mod tests {
         wait_for_peer(&node_1.net, HostId(0), true).await;
 
         traffic.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_ack_reconnects_after_the_destination_restarts() {
+        use blockd_core::protocol::ReplicaCommitInfo;
+        use blockd_core::types::JournalSeq;
+
+        let addresses = addresses(2);
+        let config_a = PeerConfig {
+            listen: addresses[&HostId(0)],
+        };
+        let config_b = PeerConfig {
+            listen: addresses[&HostId(1)],
+        };
+        let (first_send, mut first_receive) = tokio::sync::mpsc::unbounded_channel();
+        let first = PeerNet::start_plaintext(
+            &config_a,
+            HostId(0),
+            addresses.clone(),
+            move |from, message| {
+                let _ = first_send.send((from, message));
+            },
+        )
+        .await
+        .expect("start first destination");
+        let source = PeerNet::start_plaintext(&config_b, HostId(1), addresses.clone(), |_, _| {})
+            .await
+            .expect("start source");
+
+        let warmup = PeerMsg::ReleasedAck {
+            vset: VsetId(7),
+            release_fence: 3,
+        };
+        source.send(HostId(1), HostId(0), &warmup);
+        assert_eq!(
+            timeout(Duration::from_secs(5), first_receive.recv())
+                .await
+                .expect("warmup delivery timeout")
+                .expect("warmup receiver closed"),
+            (HostId(1), warmup)
+        );
+        drop(first);
+        tokio::task::yield_now().await;
+
+        let (restarted_send, mut restarted_receive) = tokio::sync::mpsc::unbounded_channel();
+        let restarted = loop {
+            let restarted_send = restarted_send.clone();
+            match PeerNet::start_plaintext(
+                &config_a,
+                HostId(0),
+                addresses.clone(),
+                move |from, message| {
+                    let _ = restarted_send.send((from, message));
+                },
+            )
+            .await
+            {
+                Ok(peer) => break peer,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("restart destination: {error}"),
+            }
+        };
+        let ack = PeerMsg::ReplicaReleaseAck {
+            vset: VsetId(7),
+            assignment_epoch: 2,
+            through: ReplicaCommitInfo {
+                writer_fence: 4,
+                seq: JournalSeq(5),
+                sync_covered_through: 6,
+            },
+        };
+        source.send(HostId(1), HostId(0), &ack);
+        assert_eq!(
+            timeout(Duration::from_secs(5), restarted_receive.recv())
+                .await
+                .expect("release ack delivery timeout")
+                .expect("restarted receiver closed"),
+            (HostId(1), ack)
+        );
+
+        drop(restarted);
+        drop(source);
     }
 
     #[test]
