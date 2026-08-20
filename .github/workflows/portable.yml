@@ -1,0 +1,58 @@
+name: Portable quality gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Lint, tests, and documentation
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint
+        run: ./lint.sh
+      - name: Portable workspace tests
+        run: cargo test --workspace --all-targets
+      - name: Workspace documentation tests
+        run: cargo test --doc --workspace
+      - name: Dynamic membership deterministic gate
+        env:
+          BLOCKD_SWEEP_REQUIRE_COVERAGE: "1"
+          BLOCKD_SWEEP_REQUIRE_REPLAY: "1"
+        run: cargo run --release -p blockd-sim --bin sweep -- dynamic-membership 200 25
+
+  dependencies:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Install policy tools
+        run: |
+          cargo install cargo-audit --version 0.22.0 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - name: Resolve the locked dependency graph
+        run: cargo fetch --locked
+      - name: Check out the reviewed advisory database
+        env:
+          ADVISORY_DB_REVISION: 2f08fbb85332687b721f2f22706d07448369451b
+        run: |
+          git clone https://github.com/RustSec/advisory-db.git "$CARGO_HOME/advisory-dbs/advisory-db-3157b0e258782691"
+          git -C "$CARGO_HOME/advisory-dbs/advisory-db-3157b0e258782691" checkout "$ADVISORY_DB_REVISION"
+      - name: Security advisories
+        run: cargo audit --db "$CARGO_HOME/advisory-dbs/advisory-db-3157b0e258782691" --no-fetch
+      - name: Dependency policy
+        run: cargo deny --offline --locked check advisories licenses bans sources

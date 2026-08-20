@@ -59,10 +59,10 @@ impl<W> VolumeCtx<W> {
         self.volume
     }
 
-    pub(super) fn pin(&self, incarnation: u64) -> VolumeRun<W> {
+    pub(super) fn pin(&self, run_generation: u64) -> VolumeRun<W> {
         VolumeRun {
             volume: self.clone(),
-            incarnation,
+            run_generation,
         }
     }
 }
@@ -78,7 +78,7 @@ impl<W> Clone for VolumeCtx<W> {
 
 pub(super) struct VolumeRun<W> {
     volume: VolumeCtx<W>,
-    incarnation: u64,
+    run_generation: u64,
 }
 
 impl<W> VolumeRun<W> {
@@ -86,8 +86,8 @@ impl<W> VolumeRun<W> {
         &self.volume
     }
 
-    pub(super) fn incarnation(&self) -> u64 {
-        self.incarnation
+    pub(super) fn run_generation(&self) -> u64 {
+        self.run_generation
     }
 
     pub(super) fn interrupted(&self) -> bool {
@@ -95,7 +95,7 @@ impl<W> VolumeRun<W> {
             .host
             .state
             .borrow()
-            .volume_at(self.volume.volume, self.incarnation)
+            .volume_at(self.volume.volume, self.run_generation)
             .is_none_or(|state| state.operations.migration_running() || state.outbound.is_some())
     }
 }
@@ -104,7 +104,7 @@ impl<W> Clone for VolumeRun<W> {
     fn clone(&self) -> Self {
         Self {
             volume: self.volume.clone(),
-            incarnation: self.incarnation,
+            run_generation: self.run_generation,
         }
     }
 }

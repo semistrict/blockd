@@ -14,7 +14,9 @@ use crate::blx::{
     state_contribution,
 };
 use crate::format::checksum64;
-use crate::journal::{JournalRecord, MigrationSource, RecordKind, VolumeConfig};
+use crate::journal::{
+    JournalRecord, MigrationArchiveClosure, MigrationSource, RecordKind, VolumeConfig,
+};
 use crate::layout;
 use crate::manifest::{ObjectIdentity, ObjectRef};
 use crate::page_file::{PageBatchBuilder, PageFileLoc, open_entry, scan_page_file};
@@ -62,14 +64,14 @@ async fn reset_archived_non_data<W: Store>(
     world: &W,
     volume: VolumeId,
 ) -> Option<()> {
-    let (incarnation, objects, cached) = {
+    let (run_generation, objects, cached) = {
         let host = state.borrow();
         let volume_state = host.volumes.get(&volume)?;
         if volume_state.archived_non_data_reset {
             return Some(());
         }
         (
-            volume_state.incarnation,
+            volume_state.run_generation,
             volume_state.archive_objects.clone(),
             volume_state.archive_footers.clone(),
         )
@@ -139,7 +141,7 @@ async fn reset_archived_non_data<W: Store>(
     let volume_state = host
         .volumes
         .get_mut(&volume)
-        .filter(|volume_state| volume_state.incarnation == incarnation)?;
+        .filter(|volume_state| volume_state.run_generation == run_generation)?;
     if volume_state.archived_non_data_reset {
         return Some(());
     }
@@ -171,7 +173,7 @@ enum CheckpointDecision {
     Existing(crate::types::Epoch),
     Busy(OneReceiver<()>),
     Reserved {
-        incarnation: u64,
+        run_generation: u64,
         epoch: crate::types::Epoch,
         cleanup: OneSender<Vec<PageId>>,
         protections: OneReceiver<Vec<PageId>>,
@@ -206,7 +208,7 @@ fn reserve_checkpoint(state: &SharedHost, req: ReqId, volume: VolumeId) -> Check
     );
     let (cleanup, protections) = oneshot();
     CheckpointDecision::Reserved {
-        incarnation: volume_state.incarnation,
+        run_generation: volume_state.run_generation,
         epoch,
         cleanup,
         protections,
@@ -223,7 +225,7 @@ struct PauseTracker<W: GuestMem + AdminIo + 'static> {
     state: SharedHost,
     world: Rc<W>,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     pause: GuestPause,
     active: Rc<Cell<bool>>,
 }
@@ -234,7 +236,7 @@ impl<W: GuestMem + AdminIo + 'static> Clone for PauseTracker<W> {
             state: Rc::clone(&self.state),
             world: Rc::clone(&self.world),
             volume: self.volume,
-            incarnation: self.incarnation,
+            run_generation: self.run_generation,
             pause: self.pause.clone(),
             active: Rc::clone(&self.active),
         }
@@ -252,7 +254,8 @@ impl<W: GuestMem + AdminIo + 'static> PauseTracker<W> {
             .volumes
             .get(&self.volume)
             .is_some_and(|volume| {
-                volume.incarnation == self.incarnation && volume.operations.guest_resume_pending()
+                volume.run_generation == self.run_generation
+                    && volume.operations.guest_resume_pending()
             });
         if !current {
             self.active.set(false);
@@ -284,7 +287,7 @@ impl<W: GuestMem + AdminIo + 'static> PauseTracker<W> {
             let Some(volume) = host
                 .volumes
                 .get_mut(&self.volume)
-                .filter(|volume| volume.incarnation == self.incarnation)
+                .filter(|volume| volume.run_generation == self.run_generation)
             else {
                 return;
             };
@@ -303,7 +306,7 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
         state: &SharedHost,
         world: &Rc<W>,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
         protections: OneReceiver<Vec<PageId>>,
     ) -> Option<Self> {
         let Ok(pause) = GuestMem::pause(world.as_ref(), volume).await else {
@@ -314,7 +317,7 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
             state,
             world,
             volume,
-            incarnation,
+            run_generation,
             pause.clone(),
             protections,
         ) else {
@@ -333,7 +336,7 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
         state: &SharedHost,
         world: &Rc<W>,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
         pause: GuestPause,
         protections: OneReceiver<Vec<PageId>>,
     ) -> Option<Self> {
@@ -343,7 +346,7 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
             let volume_state = host
                 .volumes
                 .get_mut(&volume)
-                .filter(|volume_state| volume_state.incarnation == incarnation)?;
+                .filter(|volume_state| volume_state.run_generation == run_generation)?;
             if !volume_state.operations.start_guest_resume() {
                 return None;
             }
@@ -352,7 +355,7 @@ impl<W: GuestMem + AdminIo + 'static> PausedGuest<W> {
             state: Rc::clone(state),
             world: Rc::clone(world),
             volume,
-            incarnation,
+            run_generation,
             pause,
             active,
         };
@@ -561,13 +564,13 @@ pub(super) async fn finish_creation<W: Blobs>(
     state: SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
 ) -> bool {
     let Some((config, fence)) = state
         .borrow()
         .volumes
         .get(&volume)
-        .filter(|state| state.incarnation == incarnation)
+        .filter(|state| state.run_generation == run_generation)
         .map(|state| (state.config, state.fence))
     else {
         return false;
@@ -581,16 +584,14 @@ pub(super) async fn finish_creation<W: Blobs>(
         let Some(volume_state) = host
             .volumes
             .get_mut(&volume)
-            .filter(|state| state.incarnation == incarnation)
+            .filter(|state| state.run_generation == run_generation)
         else {
             return false;
         };
-        volume_state.ready = true;
         volume_state.next_seq = 1;
         volume_state.best_record = Some(record.clone());
         volume_state.record_writes.insert(record.seq, (fence, 0));
         host.counters.records_written += 1;
-        host.schedule_volume(volume);
     }
     true
 }
@@ -649,7 +650,7 @@ where
             volume_state.config.kind
         };
 
-        let (incarnation, epoch, lease, protections) = loop {
+        let (run_generation, epoch, lease, protections) = loop {
             match reserve_checkpoint(&state, req, volume) {
                 CheckpointDecision::Missing | CheckpointDecision::Invalid => {
                     return Some(Err(AdminError::Rejected));
@@ -661,18 +662,18 @@ where
                     let _ = wait.await;
                 }
                 CheckpointDecision::Reserved {
-                    incarnation,
+                    run_generation,
                     epoch,
                     cleanup,
                     protections,
                 } => {
                     break (
-                        incarnation,
+                        run_generation,
                         epoch,
                         CaptureLease::new(
                             &state,
                             volume,
-                            incarnation,
+                            run_generation,
                             MutationOwner::Capture(CaptureKind::Checkpoint),
                             cleanup,
                         ),
@@ -688,7 +689,7 @@ where
                 volume,
                 CaptureKind::Checkpoint,
                 None,
-                Some((incarnation, lease)),
+                Some((run_generation, lease)),
                 None,
             )
             .await?;
@@ -696,14 +697,15 @@ where
             let volume_state = host
                 .volumes
                 .get_mut(&volume)
-                .filter(|volume_state| volume_state.incarnation == incarnation)?;
+                .filter(|volume_state| volume_state.run_generation == run_generation)?;
             volume_state.epoch = epoch;
             volume_state.pinned = Some(captured);
             volume_state.checkpoint_results.insert(req, epoch);
             host.counters.checkpoints_done = host.counters.checkpoints_done.saturating_add(1);
             return Some(Ok(AdminSuccess::CheckpointDone { volume, epoch }));
         }
-        let paused = PausedGuest::acquire(&state, &world, volume, incarnation, protections).await?;
+        let paused =
+            PausedGuest::acquire(&state, &world, volume, run_generation, protections).await?;
         let checkpoint = Checkpoint {
             req: Some(req),
             epoch,
@@ -716,7 +718,7 @@ where
             volume,
             CaptureKind::Checkpoint,
             Some(checkpoint),
-            Some((incarnation, lease)),
+            Some((run_generation, lease)),
             Some(paused.tracker()),
         )
         .await;
@@ -741,7 +743,9 @@ where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
     let pre_reserved = reservation.is_some();
-    let reserved_incarnation = reservation.as_ref().map(|(incarnation, _)| *incarnation);
+    let reserved_run_generation = reservation
+        .as_ref()
+        .map(|(run_generation, _)| *run_generation);
     let capture_owner = MutationOwner::Capture(capture_kind);
     reset_archived_non_data(&state, world.as_ref(), volume).await?;
     let complete_memory_snapshot = checkpoint.is_some()
@@ -752,7 +756,7 @@ where
             .is_some_and(|volume_state| !volume_state.archived_memory_usable);
     let prepared_compaction = prepare_compaction(&state, world.as_ref(), volume).await;
     let (
-        incarnation,
+        run_generation,
         seq,
         capture_seq,
         fence,
@@ -808,14 +812,14 @@ where
                 && (volume_state.operations.mutation_blocked()
                     || volume_state.operations.migration_running()
                     || !needs_commit))
-            || reserved_incarnation.is_some_and(|incarnation| {
-                volume_state.incarnation != incarnation
+            || reserved_run_generation.is_some_and(|run_generation| {
+                volume_state.run_generation != run_generation
                     || volume_state.operations.mutation_owner() != Some(capture_owner)
             })
         {
             return None;
         }
-        let incarnation = volume_state.incarnation;
+        let run_generation = volume_state.run_generation;
         let flushed_pages = host.cache.unstable_pages_of(volume);
         let mut pages = flushed_pages.iter().copied().collect::<BTreeSet<_>>();
         if complete_memory_snapshot {
@@ -890,7 +894,7 @@ where
             host.cache.begin_flush(page);
         }
         (
-            incarnation,
+            run_generation,
             seq,
             capture_seq,
             fence,
@@ -927,7 +931,7 @@ where
                     let Some(volume_state) = host
                         .volumes
                         .get_mut(&volume)
-                        .filter(|volume_state| volume_state.incarnation == incarnation)
+                        .filter(|volume_state| volume_state.run_generation == run_generation)
                     else {
                         return;
                     };
@@ -945,7 +949,7 @@ where
             CaptureLease::new_with_serialized_cleanup(
                 &state,
                 volume,
-                incarnation,
+                run_generation,
                 capture_owner,
                 cleanup,
             )
@@ -972,7 +976,7 @@ where
             let mut host = state.borrow_mut();
             host.volumes
                 .get_mut(&volume)
-                .filter(|state| state.incarnation == incarnation)
+                .filter(|state| state.run_generation == run_generation)
                 .and_then(|volume_state| volume_state.operations.drain_mut())
                 .and_then(|drain| match drain.unread.remove(&page) {
                     Some(generation) => Some((generation, observed)),
@@ -1004,7 +1008,7 @@ where
         let volume_state = host
             .volumes
             .get_mut(&volume)
-            .filter(|state| state.incarnation == incarnation)?;
+            .filter(|state| state.run_generation == run_generation)?;
         std::mem::take(&mut volume_state.operations.drain_mut()?.rescues)
     };
     for (index, rescued) in rescues.into_iter().enumerate() {
@@ -1118,7 +1122,7 @@ where
             let volume_state = host
                 .volumes
                 .get_mut(&volume)
-                .filter(|state| state.incarnation == incarnation)?;
+                .filter(|state| state.run_generation == run_generation)?;
             for &(page, generation, location) in entries {
                 volume_state.page_locs.insert(page, (generation, location));
                 if let Some(drain) = volume_state.operations.drain_mut() {
@@ -1154,7 +1158,7 @@ where
         let volume_state = host
             .volumes
             .get_mut(&volume)
-            .filter(|state| state.incarnation == incarnation)?;
+            .filter(|state| state.run_generation == run_generation)?;
         volume_state.vmm_blx_files = blx_blobs
             .iter()
             .map(|(blx, _, _)| ObjectIdentity::volume(volume, fence, blx.0))
@@ -1166,7 +1170,7 @@ where
         let volume_state = host
             .volumes
             .get(&volume)
-            .filter(|state| state.incarnation == incarnation)?;
+            .filter(|state| state.run_generation == run_generation)?;
         if capture_kind == CaptureKind::Migration
             || volume_state.peer_source.is_some()
             || volume_state
@@ -1185,7 +1189,7 @@ where
         let volume_state = host
             .volumes
             .get_mut(&volume)
-            .filter(|state| state.incarnation == incarnation)?;
+            .filter(|state| state.run_generation == run_generation)?;
         let covered = volume_state
             .pending_syncs
             .iter()
@@ -1226,7 +1230,7 @@ where
         let volume_state = host
             .volumes
             .get_mut(&volume)
-            .filter(|state| state.incarnation == incarnation)?;
+            .filter(|state| state.run_generation == run_generation)?;
         volume_state.best_record = Some(record.clone());
         if complete_memory_snapshot {
             volume_state.archived_memory_usable = true;
@@ -1290,7 +1294,7 @@ where
     for sync in syncs {
         sync.resolve(true);
     }
-    if cleanup_local(Rc::clone(&state), world.as_ref(), volume, incarnation)
+    if cleanup_local(Rc::clone(&state), world.as_ref(), volume, run_generation)
         .await
         .is_err()
     {
@@ -1308,7 +1312,7 @@ pub(super) async fn capture_migration<W>(
 where
     W: Blobs + Store + GuestMem + AdminIo + 'static,
 {
-    let (incarnation, epoch, lease, protections) = loop {
+    let (run_generation, epoch, lease, protections) = loop {
         enum Decision {
             Invalid,
             Busy(OneReceiver<()>),
@@ -1337,7 +1341,7 @@ where
                         .try_start_mutation(MutationOwner::Capture(CaptureKind::Migration))
                 );
                 let (cleanup, protections) = oneshot();
-                Decision::Reserved(volume_state.incarnation, epoch, cleanup, protections)
+                Decision::Reserved(volume_state.run_generation, epoch, cleanup, protections)
             }
         };
         match reserved {
@@ -1345,14 +1349,14 @@ where
             Decision::Busy(wait) => {
                 let _ = wait.await;
             }
-            Decision::Reserved(incarnation, epoch, cleanup, protections) => {
+            Decision::Reserved(run_generation, epoch, cleanup, protections) => {
                 break (
-                    incarnation,
+                    run_generation,
                     epoch,
                     CaptureLease::new(
                         &state,
                         volume,
-                        incarnation,
+                        run_generation,
                         MutationOwner::Capture(CaptureKind::Migration),
                         cleanup,
                     ),
@@ -1361,7 +1365,7 @@ where
             }
         }
     };
-    let paused = PausedGuest::acquire(&state, &world, volume, incarnation, protections).await?;
+    let paused = PausedGuest::acquire(&state, &world, volume, run_generation, protections).await?;
     let vmstate = paused.pause().vmstate;
     let vmstate_bytes = paused.pause().vmstate_bytes.clone();
     let record = capture_record(
@@ -1375,7 +1379,7 @@ where
             vmstate,
             vmstate_bytes: vmstate_bytes.clone(),
         }),
-        Some((incarnation, lease)),
+        Some((run_generation, lease)),
         None,
     )
     .await;
@@ -1394,12 +1398,32 @@ pub(super) async fn write_record_copies<W: Blobs>(
     record: &JournalRecord,
     block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
 ) -> bool {
+    let archive = state
+        .borrow()
+        .volumes
+        .get(&volume)
+        .map(|volume_state| MigrationArchiveClosure {
+            objects: volume_state.archive_objects.clone(),
+            base: volume_state.archive_base,
+        })
+        .unwrap_or_default();
+    write_record_copies_with_archive(state, world, volume, record, block_checksums, &archive).await
+}
+
+pub(super) async fn write_record_copies_with_archive<W: Blobs>(
+    state: &SharedHost,
+    world: &W,
+    volume: VolumeId,
+    record: &JournalRecord,
+    block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
+    archive: &MigrationArchiveClosure,
+) -> bool {
     // A destination that still depends on its migration source must survive a
     // daemon crash without forgetting the remote page locations. Keep that
     // temporary lookup index in both local journal copies until hydration has
     // made the cut wholly local.
     let bytes = if record.migrated_from.is_some() {
-        record.encode_migration_with_checksums(volume, block_checksums)
+        record.encode_migration_state(volume, block_checksums, archive)
     } else {
         record.encode(volume)
     };

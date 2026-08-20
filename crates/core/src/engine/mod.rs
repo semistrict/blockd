@@ -19,15 +19,12 @@ pub(crate) mod recovery_policy;
 mod replica;
 mod restore;
 mod state;
-mod store_gc;
 mod store_retry;
-mod vnode_member;
 
 pub use authority::{
     AuthorityError, PollSession, VersionedSession, activate_host_session, cas_placement,
-    cas_vnode_authority, challenge_host_session, create_host_session, poll_or_defend_host_session,
-    read_host_session, read_placement, read_vnode_authority, revoke_host_session,
-    verify_authority_proof,
+    challenge_host_session, create_host_session, poll_or_defend_host_session, read_host_session,
+    read_placement, revoke_host_session,
 };
 pub use backup::publish_latest;
 pub(crate) use backup::reconcile_backed_recovery_event;
@@ -45,7 +42,3 @@ pub use recovery::recover_local;
 pub use replica::{create_peer_stashed, replica_message, replicate_latest, retry_replica_releases};
 pub use restore::restore_volume;
 pub use state::{HostState, SharedHost, VolumeState};
-pub use vnode_member::{
-    adopt_vnode_generation, adopt_vnode_quorum, claim_vnode_authority, commit_active_vnode_quorum,
-    commit_vnode_closure, failover_vnode, read_vnode_closure, read_vnode_member,
-};

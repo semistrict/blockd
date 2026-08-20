@@ -8,6 +8,7 @@ use std::time::Duration;
 use blockd_core::head::HeadRecord;
 use blockd_core::journal::VolumeConfig;
 use blockd_core::layout;
+use blockd_core::protocol::Verdict;
 use blockd_core::types::{PageId, PageNo, VolumeId};
 use blockd_runtime::fakegcs::{FakeGcs, Fault};
 use blockd_runtime::{GcsConfig, GcsStore, ObjectStore, Runtime};
@@ -27,7 +28,7 @@ fn store(endpoint: &str, prefix: &str) -> Arc<GcsStore> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::large_futures, clippy::too_many_lines)]
 async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
     support::local(async {
         let iterations = std::env::var("BLOCKD_RECOVERY_DRILL_ITERATIONS")
@@ -52,9 +53,23 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
                 support::three_host_runtime_config(1, roots[1].clone(), addresses),
                 support::three_host_runtime_config(2, roots[2].clone(), addresses),
             ];
-            let a = Runtime::new(&configs[0], store(&endpoint, &prefix)).await;
-            let b = Runtime::new(&configs[1], store(&endpoint, &prefix)).await;
-            let c = Runtime::new(&configs[2], store(&endpoint, &prefix)).await;
+            // Direct Runtime fixtures bypass daemon bootstrap, so seed the
+            // permanent source claim required by the offline recovery tool.
+            store(&endpoint, &prefix)
+                .put(
+                    layout::node_claim_key(configs[0].daemon.host),
+                    vec![0x5a; 16],
+                )
+                .await
+                .expect("seed source claim");
+            let (a, b, c) = tokio::join!(
+                Runtime::new(&configs[0], store(&endpoint, &prefix)),
+                Runtime::new(&configs[1], store(&endpoint, &prefix)),
+                Runtime::new(&configs[2], store(&endpoint, &prefix)),
+            );
+            let a = a.expect("runtime startup");
+            let b = b.expect("runtime startup");
+            let c = c.expect("runtime startup");
             for runtime in [&a, &b, &c] {
                 support::wait_for_peer_membership(runtime, 2).await;
             }
@@ -88,7 +103,7 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
             std::fs::remove_dir_all(&roots[0]).expect("delete primary root");
             fake.faults.lock().expect("fault lock").clear();
 
-            let peer_root = &roots[usize::from(active.0)];
+            let peer_root = &roots[usize::try_from(active.get()).expect("host index")];
             let common = [
                 "--endpoint",
                 endpoint.as_str(),
@@ -109,7 +124,7 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
                 .arg("report")
                 .args(common)
                 .arg("--peer")
-                .arg(active.0.to_string())
+                .arg(active.get().to_string())
                 .output()
                 .await
                 .expect("run report command");
@@ -121,7 +136,7 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
             let report = String::from_utf8(report.stdout).expect("UTF-8 report");
             assert!(report.contains("\"status\":\"complete\""), "{report}");
             assert!(
-                report.contains(&format!("\"chosen_peer\":{}", active.0)),
+                report.contains(&format!("\"chosen_peer\":{}", active.get())),
                 "{report}"
             );
 
@@ -129,7 +144,7 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
                 .arg("install")
                 .args(common)
                 .arg("--peer")
-                .arg(active.0.to_string())
+                .arg(active.get().to_string())
                 .arg("--claimant")
                 .arg("0")
                 .arg("--target")
@@ -143,14 +158,18 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
                 String::from_utf8_lossy(&install.stderr)
             );
 
-            let (recovered, verdicts) = Runtime::recover(
-                &configs[0],
-                store(&endpoint, &prefix),
-                &BTreeMap::from([(VOLUME, volume_config)]),
-            )
-            .await;
-            assert!(verdicts.is_empty());
-            let _ = recovered.wait_recovered(VOLUME).await;
+            let expected_volumes = BTreeMap::from([(VOLUME, volume_config)]);
+            let (recovery, passive_b, passive_c) = tokio::join!(
+                Runtime::recover(&configs[0], store(&endpoint, &prefix), &expected_volumes,),
+                Runtime::new(&configs[1], store(&endpoint, &prefix)),
+                Runtime::new(&configs[2], store(&endpoint, &prefix)),
+            );
+            let recovered_passives = [
+                passive_b.expect("passive B restart"),
+                passive_c.expect("passive C restart"),
+            ];
+            let (recovered, verdicts) = recovery.expect("runtime startup");
+            assert_eq!(verdicts, BTreeMap::from([(VOLUME, Verdict::ColdBoot)]));
             let bytes = recovered.guest_read(VOLUME, page).await;
             assert_eq!(
                 u64::from_ne_bytes(bytes[..8].try_into().expect("word")),
@@ -158,6 +177,7 @@ async fn repeated_operator_command_recovers_the_last_acknowledged_sync() {
             );
             assert!(recovered.incidents().is_empty());
             drop(recovered);
+            drop(recovered_passives);
             for root in &roots {
                 std::fs::remove_dir_all(root).expect("cleanup root");
             }

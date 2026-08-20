@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "name": "dynamic-membership",
+  "description": "Deterministic object-store membership lifecycle and durable volume continuity under churn.",
+  "kind": "cluster",
+  "daemon": {
+    "cache_pages": 128,
+    "writeback_interval": "20ms",
+    "backup_retry": "100ms",
+    "disk_capacity_bytes": null,
+    "disk_headroom_bytes": 0,
+    "wedge_ticks": 25
+  },
+  "storage": {
+    "blob_device": {
+      "read_latency": { "min": "20us", "max": "300us" },
+      "write_latency": { "min": "30us", "max": "500us" },
+      "ns_per_byte": 1
+    },
+    "object_store": {
+      "latency": { "min": "1ms", "max": "10ms" },
+      "ns_per_byte": 5
+    }
+  },
+  "topology": {
+    "hosts": 6,
+    "volume_count": 4,
+    "volume_kind": "data",
+    "pages": 16,
+    "cluster_placement": {
+      "membership_epoch": 7
+    }
+  },
+  "workload": {
+    "horizon": "7s",
+    "think": { "min": "1ms", "max": "5ms" },
+    "checkpoint_interval": "300ms",
+    "sync_share_ppm": 500000,
+    "hot_pages": null
+  },
+  "nemeses": {
+    "restart_delay": { "min": "20ms", "max": "400ms" },
+    "kill_hosts": [
+      { "at": "3200ms", "host": 2 }
+    ],
+    "peer_link_outages": [
+      {
+        "window": { "start": "1800ms", "end": "2600ms" },
+        "from": 0,
+        "to": 3
+      }
+    ],
+    "store_outage": { "start": "2600ms", "end": "3000ms" },
+    "membership_events": [
+      { "at": "50ms", "action": "claim", "host": 0, "token": 101 },
+      { "at": "60ms", "action": "claim", "host": 1, "token": 102 },
+      { "at": "70ms", "action": "claim", "host": 2, "token": 103 },
+      { "at": "80ms", "action": "claim", "host": 3, "token": 104, "commit_response_lost": true },
+      { "at": "90ms", "action": "claim", "host": 4, "token": 105 },
+      { "at": "100ms", "action": "claim", "host": 5, "token": 106 },
+      { "at": "150ms", "action": "publish", "host": 0, "lease_duration": "6500ms", "certificate_generation": 1 },
+      { "at": "160ms", "action": "publish", "host": 1, "lease_duration": "6500ms", "certificate_generation": 1, "commit_response_lost": true },
+      { "at": "170ms", "action": "publish", "host": 2, "lease_duration": "2400ms", "certificate_generation": 1 },
+      { "at": "180ms", "action": "publish", "host": 3, "lease_duration": "6500ms", "certificate_generation": 1 },
+      { "at": "190ms", "action": "publish", "host": 4, "lease_duration": "600ms", "certificate_generation": 1 },
+      { "at": "200ms", "action": "publish", "host": 5, "lease_duration": "6500ms", "certificate_generation": 1 },
+      { "at": "400ms", "action": "discover", "host": 0, "reverse_list": true, "reverse_gets": true },
+      { "at": "900ms", "action": "discover", "host": 1, "reverse_list": true, "reverse_gets": true },
+      { "at": "1050ms", "action": "publish", "host": 4, "lease_duration": "5500ms", "certificate_generation": 1 },
+      { "at": "1200ms", "action": "discover", "host": 2, "reverse_list": true, "reverse_gets": true },
+      { "at": "1400ms", "action": "rotate-certificate", "host": 0, "certificate_generation": 2, "commit_response_lost": true },
+      { "at": "1500ms", "action": "discover", "host": 3, "reverse_list": true, "reverse_gets": true },
+      { "at": "1600ms", "action": "restart", "host": 4, "downtime": "20ms", "class": "fast" },
+      { "at": "2100ms", "action": "restart", "host": 5, "downtime": "400ms", "class": "slow" },
+      { "at": "2700ms", "action": "discover", "host": 0, "reverse_list": true, "reverse_gets": true },
+      { "at": "3700ms", "action": "restart", "host": 0, "downtime": "80ms", "class": "rolling" },
+      { "at": "4100ms", "action": "restart", "host": 5, "downtime": "80ms", "class": "rolling" },
+      { "at": "4500ms", "action": "discover", "host": 1, "reverse_list": true, "reverse_gets": true }
+    ],
+    "race_restore": false
+  },
+  "coverage": [
+    { "metric": "exhaustive-audit", "label": "post-transition durable audit" },
+    { "metric": "daemon-crash", "label": "rolling membership restarts" },
+    { "metric": "store-retry", "label": "claim and placement store retries" },
+    { "metric": "certificate-auth-drop", "label": "obsolete certificate frame rejected" },
+    { "metric": "certificate-renewed-frame", "label": "renewed certificate traffic accepted" }
+  ],
+  "outcomes": [
+    { "metric": "exhaustive-audit", "label": "all volumes audited", "min": 1 },
+    { "metric": "daemon-crash", "label": "membership restart schedule executed", "min": 4 },
+    { "metric": "orphan-restore", "label": "expired member recovery completed", "min": 1 },
+    { "metric": "store-unavailable", "label": "membership discovery crossed a store partition", "min": 1 },
+    { "metric": "certificate-auth-drop", "label": "rotated certificate revoked delayed traffic", "min": 1 },
+    { "metric": "certificate-renewed-frame", "label": "traffic resumed on the rotated certificate", "min": 1 }
+  ]
+}

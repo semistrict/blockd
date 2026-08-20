@@ -16,7 +16,9 @@ use blockd_core::world::{
     GuestMemoryError, GuestPause, GuestSync, GuestSyncRequest, Peers, Store, StoreError,
 };
 use blockd_exec::channel::{OneSender, UnboundedReceiver, UnboundedSender, oneshot, unbounded};
-use blockd_exec::{Response, current_poll, delay, now, random_between, random_u64, request};
+use blockd_exec::{
+    Response, current_poll, delay, now, random_between, random_u64, request, yield_now,
+};
 
 use crate::model::{
     BlobDevConfig, CrashFate, MAX_OBJECT_BYTES, StoreConfig, StoreCounters, StoreObjectKind,
@@ -390,10 +392,11 @@ pub(crate) struct SimWorld {
     admin_events: Stream<(u64, u64, AdminEvent)>,
     admin_event_generations: RefCell<BTreeMap<VolumeId, u64>>,
     admin_event_generation_waiters: RefCell<BTreeMap<VolumeId, Vec<OneSender<()>>>>,
-    incarnation: Cell<u64>,
+    run_generation: Cell<u64>,
     faults: Stream<GuestFault>,
     syncs: Stream<GuestSyncRequest>,
     peer_transport: RefCell<Option<Rc<PeerTransport>>>,
+    peer_identities: RefCell<BTreeMap<HostId, HostId>>,
     aborts: Stream<&'static str>,
     fault_waiters: RefCell<BTreeMap<PageId, Vec<OneSender<bool>>>>,
     faults_inflight: RefCell<BTreeSet<PageId>>,
@@ -452,17 +455,24 @@ impl SimWorld {
     ) -> Vec<Rc<Self>> {
         let store = Rc::new(RefCell::new(StoreState::default()));
         let checkpoint_oracle = Rc::new(RefCell::new(CheckpointOracle::default()));
-        (0..hosts)
+        let worlds = (0..hosts)
             .map(|host| {
                 Self::with_store(
-                    HostId(host),
+                    HostId::new(u32::from(host)),
                     blob_config,
                     store_config,
                     Rc::clone(&store),
                     Rc::clone(&checkpoint_oracle),
                 )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let identities = (0..hosts)
+            .map(|host| HostId::new(u32::from(host)))
+            .collect::<Vec<_>>();
+        for world in &worlds {
+            world.replace_peer_identities(identities.iter().copied());
+        }
+        worlds
     }
 
     pub(crate) fn pair(
@@ -472,7 +482,7 @@ impl SimWorld {
     ) -> [Rc<Self>; 2] {
         let store = Rc::new(RefCell::new(StoreState::default()));
         let checkpoint_oracle = Rc::new(RefCell::new(CheckpointOracle::default()));
-        hosts.map(|host| {
+        let worlds = hosts.map(|host| {
             Self::with_store(
                 host,
                 blob_config,
@@ -480,7 +490,12 @@ impl SimWorld {
                 Rc::clone(&store),
                 Rc::clone(&checkpoint_oracle),
             )
-        })
+        });
+        let identities = hosts.map(|host| host);
+        for world in &worlds {
+            world.replace_peer_identities(identities);
+        }
+        worlds
     }
 
     fn with_store(
@@ -501,10 +516,11 @@ impl SimWorld {
             admin_events: Stream::new(),
             admin_event_generations: RefCell::new(BTreeMap::new()),
             admin_event_generation_waiters: RefCell::new(BTreeMap::new()),
-            incarnation: Cell::new(0),
+            run_generation: Cell::new(1),
             faults: Stream::new(),
             syncs: Stream::new(),
             peer_transport: RefCell::new(None),
+            peer_identities: RefCell::new(BTreeMap::from([(host, host)])),
             aborts: Stream::new(),
             fault_waiters: RefCell::new(BTreeMap::new()),
             faults_inflight: RefCell::new(BTreeSet::new()),
@@ -538,6 +554,34 @@ impl SimWorld {
         PeerAttachment {
             world: Rc::clone(self),
         }
+    }
+
+    pub(crate) fn send_peer_authentication_probe(&self, to: HostId) -> bool {
+        self.peer_transport
+            .borrow()
+            .as_ref()
+            .is_some_and(|transport| transport.send_authentication_probe(to))
+    }
+
+    pub(crate) fn hold_peer_authentication_probe(&self, to: HostId) -> bool {
+        self.peer_transport
+            .borrow()
+            .as_ref()
+            .is_some_and(|transport| transport.hold_authentication_probe(to))
+    }
+
+    pub(crate) fn release_peer_authentication_probe(&self) -> bool {
+        self.peer_transport
+            .borrow()
+            .as_ref()
+            .is_some_and(|transport| transport.release_authentication_probe())
+    }
+
+    pub(crate) fn replace_peer_identities(&self, identities: impl IntoIterator<Item = HostId>) {
+        *self.peer_identities.borrow_mut() = identities
+            .into_iter()
+            .map(|identity| (identity, identity))
+            .collect();
     }
 
     pub(crate) fn request_admin(&self, call: AdminCall) -> Response<AdminResult> {
@@ -590,16 +634,16 @@ impl SimWorld {
 
     pub(crate) async fn next_admin_event_with_generation(&self) -> Option<(AdminEvent, u64)> {
         loop {
-            let (incarnation, generation, event) = self.admin_events.recv().await?;
-            if incarnation == self.incarnation.get() {
+            let (run_generation, generation, event) = self.admin_events.recv().await?;
+            if run_generation == self.run_generation.get() {
                 return Some((event, generation));
             }
         }
     }
 
     pub(crate) fn try_next_admin_event(&self) -> Option<AdminEvent> {
-        while let Some((incarnation, _, event)) = self.admin_events.try_recv() {
-            if incarnation == self.incarnation.get() {
+        while let Some((run_generation, _, event)) = self.admin_events.try_recv() {
+            if run_generation == self.run_generation.get() {
                 return Some(event);
             }
         }
@@ -637,12 +681,12 @@ impl SimWorld {
         }
     }
 
-    pub(crate) fn advance_incarnation(&self) {
-        let incarnation = self
-            .incarnation
+    pub(crate) fn advance_run_generation(&self) {
+        let run_generation = self
+            .run_generation
             .get()
             .checked_add(1)
-            .expect("host incarnation overflow");
+            .expect("host run_generation overflow");
         let invalidated = self
             .admin_event_generations
             .borrow()
@@ -663,11 +707,11 @@ impl SimWorld {
         {
             let _ = waiter.send(());
         }
-        self.incarnation.set(incarnation);
+        self.run_generation.set(run_generation);
     }
 
-    pub(crate) fn incarnation(&self) -> u64 {
-        self.incarnation.get()
+    pub(crate) fn run_generation(&self) -> u64 {
+        self.run_generation.get()
     }
 
     pub(crate) fn durable_blobs(&self) -> Vec<(String, Vec<u8>)> {
@@ -771,6 +815,20 @@ impl SimWorld {
             .iter()
             .map(|(key, (_, bytes))| (key.clone(), bytes.clone()))
             .collect()
+    }
+
+    /// Install deployment-owned bootstrap metadata before the simulated
+    /// daemons start. Runtime mutations still go through the real [`Store`]
+    /// implementation and its generation preconditions.
+    pub(crate) fn seed_store_object(&self, key: String, bytes: Vec<u8>) {
+        let mut store = self.store.borrow_mut();
+        assert!(
+            !store.objects.contains_key(&key),
+            "bootstrap object already exists"
+        );
+        store.next_version = store.next_version.saturating_add(1);
+        let version = store.next_version;
+        store.objects.insert(key, (version, bytes));
     }
 
     pub(crate) fn blob_count(&self) -> usize {
@@ -1276,6 +1334,54 @@ impl Blobs for SimWorld {
         self.finish_blob(io, latency).await
     }
 
+    async fn replace_tail_if_len(
+        &self,
+        name: String,
+        expected_total_len: u64,
+        valid_prefix_len: u64,
+        bytes: Vec<u8>,
+    ) -> Result<bool, BlobError> {
+        if valid_prefix_len > expected_total_len {
+            return Err(BlobError::Io);
+        }
+        let latency = self.blob_latency(bytes.len(), true);
+        if let Some(error) = self.blob_write_fault(&name) {
+            delay(latency).await;
+            return Err(error);
+        }
+        loop {
+            let pending = self
+                .blobs
+                .borrow()
+                .pending
+                .values()
+                .any(|pending| pending.name == name);
+            if !pending {
+                break;
+            }
+            yield_now().await;
+        }
+        let actual = self
+            .blobs
+            .borrow()
+            .durable
+            .get(&name)
+            .map_or(0, |bytes| bytes.len() as u64);
+        if actual != expected_total_len {
+            delay(latency).await;
+            return Ok(false);
+        }
+        self.blobs
+            .borrow_mut()
+            .durable
+            .entry(name.clone())
+            .or_default()
+            .truncate(usize::try_from(valid_prefix_len).map_err(|_| BlobError::Io)?);
+        let io = self.submit_blob(name, bytes, BlobWriteKind::Append);
+        self.finish_blob(io, latency).await?;
+        Ok(true)
+    }
+
     async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError> {
         delay(self.blob_latency(0, true)).await;
         if let Some(bytes) = self.blobs.borrow_mut().durable.get_mut(name) {
@@ -1494,12 +1600,15 @@ impl Store for SimWorld {
 
 impl Peers for SimWorld {
     async fn send(&self, to: HostId, message: PeerMsg) {
+        if self.peer_identities.borrow().get(&to) != Some(&to) {
+            return;
+        }
         let transport = self
             .peer_transport
             .borrow()
             .clone()
             .expect("peer send requires an attached Tokio transport");
-        let _ = transport.send(to, &message).await;
+        let _ = transport.send(to, &message);
     }
 
     async fn recv(&self) -> Option<(HostId, PeerMsg)> {
@@ -1806,7 +1915,7 @@ impl AdminIo for SimWorld {
         }
         let _ = self
             .admin_events
-            .send((self.incarnation.get(), generation, event));
+            .send((self.run_generation.get(), generation, event));
     }
 
     async fn host_failed(&self, failure: HostFatal) {
@@ -1823,27 +1932,25 @@ mod tests {
     use std::future::Future;
     use std::time::Duration;
 
-    use blockd_core::authority::{
-        HostSessionRecord, PlacementRecord, VnodeAuthority, VnodeId, VnodePlacement,
-    };
+    use blockd_core::authority::HostSessionRecord;
     use blockd_core::engine::{
-        AuthorityError, PollSession, activate_host_session, adopt_vnode_generation, cas_placement,
-        cas_vnode_authority, challenge_host_session, claim_vnode_authority,
-        commit_active_vnode_quorum, commit_vnode_closure, create_host_session, failover_vnode,
-        poll_or_defend_host_session, read_host_session, read_vnode_closure, revoke_host_session,
-        verify_authority_proof,
+        AuthorityError, PollSession, activate_host_session, cas_placement, challenge_host_session,
+        create_host_session, poll_or_defend_host_session, revoke_host_session,
     };
     use blockd_core::engine::{HostState, host_actor_with_state};
-    use blockd_core::hostmeta::{AuthorityHostConfig, HostConfig, ReplicaPlacementConfig};
+    use blockd_core::hostmeta::{AuthorityHostConfig, ClusterPlacementConfig, HostConfig};
     use blockd_core::journal::VolumeConfig;
-    use blockd_core::placement::PeerCandidate;
+    use blockd_core::placement::ClusterPlacement;
     use blockd_core::protocol::{AdminCall, AdminSuccess, ReqId};
     use blockd_core::types::VolumeId;
-    use blockd_core::vnode_member::adoption_quorum;
-    use blockd_exec::{FaultConfig, SimulationContext, delay, spawn, yield_now};
+    use blockd_exec::{FaultConfig, SimulationContext, delay, spawn};
 
     use super::*;
     use crate::peer_transport::{PeerTransportFaults, PeerTransportStats};
+
+    fn test_identity(host: u32) -> HostId {
+        HostId::new(host)
+    }
 
     macro_rules! simulate {
         ($seed:expr, $future:expr) => {{
@@ -1871,7 +1978,15 @@ mod tests {
         let client_finished = Rc::clone(&finished);
         let roster = worlds
             .iter()
-            .map(|world| (world.host_id(), format!("host-{}", world.host_id().0)))
+            .map(|world| {
+                let identity = world
+                    .peer_identities
+                    .borrow()
+                    .get(&world.host_id())
+                    .copied()
+                    .expect("Turmoil test world has an exact live identity");
+                (identity, format!("host-{}", world.host_id().get()))
+            })
             .collect::<BTreeMap<_, _>>();
         let stats = Rc::new(PeerTransportStats::default());
         let mut simulation = turmoil::Builder::new()
@@ -1887,15 +2002,21 @@ mod tests {
             let stats = Rc::clone(&stats);
             let ready = Rc::clone(&ready);
             let ready_notify = Rc::clone(&ready_notify);
-            simulation.host(format!("host-{}", host.0), move || {
+            simulation.host(format!("host-{}", host.get()), move || {
                 let world = Rc::clone(&world);
                 let roster = roster.clone();
                 let stats = Rc::clone(&stats);
                 let ready = Rc::clone(&ready);
                 let ready_notify = Rc::clone(&ready_notify);
                 async move {
+                    let identity = world
+                        .peer_identities
+                        .borrow()
+                        .get(&host)
+                        .copied()
+                        .expect("Turmoil test host has an exact live identity");
                     let transport = PeerTransport::start(
-                        host,
+                        identity,
                         roster,
                         PeerTransportFaults {
                             max_frames_per_connection: 1,
@@ -1939,28 +2060,33 @@ mod tests {
         output.borrow_mut().take().expect("test completed")
     }
 
-    fn authority_placement() -> PlacementRecord {
-        PlacementRecord::new(
-            41,
-            7,
-            vec![VnodePlacement {
-                vnode: VnodeId(0),
-                members: [HostId(1), HostId(2), HostId(3)],
-                next_members: None,
-            }],
+    #[tokio::test(start_paused = true)]
+    async fn unknown_target_host_is_dropped_before_transport() {
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let current = HostId::new(2);
+        world.replace_peer_identities([test_identity(1), current]);
+
+        Peers::send(
+            world.as_ref(),
+            HostId::new(3),
+            PeerMsg::Released {
+                volume: VolumeId(7),
+                release_fence: 9,
+            },
         )
-        .expect("valid test placement")
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn healthy_session_polling_uses_reads_without_lease_writes() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let metrics_world = Rc::clone(&world);
         let world = Rc::clone(&world);
         simulate!(8, async move {
-            create_host_session(world.as_ref(), HostId(1), 101).await?;
+            create_host_session(world.as_ref(), test_identity(1), 101).await?;
             for _ in 0..4 {
-                let polled = poll_or_defend_host_session(world.as_ref(), HostId(1), 101).await?;
+                let polled =
+                    poll_or_defend_host_session(world.as_ref(), test_identity(1), 101).await?;
                 assert!(matches!(polled, PollSession::Active(_)));
             }
             Ok::<_, AuthorityError>(())
@@ -1975,24 +2101,24 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn exact_challenge_cas_fences_the_losing_side() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let metrics_world = Rc::clone(&world);
         let world = Rc::clone(&world);
         simulate!(9, async move {
-            create_host_session(world.as_ref(), HostId(1), 101)
+            create_host_session(world.as_ref(), test_identity(1), 101)
                 .await
                 .expect("create session");
-            let challenged = challenge_host_session(world.as_ref(), HostId(1), HostId(2), 9001, 50)
+            let challenged = challenge_host_session(world.as_ref(), test_identity(1), 9001, 50)
                 .await
                 .expect("install challenge");
 
-            let joined = challenge_host_session(world.as_ref(), HostId(1), HostId(3), 9002, 51)
+            let joined = challenge_host_session(world.as_ref(), test_identity(1), 9002, 51)
                 .await
                 .expect("concurrent suspect joins existing challenge");
             assert_eq!(joined, challenged);
 
             assert!(matches!(
-                poll_or_defend_host_session(world.as_ref(), HostId(1), 101).await,
+                poll_or_defend_host_session(world.as_ref(), test_identity(1), 101).await,
                 Ok(PollSession::Defended(_))
             ));
             assert_eq!(
@@ -2008,12 +2134,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn revocation_must_land_before_replacement_session_activates() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         simulate!(10, async move {
-            create_host_session(world.as_ref(), HostId(1), 101)
+            create_host_session(world.as_ref(), test_identity(1), 101)
                 .await
                 .expect("create session");
-            let challenged = challenge_host_session(world.as_ref(), HostId(1), HostId(2), 9001, 50)
+            let challenged = challenge_host_session(world.as_ref(), test_identity(1), 9001, 50)
                 .await
                 .expect("install challenge");
             let revoked = revoke_host_session(world.as_ref(), challenged, 9001)
@@ -2025,152 +2151,12 @@ mod tests {
             assert_eq!(
                 replacement.record,
                 HostSessionRecord::Active {
-                    host: HostId(1),
                     session: 202,
                     epoch: 2,
                 }
             );
             assert_eq!(
-                poll_or_defend_host_session(world.as_ref(), HostId(1), 101).await,
-                Err(AuthorityError::Fenced)
-            );
-        });
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn replicas_reread_vnode_authority_and_reject_stale_proofs() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
-        let placement = authority_placement();
-        simulate!(11, async move {
-            create_host_session(world.as_ref(), HostId(1), 101)
-                .await
-                .expect("create initial primary session");
-            let initial = VnodeAuthority {
-                cluster_id: placement.cluster_id,
-                placement_epoch: placement.epoch,
-                vnode: VnodeId(0),
-                generation: 1,
-                primary: HostId(1),
-                primary_session: 101,
-                primary_host_epoch: 1,
-            };
-            let old_proof = cas_vnode_authority(world.as_ref(), &placement, None, initial)
-                .await
-                .expect("create vnode authority");
-            verify_authority_proof(world.as_ref(), &placement, old_proof)
-                .await
-                .expect("current proof verifies");
-
-            create_host_session(world.as_ref(), HostId(2), 202)
-                .await
-                .expect("create replacement primary session");
-            let next = initial
-                .advance(HostId(2), 202, 1)
-                .expect("advance authority");
-            let current = cas_vnode_authority(world.as_ref(), &placement, Some(old_proof), next)
-                .await
-                .expect("advance vnode authority");
-
-            assert_eq!(
-                verify_authority_proof(world.as_ref(), &placement, old_proof).await,
-                Err(AuthorityError::Fenced)
-            );
-            verify_authority_proof(world.as_ref(), &placement, current)
-                .await
-                .expect("new proof verifies");
-            assert_eq!(
-                cas_vnode_authority(world.as_ref(), &placement, Some(old_proof), next).await,
-                Err(AuthorityError::Conflict)
-            );
-        });
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn intersecting_adoption_quorum_preserves_the_latest_protected_closure() {
-        let worlds = SimWorld::cluster(4, BlobDevConfig::nvme(), StoreConfig::gcs());
-        let placement = authority_placement();
-        let old = VnodeAuthority {
-            cluster_id: placement.cluster_id,
-            placement_epoch: placement.epoch,
-            vnode: VnodeId(0),
-            generation: 1,
-            primary: HostId(1),
-            primary_session: 101,
-            primary_host_epoch: 1,
-        };
-        simulate!(12, async move {
-            create_host_session(worlds[1].as_ref(), HostId(1), 101)
-                .await
-                .expect("create old primary session");
-            let old_proof = cas_vnode_authority(worlds[1].as_ref(), &placement, None, old)
-                .await
-                .expect("create old authority");
-            adopt_vnode_generation(worlds[1].as_ref(), &placement, HostId(1), old_proof)
-                .await
-                .expect("member one adopts");
-            adopt_vnode_generation(worlds[2].as_ref(), &placement, HostId(2), old_proof)
-                .await
-                .expect("member two adopts");
-
-            let gets_before_commit = worlds[1].store_metrics().gets;
-            let closure = b"latest acknowledged recovery closure".to_vec();
-            commit_vnode_closure(
-                worlds[2].as_ref(),
-                &placement,
-                old,
-                VolumeId(7),
-                44,
-                closure.clone(),
-            )
-            .await
-            .expect("first member commits");
-            commit_vnode_closure(
-                worlds[1].as_ref(),
-                &placement,
-                old,
-                VolumeId(7),
-                44,
-                closure.clone(),
-            )
-            .await
-            .expect("second member commits");
-            assert_eq!(worlds[1].store_metrics().gets, gets_before_commit);
-
-            create_host_session(worlds[3].as_ref(), HostId(3), 303)
-                .await
-                .expect("create new primary session");
-            let next = old.advance(HostId(3), 303, 1).expect("advance authority");
-            let next_proof =
-                cas_vnode_authority(worlds[3].as_ref(), &placement, Some(old_proof), next)
-                    .await
-                    .expect("publish next authority");
-            let receipt_two =
-                adopt_vnode_generation(worlds[2].as_ref(), &placement, HostId(2), next_proof)
-                    .await
-                    .expect("intersection member adopts");
-            let receipt_three =
-                adopt_vnode_generation(worlds[3].as_ref(), &placement, HostId(3), next_proof)
-                    .await
-                    .expect("new primary member adopts");
-            let inventory = adoption_quorum(&placement, next_proof, &[receipt_two, receipt_three])
-                .expect("two members form adoption quorum");
-            let recovered = inventory[&VolumeId(7)];
-            assert_eq!(recovered.sequence, 44);
-            assert_eq!(
-                read_vnode_closure(worlds[2].as_ref(), VnodeId(0), recovered).await,
-                Ok(closure)
-            );
-
-            assert_eq!(
-                commit_vnode_closure(
-                    worlds[2].as_ref(),
-                    &placement,
-                    old,
-                    VolumeId(7),
-                    45,
-                    b"stale primary".to_vec(),
-                )
-                .await,
+                poll_or_defend_host_session(world.as_ref(), test_identity(1), 101).await,
                 Err(AuthorityError::Fenced)
             );
         });
@@ -2196,37 +2182,24 @@ mod tests {
                 ns_per_byte: 0,
             },
         );
-        let placement = PlacementRecord::new(
+        let placement = ClusterPlacement::new(
             41,
             1,
-            vec![VnodePlacement {
-                vnode: VnodeId(0),
-                members: [HostId(0), HostId(1), HostId(2)],
-                next_members: None,
-            }],
+            vec![test_identity(0), test_identity(1), test_identity(2)],
         )
         .expect("valid placement");
-        let roster = [HostId(0), HostId(1), HostId(2)]
-            .into_iter()
-            .map(|host| PeerCandidate {
-                host,
-                weight: 1,
-                failure_domain: host.0,
-                drained: false,
-            })
-            .collect();
+        let roster = vec![HostId::new(0), HostId::new(1), HostId::new(2)];
         let config = HostConfig {
             archive: Default::default(),
-            host: HostId(0),
+            host: HostId::new(0),
             cache_pages: 8,
             writeback_interval: 100,
             backup_retry: 5,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(ReplicaPlacementConfig {
+            cluster_placement: Some(ClusterPlacementConfig {
                 membership_epoch: 1,
-                local_failure_domain: 0,
                 roster,
                 authority: Some(AuthorityHostConfig {
                     cluster_id: 41,
@@ -2262,198 +2235,9 @@ mod tests {
         });
     }
 
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn failed_primary_advances_generation_on_a_quorum_before_recovery() {
-        let blob = BlobDevConfig {
-            read_latency_min: 1,
-            read_latency_max: 1,
-            write_latency_min: 1,
-            write_latency_max: 1,
-            ns_per_byte: 0,
-            full_window: None,
-            handoff_full_writes: 0,
-            eio_at: None,
-        };
-        let store = StoreConfig {
-            latency_min: 1,
-            latency_max: 1,
-            ns_per_byte: 0,
-        };
-        let worlds = SimWorld::cluster(3, blob, store);
-        let placement = PlacementRecord::new(
-            71,
-            1,
-            vec![VnodePlacement {
-                vnode: VnodeId(0),
-                members: [HostId(0), HostId(1), HostId(2)],
-                next_members: None,
-            }],
-        )
-        .expect("valid placement");
-        let roster = [HostId(0), HostId(1), HostId(2)]
-            .into_iter()
-            .map(|host| PeerCandidate {
-                host,
-                weight: 1,
-                failure_domain: host.0,
-                drained: false,
-            })
-            .collect::<Vec<_>>();
-        let states = (0..3)
-            .map(|host| {
-                Rc::new(RefCell::new(HostState::new(HostConfig {
-                    archive: Default::default(),
-                    host: HostId(host),
-                    cache_pages: 8,
-                    writeback_interval: 1_000,
-                    backup_retry: 100,
-                    disk_capacity: None,
-                    disk_headroom: 0,
-                    wedge_ticks: 0,
-                    replica_placement: Some(ReplicaPlacementConfig {
-                        membership_epoch: 1,
-                        local_failure_domain: host,
-                        roster: roster.clone(),
-                        authority: Some(AuthorityHostConfig {
-                            cluster_id: 71,
-                            poll_interval: 10,
-                            max_poll_staleness: 30,
-                            challenge_interval: 40,
-                        }),
-                    }),
-                })))
-            })
-            .collect::<Vec<_>>();
-        let test_worlds = worlds.clone();
-        run_on_turmoil_hosts(14, &worlds, async move {
-            cas_placement(test_worlds[0].as_ref(), None, placement.clone())
-                .await
-                .expect("install placement");
-            let mut hosts = states
-                .iter()
-                .zip(&test_worlds)
-                .map(|(state, world)| {
-                    spawn(host_actor_with_state(Rc::clone(state), Rc::clone(world)))
-                })
-                .collect::<Vec<_>>();
-            delay(100).await;
-            assert!(
-                states
-                    .iter()
-                    .all(|state| state.borrow().authority_serving())
-            );
-
-            let old_record = read_host_session(test_worlds[0].as_ref(), HostId(0))
-                .await
-                .expect("read old session")
-                .expect("old session exists")
-                .record;
-            let HostSessionRecord::Active {
-                session: old_session,
-                epoch: old_epoch,
-                ..
-            } = old_record
-            else {
-                panic!("old session must be active");
-            };
-            let old = VnodeAuthority {
-                cluster_id: 71,
-                placement_epoch: 1,
-                vnode: VnodeId(0),
-                generation: 1,
-                primary: HostId(0),
-                primary_session: old_session,
-                primary_host_epoch: old_epoch,
-            };
-            let old_proof = claim_vnode_authority(&states[0], test_worlds[0].as_ref(), VnodeId(0))
-                .await
-                .expect("claim initial authority on a quorum");
-            assert_eq!(old_proof.authority, old);
-            adopt_vnode_generation(test_worlds[2].as_ref(), &placement, HostId(2), old_proof)
-                .await
-                .expect("adopt old generation");
-            let bytes = b"quorum protected before failover".to_vec();
-            commit_vnode_closure(
-                test_worlds[0].as_ref(),
-                &placement,
-                old,
-                VolumeId(7),
-                88,
-                bytes.clone(),
-            )
-            .await
-            .expect("commit old closure on primary");
-            commit_vnode_closure(
-                test_worlds[2].as_ref(),
-                &placement,
-                old,
-                VolumeId(7),
-                88,
-                bytes,
-            )
-            .await
-            .expect("commit old closure on quorum member");
-
-            hosts[0].cancel();
-            yield_now().await;
-            let (proof, inventory) = failover_vnode(
-                &states[1],
-                test_worlds[1].as_ref(),
-                VnodeId(0),
-                HostId(0),
-                91,
-            )
-            .await
-            .expect("fail over to host one");
-            assert_eq!(proof.authority.generation, 2);
-            assert_eq!(proof.authority.primary, HostId(1));
-            assert_eq!(inventory[&VolumeId(7)].sequence, 88);
-            assert_eq!(
-                read_vnode_closure(test_worlds[1].as_ref(), VnodeId(0), inventory[&VolumeId(7)],)
-                    .await
-                    .expect("read protected closure"),
-                b"quorum protected before failover"
-            );
-            let store_before = test_worlds[1].store_metrics();
-            let committed = commit_active_vnode_quorum(
-                &states[1],
-                test_worlds[1].as_ref(),
-                VolumeId(7),
-                89,
-                b"new primary hot-path closure".to_vec(),
-            )
-            .await
-            .expect("commit on new two-member quorum");
-            let store_after = test_worlds[1].store_metrics();
-            assert_eq!(store_after.put_attempts, store_before.put_attempts);
-            assert_eq!(
-                read_vnode_closure(test_worlds[2].as_ref(), VnodeId(0), committed)
-                    .await
-                    .expect("read new protected closure"),
-                b"new primary hot-path closure"
-            );
-            assert_eq!(
-                commit_vnode_closure(
-                    test_worlds[1].as_ref(),
-                    &placement,
-                    old,
-                    VolumeId(7),
-                    90,
-                    b"stale".to_vec(),
-                )
-                .await,
-                Err(AuthorityError::Fenced)
-            );
-            for host in &mut hosts[1..] {
-                host.cancel();
-            }
-        });
-    }
-
     #[tokio::test(start_paused = true)]
     async fn unservable_page_failure_matches_the_production_fatal_signal() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
             volume: VolumeId(1),
             page: blockd_core::types::PageNo(3),
@@ -2466,22 +2250,13 @@ mod tests {
         assert!(world.memory.borrow().failed.contains(&page));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn world_runs_creation_through_the_real_async_host() {
-        let host = HostId(1);
-        let passive_host = HostId(2);
-        let placement = |local: HostId| ReplicaPlacementConfig {
+    #[test]
+    fn world_runs_creation_through_the_real_async_host() {
+        let host = HostId::new(1);
+        let passive_host = HostId::new(2);
+        let placement = |_local: HostId| ClusterPlacementConfig {
             membership_epoch: 1,
-            local_failure_domain: local.0,
-            roster: [host, passive_host]
-                .into_iter()
-                .map(|candidate| PeerCandidate {
-                    host: candidate,
-                    weight: 1,
-                    failure_domain: candidate.0,
-                    drained: false,
-                })
-                .collect(),
+            roster: vec![host, passive_host],
             authority: None,
         };
         let config = HostConfig {
@@ -2493,7 +2268,7 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(placement(host)),
+            cluster_placement: Some(placement(host)),
         };
         let blob_config = BlobDevConfig {
             read_latency_min: 1,
@@ -2522,14 +2297,15 @@ mod tests {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(placement(passive_host)),
+            cluster_placement: Some(placement(passive_host)),
         })));
-        let reply = world.request_admin(AdminCall::CreateVolume {
-            volume: VolumeId(2),
-            config: VolumeConfig::data(4),
-            from_base: None,
-        });
-        simulate!(4, async move {
+        let worlds = [Rc::clone(&world), Rc::clone(&passive_world)];
+        run_on_turmoil_hosts(4, &worlds, async move {
+            let reply = world.request_admin(AdminCall::CreateVolume {
+                volume: VolumeId(2),
+                config: VolumeConfig::data(4),
+                from_base: None,
+            });
             let passive = spawn(host_actor_with_state(passive_state, passive_world));
             let actor = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
             let reply = reply.await.ok();
@@ -2548,7 +2324,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn paused_guests_do_not_emit_faults_until_resume() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
             volume: VolumeId(1),
             page: blockd_core::types::PageNo(3),
@@ -2597,7 +2373,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stale_resume_cannot_release_a_newer_pause() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let volume = VolumeId(1);
         world.set_vmstate(volume, 9);
         simulate!(11, async move {
@@ -2620,7 +2396,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn checkpoint_pause_waits_for_an_inflight_guest_operation() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let volume = VolumeId(1);
         world.memory.borrow_mut().in_ops.insert(volume);
         let paused_at = Rc::new(Cell::new(None));
@@ -2652,7 +2428,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelling_a_pending_pause_clears_its_bookkeeping() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let volume = VolumeId(1);
         world.memory.borrow_mut().in_ops.insert(volume);
         simulate!(12, async move {
@@ -2671,7 +2447,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelling_a_pending_fault_releases_the_guest_operation() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let volume = VolumeId(1);
         let page = PageId {
             volume,
@@ -2691,8 +2467,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn advancing_incarnation_invalidates_active_recovery_generations() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+    async fn advancing_run_generation_invalidates_active_recovery_generations() {
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let volume = VolumeId(1);
         let (_, generation) = simulate!(13, {
             let world = Rc::clone(&world);
@@ -2712,14 +2488,14 @@ mod tests {
             }
         });
 
-        world.advance_incarnation();
+        world.advance_run_generation();
 
         assert_ne!(world.admin_event_generation(volume), generation);
     }
 
     #[test]
     fn crash_discards_stale_guest_events() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let page = PageId {
             volume: VolumeId(1),
             page: blockd_core::types::PageNo(3),
@@ -2744,7 +2520,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn scheduled_record_rot_targets_the_newest_requested_copy() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let older =
             blockd_core::layout::journal_blob(VolumeId(1), 2, blockd_core::types::JournalSeq(3));
         let newer =
@@ -2777,7 +2553,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn write_metrics_include_blobs_deleted_before_the_report() {
-        let world = SimWorld::new(HostId(1), BlobDevConfig::nvme(), StoreConfig::gcs());
+        let world = SimWorld::new(HostId::new(1), BlobDevConfig::nvme(), StoreConfig::gcs());
         let name =
             blockd_core::layout::journal_blob(VolumeId(1), 1, blockd_core::types::JournalSeq(0));
         let task_world = Rc::clone(&world);

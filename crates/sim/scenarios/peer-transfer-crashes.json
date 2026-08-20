@@ -11,14 +11,14 @@
     "store_outage": null,
     "fault_points": [
       "crash-primary-before-closure-capture",
-      "crash-primary-after-closure-capture",
+      "crash-primary-after-ack-before-sync-ok",
       "crash-primary-during-artifact-transfer",
       "crash-peer-after-data-flush-before-commit"
     ]
   },
   "coverage": [
     { "metric": "peer-fault", "fault_point": "crash-primary-before-closure-capture", "label": "primary crash before closure capture" },
-    { "metric": "peer-fault", "fault_point": "crash-primary-after-closure-capture", "label": "primary crash after closure capture" },
+    { "metric": "peer-fault", "fault_point": "crash-primary-after-ack-before-sync-ok", "label": "primary crash after passive acknowledgement" },
     { "metric": "peer-fault", "fault_point": "crash-primary-during-artifact-transfer", "label": "primary crash during artifact transfer" },
     { "metric": "peer-fault", "fault_point": "crash-peer-after-data-flush-before-commit", "label": "peer crash after data flush" }
   ],

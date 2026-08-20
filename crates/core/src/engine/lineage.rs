@@ -260,9 +260,9 @@ where
         let Some(stash) = initial_stash(&state, volume) else {
             return Some(Err(AdminError::Rejected));
         };
-        let incarnation = state.borrow_mut().insert_fresh(volume, config);
+        let run_generation = state.borrow_mut().insert_fresh(volume, config);
         let Some(fence) =
-            claim_new_head_with_stash(&state, world.as_ref(), volume, incarnation, Some(stash))
+            claim_new_head_with_stash(&state, world.as_ref(), volume, run_generation, Some(stash))
                 .await
         else {
             state.borrow_mut().volumes.remove(&volume);
@@ -368,8 +368,7 @@ where
         };
         {
             let mut host = state.borrow_mut();
-            let volume_state = host.volume_at_mut(volume, incarnation)?;
-            volume_state.ready = true;
+            let volume_state = host.volume_at_mut(volume, run_generation)?;
             volume_state.next_seq = 1;
             volume_state.backed = Some(pointer);
             volume_state.head_version = Some(version);
@@ -379,7 +378,9 @@ where
             }
             host.counters.records_written += 1;
             host.counters.manifests_published += 1;
-            host.schedule_volume(volume);
+        }
+        if !self.protect_initial_replica(run_generation).await {
+            return None;
         }
         Some(Ok(AdminSuccess::VolumeForked { volume, verdict }))
     }

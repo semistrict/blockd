@@ -115,14 +115,26 @@ pub fn observe(record: &dyn fmt::Debug) {
     with_context(|context| context.trace.borrow_mut().record(record));
 }
 
+/// Deterministic under simulation; sourced from the operating system and
+/// guaranteed nonzero in production for durable session/nonce identities.
 pub fn random_u64() -> u64 {
     with_context(|context| {
-        let value = context
-            .rng
-            .borrow_mut()
-            .as_mut()
-            .expect("randomness is available only in simulation")
-            .next_u64();
+        let value = match context.mode {
+            Mode::Simulation => context
+                .rng
+                .borrow_mut()
+                .as_mut()
+                .expect("simulation RNG is seeded")
+                .next_u64(),
+            Mode::Production => loop {
+                let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+                getrandom::fill(&mut bytes).expect("operating-system randomness unavailable");
+                let value = u64::from_ne_bytes(bytes);
+                if value != 0 {
+                    break value;
+                }
+            },
+        };
         context
             .trace
             .borrow_mut()
@@ -407,11 +419,11 @@ impl ProductionContext {
     }
 }
 
-/// Deterministic hooks shared by successive incarnations of one simulated host.
+/// Deterministic hooks shared by successive process runs of one simulated host.
 ///
 /// Turmoil destroys a host's Tokio runtime on crash. Keeping these hooks outside
 /// that runtime preserves the host's RNG stream, trace, and fault coverage when
-/// Turmoil later constructs a fresh software incarnation.
+/// Turmoil later constructs a fresh process run.
 #[derive(Clone)]
 pub struct SimulationContext {
     context: RuntimeContext,
@@ -453,6 +465,12 @@ impl SimulationContext {
 
     pub fn fault_hits(&self) -> BTreeMap<FaultPoint, u64> {
         self.context.fault_hits.borrow().clone()
+    }
+
+    /// Replace the fault schedule shared by all current and future scopes for
+    /// this simulated host.
+    pub fn set_fault_config(&self, faults: FaultConfig) {
+        *self.context.faults.borrow_mut() = faults;
     }
 
     pub fn now(&self) -> u64 {
@@ -518,14 +536,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_observer_sees_task_polls() {
+    async fn production_observer_sees_task_polls_and_has_nonzero_randomness() {
         let polls = Arc::new(AtomicU64::new(0));
         let poll_totals = Arc::clone(&polls);
         let context = ProductionContext::new(move |nanoseconds| {
             poll_totals.fetch_add(nanoseconds.saturating_add(1), Ordering::Relaxed);
         });
 
-        context.scope(async { delay(1_000_000).await }).await;
+        context
+            .scope(async {
+                assert_ne!(random_u64(), 0);
+                delay(1_000_000).await;
+            })
+            .await;
 
         assert!(polls.load(Ordering::Relaxed) > 0);
     }

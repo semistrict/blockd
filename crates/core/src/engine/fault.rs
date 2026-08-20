@@ -10,21 +10,21 @@ use crate::format::checksum64;
 use crate::layout;
 use crate::manifest::ObjectRef;
 use crate::page_file::{PageFileLoc, open_entry};
-use crate::types::{Gen, PageId, VolumeId, page_size};
+use crate::types::{Gen, HostId, PageId, VolumeId, page_size};
 use crate::world::{Blobs, FillSource, GuestFault, GuestMem, Peers, Store};
 
 #[derive(Clone, Copy)]
 struct FetchPlan {
     generation: Gen,
     location: PageFileLoc,
-    source: Option<crate::types::HostId>,
+    source: Option<HostId>,
 }
 
 enum FaultSlot {
     Ready {
         location: Option<(Gen, PageFileLoc)>,
         memory: bool,
-        source: Option<crate::types::HostId>,
+        source: Option<HostId>,
         victim: Option<PageId>,
     },
     Shared {
@@ -48,21 +48,21 @@ struct FaultCtx<W> {
     state: SharedHost,
     world: Rc<W>,
     page: PageId,
-    incarnation: u64,
+    run_generation: u64,
 }
 
 impl<W> FaultCtx<W> {
-    fn new(state: SharedHost, world: Rc<W>, page: PageId, incarnation: u64) -> Self {
+    fn new(state: SharedHost, world: Rc<W>, page: PageId, run_generation: u64) -> Self {
         Self {
             state,
             world,
             page,
-            incarnation,
+            run_generation,
         }
     }
 
     fn current(&self, host: &super::state::HostState) -> bool {
-        host.volume_at(self.page.volume, self.incarnation)
+        host.volume_at(self.page.volume, self.run_generation)
             .is_some_and(|volume| volume.ready)
     }
 }
@@ -77,11 +77,11 @@ where
         wp,
         minor,
     } = fault;
-    let incarnation = {
+    let run_generation = {
         let mut host = state.borrow_mut();
         if let Some(volume) = host.volumes.get(&page.volume) {
             if volume.ready && volume.config.contains(page) {
-                Some(volume.incarnation)
+                Some(volume.run_generation)
             } else {
                 host.counters.guest_rejected += 1;
                 None
@@ -91,14 +91,14 @@ where
             None
         }
     };
-    let Some(incarnation) = incarnation else {
+    let Some(run_generation) = run_generation else {
         let _ = GuestMem::fail(world.as_ref(), page).await;
         state.borrow_mut().fail("unservable guest page");
         return;
     };
 
     let resident = state.borrow().cache.is_resident(page);
-    let fault = FaultCtx::new(state, world, page, incarnation);
+    let fault = FaultCtx::new(state, world, page, run_generation);
     if resident {
         if minor {
             fault.serve_resident_minor().await;
@@ -134,13 +134,13 @@ impl<W: GuestMem> FaultCtx<W> {
         let state = &self.state;
         let world = self.world.as_ref();
         let page = self.page;
-        let incarnation = self.incarnation;
+        let run_generation = self.run_generation;
         let copy_on_fault = write
             && state
                 .borrow()
                 .volumes
                 .get(&page.volume)
-                .filter(|volume| volume.incarnation == incarnation)
+                .filter(|volume| volume.run_generation == run_generation)
                 .and_then(|volume| volume.operations.drain())
                 .is_some_and(|drain| drain.unread.contains_key(&page));
         if copy_on_fault {
@@ -149,7 +149,7 @@ impl<W: GuestMem> FaultCtx<W> {
             let Some(volume) = host
                 .volumes
                 .get_mut(&page.volume)
-                .filter(|volume| volume.incarnation == incarnation)
+                .filter(|volume| volume.run_generation == run_generation)
             else {
                 return;
             };
@@ -175,10 +175,12 @@ impl<W: GuestMem> FaultCtx<W> {
                 }
                 if !host.cache.is_dirty(page) {
                     host.cache.mark_dirty(page);
-                    host.volumes
+                    let volume = host
+                        .volumes
                         .get_mut(&page.volume)
-                        .expect("validated volume")
-                        .mutation_seq += 1;
+                        .expect("validated volume");
+                    volume.mutation_seq += 1;
+                    volume.pages_dirtied_total += 1;
                     host.counters.wp_faults += 1;
                     host.counters.guest_pages_dirtied += 1;
                 }
@@ -200,7 +202,7 @@ where
         let state = &self.state;
         let world = &self.world;
         let page = self.page;
-        let incarnation = self.incarnation;
+        let run_generation = self.run_generation;
         if self.resolve_archive_mapping().await.is_err() {
             state.borrow_mut().counters.faults_unservable += 1;
             let _ = GuestMem::fail(world.as_ref(), page).await;
@@ -214,7 +216,7 @@ where
                 if let Some(volume) = host
                     .volumes
                     .get(&page.volume)
-                    .filter(|volume| volume.incarnation == incarnation && volume.ready)
+                    .filter(|volume| volume.run_generation == run_generation && volume.ready)
                 {
                     let location = volume.page_locs.get(&page).copied();
                     let memory = volume.config.is_memory();
@@ -298,10 +300,12 @@ where
                             return;
                         }
                         host.cache.fill_slot(page, true, memory);
-                        host.volumes
+                        let volume = host
+                            .volumes
                             .get_mut(&page.volume)
-                            .expect("validated volume")
-                            .mutation_seq += 1;
+                            .expect("validated volume");
+                        volume.mutation_seq += 1;
+                        volume.pages_dirtied_total += 1;
                         host.counters.guest_pages_dirtied += 1;
                         if write_protected {
                             host.counters.wp_faults += 1;
@@ -374,10 +378,12 @@ where
                     }
                     host.cache.fill_slot(page, write, memory);
                     if write {
-                        host.volumes
+                        let volume = host
+                            .volumes
                             .get_mut(&page.volume)
-                            .expect("validated volume")
-                            .mutation_seq += 1;
+                            .expect("validated volume");
+                        volume.mutation_seq += 1;
+                        volume.pages_dirtied_total += 1;
                         host.counters.guest_pages_dirtied += 1;
                         host.schedule_volume(page.volume);
                     }
@@ -418,7 +424,7 @@ where
                     .borrow()
                     .volumes
                     .get(&page.volume)
-                    .filter(|volume| volume.incarnation == incarnation)
+                    .filter(|volume| volume.run_generation == run_generation)
                     .and_then(|volume| volume.page_locs.get(&page))
                     .is_some_and(|current| *current != (generation, location));
                 drop(reservation);
@@ -463,10 +469,12 @@ where
                         (generation, checksum64(&raw)),
                     );
                 if write {
-                    host.volumes
+                    let volume = host
+                        .volumes
                         .get_mut(&page.volume)
-                        .expect("validated volume")
-                        .mutation_seq += 1;
+                        .expect("validated volume");
+                    volume.mutation_seq += 1;
+                    volume.pages_dirtied_total += 1;
                     host.counters.guest_pages_dirtied += 1;
                     host.schedule_volume(page.volume);
                 }
@@ -613,14 +621,14 @@ where
         let state = &self.state;
         let world = self.world.as_ref();
         let page = self.page;
-        let incarnation = self.incarnation;
+        let run_generation = self.run_generation;
         loop {
             let action = {
                 let host = state.borrow();
                 let Some(volume) = host
                     .volumes
                     .get(&page.volume)
-                    .filter(|volume| volume.incarnation == incarnation && volume.ready)
+                    .filter(|volume| volume.run_generation == run_generation && volume.ready)
                 else {
                     return Err(());
                 };
@@ -677,7 +685,7 @@ where
                     let Some(volume) = host
                         .volumes
                         .get_mut(&page.volume)
-                        .filter(|volume| volume.incarnation == incarnation && volume.ready)
+                        .filter(|volume| volume.run_generation == run_generation && volume.ready)
                     else {
                         return Err(());
                     };
@@ -690,7 +698,7 @@ where
                     let Some(volume) = host
                         .volumes
                         .get_mut(&page.volume)
-                        .filter(|volume| volume.incarnation == incarnation && volume.ready)
+                        .filter(|volume| volume.run_generation == run_generation && volume.ready)
                     else {
                         return Err(());
                     };

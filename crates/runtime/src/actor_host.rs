@@ -5,19 +5,21 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use blockd_core::authority::HostSessionRecord;
 use blockd_core::engine::{HostFatal, HostState, host_actor_with_state};
 use blockd_core::hostmeta::{
-    Counters, DaemonStats, HostConfig, ReplicaPlacementConfig, ReplicaSpoolMetrics,
+    ClusterPlacementConfig, Counters, DaemonStats, HostConfig, ReplicaSpoolMetrics,
     ReplicaVolumeMetrics, VolumeOperations,
 };
-use blockd_core::journal::{VolumeConfig, VolumeKind};
-use blockd_core::placement::PeerCandidate;
+use blockd_core::journal::{JournalRecord, VolumeConfig, VolumeKind};
+use blockd_core::layout::BlobName;
+use blockd_core::placement::ClusterPlacement;
 use blockd_core::protocol::{
-    AdminCall, AdminEvent, AdminResult, AdminSuccess, PeerMsg, ReqId, Verdict,
+    AdminCall, AdminError, AdminEvent, AdminResult, AdminSuccess, PeerMsg, ReqId, Verdict,
 };
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId};
 use blockd_core::world::{
@@ -28,32 +30,305 @@ use blockd_exec::inject::{Injected, Injector, Lane, bounded_injector, injector};
 use blockd_exec::{ProductionContext, delay, request};
 use blockd_hostmem::{GuestView, HostRegion, Uffd, UffdFeatures, page_size};
 use tokio::io::unix::AsyncFd;
+use tracing::Instrument as _;
 
 use crate::loopstats::{LoopStats, world_kind};
 use crate::metrics::{
     AtomicHistogram, FaultLatency, FaultReaderMetrics, FaultWorkMetrics, LatencySeries,
     TimingSeries, detailed_profile_metrics_enabled,
 };
-use crate::peer::{PeerConfig, PeerNet};
+use crate::peer::{PeerConfig, PeerNet, PeerResourceMetrics};
 use crate::store::ObjectStore;
 use crate::world::{FileBlobs, RuntimeStore};
 use crate::{CapacityController, CapacityInputs, CapacitySignal};
 
 pub struct RuntimeConfig {
     pub daemon: HostConfig,
+    pub cluster_id: Option<u64>,
     pub blob_dir: PathBuf,
     pub peer: Option<PeerConfig>,
 }
 
+#[derive(Debug)]
+pub enum RuntimeStartupError {
+    LocalDiscovery(String),
+    BlobDirectory(std::io::Error),
+    PeerListener(std::io::Error),
+    PeerMembership(blockd_core::protocol::StoreFault),
+    Placement(blockd_core::protocol::StoreFault),
+    ThreadSpawn {
+        thread: &'static str,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for RuntimeStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalDiscovery(error) => {
+                write!(formatter, "local volume discovery failed: {error}")
+            }
+            Self::BlobDirectory(error) => {
+                write!(formatter, "secure blob directory failed: {error}")
+            }
+            Self::PeerListener(error) => write!(formatter, "peer listener startup failed: {error}"),
+            Self::PeerMembership(error) => {
+                write!(
+                    formatter,
+                    "initial peer membership publication failed: {error:?}"
+                )
+            }
+            Self::Placement(error) => {
+                write!(formatter, "initial cluster placement failed: {error:?}")
+            }
+            Self::ThreadSpawn { thread, source } => {
+                write!(formatter, "{thread} thread startup failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BlobDirectory(error)
+            | Self::PeerListener(error)
+            | Self::ThreadSpawn { source: error, .. } => Some(error),
+            Self::LocalDiscovery(_) | Self::PeerMembership(_) | Self::Placement(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
 fn live_membership_epoch(members: &[HostId]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for member in members {
-        for byte in member.0.to_le_bytes() {
+        for byte in member.get().to_le_bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
     hash.max(1)
+}
+
+struct LivePlacementStatus {
+    state: Mutex<LivePlacementState>,
+}
+
+struct LivePlacementState {
+    enabled: bool,
+    desired: Vec<HostId>,
+    applied: Option<(Vec<HostId>, u64)>,
+}
+
+impl LivePlacementStatus {
+    fn new(enabled: bool) -> Self {
+        Self {
+            state: Mutex::new(LivePlacementState {
+                enabled,
+                desired: Vec::new(),
+                applied: None,
+            }),
+        }
+    }
+
+    fn publish(&self, members: Vec<HostId>) {
+        self.state.lock().expect("placement status lock").desired = members;
+    }
+
+    fn is_current(&self, members: &[HostId]) -> bool {
+        self.state.lock().expect("placement status lock").desired == members
+    }
+
+    fn complete_if_current(
+        &self,
+        members: &[HostId],
+        epoch: u64,
+        publish: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut state = self.state.lock().expect("placement status lock");
+        if state.desired != members || !publish() {
+            return false;
+        }
+        state.applied = Some((members.to_vec(), epoch));
+        true
+    }
+
+    fn readiness(&self) -> (bool, u64) {
+        let state = self.state.lock().expect("placement status lock");
+        if !state.enabled {
+            return (true, 0);
+        }
+        match &state.applied {
+            Some((members, epoch)) if *members == state.desired => (true, *epoch),
+            Some((_, epoch)) => (false, *epoch),
+            None => (false, 0),
+        }
+    }
+}
+
+fn live_roster_includes_local(members: &[HostId], local: HostId) -> bool {
+    members.len() >= blockd_core::placement::MIN_PLACEMENT_MEMBERS && members.contains(&local)
+}
+
+fn cluster_placement_config(
+    placement: &ClusterPlacement,
+    authority: Option<blockd_core::hostmeta::AuthorityHostConfig>,
+) -> ClusterPlacementConfig {
+    ClusterPlacementConfig {
+        membership_epoch: placement.epoch,
+        roster: placement.roster.clone(),
+        authority,
+    }
+}
+
+#[cfg(test)]
+async fn reconcile_cluster_placement(
+    store: Arc<dyn ObjectStore>,
+    cluster_id: u64,
+    members: Vec<HostId>,
+) -> Result<ClusterPlacement, blockd_core::protocol::StoreFault> {
+    reconcile_cluster_placement_if_current(store, cluster_id, members, || true)
+        .await?
+        .ok_or(blockd_core::protocol::StoreFault::Unavailable)
+}
+
+async fn reconcile_cluster_placement_if_current(
+    store: Arc<dyn ObjectStore>,
+    cluster_id: u64,
+    members: Vec<HostId>,
+    is_current: impl Fn() -> bool,
+) -> Result<Option<ClusterPlacement>, blockd_core::protocol::StoreFault> {
+    let key = blockd_core::layout::placement_key();
+    for _ in 0..16 {
+        let found = Arc::clone(&store).get(key.clone()).await?;
+        if !is_current() {
+            return Ok(None);
+        }
+        let (generation, existing) = match found {
+            Some((generation, bytes)) => {
+                let placement = ClusterPlacement::decode(&bytes)
+                    .filter(|placement| placement.cluster_id == cluster_id)
+                    .ok_or(blockd_core::protocol::StoreFault::Unavailable)?;
+                (Some(generation), Some(placement))
+            }
+            None => (None, None),
+        };
+        let epoch = match existing.as_ref() {
+            Some(placement) => placement
+                .epoch
+                .checked_add(1)
+                .ok_or(blockd_core::protocol::StoreFault::Unavailable)?,
+            None => 1,
+        };
+        let desired = ClusterPlacement::from_members(cluster_id, epoch, members.clone());
+        if let Some(existing) = existing
+            && existing.roster == desired.roster
+        {
+            return Ok(Some(existing));
+        }
+        if !is_current() {
+            return Ok(None);
+        }
+        match Arc::clone(&store)
+            .put_cas(key.clone(), generation, desired.encode())
+            .await
+        {
+            Ok(_) => return Ok(Some(desired)),
+            Err(blockd_core::protocol::StoreFault::CasConflict { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(blockd_core::protocol::StoreFault::Unavailable)
+}
+
+struct PlacementOwner {
+    store: Arc<dyn ObjectStore>,
+    cluster_id: u64,
+    authority: Option<blockd_core::hostmeta::AuthorityHostConfig>,
+    local: HostId,
+    status: Arc<LivePlacementStatus>,
+    rosters: tokio::sync::watch::Receiver<Vec<HostId>>,
+    admin: Injector<AdminRequest>,
+    startup: tokio::sync::oneshot::Sender<Result<ClusterPlacementConfig, RuntimeStartupError>>,
+}
+
+impl PlacementOwner {
+    async fn run(self) {
+        let Self {
+            store,
+            cluster_id,
+            authority,
+            local,
+            status,
+            mut rosters,
+            admin,
+            startup,
+        } = self;
+        let mut startup = Some(startup);
+        loop {
+            let members = rosters.borrow_and_update().clone();
+            let mut settled = !live_roster_includes_local(&members, local);
+            if live_roster_includes_local(&members, local) {
+                let reconciled = reconcile_cluster_placement_if_current(
+                    Arc::clone(&store),
+                    cluster_id,
+                    members.clone(),
+                    || status.is_current(&members),
+                )
+                .await;
+                match reconciled {
+                    Ok(Some(reconciled)) => {
+                        let placement = cluster_placement_config(&reconciled, authority);
+                        let published =
+                            status.complete_if_current(&members, reconciled.epoch, || {
+                                if startup.is_some() {
+                                    true
+                                } else {
+                                    let (update, _reply) =
+                                        request(AdminCall::UpdateClusterPlacement {
+                                            placement: placement.clone(),
+                                        });
+                                    admin.push(Lane::Background, update).is_ok()
+                                }
+                            });
+                        if published && let Some(ready) = startup.take() {
+                            let _ = ready.send(Ok(placement));
+                        }
+                        if published {
+                            settled = true;
+                        } else if startup.is_none() && status.is_current(&members) {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if let Some(ready) = startup.take() {
+                            let _ = ready.send(Err(RuntimeStartupError::Placement(error)));
+                            return;
+                        }
+                        tracing::warn!(?error, "cluster placement reconciliation deferred");
+                    }
+                }
+            }
+            if status.is_current(&members) {
+                if settled {
+                    if rosters.changed().await.is_err() {
+                        return;
+                    }
+                } else {
+                    tokio::select! {
+                        changed = rosters.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn assert_peer_stash_transport(config: VolumeConfig, authenticated: bool) {
@@ -129,7 +404,7 @@ impl VolumeHost {
         })
     }
 
-    fn page_index(&self, page: PageId) -> usize {
+    fn page_index(page: PageId) -> usize {
         usize::try_from(page.page.0).expect("page index fits")
     }
 
@@ -357,11 +632,20 @@ struct Shared {
     volumes: Mutex<BTreeMap<VolumeId, Arc<VolumeHost>>>,
     admin_events: Mutex<VecDeque<AdminEvent>>,
     admin_event_ready: tokio::sync::Notify,
+    released_volumes: Mutex<BTreeSet<VolumeId>>,
+    volume_released: tokio::sync::Notify,
     incidents: Mutex<Vec<String>>,
+    quarantines: Mutex<BTreeMap<VolumeId, String>>,
+    quarantine_cleanup: tokio::sync::Mutex<()>,
+    authority_identity: Mutex<Option<(u64, u64)>>,
+    planned_retirement: Mutex<Option<HostSessionRecord>>,
+    planned_retirement_verified: AtomicBool,
+    authority_placement_epoch: AtomicU64,
     counters: Mutex<Counters>,
     daemon_stats: Mutex<DaemonStats>,
     replica_metrics: Mutex<Vec<ReplicaVolumeMetrics>>,
     replica_spool_metrics: Mutex<Vec<ReplicaSpoolMetrics>>,
+    replica_spool_capacity_bytes: u64,
     capacity: Mutex<CapacityController>,
     stats: LoopStats,
     fault_in_flight: Mutex<BTreeMap<PageId, VecDeque<FaultInFlight>>>,
@@ -376,6 +660,28 @@ struct Shared {
     backup_lag_started: Mutex<BTreeMap<VolumeId, Instant>>,
     operation_started: Mutex<BTreeMap<(VolumeId, u8), Instant>>,
     next_req: AtomicU64,
+    cluster_placement_epoch: AtomicU64,
+    recovery_complete: AtomicBool,
+    critical_healthy: AtomicBool,
+    critical_failed: tokio::sync::Notify,
+    fault_readers: Mutex<BTreeMap<VolumeId, FaultReaderTask>>,
+    #[cfg(test)]
+    fault_reader_start: Mutex<Option<TestFaultReaderStart>>,
+}
+
+struct CriticalThreadGuard {
+    shared: Arc<Shared>,
+    expected_stop: Arc<AtomicBool>,
+    name: &'static str,
+}
+
+impl Drop for CriticalThreadGuard {
+    fn drop(&mut self) {
+        if !self.expected_stop.load(Ordering::SeqCst) {
+            self.shared
+                .fail_critical(format!("{} stopped unexpectedly", self.name));
+        }
+    }
 }
 
 impl Shared {
@@ -385,11 +691,20 @@ impl Shared {
             volumes: Mutex::new(volumes),
             admin_events: Mutex::new(VecDeque::new()),
             admin_event_ready: tokio::sync::Notify::new(),
+            released_volumes: Mutex::new(BTreeSet::new()),
+            volume_released: tokio::sync::Notify::new(),
             incidents: Mutex::new(Vec::new()),
+            quarantines: Mutex::new(BTreeMap::new()),
+            quarantine_cleanup: tokio::sync::Mutex::new(()),
+            authority_identity: Mutex::new(None),
+            planned_retirement: Mutex::new(None),
+            planned_retirement_verified: AtomicBool::new(false),
+            authority_placement_epoch: AtomicU64::new(0),
             counters: Mutex::new(Counters::default()),
             daemon_stats: Mutex::new(state.stats()),
             replica_metrics: Mutex::new(Vec::new()),
             replica_spool_metrics: Mutex::new(Vec::new()),
+            replica_spool_capacity_bytes: config.archive.spool_capacity_bytes,
             capacity: Mutex::new(CapacityController::default()),
             stats: LoopStats::default(),
             fault_in_flight: Mutex::new(BTreeMap::new()),
@@ -408,7 +723,25 @@ impl Shared {
             backup_lag_started: Mutex::new(BTreeMap::new()),
             operation_started: Mutex::new(BTreeMap::new()),
             next_req: AtomicU64::new(1),
+            cluster_placement_epoch: AtomicU64::new(
+                config
+                    .cluster_placement
+                    .as_ref()
+                    .map_or(0, |placement| placement.membership_epoch),
+            ),
+            recovery_complete: AtomicBool::new(false),
+            critical_healthy: AtomicBool::new(true),
+            critical_failed: tokio::sync::Notify::new(),
+            fault_readers: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            fault_reader_start: Mutex::new(None),
         }
+    }
+
+    fn fail_critical(&self, reason: String) {
+        self.incidents.lock().expect("incident lock").push(reason);
+        self.critical_healthy.store(false, Ordering::SeqCst);
+        self.critical_failed.notify_waiters();
     }
 }
 
@@ -424,6 +757,7 @@ struct FaultReaderStats {
 
 struct ActiveFaultReader {
     shared: Arc<Shared>,
+    expected_stop: Arc<AtomicBool>,
 }
 
 impl Drop for ActiveFaultReader {
@@ -432,6 +766,10 @@ impl Drop for ActiveFaultReader {
             .fault_reader
             .readers_exited
             .fetch_add(1, Ordering::Relaxed);
+        if !self.expected_stop.load(Ordering::SeqCst) {
+            self.shared
+                .fail_critical("fault reader stopped unexpectedly".to_owned());
+        }
     }
 }
 
@@ -505,6 +843,8 @@ enum FaultWork {
     Barrier {
         done: tokio::sync::oneshot::Sender<()>,
     },
+    #[cfg(test)]
+    CrashDispatcher,
     #[cfg(test)]
     Test {
         volume: VolumeId,
@@ -691,6 +1031,8 @@ impl FaultWork {
             Self::WriteProtect { .. } => 3,
             Self::Barrier { .. } => 4,
             #[cfg(test)]
+            Self::CrashDispatcher => 4,
+            #[cfg(test)]
             Self::Test { .. } => 0,
         }
     }
@@ -872,6 +1214,8 @@ impl FaultWorkDispatcher<'_> {
                 self.barrier = Some(done);
             }
             #[cfg(test)]
+            FaultWork::CrashDispatcher => panic!("injected fault dispatcher failure"),
+            #[cfg(test)]
             FaultWork::Test {
                 volume,
                 entered,
@@ -987,7 +1331,7 @@ fn execute_fault_work(work: BlockingFaultWork) -> Result<(), ()> {
             bytes,
             writable,
         } => {
-            let index = host.page_index(page);
+            let index = VolumeHost::page_index(page);
             if let Some(bytes) = bytes {
                 host.region.write_page(index, &bytes);
             }
@@ -998,7 +1342,7 @@ fn execute_fault_work(work: BlockingFaultWork) -> Result<(), ()> {
                 .map_err(|_| ())
         }
         BlockingFaultWork::Unprotect { host, page } => {
-            let index = host.page_index(page);
+            let index = VolumeHost::page_index(page);
             host.uffd
                 .as_ref()
                 .expect("compute unprotect")
@@ -1006,7 +1350,7 @@ fn execute_fault_work(work: BlockingFaultWork) -> Result<(), ()> {
                 .map_err(|_| ())
         }
         BlockingFaultWork::Evict { host, page } => {
-            let index = host.page_index(page);
+            let index = VolumeHost::page_index(page);
             host.view
                 .evict(index, 1)
                 .and_then(|()| host.region.punch_hole(index, 1))
@@ -1066,9 +1410,10 @@ struct ProductionWorld {
     blobs: FileBlobs,
     store: RuntimeStore,
     peers: Option<Arc<PeerNet>>,
-    self_id: HostId,
-    peer_rx: Injected<(HostId, PeerMsg)>,
+    local_host: HostId,
+    peer_rx: Injected<(blockd_core::types::HostId, PeerMsg)>,
     fault_rx: Injected<GuestFault>,
+    fault_tx: Injector<GuestFault>,
     sync_rx: Injected<GuestSyncRequest>,
     admin_rx: Injected<AdminRequest>,
     shared: Arc<Shared>,
@@ -1084,6 +1429,25 @@ impl ProductionWorld {
     fn enqueue_fault_work(&self, item: FaultWork) -> Result<(), GuestMemoryError> {
         enqueue_fault_work(&self.fault_work, &self.shared.fault_work_stats, item)
             .map_err(|()| GuestMemoryError::Unavailable)
+    }
+
+    async fn exact_planned_retirement_is_durable(&self) -> bool {
+        let expected = *self
+            .shared
+            .planned_retirement
+            .lock()
+            .expect("planned retirement lock");
+        let Some(expected) = expected else {
+            return false;
+        };
+        let key = blockd_core::layout::host_session_key(self.local_host);
+        self.store
+            .get(&key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(_, bytes)| HostSessionRecord::decode(&bytes).ok())
+            == Some(expected)
     }
 
     async fn fault_response(
@@ -1157,6 +1521,23 @@ impl Blobs for ProductionWorld {
             0,
             self.blobs.append(name, bytes),
             |()| false,
+        )
+        .await
+    }
+
+    async fn replace_tail_if_len(
+        &self,
+        name: String,
+        expected_total_len: u64,
+        valid_prefix_len: u64,
+        bytes: Vec<u8>,
+    ) -> Result<bool, BlobError> {
+        self.blob_observe(
+            world_kind::REPLICA_APPEND,
+            0,
+            self.blobs
+                .replace_tail_if_len(name, expected_total_len, valid_prefix_len, bytes),
+            |appended| !appended,
         )
         .await
     }
@@ -1266,7 +1647,7 @@ impl Peers for ProductionWorld {
     async fn send(&self, to: HostId, message: PeerMsg) {
         let started = Instant::now();
         if let Some(peers) = &self.peers {
-            peers.send(self.self_id, to, &message);
+            peers.send_identity(to, &message);
         } else {
             self.shared
                 .incidents
@@ -1279,30 +1660,37 @@ impl Peers for ProductionWorld {
             .record_world(world_kind::PEER_SEND, elapsed_ns(started.elapsed()));
     }
 
-    async fn recv(&self) -> Option<(HostId, PeerMsg)> {
+    async fn recv(&self) -> Option<(blockd_core::types::HostId, PeerMsg)> {
         self.peer_rx.recv().await
     }
+}
+
+fn group_write_protect_pages(
+    pages: &[PageId],
+    mut volume_kind: impl FnMut(VolumeId) -> VolumeKind,
+) -> BTreeMap<VolumeId, Vec<usize>> {
+    let mut by_volume = BTreeMap::<VolumeId, Vec<usize>>::new();
+    for &page in pages {
+        match volume_kind(page.volume) {
+            VolumeKind::Memory | VolumeKind::Data => by_volume
+                .entry(page.volume)
+                .or_default()
+                .push(VolumeHost::page_index(page)),
+        }
+    }
+    by_volume
 }
 
 impl GuestMem for ProductionWorld {
     async fn read_page(&self, page: PageId) -> Vec<u8> {
         let host = self.host(page.volume);
-        host.region.read_page(host.page_index(page))
+        host.region.read_page(VolumeHost::page_index(page))
     }
 
     async fn arm_write_protect(&self, pages: &[PageId]) -> Result<(), GuestMemoryError> {
         let hosts = {
-            let mut by_volume = BTreeMap::<VolumeId, Vec<usize>>::new();
             let volumes = self.shared.volumes.lock().expect("volume lock");
-            for &page in pages {
-                let host = &volumes[&page.volume];
-                if host.config.kind == VolumeKind::Data {
-                    by_volume
-                        .entry(page.volume)
-                        .or_default()
-                        .push(host.page_index(page));
-                }
-            }
+            let by_volume = group_write_protect_pages(pages, |volume| volumes[&volume].config.kind);
             by_volume
                 .into_iter()
                 .map(|(volume, pages)| (volume, Arc::clone(&volumes[&volume]), pages))
@@ -1388,7 +1776,11 @@ impl GuestMem for ProductionWorld {
         self.shared.stats.record_world(world_kind::FILL_FAILED, 0);
         self.shared
             .complete_fault(None, page, FaultSource::Unservable, "failed");
-        tracing::error!(?page, "fatal unservable guest page");
+        tracing::error!(
+            volume_id = page.volume.0,
+            ?page,
+            "fatal unservable guest page"
+        );
         Err(GuestMemoryError::Unservable)
     }
 
@@ -1552,17 +1944,82 @@ impl AdminIo for ProductionWorld {
         self.shared.stats.record_world(world_kind::ADMIN, 0);
     }
 
+    async fn prepare_recovered_volume(&self, volume: VolumeId, config: VolumeConfig) -> bool {
+        prepare_recovered_volume_with(
+            Arc::clone(&self.shared),
+            self.fault_tx.clone(),
+            volume,
+            config,
+        )
+        .await
+    }
+
+    async fn volume_released(&self, volume: VolumeId) {
+        self.shared
+            .released_volumes
+            .lock()
+            .expect("released volume lock")
+            .insert(volume);
+        self.shared.volume_released.notify_waiters();
+    }
+
     async fn host_failed(&self, failure: HostFatal) {
+        use std::io::Write as _;
+
+        if failure.reason == "host session fenced"
+            && self.exact_planned_retirement_is_durable().await
+        {
+            self.shared
+                .planned_retirement_verified
+                .store(true, Ordering::SeqCst);
+            return;
+        }
         tracing::error!(reason = failure.reason, "fatal host actor failure");
-        eprintln!("fatal host actor failure: {}", failure.reason);
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "fatal host actor failure: {}", failure.reason);
+        let _ = stderr.flush();
+        drop(stderr);
         self.shared
             .incidents
             .lock()
             .expect("incident lock")
             .push(format!("host failure: {}", failure.reason));
         self.shared.stats.record_world(world_kind::ABORT, 0);
+        crate::flush_fatal_records();
         std::process::abort();
     }
+}
+
+async fn prepare_recovered_volume_with(
+    shared: Arc<Shared>,
+    fault_tx: Injector<GuestFault>,
+    volume: VolumeId,
+    config: VolumeConfig,
+) -> bool {
+    let (host, existing) = {
+        let mut volumes = shared.volumes.lock().expect("volume lock");
+        if let Some(existing) = volumes.get(&volume) {
+            if existing.config != config {
+                return false;
+            }
+            (Arc::clone(existing), true)
+        } else {
+            let host = VolumeHost::new(volume, config);
+            volumes.insert(volume, Arc::clone(&host));
+            (host, false)
+        }
+    };
+    if existing {
+        return shared
+            .fault_readers
+            .lock()
+            .expect("fault reader lock")
+            .get(&volume)
+            .is_some_and(FaultReaderTask::is_live);
+    }
+    Runtime::spawn_fault_reader_with(&shared, fault_tx, volume, host)
+        .await
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
@@ -1570,7 +2027,7 @@ struct Inputs {
     admin: Injector<AdminRequest>,
     faults: Injector<GuestFault>,
     syncs: Injector<GuestSyncRequest>,
-    peers: Injector<(HostId, PeerMsg)>,
+    peers: Injector<(blockd_core::types::HostId, PeerMsg)>,
 }
 
 const PEER_INPUT_CAPACITY: usize = 4;
@@ -1594,16 +2051,211 @@ impl Inputs {
     }
 }
 
+struct RuntimeStartupGuard {
+    peers: Option<Arc<PeerNet>>,
+    placement_worker: Option<tokio::task::JoinHandle<()>>,
+    fault_work: Option<tokio::sync::mpsc::UnboundedSender<FaultWork>>,
+    fault_worker: Option<std::thread::JoinHandle<()>>,
+    fault_worker_expected_stop: Arc<AtomicBool>,
+    armed: bool,
+}
+
+struct RuntimeStartupResources {
+    peers: Option<Arc<PeerNet>>,
+    placement_worker: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(test)]
+    fault_work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
+    fault_worker: std::thread::JoinHandle<()>,
+}
+
+impl RuntimeStartupGuard {
+    fn new(
+        fault_work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
+        fault_worker: std::thread::JoinHandle<()>,
+        fault_worker_expected_stop: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            peers: None,
+            placement_worker: None,
+            fault_work: Some(fault_work),
+            fault_worker: Some(fault_worker),
+            fault_worker_expected_stop,
+            armed: true,
+        }
+    }
+
+    fn fault_work(&self) -> &tokio::sync::mpsc::UnboundedSender<FaultWork> {
+        self.fault_work.as_ref().expect("startup fault sender")
+    }
+
+    async fn rollback<T>(mut self, error: RuntimeStartupError) -> Result<T, RuntimeStartupError> {
+        self.cleanup().await;
+        Err(error)
+    }
+
+    async fn cleanup(&mut self) {
+        self.fault_worker_expected_stop
+            .store(true, Ordering::SeqCst);
+        if let Some(worker) = self.placement_worker.take() {
+            worker.abort();
+            let _ = worker.await;
+        }
+        if let Some(peers) = self.peers.take() {
+            let _ = peers.shutdown().await;
+        }
+        self.fault_work.take();
+        if let Some(worker) = self.fault_worker.take() {
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
+        }
+        self.armed = false;
+    }
+
+    fn commit(mut self) -> RuntimeStartupResources {
+        self.armed = false;
+        let fault_work = self.fault_work.take().expect("startup fault sender");
+        #[cfg(not(test))]
+        drop(fault_work);
+        RuntimeStartupResources {
+            peers: self.peers.take(),
+            placement_worker: self.placement_worker.take(),
+            #[cfg(test)]
+            fault_work,
+            fault_worker: self.fault_worker.take().expect("startup fault worker"),
+        }
+    }
+}
+
+impl Drop for RuntimeStartupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.fault_worker_expected_stop
+            .store(true, Ordering::SeqCst);
+        self.fault_work.take();
+        if let Some(worker) = self.placement_worker.take() {
+            worker.abort();
+        }
+        if let Some(peers) = self.peers.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                let _ = peers.shutdown().await;
+            });
+        }
+        if let Some(worker) = self.fault_worker.take() {
+            let _ = std::thread::Builder::new()
+                .name("blockd-startup-rollback".to_owned())
+                .spawn(move || {
+                    let _ = worker.join();
+                });
+        }
+    }
+}
+
 pub struct Runtime {
     inputs: Inputs,
     shared: Arc<Shared>,
     blob_dir: PathBuf,
+    store: Arc<dyn ObjectStore>,
+    host: HostId,
+    authority_required: bool,
     peers: Option<Arc<PeerNet>>,
-    authenticated_peers: bool,
+    placement_worker: Option<tokio::task::JoinHandle<()>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    actor_expected_stop: Arc<AtomicBool>,
     actor_task: Option<std::thread::JoinHandle<()>>,
-    fault_readers: Mutex<BTreeMap<VolumeId, tokio::task::JoinHandle<()>>>,
     fault_worker: Option<std::thread::JoinHandle<()>>,
+    fault_worker_expected_stop: Arc<AtomicBool>,
+    live_placement: Arc<LivePlacementStatus>,
+    #[cfg(test)]
+    actor_failure: tokio::sync::mpsc::UnboundedSender<TestActorFailure>,
+    #[cfg(test)]
+    fault_work: tokio::sync::mpsc::UnboundedSender<FaultWork>,
+}
+
+/// The independently actionable dependencies behind daemon readiness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // each bool is an independently reported health gate
+pub struct RuntimeReadiness {
+    pub authority: bool,
+    pub membership_ownership: bool,
+    pub placement: bool,
+    pub recovery: bool,
+    pub peer_listener: bool,
+    pub critical_tasks: bool,
+    pub unfenced: bool,
+}
+
+impl RuntimeReadiness {
+    pub fn ready(self) -> bool {
+        self.authority
+            && self.membership_ownership
+            && self.placement
+            && self.recovery
+            && self.peer_listener
+            && self.critical_tasks
+            && self.unfenced
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy)]
+enum TestActorFailure {
+    HostActor,
+    Observation,
+}
+
+struct FaultReaderTask {
+    task: tokio::task::JoinHandle<()>,
+    expected_stop: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+}
+
+impl FaultReaderTask {
+    fn is_live(&self) -> bool {
+        self.ready.load(Ordering::SeqCst) && !self.task.is_finished()
+    }
+
+    fn stop(self) -> tokio::task::JoinHandle<()> {
+        self.expected_stop.store(true, Ordering::SeqCst);
+        self.task.abort();
+        self.task
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestFaultReaderStart {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    fail: bool,
+}
+
+#[cfg(test)]
+impl TestFaultReaderStart {
+    fn held(fail: bool) -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            fail,
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_fault_reader_starts() -> &'static Mutex<BTreeMap<PathBuf, TestFaultReaderStart>> {
+    static STARTS: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, TestFaultReaderStart>>> =
+        std::sync::OnceLock::new();
+    STARTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn set_test_fault_reader_start(blob_dir: &Path, start: TestFaultReaderStart) {
+    test_fault_reader_starts()
+        .lock()
+        .expect("test fault reader starts lock")
+        .insert(blob_dir.to_path_buf(), start);
 }
 
 /// A persistent guest thread's access to one compute volume.
@@ -1643,19 +2295,21 @@ impl GuestAccess {
 
 impl GuestOperation {
     pub fn read_word(&self, page: PageId) -> u64 {
-        self.host.view.read_word(self.host.page_index(page))
+        self.host.view.read_word(VolumeHost::page_index(page))
     }
 
     pub fn read_page(&self, page: PageId) -> Vec<u8> {
-        self.host.view.read_page(self.host.page_index(page))
+        self.host.view.read_page(VolumeHost::page_index(page))
     }
 
     pub fn write_word(&self, page: PageId, value: u64) {
-        self.host.view.write_word(self.host.page_index(page), value);
+        self.host
+            .view
+            .write_word(VolumeHost::page_index(page), value);
     }
 
     pub fn evict_page(&self, page: PageId) -> std::io::Result<()> {
-        self.host.view.evict(self.host.page_index(page), 1)
+        self.host.view.evict(VolumeHost::page_index(page), 1)
     }
 }
 
@@ -1667,8 +2321,104 @@ impl Drop for GuestOperation {
 
 impl Runtime {
     #[allow(clippy::needless_pass_by_value)]
-    pub async fn new(config: &RuntimeConfig, store: Arc<dyn ObjectStore>) -> Self {
-        Self::start(BTreeMap::new(), config, store).await
+    pub async fn new(
+        config: &RuntimeConfig,
+        store: Arc<dyn ObjectStore>,
+    ) -> Result<Self, RuntimeStartupError> {
+        let blob_dir = config.blob_dir.clone();
+        let (volume_configs, unidentified_volumes) = tokio::task::spawn_blocking(move || {
+            crate::world::prepare_blob_root(&blob_dir)?;
+            let mut recovered = BTreeMap::<VolumeId, ((u64, u64), VolumeConfig)>::new();
+            let mut discovered = BTreeSet::new();
+            for blob in crate::blobscan::scan_blob_dir_for_recovery(&blob_dir) {
+                let Some(BlobName::Journal { volume, .. }) =
+                    blockd_core::layout::parse_blob(&blob.name)
+                else {
+                    continue;
+                };
+                discovered.insert(volume);
+                let Ok(record) = JournalRecord::decode(volume, &blob.bytes) else {
+                    continue;
+                };
+                let order = (record.capture_seq, record.seq.0);
+                if recovered
+                    .get(&volume)
+                    .is_none_or(|(current, _)| order > *current)
+                {
+                    recovered.insert(volume, (order, record.config));
+                }
+            }
+            let configs = recovered
+                .into_iter()
+                .map(|(volume, (_, config))| (volume, config))
+                .collect::<BTreeMap<_, _>>();
+            let unidentified = discovered
+                .into_iter()
+                .filter(|volume| !configs.contains_key(volume))
+                .collect::<Vec<_>>();
+            Ok::<_, std::io::Error>((configs, unidentified))
+        })
+        .await
+        .map_err(|error| RuntimeStartupError::LocalDiscovery(error.to_string()))?
+        .map_err(RuntimeStartupError::BlobDirectory)?;
+        let recovered_volumes = volume_configs.keys().copied().collect::<Vec<_>>();
+        let hosts = volume_configs
+            .into_iter()
+            .map(|(volume, volume_config)| {
+                assert_peer_stash_transport(volume_config, config.peer.is_some());
+                (volume, VolumeHost::new(volume, volume_config))
+            })
+            .collect();
+        let runtime = Self::start(hosts, config, store).await?;
+        #[cfg(test)]
+        if let Some(start) = test_fault_reader_starts()
+            .lock()
+            .expect("test fault reader starts lock")
+            .remove(&config.blob_dir)
+        {
+            *runtime
+                .shared
+                .fault_reader_start
+                .lock()
+                .expect("fault reader start lock") = Some(start);
+        }
+        for volume in unidentified_volumes {
+            runtime.shared.quarantines.lock().expect("quarantine lock").insert(
+                volume,
+                "local journal metadata is corrupt; preserve artifacts for repair or explicit audited cleanup"
+                    .to_owned(),
+            );
+        }
+        for volume in recovered_volumes {
+            let verdict = runtime.wait_recovered(volume).await;
+            if verdict == Verdict::Unrestorable {
+                runtime.shared.quarantines.lock().expect("quarantine lock").insert(
+                    volume,
+                    "no intact local recovery point; repair local artifacts or restore from an operator-verified source"
+                        .to_owned(),
+                );
+            } else {
+                let host = runtime.host(volume);
+                if !runtime.start_fault_reader(volume, host).await {
+                    runtime.shared.quarantines.lock().expect("quarantine lock").insert(
+                        volume,
+                        "runtime fault service failed to register; retain local artifacts and keep the volume unavailable"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        let recovery_healthy = runtime
+            .shared
+            .quarantines
+            .lock()
+            .expect("quarantine lock")
+            .is_empty();
+        runtime
+            .shared
+            .recovery_complete
+            .store(recovery_healthy, Ordering::SeqCst);
+        Ok(runtime)
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -1676,14 +2426,45 @@ impl Runtime {
         config: &RuntimeConfig,
         store: Arc<dyn ObjectStore>,
         volume_configs: &BTreeMap<VolumeId, VolumeConfig>,
-    ) -> (Self, BTreeMap<VolumeId, Verdict>) {
+    ) -> Result<(Self, BTreeMap<VolumeId, Verdict>), RuntimeStartupError> {
         let mut hosts = BTreeMap::new();
         for (&volume, &volume_config) in volume_configs {
             assert_peer_stash_transport(volume_config, config.peer.is_some());
             hosts.insert(volume, VolumeHost::new(volume, volume_config));
         }
-        let runtime = Self::start(hosts, config, store).await;
-        (runtime, BTreeMap::new())
+        let runtime = Self::start(hosts, config, store).await?;
+        let mut verdicts = BTreeMap::new();
+        for &volume in volume_configs.keys() {
+            let verdict = runtime.wait_recovered(volume).await;
+            if verdict == Verdict::Unrestorable {
+                runtime.shared.quarantines.lock().expect("quarantine lock").insert(
+                    volume,
+                    "no intact local recovery point; repair local artifacts or restore from an operator-verified source"
+                        .to_owned(),
+                );
+            } else {
+                let host = runtime.host(volume);
+                if !runtime.start_fault_reader(volume, host).await {
+                    runtime.shared.quarantines.lock().expect("quarantine lock").insert(
+                        volume,
+                        "runtime fault service failed to register; retain local artifacts and keep the volume unavailable"
+                            .to_owned(),
+                    );
+                }
+            }
+            verdicts.insert(volume, verdict);
+        }
+        let recovery_healthy = runtime
+            .shared
+            .quarantines
+            .lock()
+            .expect("quarantine lock")
+            .is_empty();
+        runtime
+            .shared
+            .recovery_complete
+            .store(recovery_healthy, Ordering::SeqCst);
+        Ok((runtime, verdicts))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1691,10 +2472,31 @@ impl Runtime {
         hosts: BTreeMap<VolumeId, Arc<VolumeHost>>,
         config: &RuntimeConfig,
         store: Arc<dyn ObjectStore>,
-    ) -> Self {
-        tokio::fs::create_dir_all(&config.blob_dir)
+    ) -> Result<Self, RuntimeStartupError> {
+        let placement_authority = config
+            .daemon
+            .cluster_placement
+            .as_ref()
+            .and_then(|placement| placement.authority);
+        if let Some(authority) = placement_authority {
+            assert_eq!(
+                config.cluster_id,
+                Some(authority.cluster_id),
+                "runtime cluster identity must match authority placement"
+            );
+        }
+        let placement_cluster_id = config
+            .cluster_id
+            .or_else(|| placement_authority.map(|authority| authority.cluster_id));
+        assert!(
+            config.peer.is_none() || placement_cluster_id.is_some(),
+            "peer runtime requires a durable cluster identity"
+        );
+        let blob_root = config.blob_dir.clone();
+        tokio::task::spawn_blocking(move || crate::world::prepare_blob_root(&blob_root))
             .await
-            .expect("blob directory");
+            .map_err(|error| RuntimeStartupError::LocalDiscovery(error.to_string()))?
+            .map_err(RuntimeStartupError::BlobDirectory)?;
         let (fault_work, fault_work_rx) = tokio::sync::mpsc::unbounded_channel();
         let (admin, admin_rx_actor) = injector();
         let (faults, fault_rx_actor) = injector();
@@ -1708,69 +2510,126 @@ impl Runtime {
         };
         let shared = Arc::new(Shared::new(hosts, &config.daemon));
         let fault_worker_shared = Arc::clone(&shared);
+        let fault_worker_expected_stop = Arc::new(AtomicBool::new(false));
+        let fault_worker_stop = Arc::clone(&fault_worker_expected_stop);
+        let fault_worker_span = tracing::Span::current();
         let fault_worker = std::thread::Builder::new()
             .name("blockd-fault-work".to_owned())
-            .spawn(move || fault_work_loop(fault_work_rx, fault_worker_shared))
-            .expect("spawn fault worker");
+            .spawn(move || {
+                let _span = fault_worker_span.enter();
+                let _guard = CriticalThreadGuard {
+                    shared: Arc::clone(&fault_worker_shared),
+                    expected_stop: fault_worker_stop,
+                    name: "fault worker",
+                };
+                fault_work_loop(fault_work_rx, fault_worker_shared);
+            })
+            .map_err(|source| RuntimeStartupError::ThreadSpawn {
+                thread: "fault worker",
+                source,
+            })?;
+        let mut startup = RuntimeStartupGuard::new(
+            fault_work,
+            fault_worker,
+            Arc::clone(&fault_worker_expected_stop),
+        );
         let blobs = FileBlobs::new(&config.blob_dir);
         let peer_store = Arc::clone(&store);
-        let runtime_store = RuntimeStore::new(store);
-        let actor_config = config.daemon.clone();
+        let runtime_store = RuntimeStore::new(Arc::clone(&store));
+        let mut actor_config = config.daemon.clone();
         let peer_input = inputs.peers.clone();
         let placement_input = inputs.admin.clone();
         let placement_host = actor_config.host;
-        let placement_authority = actor_config
-            .replica_placement
-            .as_ref()
-            .and_then(|placement| placement.authority);
+        let live_placement = Arc::new(LivePlacementStatus::new(config.peer.is_some()));
+        let (placement_rosters, placement_roster_rx) =
+            tokio::sync::watch::channel(Vec::<HostId>::new());
         let peers = match config.peer.clone() {
-            Some(peer_config) => Some(
-                PeerNet::start_with_membership(
+            Some(peer_config) => {
+                let placement_status = Arc::clone(&live_placement);
+                PeerNet::start_with_membership_result(
                     &peer_config,
-                    actor_config.host,
-                    peer_store,
+                    placement_host,
+                    Arc::clone(&peer_store),
                     move |from, message| {
                         let lane = peer_lane(&message);
                         let _ = peer_input.push(lane, (from, message));
                     },
                     move |members| {
-                        let roster = members
-                            .iter()
-                            .map(|member| PeerCandidate {
-                                host: *member,
-                                weight: 1,
-                                failure_domain: member.0,
-                                drained: false,
-                            })
-                            .collect();
-                        let placement = ReplicaPlacementConfig {
-                            membership_epoch: live_membership_epoch(&members),
-                            local_failure_domain: placement_host.0,
-                            roster,
-                            authority: placement_authority,
-                        };
-                        let (update, _reply) =
-                            request(AdminCall::UpdateReplicaPlacement { placement });
-                        let _ = placement_input.push(Lane::Background, update);
+                        placement_status.publish(members.clone());
+                        placement_rosters.send_replace(members);
                     },
                 )
                 .await
-                .expect("peer listen"),
-            ),
-            None => None,
+                .map(Some)
+                .map_err(|error| match error {
+                    crate::peer::PeerStartError::Listener(error) => {
+                        RuntimeStartupError::PeerListener(error)
+                    }
+                    crate::peer::PeerStartError::Membership(error) => {
+                        RuntimeStartupError::PeerMembership(error)
+                    }
+                })
+            }
+            None => Ok(None),
         };
-        let authenticated_peers = peers.as_ref().is_some_and(|peers| peers.authenticated());
+        startup.peers = match peers {
+            Ok(peers) => peers,
+            Err(error) => return startup.rollback(error).await,
+        };
+        let peers = startup.peers.as_ref();
+        if peers.is_some() {
+            let (placement_ready, ready) = tokio::sync::oneshot::channel();
+            let placement_owner = tokio::spawn(
+                PlacementOwner {
+                    store: Arc::clone(&peer_store),
+                    cluster_id: placement_cluster_id
+                        .expect("peer runtime has a durable cluster identity"),
+                    authority: placement_authority,
+                    local: placement_host,
+                    status: Arc::clone(&live_placement),
+                    rosters: placement_roster_rx,
+                    admin: placement_input,
+                    startup: placement_ready,
+                }
+                .run()
+                .instrument(tracing::Span::current()),
+            );
+            startup.placement_worker = Some(placement_owner);
+            match ready.await {
+                Ok(Ok(placement)) => actor_config.cluster_placement = Some(placement),
+                Ok(Err(error)) => return startup.rollback(error).await,
+                Err(_) => {
+                    return startup
+                        .rollback(RuntimeStartupError::Placement(
+                            blockd_core::protocol::StoreFault::Unavailable,
+                        ))
+                        .await;
+                }
+            }
+        }
         let actor_shared = Arc::clone(&shared);
         let actor_inputs = inputs.clone();
-        let world_fault_work = fault_work.clone();
-        let shutdown_fault_work = fault_work.clone();
-        let actor_peers = peers.clone();
-        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let world_fault_work = startup.fault_work().clone();
+        let shutdown_fault_work = startup.fault_work().clone();
+        let actor_peers = startup.peers.clone();
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        #[cfg(test)]
+        let (actor_failure, mut actor_failure_rx) = tokio::sync::mpsc::unbounded_channel();
         let poll_stats = Arc::clone(&actor_shared);
-        let actor_thread_name = format!("blockd-actor-{}", actor_config.host.0);
+        let actor_expected_stop = Arc::new(AtomicBool::new(false));
+        let actor_stop = Arc::clone(&actor_expected_stop);
+        let actor_guard_shared = Arc::clone(&actor_shared);
+        let actor_thread_name = format!("blockd-actor-{}", actor_config.host.get());
+        let actor_span = tracing::Span::current();
         let actor_task = std::thread::Builder::new()
             .name(actor_thread_name)
             .spawn(move || {
+                let _span = actor_span.enter();
+                let _guard = CriticalThreadGuard {
+                    shared: actor_guard_shared,
+                    expected_stop: actor_stop,
+                    name: "actor thread",
+                };
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -1785,9 +2644,10 @@ impl Runtime {
                                 blobs,
                                 store: runtime_store,
                                 peers: actor_peers.clone(),
-                                self_id: actor_config.host,
+                                local_host: actor_config.host,
                                 peer_rx: peer_rx_actor,
                                 fault_rx: fault_rx_actor,
+                                fault_tx: actor_inputs.faults.clone(),
                                 sync_rx: sync_rx_actor,
                                 admin_rx: admin_rx_actor,
                                 shared: Arc::clone(&actor_shared),
@@ -1811,7 +2671,46 @@ impl Runtime {
                                     delay(OBSERVATION_INTERVAL_NS).await;
                                 }
                             });
-                            let _ = shutdown_rx.await;
+                            #[cfg(test)]
+                            let mut injected_failure = Box::pin(actor_failure_rx.recv());
+                            #[cfg(not(test))]
+                            let mut injected_failure = Box::pin(std::future::pending::<
+                                Option<TestActorFailure>,
+                            >());
+                            let unexpected = loop {
+                                tokio::select! {
+                                    result = &mut host_actor => {
+                                        if actor_shared
+                                            .planned_retirement_verified
+                                            .load(Ordering::SeqCst)
+                                        {
+                                            break None;
+                                        }
+                                        break Some(("host actor", result));
+                                    },
+                                    result = &mut observation => break Some(("observation task", result)),
+                                    _ = &mut shutdown_rx => break None,
+                                    failure = &mut injected_failure => match failure {
+                                        Some(TestActorFailure::HostActor) => {
+                                            host_actor.cancel();
+                                            break Some(("host actor", Err(blockd_exec::Cancelled)));
+                                        }
+                                        Some(TestActorFailure::Observation) => {
+                                            observation.cancel();
+                                            break Some((
+                                                "observation task",
+                                                Err(blockd_exec::Cancelled),
+                                            ));
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            };
+                            if let Some((task, result)) = unexpected {
+                                actor_shared.fail_critical(format!(
+                                    "{task} stopped unexpectedly: {result:?}"
+                                ));
+                            }
                             host_actor.cancel();
                             observation.cancel();
                             for _ in 0..64 {
@@ -1831,32 +2730,45 @@ impl Runtime {
                         })
                         .await;
                 }));
-            })
-            .expect("spawn actor thread");
+            });
+        let actor_task = match actor_task {
+            Ok(actor_task) => actor_task,
+            Err(source) => {
+                return startup
+                    .rollback(RuntimeStartupError::ThreadSpawn {
+                        thread: "actor",
+                        source,
+                    })
+                    .await;
+            }
+        };
+        let committed = startup.commit();
 
-        let runtime = Self {
+        Ok(Self {
             inputs,
             shared,
             blob_dir: config.blob_dir.clone(),
-            peers,
-            authenticated_peers,
+            store,
+            host: config.daemon.host,
+            authority_required: config
+                .daemon
+                .cluster_placement
+                .as_ref()
+                .and_then(|placement| placement.authority)
+                .is_some(),
+            peers: committed.peers,
+            placement_worker: committed.placement_worker,
             shutdown: Some(shutdown),
+            actor_expected_stop,
             actor_task: Some(actor_task),
-            fault_readers: Mutex::new(BTreeMap::new()),
-            fault_worker: Some(fault_worker),
-        };
-        let hosts = runtime
-            .shared
-            .volumes
-            .lock()
-            .expect("volume lock")
-            .iter()
-            .map(|(&volume, host)| (volume, Arc::clone(host)))
-            .collect::<Vec<_>>();
-        for (volume, host) in hosts {
-            runtime.spawn_fault_reader(volume, host);
-        }
-        runtime
+            fault_worker: Some(committed.fault_worker),
+            fault_worker_expected_stop,
+            live_placement,
+            #[cfg(test)]
+            actor_failure,
+            #[cfg(test)]
+            fault_work: committed.fault_work,
+        })
     }
 
     pub fn loop_stats(&self) -> &LoopStats {
@@ -1985,6 +2897,12 @@ impl Runtime {
             .map_or(0, |peers| peers.dropped_sends.load(Ordering::SeqCst))
     }
 
+    pub fn peer_overload_rejections(&self) -> u64 {
+        self.peers
+            .as_ref()
+            .map_or(0, |peers| peers.overload_rejections())
+    }
+
     pub fn peer_connections(&self) -> Vec<(HostId, bool)> {
         self.peers
             .as_ref()
@@ -1993,118 +2911,200 @@ impl Runtime {
 
     #[allow(clippy::too_many_lines)] // readiness, error, tracing, and injection are one loop
     fn spawn_fault_reader(&self, volume: VolumeId, host: Arc<VolumeHost>) {
-        let faults = self.inputs.faults.clone();
-        let shared = Arc::clone(&self.shared);
-        let uffd = host
-            .uffd
-            .as_ref()
-            .expect("compute volume has userfaultfd")
-            .clone();
-        uffd.set_nonblocking(true).expect("nonblocking userfaultfd");
+        drop(Self::spawn_fault_reader_with(
+            &self.shared,
+            self.inputs.faults.clone(),
+            volume,
+            host,
+        ));
+    }
+
+    async fn start_fault_reader(&self, volume: VolumeId, host: Arc<VolumeHost>) -> bool {
+        Self::spawn_fault_reader_with(&self.shared, self.inputs.faults.clone(), volume, host)
+            .await
+            .unwrap_or(false)
+    }
+
+    #[allow(clippy::too_many_lines)] // readiness, error, tracing, and injection are one loop
+    fn spawn_fault_reader_with(
+        shared: &Arc<Shared>,
+        faults: Injector<GuestFault>,
+        volume: VolumeId,
+        host: Arc<VolumeHost>,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (started, startup) = tokio::sync::oneshot::channel();
+        let Some(uffd) = host.uffd.clone() else {
+            let _ = started.send(false);
+            return startup;
+        };
+        if let Err(error) = uffd.set_nonblocking(true) {
+            shared.fail_critical(format!(
+                "fault reader nonblocking setup failed for {volume:?}: {error}"
+            ));
+            let _ = started.send(false);
+            return startup;
+        }
         shared
             .fault_reader
             .readers_started
             .fetch_add(1, Ordering::Relaxed);
-        let task = tokio::spawn(async move {
-            let _active = ActiveFaultReader {
-                shared: Arc::clone(&shared),
-            };
-            let uffd = AsyncFd::new(SharedUffd(uffd)).expect("register runtime userfaultfd");
-            loop {
-                let mut ready = match uffd.readable().await {
-                    Ok(ready) => ready,
+        let expected_stop = Arc::new(AtomicBool::new(false));
+        let reader_expected_stop = Arc::clone(&expected_stop);
+        let ready = Arc::new(AtomicBool::new(false));
+        let reader_ready = Arc::clone(&ready);
+        let reader_shared = Arc::clone(shared);
+        let volume_span = tracing::info_span!("blockd.volume", volume_id = volume.0);
+        let task = tokio::spawn(
+            async move {
+                let _active = ActiveFaultReader {
+                    shared: Arc::clone(&reader_shared),
+                    expected_stop: reader_expected_stop,
+                };
+                #[cfg(test)]
+                let test_start = reader_shared
+                    .fault_reader_start
+                    .lock()
+                    .expect("fault reader start lock")
+                    .take();
+                #[cfg(test)]
+                if let Some(start) = test_start {
+                    start.entered.notify_one();
+                    start.release.notified().await;
+                    if start.fail {
+                        reader_shared.fail_critical(format!(
+                            "fault reader registration failed for {volume:?}: injected failure"
+                        ));
+                        let _ = started.send(false);
+                        return;
+                    }
+                }
+                let uffd = match AsyncFd::new(SharedUffd(uffd)) {
+                    Ok(uffd) => uffd,
                     Err(error) => {
-                        shared
-                            .fault_reader
-                            .terminal_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        shared
-                            .incidents
-                            .lock()
-                            .expect("incident lock")
-                            .push(format!(
-                                "fault reader readiness failed for {volume:?}: {error}"
-                            ));
+                        reader_shared.fail_critical(format!(
+                            "fault reader registration failed for {volume:?}: {error}"
+                        ));
+                        let _ = started.send(false);
                         return;
                     }
                 };
+                reader_ready.store(true, Ordering::SeqCst);
+                let _ = started.send(true);
                 loop {
-                    let events = match ready.try_io(|inner| inner.get_ref().0.read_events()) {
-                        Ok(Ok(events)) => events,
-                        Ok(Err(error)) => {
-                            shared
+                    let mut ready = match uffd.readable().await {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            reader_shared
                                 .fault_reader
                                 .terminal_errors
                                 .fetch_add(1, Ordering::Relaxed);
-                            shared
-                                .incidents
-                                .lock()
-                                .expect("incident lock")
-                                .push(format!("fault reader failed for {volume:?}: {error}"));
+                            reader_shared.fail_critical(format!(
+                                "fault reader readiness failed for {volume:?}: {error}"
+                            ));
                             return;
                         }
-                        Err(_) => break,
                     };
-                    shared.fault_reader.events_read.fetch_add(
-                        u64::try_from(events.len()).unwrap_or(u64::MAX),
-                        Ordering::Relaxed,
-                    );
-                    for event in events {
-                        let page = host.page_of_addr(event.address & !(page_size() - 1));
-                        let span = tracing::debug_span!(
-                            "page.fault",
-                            volume_id = volume.0,
-                            page = page.page.0,
-                            write = event.write,
-                            wp = event.wp,
-                            minor = event.minor,
-                            source = tracing::field::Empty,
-                            outcome = tracing::field::Empty,
-                            duration_ms = tracing::field::Empty,
+                    loop {
+                        let events = match ready.try_io(|inner| inner.get_ref().0.read_events()) {
+                            Ok(Ok(events)) => events,
+                            Ok(Err(error)) => {
+                                reader_shared
+                                    .fault_reader
+                                    .terminal_errors
+                                    .fetch_add(1, Ordering::Relaxed);
+                                reader_shared.fail_critical(format!(
+                                    "fault reader failed for {volume:?}: {error}"
+                                ));
+                                return;
+                            }
+                            Err(_) => break,
+                        };
+                        reader_shared.fault_reader.events_read.fetch_add(
+                            u64::try_from(events.len()).unwrap_or(u64::MAX),
+                            Ordering::Relaxed,
                         );
-                        shared
-                            .fault_in_flight
-                            .lock()
-                            .expect("fault lock")
-                            .entry(page)
-                            .or_default()
-                            .push_back(FaultInFlight {
-                                started: Instant::now(),
-                                span,
-                            });
-                        if faults
-                            .push(
-                                Lane::Critical,
-                                GuestFault {
-                                    page,
-                                    write: event.write,
-                                    wp: event.wp,
-                                    minor: event.minor,
-                                },
-                            )
-                            .is_err()
-                        {
-                            shared
+                        for event in events {
+                            let page = host.page_of_addr(event.address & !(page_size() - 1));
+                            let span = tracing::debug_span!(
+                                "page.fault",
+                                volume_id = volume.0,
+                                page = page.page.0,
+                                write = event.write,
+                                wp = event.wp,
+                                minor = event.minor,
+                                source = tracing::field::Empty,
+                                outcome = tracing::field::Empty,
+                                duration_ms = tracing::field::Empty,
+                            );
+                            reader_shared
+                                .fault_in_flight
+                                .lock()
+                                .expect("fault lock")
+                                .entry(page)
+                                .or_default()
+                                .push_back(FaultInFlight {
+                                    started: Instant::now(),
+                                    span,
+                                });
+                            if faults
+                                .push(
+                                    Lane::Critical,
+                                    GuestFault {
+                                        page,
+                                        write: event.write,
+                                        wp: event.wp,
+                                        minor: event.minor,
+                                    },
+                                )
+                                .is_err()
+                            {
+                                reader_shared
+                                    .fault_reader
+                                    .injection_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                reader_shared.fail_critical(format!(
+                                    "fault reader injection failed for {volume:?}"
+                                ));
+                                return;
+                            }
+                            reader_shared
                                 .fault_reader
-                                .injection_failures
+                                .events_injected
                                 .fetch_add(1, Ordering::Relaxed);
-                            return;
                         }
-                        shared
-                            .fault_reader
-                            .events_injected
-                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-        });
-        if let Some(previous) = self
+            .instrument(volume_span),
+        );
+        if let Some(previous) = shared
             .fault_readers
             .lock()
             .expect("fault reader lock")
-            .insert(volume, task)
+            .insert(
+                volume,
+                FaultReaderTask {
+                    task,
+                    expected_stop,
+                    ready,
+                },
+            )
         {
-            previous.abort();
+            drop(previous.stop());
+        }
+        startup
+    }
+
+    #[cfg(test)]
+    fn stop_fault_reader_unexpectedly_for_test(&self, volume: VolumeId) {
+        if let Some(reader) = self
+            .shared
+            .fault_readers
+            .lock()
+            .expect("fault reader lock")
+            .get(&volume)
+        {
+            reader.task.abort();
         }
     }
 
@@ -2148,10 +3148,13 @@ impl Runtime {
         .expect("admin event within 30 seconds")
     }
 
-    pub async fn create_volume(&self, volume: VolumeId, config: VolumeConfig) {
+    pub async fn try_create_volume(
+        &self,
+        volume: VolumeId,
+        config: VolumeConfig,
+    ) -> Result<(), blockd_core::protocol::AdminError> {
         let started = Instant::now();
-        self.install_volume_host(volume, config);
-        let created = match self
+        let result = match self
             .admin_request(AdminCall::CreateVolume {
                 volume,
                 config,
@@ -2159,12 +3162,21 @@ impl Runtime {
             })
             .await
         {
-            Ok(AdminSuccess::VolumeCreated { volume: found }) if found == volume => true,
-            Err(_) => false,
+            Ok(AdminSuccess::VolumeCreated { volume: found }) if found == volume => Ok(()),
+            Err(error) => Err(error),
             result => panic!("unexpected create result: {result:?}"),
         };
-        self.observe_operation(0, created, started.elapsed());
-        assert!(created, "volume creation failed");
+        self.observe_operation(0, result.is_ok(), started.elapsed());
+        if result.is_ok() {
+            self.install_volume_host(volume, config, true);
+        }
+        result
+    }
+
+    pub async fn create_volume(&self, volume: VolumeId, config: VolumeConfig) {
+        self.try_create_volume(volume, config)
+            .await
+            .expect("volume creation failed");
     }
 
     pub async fn keep_base(&self, volume: VolumeId, base: u64) {
@@ -2179,7 +3191,7 @@ impl Runtime {
 
     pub async fn fork_volume(&self, volume: VolumeId, config: VolumeConfig, base: u64) -> Verdict {
         let started = Instant::now();
-        self.install_volume_host(volume, config);
+        self.install_volume_host(volume, config, true);
         let result = match self
             .admin_request(AdminCall::CreateVolume {
                 volume,
@@ -2229,8 +3241,9 @@ impl Runtime {
     }
 
     pub async fn restore_volume(&self, volume: VolumeId, config: VolumeConfig) -> Verdict {
+        self.shared.recovery_complete.store(false, Ordering::SeqCst);
         let started = Instant::now();
-        self.install_volume_host(volume, config);
+        self.install_volume_host(volume, config, false);
         let result = match self
             .admin_request(AdminCall::RestoreVolume { volume })
             .await
@@ -2240,7 +3253,42 @@ impl Runtime {
             result => panic!("unexpected restore result: {result:?}"),
         };
         self.observe_operation(2, result.is_some(), started.elapsed());
-        result.expect("restore failed")
+        let verdict = match result {
+            Some(verdict) if !matches!(verdict, Verdict::Unrestorable) => {
+                let host = self.host(volume);
+                let reader_ready = self.start_fault_reader(volume, host).await;
+                let mut quarantines = self.shared.quarantines.lock().expect("quarantine lock");
+                if reader_ready {
+                    quarantines.remove(&volume);
+                } else {
+                    quarantines.insert(
+                        volume,
+                        "runtime fault service failed to register; retain local artifacts and keep the volume unavailable"
+                            .to_owned(),
+                    );
+                }
+                verdict
+            }
+            Some(Verdict::Unrestorable) | None => {
+                self.shared.quarantines.lock().expect("quarantine lock").insert(
+                    volume,
+                    "operator restore did not prove an intact recovery point; retain artifacts and retry repair"
+                        .to_owned(),
+                );
+                Verdict::Unrestorable
+            }
+            Some(_) => unreachable!("all restorable verdicts handled"),
+        };
+        let recovery_healthy = self
+            .shared
+            .quarantines
+            .lock()
+            .expect("quarantine lock")
+            .is_empty();
+        self.shared
+            .recovery_complete
+            .store(recovery_healthy, Ordering::SeqCst);
+        verdict
     }
 
     pub async fn wait_recovered(&self, volume: VolumeId) -> Verdict {
@@ -2255,43 +3303,61 @@ impl Runtime {
     }
 
     pub fn expect_migration(&self, volume: VolumeId, config: VolumeConfig) {
-        self.install_volume_host(volume, config);
+        self.install_volume_host(volume, config, true);
     }
 
-    fn install_volume_host(&self, volume: VolumeId, config: VolumeConfig) {
-        assert_peer_stash_transport(config, self.authenticated_peers);
+    fn install_volume_host(
+        &self,
+        volume: VolumeId,
+        config: VolumeConfig,
+        start_fault_reader: bool,
+    ) {
+        assert_peer_stash_transport(
+            config,
+            self.peers
+                .as_ref()
+                .is_some_and(|peers| peers.authenticated()),
+        );
         let host = VolumeHost::new(volume, config);
         self.shared
             .volumes
             .lock()
             .expect("volume lock")
             .insert(volume, Arc::clone(&host));
-        self.spawn_fault_reader(volume, host);
+        if start_fault_reader {
+            self.spawn_fault_reader(volume, host);
+        }
     }
 
-    pub async fn migrate_out(&self, volume: VolumeId, to: HostId) {
+    pub async fn try_migrate_out(&self, volume: VolumeId, to: HostId) -> Result<(), AdminError> {
         let started = Instant::now();
         let pauses_guest = self.host(volume).config.kind == VolumeKind::Memory;
         if pauses_guest {
             self.expect_pause(volume, 1);
         }
-        let migrated = match self
+        let result = match self
             .admin_request(AdminCall::MigrateOut { volume, to })
             .await
         {
-            Ok(AdminSuccess::MigratedOut { .. }) => true,
-            Err(_) => false,
+            Ok(AdminSuccess::MigratedOut { .. }) => Ok(()),
+            Err(error) => Err(error),
             result => panic!("unexpected migration result: {result:?}"),
         };
-        self.observe_operation(3, migrated, started.elapsed());
+        self.observe_operation(3, result.is_ok(), started.elapsed());
         if pauses_guest {
-            if migrated {
+            if result.is_ok() {
                 self.shared.complete_pause(volume);
             } else {
                 self.cancel_expected_pause(volume, 1);
             }
         }
-        assert!(migrated, "migrate out failed");
+        result
+    }
+
+    pub async fn migrate_out(&self, volume: VolumeId, to: HostId) {
+        self.try_migrate_out(volume, to)
+            .await
+            .expect("migrate out failed");
     }
 
     pub async fn wait_migrated_in(&self, volume: VolumeId) -> Verdict {
@@ -2299,10 +3365,27 @@ impl Runtime {
             AdminEvent::VolumeMigratedIn {
                 volume: found,
                 verdict,
+                ..
             } if *found == volume => Some(*verdict),
             _ => None,
         })
         .await
+    }
+
+    pub async fn wait_volume_released(&self, volume: VolumeId) {
+        loop {
+            let notified = self.shared.volume_released.notified();
+            if self
+                .shared
+                .released_volumes
+                .lock()
+                .expect("released volume lock")
+                .remove(&volume)
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub fn counters(&self) -> Counters {
@@ -2329,8 +3412,322 @@ impl Runtime {
         self.shared.incidents.lock().expect("incident lock").clone()
     }
 
+    pub fn quarantines(&self) -> BTreeMap<VolumeId, String> {
+        self.shared
+            .quarantines
+            .lock()
+            .expect("quarantine lock")
+            .clone()
+    }
+
+    pub fn volume_inventory(&self) -> Vec<(VolumeId, VolumeConfig, bool)> {
+        let quarantines = self.shared.quarantines.lock().expect("quarantine lock");
+        self.shared
+            .volumes
+            .lock()
+            .expect("volume lock")
+            .iter()
+            .map(|(&volume, host)| (volume, host.config, quarantines.contains_key(&volume)))
+            .collect()
+    }
+
+    /// Permanently remove one quarantined volume after recording immutable
+    /// operator intent and completion records beside the local blob store.
+    ///
+    /// The intent record is synced before any artifact is unlinked. If the
+    /// process crashes during cleanup, the surviving intent and any remaining
+    /// artifacts make the interrupted operation explicit and retryable.
+    pub async fn discard_quarantine(
+        &self,
+        volume: VolumeId,
+        operator_reason: &str,
+    ) -> Result<String, String> {
+        let operator_reason = operator_reason.trim();
+        if operator_reason.is_empty() {
+            return Err("an operator reason is required".to_owned());
+        }
+        if operator_reason.len() > 4_096 {
+            return Err("operator reason exceeds 4096 bytes".to_owned());
+        }
+
+        let _cleanup = self.shared.quarantine_cleanup.lock().await;
+        let quarantine_reason = self
+            .shared
+            .quarantines
+            .lock()
+            .expect("quarantine lock")
+            .get(&volume)
+            .cloned()
+            .ok_or_else(|| "volume is not quarantined".to_owned())?;
+
+        let blobs = FileBlobs::new(&self.blob_dir);
+        let mut artifacts = blobs
+            .scan()
+            .await
+            .map_err(|error| format!("scan quarantined artifacts: {error:?}"))?
+            .into_iter()
+            .filter_map(|blob| {
+                let belongs = match blockd_core::layout::parse_blob(&blob.name)? {
+                    BlobName::Journal { volume: found, .. }
+                    | BlobName::Blx { volume: found, .. }
+                    | BlobName::Handoff { volume: found }
+                    | BlobName::ReplicaSpool { volume: found, .. } => found == volume,
+                };
+                belongs.then_some(blob.name)
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort();
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock precedes Unix epoch".to_owned())?
+            .as_millis();
+        let sequence = self.shared.next_req.fetch_add(1, Ordering::Relaxed);
+        let audit_id = format!("{timestamp_ms:032x}-{sequence:016x}");
+        let audit_root = format!("quarantine-audit/{:016x}/{audit_id}", volume.0);
+        let intent = serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "audit_id": audit_id,
+            "phase": "intent",
+            "volume": volume.0,
+            "quarantine_reason": quarantine_reason,
+            "operator_reason": operator_reason,
+            "artifacts": artifacts,
+        }))
+        .map_err(|error| format!("encode cleanup audit: {error}"))?;
+        blobs
+            .write(format!("{audit_root}.intent.json"), intent)
+            .await
+            .map_err(|error| format!("persist cleanup intent: {error:?}"))?;
+        blobs
+            .delete_many_durable(&artifacts)
+            .await
+            .map_err(|error| format!("delete quarantined artifacts: {error:?}"))?;
+
+        let completion = serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "audit_id": audit_id,
+            "phase": "complete",
+            "volume": volume.0,
+            "deleted_artifacts": artifacts.len(),
+        }))
+        .map_err(|error| format!("encode cleanup completion: {error}"))?;
+        blobs
+            .write(format!("{audit_root}.complete.json"), completion)
+            .await
+            .map_err(|error| format!("persist cleanup completion: {error:?}"))?;
+
+        self.shared
+            .quarantines
+            .lock()
+            .expect("quarantine lock")
+            .remove(&volume);
+        self.shared
+            .volumes
+            .lock()
+            .expect("volume lock")
+            .remove(&volume);
+        let recovery_healthy = self
+            .shared
+            .quarantines
+            .lock()
+            .expect("quarantine lock")
+            .is_empty();
+        self.shared
+            .recovery_complete
+            .store(recovery_healthy, Ordering::SeqCst);
+        Ok(audit_id)
+    }
+
+    pub fn readiness(&self) -> RuntimeReadiness {
+        let peer_listener = self
+            .peers
+            .as_ref()
+            .is_none_or(|peers| peers.listener_healthy());
+        let peer_tasks = self.peers.as_ref().is_none_or(|peers| peers.healthy());
+        let (placement_current, expected_placement_epoch) = self.live_placement.readiness();
+        RuntimeReadiness {
+            authority: !self.authority_required
+                || (self
+                    .shared
+                    .authority_identity
+                    .lock()
+                    .expect("authority identity lock")
+                    .is_some()
+                    && self.authority_control_ready()),
+            membership_ownership: self
+                .peers
+                .as_ref()
+                .is_none_or(|peers| peers.membership_owned()),
+            placement: placement_current
+                && self.shared.cluster_placement_epoch.load(Ordering::SeqCst)
+                    == expected_placement_epoch,
+            recovery: self.shared.recovery_complete.load(Ordering::SeqCst),
+            peer_listener,
+            critical_tasks: self.shared.critical_healthy.load(Ordering::SeqCst) && peer_tasks,
+            unfenced: self.incidents().iter().all(|incident| {
+                !incident.starts_with("host failure:") && !incident.starts_with("fenced:")
+            }),
+        }
+    }
+
+    pub fn authority_session_ready(&self) -> bool {
+        !self.authority_required
+            || self
+                .shared
+                .authority_identity
+                .lock()
+                .expect("authority identity lock")
+                .is_some()
+    }
+
+    pub fn authority_control_ready(&self) -> bool {
+        let (_, expected_placement_epoch) = self.live_placement.readiness();
+        !self.authority_required
+            || (self.shared.authority_placement_epoch.load(Ordering::SeqCst) != 0
+                && self.shared.authority_placement_epoch.load(Ordering::SeqCst)
+                    == expected_placement_epoch)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.readiness().ready()
+    }
+
+    pub fn peer_resource_metrics(&self) -> PeerResourceMetrics {
+        self.peers
+            .as_ref()
+            .map_or_else(PeerResourceMetrics::default, |peers| {
+                peers.resource_metrics()
+            })
+    }
+
+    pub fn replica_spool_capacity_bytes(&self) -> u64 {
+        self.shared.replica_spool_capacity_bytes
+    }
+
+    pub async fn critical_failure(&self) {
+        let local = self.shared.critical_failed.notified();
+        if !self.shared.critical_healthy.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(peers) = &self.peers {
+            tokio::select! {
+                () = local => {},
+                () = peers.critical_failure() => {},
+            }
+        } else {
+            local.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_actor_task_failure(&self, failure: TestActorFailure) {
+        self.actor_failure
+            .send(failure)
+            .expect("actor failure injector alive");
+    }
+
+    #[cfg(test)]
+    fn inject_fault_worker_failure(&self) {
+        enqueue_fault_work(
+            &self.fault_work,
+            &self.shared.fault_work_stats,
+            FaultWork::CrashDispatcher,
+        )
+        .expect("fault worker failure injector alive");
+    }
+
+    pub async fn publish_drained(&self) -> Result<(), blockd_core::protocol::StoreFault> {
+        match &self.peers {
+            Some(peers) => peers.publish_drained().await,
+            None => Ok(()),
+        }
+    }
+
+    pub async fn await_authority_transfer(&self) -> Result<(), String> {
+        if !self.authority_required {
+            return Ok(());
+        }
+        loop {
+            match Arc::clone(&self.store)
+                .get(blockd_core::layout::placement_key())
+                .await
+            {
+                Ok(Some((_, bytes))) => {
+                    let placement = ClusterPlacement::decode(&bytes)
+                        .ok_or_else(|| "authority placement is corrupt during drain".to_owned())?;
+                    if !placement.contains(self.host) {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => return Err("authority placement disappeared during drain".to_owned()),
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub async fn relinquish_authority(&self) -> Result<(), String> {
+        let identity = *self
+            .shared
+            .authority_identity
+            .lock()
+            .expect("authority identity lock");
+        let Some((session, epoch)) = identity else {
+            return if self.authority_required {
+                Err("authority session was not established before drain".to_owned())
+            } else {
+                Ok(())
+            };
+        };
+        let key = blockd_core::layout::host_session_key(self.host);
+        let Some((generation, encoded)) = Arc::clone(&self.store)
+            .get(key.clone())
+            .await
+            .map_err(|error| format!("read host session during drain: {error:?}"))?
+        else {
+            return Err("host session disappeared during drain".to_owned());
+        };
+        let record = blockd_core::authority::HostSessionRecord::decode(&encoded)
+            .map_err(|_| "host session is corrupt during drain".to_owned())?;
+        if !matches!(
+            record,
+            blockd_core::authority::HostSessionRecord::Active {
+                session: found,
+                epoch: found_epoch,
+            } if found == session && found_epoch == epoch
+        ) {
+            return Err("host session was replaced before drain".to_owned());
+        }
+        let nonce = self.shared.next_req.fetch_add(1, Ordering::SeqCst).max(1);
+        let retired = record
+            .retire(session, nonce)
+            .map_err(|_| "host session could not be retired".to_owned())?;
+        *self
+            .shared
+            .planned_retirement
+            .lock()
+            .expect("planned retirement lock") = Some(retired);
+        let result = Arc::clone(&self.store)
+            .put_cas(key, Some(generation), retired.encode())
+            .await;
+        if let Err(error) = result {
+            *self
+                .shared
+                .planned_retirement
+                .lock()
+                .expect("planned retirement lock") = None;
+            return Err(format!("retire host session during drain: {error:?}"));
+        }
+        Ok(())
+    }
+
     pub fn blob_dir(&self) -> &Path {
         &self.blob_dir
+    }
+
+    pub fn host_id(&self) -> HostId {
+        self.host
     }
 
     pub fn blob_filesystem_space(&self) -> Option<(u64, u64)> {
@@ -2355,7 +3752,7 @@ impl Runtime {
         let host = self.host(volume);
         host.op_start().await;
         tokio::task::spawn_blocking(move || {
-            host.view.write_word(host.page_index(page), value);
+            host.view.write_word(VolumeHost::page_index(page), value);
             host.op_end();
         })
         .await
@@ -2366,7 +3763,7 @@ impl Runtime {
         let host = self.host(volume);
         host.op_start().await;
         tokio::task::spawn_blocking(move || {
-            let bytes = host.view.read_page(host.page_index(page));
+            let bytes = host.view.read_page(VolumeHost::page_index(page));
             host.op_end();
             bytes
         })
@@ -2432,26 +3829,53 @@ impl Runtime {
         }
     }
 
-    pub async fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) -> Result<(), blockd_core::protocol::StoreFault> {
+        if let Some(worker) = self.placement_worker.take() {
+            worker.abort();
+            let _ = worker.await;
+        }
+        self.actor_expected_stop.store(true, Ordering::SeqCst);
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
         if let Some(actor_task) = self.actor_task.take() {
-            let _ = tokio::task::spawn_blocking(move || actor_task.join()).await;
+            tokio::task::spawn_blocking(move || actor_task.join())
+                .await
+                .map_err(|_| blockd_core::protocol::StoreFault::Unavailable)?
+                .map_err(|_| blockd_core::protocol::StoreFault::Unavailable)?;
+        }
+        #[cfg(test)]
+        {
+            let (disconnected, receiver) = tokio::sync::mpsc::unbounded_channel();
+            drop(receiver);
+            drop(std::mem::replace(&mut self.fault_work, disconnected));
         }
         if let Some(fault_worker) = self.fault_worker.take() {
-            let _ = tokio::task::spawn_blocking(move || fault_worker.join()).await;
+            self.fault_worker_expected_stop
+                .store(true, Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || fault_worker.join())
+                .await
+                .map_err(|_| blockd_core::protocol::StoreFault::Unavailable)?
+                .map_err(|_| blockd_core::protocol::StoreFault::Unavailable)?;
         }
-        let readers = std::mem::take(&mut *self.fault_readers.lock().expect("fault reader lock"));
+        let readers =
+            std::mem::take(&mut *self.shared.fault_readers.lock().expect("fault reader lock"));
         for (_, reader) in readers {
-            reader.abort();
+            let reader = reader.stop();
             let _ = reader.await;
         }
+        if let Some(peers) = &self.peers {
+            peers.shutdown().await?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        if let Some(worker) = self.placement_worker.take() {
+            worker.abort();
+        }
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -2459,9 +3883,9 @@ impl Drop for Runtime {
             let _ = actor_task.join();
         }
         for (_, reader) in
-            std::mem::take(&mut *self.fault_readers.lock().expect("fault reader lock"))
+            std::mem::take(&mut *self.shared.fault_readers.lock().expect("fault reader lock"))
         {
-            reader.abort();
+            drop(reader.stop());
         }
         self.fault_worker.take();
     }
@@ -2574,7 +3998,27 @@ fn operation_name(operation: u8) -> &'static str {
 impl Shared {
     fn publish_observability(&self, state: &Rc<RefCell<HostState>>, inputs: &Inputs) {
         let state = state.borrow();
+        self.cluster_placement_epoch.store(
+            state
+                .config
+                .cluster_placement
+                .as_ref()
+                .map_or(0, |placement| placement.membership_epoch),
+            Ordering::SeqCst,
+        );
         let daemon = state.stats();
+        *self
+            .authority_identity
+            .lock()
+            .expect("authority identity lock") = if state.authority_serving() {
+            state
+                .authority_session()
+                .map(|session| (session, state.authority_host_epoch()))
+        } else {
+            None
+        };
+        self.authority_placement_epoch
+            .store(state.authority_placement_epoch(), Ordering::SeqCst);
         *self.counters.lock().expect("counter lock") = state.counters;
         *self.daemon_stats.lock().expect("stats lock") = daemon.clone();
         *self.replica_metrics.lock().expect("replica metric lock") = state.replica_metrics();
@@ -2690,6 +4134,302 @@ impl Shared {
 mod tests {
     use super::*;
 
+    struct BlockFirstPlacementRead {
+        inner: Arc<dyn ObjectStore>,
+        blocked: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockFirstPlacementRead {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                blocked: AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for BlockFirstPlacementRead {
+        async fn put(
+            self: Arc<Self>,
+            key: String,
+            bytes: Vec<u8>,
+        ) -> Result<u64, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.inner).put(key, bytes).await
+        }
+
+        async fn put_cas(
+            self: Arc<Self>,
+            key: String,
+            expected: Option<u64>,
+            bytes: Vec<u8>,
+        ) -> Result<u64, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.inner).put_cas(key, expected, bytes).await
+        }
+
+        async fn get(self: Arc<Self>, key: String) -> crate::GetResult {
+            if key == blockd_core::layout::placement_key()
+                && !self.blocked.swap(true, Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Arc::clone(&self.inner).get(key).await
+        }
+
+        async fn get_range(
+            self: Arc<Self>,
+            key: String,
+            offset: u64,
+            len: u64,
+        ) -> crate::GetResult {
+            Arc::clone(&self.inner).get_range(key, offset, len).await
+        }
+
+        async fn delete(
+            self: Arc<Self>,
+            key: String,
+        ) -> Result<bool, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.inner).delete(key).await
+        }
+
+        async fn delete_cas(
+            self: Arc<Self>,
+            key: String,
+            expected: u64,
+        ) -> Result<bool, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.inner).delete_cas(key, expected).await
+        }
+
+        async fn list_prefix(
+            self: Arc<Self>,
+            prefix: String,
+        ) -> Result<Vec<String>, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.inner).list_prefix(prefix).await
+        }
+
+        async fn list_prefix_versioned(
+            self: Arc<Self>,
+            prefix: String,
+        ) -> Result<Vec<crate::ListedObject>, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.inner).list_prefix_versioned(prefix).await
+        }
+    }
+
+    struct FailPlacementStore(Arc<dyn ObjectStore>);
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailPlacementStore {
+        async fn put(
+            self: Arc<Self>,
+            key: String,
+            bytes: Vec<u8>,
+        ) -> Result<u64, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.0).put(key, bytes).await
+        }
+
+        async fn put_cas(
+            self: Arc<Self>,
+            key: String,
+            expected: Option<u64>,
+            bytes: Vec<u8>,
+        ) -> Result<u64, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.0).put_cas(key, expected, bytes).await
+        }
+
+        async fn get(self: Arc<Self>, key: String) -> crate::GetResult {
+            if key == blockd_core::layout::placement_key() {
+                return Err(blockd_core::protocol::StoreFault::Unavailable);
+            }
+            Arc::clone(&self.0).get(key).await
+        }
+
+        async fn get_range(
+            self: Arc<Self>,
+            key: String,
+            offset: u64,
+            len: u64,
+        ) -> crate::GetResult {
+            Arc::clone(&self.0).get_range(key, offset, len).await
+        }
+
+        async fn delete(
+            self: Arc<Self>,
+            key: String,
+        ) -> Result<bool, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.0).delete(key).await
+        }
+
+        async fn delete_cas(
+            self: Arc<Self>,
+            key: String,
+            expected: u64,
+        ) -> Result<bool, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.0).delete_cas(key, expected).await
+        }
+
+        async fn list_prefix(
+            self: Arc<Self>,
+            prefix: String,
+        ) -> Result<Vec<String>, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.0).list_prefix(prefix).await
+        }
+
+        async fn list_prefix_versioned(
+            self: Arc<Self>,
+            prefix: String,
+        ) -> Result<Vec<crate::ListedObject>, blockd_core::protocol::StoreFault> {
+            Arc::clone(&self.0).list_prefix_versioned(prefix).await
+        }
+    }
+
+    async fn stop_test_fault_readers(shared: &Arc<Shared>) {
+        let readers = std::mem::take(&mut *shared.fault_readers.lock().expect("fault reader lock"));
+        for (_, reader) in readers {
+            let _ = reader.stop().await;
+        }
+    }
+
+    #[test]
+    fn capture_write_protects_memory_and_data_pages() {
+        let memory = VolumeId(1);
+        let data = VolumeId(2);
+        let pages = [
+            PageId {
+                volume: memory,
+                page: PageNo(3),
+            },
+            PageId {
+                volume: data,
+                page: PageNo(5),
+            },
+        ];
+
+        let grouped = group_write_protect_pages(&pages, |volume| {
+            if volume == memory {
+                VolumeKind::Memory
+            } else {
+                VolumeKind::Data
+            }
+        });
+
+        assert_eq!(grouped.get(&memory), Some(&vec![3]));
+        assert_eq!(grouped.get(&data), Some(&vec![5]));
+    }
+
+    #[tokio::test]
+    async fn recovered_volume_preparation_waits_for_fault_reader_registration() {
+        let shared = Arc::new(Shared::new(BTreeMap::new(), &test_host_config()));
+        let gate = TestFaultReaderStart::held(false);
+        *shared
+            .fault_reader_start
+            .lock()
+            .expect("fault reader start lock") = Some(gate.clone());
+        let (faults, _fault_rx) = injector();
+        let volume = VolumeId(92);
+        let preparation = prepare_recovered_volume_with(
+            Arc::clone(&shared),
+            faults,
+            volume,
+            VolumeConfig::data(1),
+        );
+        tokio::pin!(preparation);
+        tokio::select! {
+            () = gate.entered.notified() => {}
+            ready = &mut preparation => panic!("preparation completed before reader registration: {ready}"),
+        }
+        gate.release.notify_one();
+        assert!(preparation.await);
+        assert!(shared.fault_readers.lock().expect("fault reader lock")[&volume].is_live());
+        stop_test_fault_readers(&shared).await;
+    }
+
+    #[tokio::test]
+    async fn failed_or_lost_fault_reader_blocks_recovered_volume_preparation() {
+        let failed = Arc::new(Shared::new(BTreeMap::new(), &test_host_config()));
+        let gate = TestFaultReaderStart::held(true);
+        gate.release.notify_one();
+        *failed
+            .fault_reader_start
+            .lock()
+            .expect("fault reader start lock") = Some(gate);
+        let (faults, _fault_rx) = injector();
+        assert!(
+            !prepare_recovered_volume_with(
+                Arc::clone(&failed),
+                faults,
+                VolumeId(93),
+                VolumeConfig::data(1),
+            )
+            .await
+        );
+        assert!(!failed.critical_healthy.load(Ordering::SeqCst));
+
+        let lost = Arc::new(Shared::new(BTreeMap::new(), &test_host_config()));
+        let (faults, _fault_rx) = injector();
+        let volume = VolumeId(94);
+        let config = VolumeConfig::data(1);
+        assert!(
+            prepare_recovered_volume_with(Arc::clone(&lost), faults.clone(), volume, config).await
+        );
+        lost.fault_readers.lock().expect("fault reader lock")[&volume]
+            .task
+            .abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if lost.fault_readers.lock().expect("fault reader lock")[&volume]
+                    .task
+                    .is_finished()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fault reader stopped");
+        assert!(
+            !prepare_recovered_volume_with(Arc::clone(&lost), faults, volume, config).await,
+            "an existing volume without a live reader was reported serviceable"
+        );
+        assert!(!lost.critical_healthy.load(Ordering::SeqCst));
+        stop_test_fault_readers(&lost).await;
+    }
+
+    #[test]
+    fn stale_live_placement_completion_cannot_overwrite_a_newer_roster_shrink() {
+        let status = LivePlacementStatus::new(true);
+        let before_shrink = vec![HostId::new(1), HostId::new(2), HostId::new(3)];
+        status.publish(before_shrink.clone());
+        status.publish(vec![HostId::new(1), HostId::new(2)]);
+
+        assert!(!status.complete_if_current(&before_shrink, 11, || true));
+        assert_eq!(status.readiness(), (false, 0));
+
+        let recovered = vec![HostId::new(1), HostId::new(2), HostId::new(4)];
+        status.publish(recovered.clone());
+        assert!(status.complete_if_current(&recovered, 12, || true));
+        assert_eq!(status.readiness(), (true, 12));
+    }
+
+    #[test]
+    fn live_placement_requires_the_local_host_and_replication_factor() {
+        let local = HostId::new(2);
+        assert!(!live_roster_includes_local(
+            &[HostId::new(1), HostId::new(3), HostId::new(4)],
+            local,
+        ));
+        assert!(!live_roster_includes_local(&[HostId::new(1), local], local,));
+        assert!(live_roster_includes_local(
+            &[HostId::new(1), local, HostId::new(3)],
+            local,
+        ));
+    }
+
     fn start_test_fault_worker() -> (
         tokio::sync::mpsc::UnboundedSender<FaultWork>,
         Arc<Shared>,
@@ -2729,14 +4469,14 @@ mod tests {
     fn test_host_config() -> HostConfig {
         HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         }
     }
 
@@ -2995,6 +4735,798 @@ mod tests {
             assert_eq!(reply, Ok(AdminSuccess::BaseDeleted { base: expected }));
         }
         actor.await.expect("actor task");
+    }
+
+    async fn supervision_runtime(
+        prefix: &str,
+    ) -> (tempfile::TempDir, crate::fakegcs::FakeGcsServer, Runtime) {
+        let root = tempfile::tempdir().expect("supervision data directory");
+        let (fake, store) = test_object_store(prefix).await;
+        let config = RuntimeConfig {
+            daemon: test_host_config(),
+            cluster_id: None,
+            blob_dir: root.path().join("blobs"),
+            peer: None,
+        };
+        let runtime = Runtime::new(&config, store).await.expect("runtime startup");
+        (root, fake, runtime)
+    }
+
+    async fn assert_drain_waits_for_authority_exclusion(quarantined: bool) {
+        let (_root, _fake, mut runtime) = supervision_runtime(if quarantined {
+            "quarantined-drain-authority/"
+        } else {
+            "empty-drain-authority/"
+        })
+        .await;
+        runtime.authority_required = true;
+        if quarantined {
+            runtime
+                .shared
+                .quarantines
+                .lock()
+                .expect("quarantine lock")
+                .insert(VolumeId(91), "test quarantine".to_owned());
+            assert!(
+                runtime
+                    .volume_inventory()
+                    .iter()
+                    .all(|(_, _, quarantined)| *quarantined)
+            );
+        } else {
+            assert!(runtime.volume_inventory().is_empty());
+        }
+        let local = runtime.host;
+        let other = [HostId::new(41), HostId::new(42), HostId::new(43)];
+        let mut retaining_members = vec![local, other[0], other[1]];
+        retaining_members.sort_unstable();
+        retaining_members.dedup();
+        let retaining =
+            ClusterPlacement::new(99, 1, retaining_members).expect("retaining placement");
+        Arc::clone(&runtime.store)
+            .put(
+                blockd_core::layout::placement_key().clone(),
+                retaining.encode(),
+            )
+            .await
+            .expect("publish retaining placement");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(350),
+                runtime.await_authority_transfer()
+            )
+            .await
+            .is_err(),
+            "drain bypassed authority placement because inventory had no serviceable volumes"
+        );
+
+        let excluded = ClusterPlacement::new(99, 2, other.to_vec()).expect("excluded placement");
+        Arc::clone(&runtime.store)
+            .put(
+                blockd_core::layout::placement_key().clone(),
+                excluded.encode(),
+            )
+            .await
+            .expect("publish excluded placement");
+        tokio::time::timeout(Duration::from_secs(1), runtime.await_authority_transfer())
+            .await
+            .expect("drain observed authority exclusion")
+            .expect("valid authority placement");
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn empty_node_drain_waits_for_authority_placement_exclusion() {
+        assert_drain_waits_for_authority_exclusion(false).await;
+    }
+
+    #[tokio::test]
+    async fn all_quarantined_node_drain_waits_for_authority_placement_exclusion() {
+        assert_drain_waits_for_authority_exclusion(true).await;
+    }
+
+    async fn assert_injected_critical_failure(runtime: &Runtime, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(1), runtime.critical_failure())
+            .await
+            .expect("critical task failure propagated");
+        assert!(!runtime.is_ready());
+        assert!(
+            runtime
+                .incidents()
+                .iter()
+                .any(|incident| incident.contains(expected)),
+            "missing incident for {expected}: {:?}",
+            runtime.incidents()
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_and_observation_termination_are_host_fatal() {
+        let (_root, _fake, mut actor) = supervision_runtime("actor-supervision/").await;
+        actor.inject_actor_task_failure(TestActorFailure::HostActor);
+        assert_injected_critical_failure(&actor, "host actor stopped unexpectedly").await;
+        actor.shutdown().await.expect("failed actor still joins");
+
+        let (_root, _fake, mut observation) = supervision_runtime("observation-supervision/").await;
+        observation.inject_actor_task_failure(TestActorFailure::Observation);
+        assert_injected_critical_failure(&observation, "observation task stopped unexpectedly")
+            .await;
+        observation
+            .shutdown()
+            .await
+            .expect("failed observation still joins");
+    }
+
+    #[tokio::test]
+    async fn fault_worker_termination_is_host_fatal() {
+        let (_root, _fake, mut runtime) = supervision_runtime("fault-worker-supervision/").await;
+        runtime.inject_fault_worker_failure();
+        assert_injected_critical_failure(&runtime, "fault worker stopped unexpectedly").await;
+        assert!(
+            runtime.shutdown().await.is_err(),
+            "a panicked fault worker must make shutdown report failure"
+        );
+    }
+
+    struct RecoveryTestPeers {
+        runtimes: Vec<Runtime>,
+        _roots: Vec<tempfile::TempDir>,
+    }
+
+    impl RecoveryTestPeers {
+        async fn shutdown(mut self) {
+            for runtime in &mut self.runtimes {
+                runtime.shutdown().await.expect("peer runtime shutdown");
+            }
+        }
+    }
+
+    fn recovery_test_addr() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind recovery peer address")
+            .local_addr()
+            .expect("recovery peer address")
+    }
+
+    async fn start_peer_backed_recovery_runtime(
+        mut main: RuntimeConfig,
+        store: Arc<dyn ObjectStore>,
+    ) -> (RuntimeConfig, RecoveryTestPeers, Runtime) {
+        const CLUSTER_ID: u64 = 0x5245_434f_5645_5259;
+
+        let mut roots = Vec::new();
+        let mut configs = Vec::new();
+        let main_addr = recovery_test_addr();
+        main.cluster_id = Some(CLUSTER_ID);
+        main.peer = Some(PeerConfig {
+            listen: main_addr,
+            advertise: main_addr,
+        });
+        configs.push(main);
+        for host in [HostId::new(2), HostId::new(3)] {
+            let root = tempfile::tempdir().expect("recovery peer root");
+            let address = recovery_test_addr();
+            let mut daemon = test_host_config();
+            daemon.host = host;
+            configs.push(RuntimeConfig {
+                daemon,
+                cluster_id: Some(CLUSTER_ID),
+                blob_dir: root.path().join("blobs"),
+                peer: Some(PeerConfig {
+                    listen: address,
+                    advertise: address,
+                }),
+            });
+            roots.push(root);
+        }
+        let mut runtimes = futures_util::future::join_all(
+            configs
+                .iter()
+                .map(|config| Runtime::new(config, Arc::clone(&store))),
+        )
+        .await
+        .into_iter()
+        .map(|runtime| runtime.expect("authenticated recovery runtime startup"))
+        .collect::<Vec<_>>();
+        let main_config = configs.remove(0);
+        let main_runtime = runtimes.remove(0);
+        (
+            main_config,
+            RecoveryTestPeers {
+                runtimes,
+                _roots: roots,
+            },
+            main_runtime,
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_rolls_back_owned_membership_and_resources_after_reconciliation_failure() {
+        const CLUSTER_ID: u64 = 0x5245_434f_5645_5259;
+
+        let (_fake, store) = test_object_store("startup-rollback/").await;
+        let baseline_root = tempfile::tempdir().expect("baseline root");
+        let baseline = RuntimeConfig {
+            daemon: test_host_config(),
+            cluster_id: None,
+            blob_dir: baseline_root.path().join("blobs"),
+            peer: None,
+        };
+        let (_baseline, baseline_peers, mut baseline_main) =
+            start_peer_backed_recovery_runtime(baseline, Arc::clone(&store)).await;
+
+        let failed_root = tempfile::tempdir().expect("failed startup root");
+        let address = recovery_test_addr();
+        let identity = HostId::new(4);
+        let mut daemon = test_host_config();
+        daemon.host = identity;
+        let failed = RuntimeConfig {
+            daemon,
+            cluster_id: Some(CLUSTER_ID),
+            blob_dir: failed_root.path().join("blobs"),
+            peer: Some(PeerConfig {
+                listen: address,
+                advertise: address,
+            }),
+        };
+        let failing: Arc<dyn ObjectStore> = Arc::new(FailPlacementStore(Arc::clone(&store)));
+        let error = match Runtime::new(&failed, failing).await {
+            Ok(mut runtime) => {
+                runtime
+                    .shutdown()
+                    .await
+                    .expect("unexpected runtime shutdown");
+                panic!("cluster placement read succeeded after injected failure");
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(error, RuntimeStartupError::Placement(_)));
+        assert!(
+            Arc::clone(&store)
+                .get(blockd_core::layout::peer_membership_key(identity))
+                .await
+                .expect("rolled-back membership lookup")
+                .is_none(),
+            "failed startup leaked its exact owned membership"
+        );
+        let rebound = std::net::TcpListener::bind(address).expect("peer listener was released");
+        drop(rebound);
+
+        let mut retry = Runtime::new(&failed, Arc::clone(&store))
+            .await
+            .expect("same node resources are reusable after rollback");
+        assert!(
+            Arc::clone(&store)
+                .get(blockd_core::layout::peer_membership_key(identity))
+                .await
+                .expect("retry membership lookup")
+                .is_some()
+        );
+        retry.shutdown().await.expect("retry shutdown");
+        baseline_main.shutdown().await.expect("baseline shutdown");
+        baseline_peers.shutdown().await;
+    }
+
+    /// Regression PROD-004: the production constructor used by `blockd serve` must
+    /// rebuild runtime-side volume mappings and fault readers from local state.
+    #[tokio::test]
+    async fn runtime_new_recovers_local_volume_mapping_and_fault_reader() {
+        use crate::fakegcs::FakeGcs;
+        use crate::{GcsConfig, GcsStore};
+        use blockd_core::journal::{JournalRecord, RecordKind, VolumeConfig};
+        use blockd_core::types::{JournalSeq, VolumeId};
+
+        let volume = VolumeId(404);
+        let root = tempfile::tempdir().expect("data directory");
+        let blob_dir = root.path().join("blobs");
+        let journal = blob_dir.join(blockd_core::layout::journal_blob(volume, 1, JournalSeq(0)));
+        tokio::fs::create_dir_all(journal.parent().expect("journal parent"))
+            .await
+            .expect("journal directory");
+        let record = JournalRecord {
+            config: VolumeConfig::data(1),
+            seq: JournalSeq(0),
+            fence: 1,
+            kind: RecordKind::Commit,
+            capture_seq: 0,
+            sync_covered_through: 0,
+            post_state_checksum: 0,
+            files: Vec::new(),
+            runtime_page_index: BTreeMap::new(),
+            migrated_from: None,
+        };
+        tokio::fs::write(&journal, record.encode(volume))
+            .await
+            .expect("durable journal");
+
+        let (_fake, endpoint) = FakeGcs::start().await;
+        let store: Arc<dyn ObjectStore> = Arc::new(GcsStore::new(GcsConfig {
+            bucket: "cluster".to_owned(),
+            prefix: "runtime-new/".to_owned(),
+            endpoint: endpoint.clone(),
+            metadata_endpoint: endpoint,
+        }));
+        let config = RuntimeConfig {
+            daemon: HostConfig {
+                backup_retry: blockd_core::types::millis(100),
+                writeback_interval: blockd_core::types::millis(10),
+                ..test_host_config()
+            },
+            cluster_id: None,
+            blob_dir,
+            peer: None,
+        };
+        let start = TestFaultReaderStart::held(false);
+        set_test_fault_reader_start(&config.blob_dir, start.clone());
+        let startup = tokio::spawn(start_peer_backed_recovery_runtime(config, store));
+        tokio::time::timeout(Duration::from_secs(1), start.entered.notified())
+            .await
+            .expect("recovered fault reader entered registration");
+        assert!(
+            !startup.is_finished(),
+            "Runtime::new returned before recovered fault service registered"
+        );
+        start.release.notify_one();
+        let (_config, peers, mut runtime) = startup.await.expect("runtime startup task");
+
+        assert!(
+            runtime
+                .shared
+                .volumes
+                .lock()
+                .expect("volume lock")
+                .contains_key(&volume),
+            "local volume was absent from the runtime mapping"
+        );
+        assert!(
+            runtime
+                .shared
+                .fault_readers
+                .lock()
+                .expect("fault reader lock")
+                .contains_key(&volume),
+            "recovered volume had no fault reader"
+        );
+        runtime.stop_fault_reader_unexpectedly_for_test(volume);
+        tokio::time::timeout(Duration::from_secs(1), runtime.critical_failure())
+            .await
+            .expect("unexpected fault-reader exit becomes host-fatal");
+        assert!(!runtime.is_ready());
+        runtime.shutdown().await.expect("runtime shutdown");
+        peers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_new_keeps_recovery_unready_when_fault_reader_registration_fails() {
+        use crate::fakegcs::FakeGcs;
+        use crate::{GcsConfig, GcsStore};
+        use blockd_core::journal::{JournalRecord, RecordKind, VolumeConfig};
+        use blockd_core::types::{JournalSeq, VolumeId};
+
+        let volume = VolumeId(409);
+        let root = tempfile::tempdir().expect("data directory");
+        let blob_dir = root.path().join("blobs");
+        let journal = blob_dir.join(blockd_core::layout::journal_blob(volume, 1, JournalSeq(0)));
+        tokio::fs::create_dir_all(journal.parent().expect("journal parent"))
+            .await
+            .expect("journal directory");
+        let record = JournalRecord {
+            config: VolumeConfig::data(1),
+            seq: JournalSeq(0),
+            fence: 1,
+            kind: RecordKind::Commit,
+            capture_seq: 0,
+            sync_covered_through: 0,
+            post_state_checksum: 0,
+            files: Vec::new(),
+            runtime_page_index: BTreeMap::new(),
+            migrated_from: None,
+        };
+        tokio::fs::write(&journal, record.encode(volume))
+            .await
+            .expect("durable journal");
+
+        let (_fake, endpoint) = FakeGcs::start().await;
+        let store: Arc<dyn ObjectStore> = Arc::new(GcsStore::new(GcsConfig {
+            bucket: "cluster".to_owned(),
+            prefix: "runtime-new-reader-failure/".to_owned(),
+            endpoint: endpoint.clone(),
+            metadata_endpoint: endpoint,
+        }));
+        let config = RuntimeConfig {
+            daemon: HostConfig {
+                backup_retry: blockd_core::types::millis(100),
+                writeback_interval: blockd_core::types::millis(10),
+                ..test_host_config()
+            },
+            cluster_id: None,
+            blob_dir,
+            peer: None,
+        };
+        let start = TestFaultReaderStart::held(true);
+        set_test_fault_reader_start(&config.blob_dir, start.clone());
+        let startup = tokio::spawn(start_peer_backed_recovery_runtime(config, store));
+        tokio::time::timeout(Duration::from_secs(1), start.entered.notified())
+            .await
+            .expect("recovered fault reader entered registration");
+        assert!(
+            !startup.is_finished(),
+            "Runtime::new returned before failed registration was reported"
+        );
+        start.release.notify_one();
+        let (_config, peers, mut runtime) = startup.await.expect("runtime startup task");
+        assert!(
+            runtime
+                .quarantines()
+                .get(&volume)
+                .is_some_and(|reason| reason.contains("fault service"))
+        );
+        assert!(!runtime.shared.recovery_complete.load(Ordering::SeqCst));
+        assert!(!runtime.is_ready());
+        assert!(
+            !runtime
+                .shared
+                .fault_readers
+                .lock()
+                .expect("fault reader lock")[&volume]
+                .is_live()
+        );
+        runtime.shutdown().await.expect("runtime shutdown");
+        peers.shutdown().await;
+    }
+
+    fn missing_blx_fixture(root: &Path, volume: VolumeId) -> (RuntimeConfig, String, Vec<u8>) {
+        use blockd_core::blx::BlxObject;
+        use blockd_core::journal::{JournalRecord, RecordKind, VolumeConfig};
+        use blockd_core::page_file::PageBatchBuilder;
+        use blockd_core::types::{Gen, JournalSeq, ObjectId, PageNo};
+
+        let blob_dir = root.join("blobs");
+        let page = PageId {
+            volume,
+            page: PageNo(0),
+        };
+        let mut builder = PageBatchBuilder::new(volume, 1, ObjectId(0));
+        builder.add(page, Gen(1), &vec![7; page_size()]);
+        let (object, blx, locations) = builder.finish().pop().expect("fixture BLX");
+        let object_ref = blockd_core::manifest::ObjectRef::from_blx(
+            &BlxObject::open(&blx).expect("fixture BLX opens"),
+        );
+        let journal_name = blockd_core::layout::journal_blob(volume, 1, JournalSeq(0));
+        let journal = blob_dir.join(&journal_name);
+        std::fs::create_dir_all(journal.parent().expect("journal parent"))
+            .expect("journal directory");
+        let record = JournalRecord {
+            config: VolumeConfig::data(1),
+            seq: JournalSeq(0),
+            fence: 1,
+            kind: RecordKind::Commit,
+            capture_seq: 1,
+            sync_covered_through: 1,
+            post_state_checksum: 0,
+            files: vec![object_ref],
+            runtime_page_index: BTreeMap::from([(page, (Gen(1), locations[0].2))]),
+            migrated_from: None,
+        };
+        std::fs::write(journal, record.encode(volume)).expect("journal fixture");
+        (
+            RuntimeConfig {
+                daemon: HostConfig {
+                    backup_retry: blockd_core::types::millis(100),
+                    writeback_interval: blockd_core::types::millis(10),
+                    ..test_host_config()
+                },
+                cluster_id: None,
+                blob_dir,
+                peer: None,
+            },
+            blockd_core::layout::blx_blob(volume, 1, object),
+            blx,
+        )
+    }
+
+    async fn test_object_store(
+        prefix: &str,
+    ) -> (crate::fakegcs::FakeGcsServer, Arc<dyn ObjectStore>) {
+        use crate::fakegcs::FakeGcs;
+        use crate::{GcsConfig, GcsStore};
+
+        let (fake, endpoint) = FakeGcs::start().await;
+        (
+            fake,
+            Arc::new(GcsStore::new(GcsConfig {
+                bucket: "cluster".to_owned(),
+                prefix: prefix.to_owned(),
+                endpoint: endpoint.clone(),
+                metadata_endpoint: endpoint,
+            })),
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_coalesces_a_roster_change_inside_the_reconciliation_window() {
+        const CLUSTER_ID: u64 = 79;
+
+        let (_fake, inner) = test_object_store("startup-placement-race/").await;
+        let blocked = Arc::new(BlockFirstPlacementRead::new(inner));
+        let store: Arc<dyn ObjectStore> = blocked.clone();
+        let placement_status = Arc::new(LivePlacementStatus::new(true));
+        let (rosters, roster_rx) = tokio::sync::watch::channel(Vec::new());
+        let (admin, _admin_rx) = injector();
+        let local = test_host_config().host;
+        let old_roster = vec![local, HostId::new(2), HostId::new(3)];
+        let current_roster = vec![local, HostId::new(2), HostId::new(4)];
+        placement_status.publish(old_roster.clone());
+        rosters.send_replace(old_roster);
+
+        let (startup_ready, startup) = tokio::sync::oneshot::channel();
+        let startup_status = Arc::clone(&placement_status);
+        let owner = tokio::spawn(async move {
+            PlacementOwner {
+                store,
+                cluster_id: CLUSTER_ID,
+                authority: None,
+                local,
+                status: startup_status,
+                rosters: roster_rx,
+                admin,
+                startup: startup_ready,
+            }
+            .run()
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), blocked.entered.notified())
+            .await
+            .expect("startup entered the old reconciliation race window");
+        placement_status.publish(current_roster.clone());
+        rosters.send_replace(current_roster.clone());
+        blocked.release.notify_one();
+
+        let installed = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("startup reconciled the replacement roster")
+            .expect("placement owner alive")
+            .expect("startup placement reconciliation");
+        owner.abort();
+        let durable = Arc::clone(&blocked.inner)
+            .get(blockd_core::layout::placement_key())
+            .await
+            .expect("durable placement read")
+            .and_then(|(_, bytes)| ClusterPlacement::decode(&bytes))
+            .expect("canonical durable placement");
+
+        assert_eq!(durable.cluster_id, CLUSTER_ID);
+        assert_eq!(
+            durable.epoch, 1,
+            "a roster superseded before its store read completes must never be published"
+        );
+        assert_eq!(durable.roster, current_roster);
+        assert_eq!(installed.membership_epoch, durable.epoch);
+        assert_eq!(installed.roster, durable.roster);
+        assert_eq!(placement_status.readiness(), (true, durable.epoch));
+    }
+
+    #[tokio::test]
+    async fn cluster_placement_is_monotonic_and_restart_readable() {
+        let (_fake, store) = test_object_store("cluster-placement/").await;
+        let initial = reconcile_cluster_placement(
+            Arc::clone(&store),
+            77,
+            vec![HostId::new(3), HostId::new(1), HostId::new(2)],
+        )
+        .await
+        .expect("initial placement");
+        assert_eq!(initial.epoch, 1);
+        assert_eq!(
+            initial.roster,
+            vec![HostId::new(1), HostId::new(2), HostId::new(3)]
+        );
+        let unchanged = reconcile_cluster_placement(
+            Arc::clone(&store),
+            77,
+            vec![HostId::new(1), HostId::new(2), HostId::new(3)],
+        )
+        .await
+        .expect("unchanged placement");
+        assert_eq!(unchanged.epoch, 1);
+
+        let changed = reconcile_cluster_placement(
+            Arc::clone(&store),
+            77,
+            vec![HostId::new(1), HostId::new(2), HostId::new(4)],
+        )
+        .await
+        .expect("changed placement");
+        assert_eq!(changed.epoch, 2);
+        let disjoint = reconcile_cluster_placement(
+            Arc::clone(&store),
+            77,
+            vec![HostId::new(5), HostId::new(6), HostId::new(7)],
+        )
+        .await
+        .expect("object-store CAS accepts a disjoint live roster");
+        assert_eq!(disjoint.epoch, 3);
+        let (_, encoded) = Arc::clone(&store)
+            .get(blockd_core::layout::placement_key())
+            .await
+            .expect("read placement")
+            .expect("placement exists");
+        assert_eq!(ClusterPlacement::decode(&encoded), Some(disjoint));
+    }
+
+    #[tokio::test]
+    async fn durable_epoch_orders_a_roster_change_when_legacy_hash_decreases() {
+        let partial_roster = vec![HostId::new(0), HostId::new(1), HostId::new(2)];
+        let full_roster = vec![
+            HostId::new(0),
+            HostId::new(1),
+            HostId::new(2),
+            HostId::new(3),
+        ];
+        assert!(live_membership_epoch(&partial_roster) > live_membership_epoch(&full_roster));
+
+        let (_fake, store) = test_object_store("nonmonotonic-membership-hash/").await;
+        let initial = reconcile_cluster_placement(Arc::clone(&store), 78, partial_roster)
+            .await
+            .expect("partial placement");
+        let changed = reconcile_cluster_placement(Arc::clone(&store), 78, full_roster.clone())
+            .await
+            .expect("full placement");
+        let unchanged = reconcile_cluster_placement(store, 78, full_roster)
+            .await
+            .expect("unchanged full placement");
+
+        assert_eq!(initial.epoch, 1);
+        assert_eq!(changed.epoch, 2);
+        assert_eq!(unchanged.epoch, changed.epoch);
+    }
+
+    #[tokio::test]
+    async fn quarantine_cleanup_requires_reason_and_leaves_two_phase_audit() {
+        let volume = VolumeId(405);
+        let root = tempfile::tempdir().expect("data directory");
+        let (config, _missing_blx, _bytes) = missing_blx_fixture(root.path(), volume);
+        let (_fake, store) = test_object_store("discard-quarantine/").await;
+        let (config, peers, mut runtime) = start_peer_backed_recovery_runtime(config, store).await;
+        assert!(runtime.quarantines().contains_key(&volume));
+        assert!(runtime.discard_quarantine(volume, "  ").await.is_err());
+
+        let audit_id = runtime
+            .discard_quarantine(volume, "operator approved irreversible cleanup")
+            .await
+            .expect("explicit quarantine cleanup");
+        assert!(!runtime.quarantines().contains_key(&volume));
+        assert!(runtime.volume_inventory().is_empty());
+        assert!(crate::blobscan::scan_blob_dir_for_recovery(&config.blob_dir).is_empty());
+        let audit = config
+            .blob_dir
+            .join("quarantine-audit")
+            .join(format!("{:016x}", volume.0));
+        let intent = std::fs::read_to_string(audit.join(format!("{audit_id}.intent.json")))
+            .expect("durable cleanup intent");
+        let complete = std::fs::read_to_string(audit.join(format!("{audit_id}.complete.json")))
+            .expect("durable cleanup completion");
+        assert!(intent.contains("operator approved irreversible cleanup"));
+        assert!(complete.contains("\"phase\":\"complete\""));
+        runtime.shutdown().await.expect("runtime shutdown");
+        peers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_journal_without_decodable_config_is_reported_and_cleanable() {
+        use blockd_core::types::JournalSeq;
+
+        let volume = VolumeId(407);
+        let root = tempfile::tempdir().expect("data directory");
+        let blob_dir = root.path().join("blobs");
+        let journal = blob_dir.join(blockd_core::layout::journal_blob(volume, 1, JournalSeq(0)));
+        std::fs::create_dir_all(journal.parent().expect("journal parent"))
+            .expect("journal directory");
+        std::fs::write(&journal, b"corrupt journal").expect("corrupt fixture");
+        let config = RuntimeConfig {
+            daemon: test_host_config(),
+            cluster_id: None,
+            blob_dir,
+            peer: None,
+        };
+        let (_fake, store) = test_object_store("corrupt-quarantine/").await;
+        let mut runtime = Runtime::new(&config, store).await.expect("runtime startup");
+        assert!(
+            runtime
+                .quarantines()
+                .get(&volume)
+                .is_some_and(|reason| { reason.contains("corrupt") && reason.contains("repair") })
+        );
+        runtime
+            .discard_quarantine(volume, "forensics complete")
+            .await
+            .expect("audited cleanup");
+        assert!(!journal.exists());
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn quarantined_false_negative_can_be_repaired_before_cleanup() {
+        let volume = VolumeId(406);
+        let root = tempfile::tempdir().expect("data directory");
+        let (config, missing_blx, bytes) = missing_blx_fixture(root.path(), volume);
+        let (_fake, store) = test_object_store("repair-quarantine/").await;
+        let (config, peers, mut first) =
+            start_peer_backed_recovery_runtime(config, Arc::clone(&store)).await;
+        assert!(first.quarantines().contains_key(&volume));
+        first.shutdown().await.expect("first runtime shutdown");
+
+        let blx_path = config.blob_dir.join(missing_blx);
+        std::fs::create_dir_all(blx_path.parent().expect("BLX parent")).expect("BLX directory");
+        std::fs::write(blx_path, bytes).expect("operator repair");
+        let mut repaired = Runtime::new(&config, store).await.expect("runtime startup");
+        assert!(!repaired.quarantines().contains_key(&volume));
+        assert!(
+            repaired
+                .volume_inventory()
+                .iter()
+                .any(|(found, _, quarantined)| *found == volume && !quarantined)
+        );
+        repaired
+            .shutdown()
+            .await
+            .expect("repaired runtime shutdown");
+        peers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_after_verified_repair_clears_quarantine_and_starts_fault_reader() {
+        let volume = VolumeId(408);
+        let root = tempfile::tempdir().expect("data directory");
+        let (config, missing_blx, bytes) = missing_blx_fixture(root.path(), volume);
+        let (_fake, store) = test_object_store("live-repair-quarantine/").await;
+        let (config, peers, mut runtime) =
+            start_peer_backed_recovery_runtime(config, Arc::clone(&store)).await;
+        assert!(runtime.quarantines().contains_key(&volume));
+        assert!(
+            !runtime
+                .shared
+                .fault_readers
+                .lock()
+                .expect("fault reader lock")
+                .contains_key(&volume)
+        );
+
+        assert!(runtime.quarantines().contains_key(&volume));
+        assert!(
+            !runtime
+                .shared
+                .fault_readers
+                .lock()
+                .expect("fault reader lock")
+                .contains_key(&volume),
+            "failed live repair started a fault reader for quarantined data"
+        );
+
+        let repaired_path = config.blob_dir.join(missing_blx);
+        std::fs::create_dir_all(repaired_path.parent().expect("BLX parent"))
+            .expect("BLX directory");
+        std::fs::write(repaired_path, bytes).expect("operator repair");
+        runtime
+            .shutdown()
+            .await
+            .expect("quarantined runtime shutdown");
+        let mut repaired = Runtime::new(&config, store)
+            .await
+            .expect("repaired runtime startup");
+        assert!(!repaired.quarantines().contains_key(&volume));
+        assert!(
+            repaired
+                .shared
+                .fault_readers
+                .lock()
+                .expect("fault reader lock")
+                .contains_key(&volume),
+            "verified repair did not start its fault reader after restart"
+        );
+        repaired.shutdown().await.expect("runtime shutdown");
+        peers.shutdown().await;
     }
 
     #[test]

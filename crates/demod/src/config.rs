@@ -6,8 +6,7 @@
 //! host = 0
 //! api = 10.0.0.2:7000
 //! peer_listen = 10.0.0.2:7001
-//! placement.0 = 1
-//! placement.1 = 2
+//! placement = 0,1
 //! gcs_endpoint = https://storage.googleapis.com
 //! gcs_metadata = http://metadata.google.internal
 //! gcs_bucket = my-bucket
@@ -32,7 +31,6 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use blockd_core::placement::PeerCandidate;
 use blockd_core::types::HostId;
 
 #[derive(Clone, Debug)]
@@ -40,7 +38,7 @@ pub struct DemodConfig {
     pub host: HostId,
     pub api: SocketAddr,
     pub peer_listen: SocketAddr,
-    pub placement: Vec<PeerCandidate>,
+    pub placement: Vec<HostId>,
     pub gcs_endpoint: String,
     pub gcs_metadata: String,
     pub gcs_bucket: String,
@@ -93,18 +91,12 @@ impl DemodConfig {
                 value.parse().unwrap_or_else(|_| panic!("invalid `{key}`"))
             })
         };
-        let mut placement = Vec::new();
-        for (key, value) in &kv {
-            if let Some(id) = key.strip_prefix("placement.") {
-                placement.push(PeerCandidate {
-                    host: HostId(id.parse().expect("placement host id")),
-                    weight: 1,
-                    failure_domain: value.parse().expect("placement failure domain"),
-                    drained: false,
-                });
-            }
-        }
-        placement.sort_by_key(|candidate| candidate.host);
+        let mut placement = get("placement")
+            .split(',')
+            .map(|host| HostId::new(host.trim().parse().expect("placement host id")))
+            .collect::<Vec<_>>();
+        placement.sort_unstable();
+        placement.dedup();
         let cache_pages =
             usize::try_from(parse_or("cache_pages", 4096)).expect("cache_pages fits this platform");
         let writeback_interval_ms = parse_or("writeback_interval_ms", 10);
@@ -140,7 +132,7 @@ impl DemodConfig {
             );
         }
         DemodConfig {
-            host: HostId(get("host").parse().expect("host id")),
+            host: HostId::new(get("host").parse().expect("host id")),
             api: get("api").parse().expect("api addr"),
             peer_listen: get("peer_listen").parse().expect("peer_listen addr"),
             placement,
@@ -174,7 +166,7 @@ mod tests {
 host = 2
 api = 127.0.0.1:7000
 peer_listen = 127.0.0.1:7001
-placement.1 = 2
+placement = 1
 gcs_endpoint = http://127.0.0.1:7099
 gcs_metadata = http://127.0.0.1:7098
 gcs_bucket = test
@@ -199,8 +191,7 @@ fc_dir = /tmp/fc
         assert_eq!(defaults.disk_headroom_bytes, 0);
         assert_eq!(defaults.wedge_ticks, 500);
         assert_eq!(defaults.placement.len(), 1);
-        assert_eq!(defaults.placement[0].host, HostId(1));
-        assert_eq!(defaults.placement[0].failure_domain, 2);
+        assert_eq!(defaults.placement[0], HostId::new(1));
 
         let configured = DemodConfig::parse(&format!(
             "{REQUIRED}\ncache_pages = 8192\nwriteback_interval_ms = 25\nbackup_retry_ms = 250\narchive_interval_ms = 5000\narchive_lag_bytes = 123456\npeer_spool_capacity_bytes = 900000\npeer_spool_headroom_bytes = 100000\ndisk_capacity_bytes = 1000000\ndisk_headroom_bytes = 100000\nwedge_ticks = 40\n"

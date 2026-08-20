@@ -1,4 +1,3 @@
-use crate::placement::PeerCandidate;
 use crate::types::{HostId, VolumeId};
 
 #[derive(Clone, Debug)]
@@ -11,7 +10,7 @@ pub struct HostConfig {
     pub disk_capacity: Option<u64>,
     pub disk_headroom: u64,
     pub wedge_ticks: u64,
-    pub replica_placement: Option<ReplicaPlacementConfig>,
+    pub cluster_placement: Option<ClusterPlacementConfig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,10 +33,9 @@ impl Default for ArchivePolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReplicaPlacementConfig {
+pub struct ClusterPlacementConfig {
     pub membership_epoch: u64,
-    pub local_failure_domain: u16,
-    pub roster: Vec<PeerCandidate>,
+    pub roster: Vec<HostId>,
     pub authority: Option<AuthorityHostConfig>,
 }
 
@@ -86,6 +84,8 @@ pub struct Counters {
     pub replica_network_bytes: u64,
     pub replica_logical_bytes: u64,
     pub replica_nonactive_bytes: u64,
+    /// Invariant counter: cleanup must unlink immutable artifacts, never rewrite them.
+    pub replica_cleanup_rewrite_bytes: u64,
     pub replica_replacement_bytes: u64,
     pub replica_artifact_flushes: u64,
     pub replica_commit_flushes: u64,
@@ -95,8 +95,6 @@ pub struct Counters {
     pub lease_challenges: u64,
     pub lease_defenses: u64,
     pub lease_self_fences: u64,
-    pub vnode_adoptions: u64,
-    pub vnode_stale_rejections: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +111,9 @@ pub struct ReplicaVolumeMetrics {
     pub upload_lag: u64,
     pub current_retries: u8,
     pub queued_releases: usize,
+    pub integrity_rejects: u64,
+    pub replacement_bytes: u64,
+    pub cleanup_unlinks: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +127,9 @@ pub struct ReplicaSpoolMetrics {
     pub committed_through: u64,
     pub uploaded_through: u64,
     pub unarchived_age_ns: u64,
+    pub integrity_rejects: u64,
+    pub replacement_bytes: u64,
+    pub cleanup_unlinks: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +138,8 @@ pub struct VolumeStats {
     pub role: VolumeRole,
     pub fence: u64,
     pub dirty_pages: usize,
+    /// Monotonic count used to derive this volume's dirtying rate.
+    pub pages_dirtied_total: u64,
     pub unstable_pages: usize,
     pub pending_syncs: usize,
     pub hydration_remaining_pages: usize,

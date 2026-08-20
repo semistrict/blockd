@@ -24,7 +24,7 @@
 //! - `v/<volume:016x>/o/<fence:016x>-<object:016x>.blx` — the same immutable
 //!   BLX bytes used locally
 //! - `b/<base:016x>/…` — bases
-//! - `cluster/tls/public-keys/<host:04x>.member` — a node's current self-signed
+//! - `cluster/tls/public-keys/<host:08x>.member` — a node's current self-signed
 //!   TLS certificate and advertised peer endpoint; possession of write access
 //!   to this directory grants cluster membership
 
@@ -43,7 +43,7 @@ pub fn node_claim_prefix() -> String {
 }
 
 pub fn node_claim_key(host: HostId) -> String {
-    format!("{}{:04x}.claim", node_claim_prefix(), host.0)
+    format!("{}{:08x}.claim", node_claim_prefix(), host.get())
 }
 
 pub fn peer_membership_prefix() -> String {
@@ -51,30 +51,11 @@ pub fn peer_membership_prefix() -> String {
 }
 
 pub fn peer_membership_key(host: HostId) -> String {
-    format!("{}{:04x}.member", peer_membership_prefix(), host.0)
+    format!("{}{:08x}.member", peer_membership_prefix(), host.get())
 }
 
 pub fn host_session_key(host: HostId) -> String {
-    format!("hosts/{:04x}/session", host.0)
-}
-
-pub fn vnode_authority_key(vnode: crate::authority::VnodeId) -> String {
-    format!("vnodes/{:08x}/authority", vnode.0)
-}
-
-pub fn vnode_member_blob(vnode: crate::authority::VnodeId) -> String {
-    format!("authority/vnodes/{:08x}.state", vnode.0)
-}
-
-pub fn vnode_closure_blob(
-    vnode: crate::authority::VnodeId,
-    volume: VolumeId,
-    sequence: u64,
-) -> String {
-    format!(
-        "authority/vnodes/{:08x}/volumes/{:016x}/{sequence:016x}.closure",
-        vnode.0, volume.0
-    )
+    format!("hosts/{:08x}/session", host.get())
 }
 
 pub fn journal_blob(volume: VolumeId, fence: u64, seq: JournalSeq) -> String {
@@ -159,7 +140,7 @@ pub fn replica_spool_generation_blob(
     } else {
         format!("{assignment_epoch:016x}-{generation:016x}.spool")
     };
-    format!("r/{:04x}/{:016x}/{suffix}", source.0, volume.0)
+    format!("r/{:08x}/{:016x}/{suffix}", source.get(), volume.0)
 }
 
 /// Parse an object-store key back into its meaning (GC's mark phase).
@@ -316,7 +297,11 @@ pub enum BlobName {
 pub fn parse_blob(name: &str) -> Option<BlobName> {
     if let Some(rest) = name.strip_prefix("r/") {
         let mut parts = rest.split('/');
-        let source = HostId(u16::from_str_radix(parts.next()?, 16).ok()?);
+        let host = parts.next()?;
+        if host.len() != 8 {
+            return None;
+        }
+        let source = HostId::new(u32::from_str_radix(host, 16).ok()?);
         let volume = VolumeId(u64::from_str_radix(parts.next()?, 16).ok()?);
         let file = parts.next()?.strip_suffix(".spool")?;
         let (assignment, generation) = match file.split_once('-') {
@@ -408,26 +393,26 @@ mod tests {
         );
         assert_eq!(volume_prefix(volume), "v/000000000badcafe/");
         assert_eq!(
-            replica_spool_blob(HostId(3), volume, 9),
-            "r/0003/000000000badcafe/0000000000000009.spool"
+            replica_spool_blob(HostId::new(3), volume, 9),
+            "r/00000003/000000000badcafe/0000000000000009.spool"
         );
         assert_eq!(
-            parse_blob("r/0003/000000000badcafe/0000000000000009.spool"),
+            parse_blob("r/00000003/000000000badcafe/0000000000000009.spool"),
             Some(BlobName::ReplicaSpool {
-                source: HostId(3),
+                source: HostId::new(3),
                 volume,
                 assignment_epoch: 9,
                 generation: 0,
             })
         );
         assert_eq!(
-            replica_spool_generation_blob(HostId(3), volume, 9, 2),
-            "r/0003/000000000badcafe/0000000000000009-0000000000000002.spool"
+            replica_spool_generation_blob(HostId::new(3), volume, 9, 2),
+            "r/00000003/000000000badcafe/0000000000000009-0000000000000002.spool"
         );
         assert_eq!(
-            parse_blob("r/0003/000000000badcafe/0000000000000009-0000000000000002.spool"),
+            parse_blob("r/00000003/000000000badcafe/0000000000000009-0000000000000002.spool"),
             Some(BlobName::ReplicaSpool {
-                source: HostId(3),
+                source: HostId::new(3),
                 volume,
                 assignment_epoch: 9,
                 generation: 2,

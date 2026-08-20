@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::rc::Rc;
 
 use blockd_exec::channel::{oneshot, unbounded};
 use blockd_exec::inject::{Lane, injector};
-use blockd_exec::{Either, OneOf3, TaskSet, delay, select2, select3, yield_now};
+use blockd_exec::{Either, OneOf3, TaskId, TaskSet, delay, select2, select3, yield_now};
 
 use super::ctx::HostCtx;
 use super::lease::{bootstrap_host_authority, host_session_monitor};
@@ -23,6 +25,9 @@ const FAULT_CONCURRENCY: usize = 64;
 const SYNC_CONCURRENCY: usize = 64;
 const SYNC_QUEUE_CAPACITY: usize = 1_024;
 const SYNC_INGRESS_BATCH: usize = 64;
+/// Old placement snapshots remain eligible only for a bounded transition
+/// window. Messages older than this fail closed and recover through durable
+/// store state instead of imposing unbounded authorization work.
 
 #[derive(Clone, Copy)]
 enum ScheduledWork {
@@ -42,6 +47,56 @@ impl Drop for FatalSignalLease {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CriticalChildSource {
+    SessionMonitor,
+    Admin,
+    Fault,
+    Sync,
+    Peer,
+    ScheduledWork,
+}
+
+impl CriticalChildSource {
+    const fn fatal_reason(self) -> &'static str {
+        match self {
+            Self::SessionMonitor => "host session monitor stopped unexpectedly",
+            Self::Admin => "admin source stopped unexpectedly",
+            Self::Fault => "fault source stopped unexpectedly",
+            Self::Sync => "sync source stopped unexpectedly",
+            Self::Peer => "peer source stopped unexpectedly",
+            Self::ScheduledWork => "scheduled work source stopped unexpectedly",
+        }
+    }
+}
+
+async fn critical_child<F>(state: SharedHost, source: CriticalChildSource, future: F)
+where
+    F: Future<Output = ()>,
+{
+    #[cfg(not(test))]
+    let _ = (&state, source);
+    #[cfg(test)]
+    if state.borrow().critical_child_failure == Some(source) {
+        state.borrow_mut().critical_child_failure = None;
+        return;
+    }
+    future.await;
+}
+
+fn spawn_critical_child<F>(
+    children: &mut TaskSet,
+    tracked: &mut BTreeMap<TaskId, CriticalChildSource>,
+    state: SharedHost,
+    source: CriticalChildSource,
+    future: F,
+) where
+    F: Future<Output = ()> + 'static,
+{
+    let task = children.spawn(critical_child(state, source, future));
+    assert!(tracked.insert(task, source).is_none());
+}
+
 pub async fn host_actor<W: HostWorld>(config: HostConfig, world: Rc<W>) {
     let state = Rc::new(std::cell::RefCell::new(super::HostState::new(config)));
     host_actor_with_state(state, world).await;
@@ -52,6 +107,64 @@ pub async fn host_actor_with_state<W: HostWorld>(state: SharedHost, world: Rc<W>
 }
 
 impl<W: HostWorld> HostCtx<W> {
+    fn spawn_critical_children(
+        &self,
+        config: &HostConfig,
+        children: &mut TaskSet,
+        tracked: &mut BTreeMap<TaskId, CriticalChildSource>,
+    ) {
+        if config
+            .cluster_placement
+            .as_ref()
+            .and_then(|placement| placement.authority)
+            .is_some()
+        {
+            spawn_critical_child(
+                children,
+                tracked,
+                Rc::clone(self.state()),
+                CriticalChildSource::SessionMonitor,
+                host_session_monitor(Rc::clone(self.state()), Rc::clone(self.world())),
+            );
+        }
+        spawn_critical_child(
+            children,
+            tracked,
+            Rc::clone(self.state()),
+            CriticalChildSource::Admin,
+            self.clone().admin_source(),
+        );
+        spawn_critical_child(
+            children,
+            tracked,
+            Rc::clone(self.state()),
+            CriticalChildSource::Fault,
+            self.clone().fault_source(),
+        );
+        spawn_critical_child(
+            children,
+            tracked,
+            Rc::clone(self.state()),
+            CriticalChildSource::Sync,
+            self.clone().sync_source(),
+        );
+        spawn_critical_child(
+            children,
+            tracked,
+            Rc::clone(self.state()),
+            CriticalChildSource::Peer,
+            self.clone().peer_source(),
+        );
+        spawn_critical_child(
+            children,
+            tracked,
+            Rc::clone(self.state()),
+            CriticalChildSource::ScheduledWork,
+            self.clone()
+                .scheduled_work_source(config.writeback_interval, true),
+        );
+    }
+
     async fn run_actor(self) {
         let (send_fatal, receive_fatal) = oneshot();
         self.state().borrow_mut().install_fatal_signal(send_fatal);
@@ -102,24 +215,23 @@ impl<W: HostWorld> HostCtx<W> {
             self.state().borrow_mut().schedule_volume(volume);
         }
         let mut children = TaskSet::new();
-        children.spawn(host_session_monitor(
-            Rc::clone(self.state()),
-            Rc::clone(self.world()),
-        ));
-        children.spawn(self.clone().admin_source());
-        children.spawn(self.clone().fault_source());
-        children.spawn(self.clone().sync_source());
-        children.spawn(self.clone().peer_source());
-        children.spawn(
-            self.clone()
-                .scheduled_work_source(config.writeback_interval, true),
-        );
-        children.spawn(super::store_gc::store_gc_actor(
-            Rc::clone(self.state()),
-            Rc::clone(self.world()),
-        ));
+        let mut critical_children = BTreeMap::new();
+        self.spawn_critical_children(&config, &mut children, &mut critical_children);
         loop {
-            delay(config.writeback_interval).await;
+            match select2(children.next_done(), delay(config.writeback_interval)).await {
+                Either::First(Some(task)) => {
+                    let source = critical_children
+                        .remove(&task)
+                        .expect("completed critical child is tracked");
+                    return Err(HostFatal::new(source.fatal_reason()));
+                }
+                Either::First(None) => {
+                    return Err(HostFatal::new(
+                        "critical child supervisor stopped unexpectedly",
+                    ));
+                }
+                Either::Second(()) => {}
+            }
             if reclaim_backed_blx_files(Rc::clone(self.state()), self.world().as_ref())
                 .await
                 .is_err()
@@ -178,6 +290,11 @@ async fn reconcile_backed_volumes<W: HostWorld>(
 }
 
 impl super::HostState {
+    #[cfg(test)]
+    fn inject_critical_child_failure(&mut self, source: CriticalChildSource) {
+        assert!(self.critical_child_failure.replace(source).is_none());
+    }
+
     fn work_ready(&self, volume: crate::types::VolumeId) -> Vec<ScheduledWork> {
         let Some(volume_state) = self.volumes.get(&volume) else {
             return Vec::new();
@@ -424,7 +541,7 @@ impl<W: HostWorld> HostCtx<W> {
 
     async fn handle_admin(self, request: crate::world::AdminRequest) {
         let (call, mut reply) = request.into_parts();
-        if !matches!(call, AdminCall::UpdateReplicaPlacement { .. })
+        if !matches!(call, AdminCall::UpdateClusterPlacement { .. })
             && (!self.state().borrow().authority_serving()
                 || admin_volume(&call)
                     .is_some_and(|volume| !self.state().borrow().volume_authorized(volume)))
@@ -433,30 +550,26 @@ impl<W: HostWorld> HostCtx<W> {
             return;
         }
         let response = match call {
-            AdminCall::UpdateReplicaPlacement { placement } => {
+            AdminCall::UpdateClusterPlacement { placement } => {
                 let mut host = self.state().borrow_mut();
                 let valid = placement.membership_epoch > 0
                     && (placement.roster.is_empty()
-                        || placement.roster.iter().any(|candidate| {
-                            candidate.host == host.config.host
-                                && candidate.weight > 0
-                                && !candidate.drained
-                        }))
-                    && placement
-                        .roster
-                        .windows(2)
-                        .all(|pair| pair[0].host < pair[1].host);
+                        || placement.roster.contains(&host.config.host))
+                    && placement.roster.windows(2).all(|pair| pair[0] < pair[1]);
                 if !valid {
                     Some(Err(crate::protocol::AdminError::Rejected))
-                } else if host.config.replica_placement.as_ref() == Some(&placement) {
-                    Some(Ok(crate::protocol::AdminSuccess::ReplicaPlacementUpdated))
+                } else if host.config.cluster_placement.as_ref() == Some(&placement) {
+                    Some(Ok(crate::protocol::AdminSuccess::ClusterPlacementUpdated))
+                } else if host
+                    .config
+                    .cluster_placement
+                    .as_ref()
+                    .is_some_and(|current| current.membership_epoch >= placement.membership_epoch)
+                {
+                    Some(Err(crate::protocol::AdminError::Stale))
                 } else {
-                    if let Some(previous) = host.config.replica_placement.replace(placement)
-                        && !host.replica_placement_history.contains(&previous)
-                    {
-                        host.replica_placement_history.push(previous);
-                    }
-                    Some(Ok(crate::protocol::AdminSuccess::ReplicaPlacementUpdated))
+                    host.config.cluster_placement = Some(placement);
+                    Some(Ok(crate::protocol::AdminSuccess::ClusterPlacementUpdated))
                 }
             }
             AdminCall::CreateVolume {
@@ -512,7 +625,7 @@ fn admin_volume(call: &AdminCall) -> Option<crate::types::VolumeId> {
         | AdminCall::Checkpoint { volume, .. }
         | AdminCall::RestoreVolume { volume }
         | AdminCall::MigrateOut { volume, .. } => Some(*volume),
-        AdminCall::DeleteBase { .. } | AdminCall::UpdateReplicaPlacement { .. } => None,
+        AdminCall::DeleteBase { .. } | AdminCall::UpdateClusterPlacement { .. } => None,
     }
 }
 

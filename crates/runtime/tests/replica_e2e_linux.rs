@@ -20,7 +20,7 @@ use blockd_core::protocol::Verdict;
 use blockd_core::replica_recovery::{ReplicaResidue, export_replica_recovery};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId};
 use blockd_hostmem::page_size;
-use blockd_runtime::{ObjectStore, Runtime, install_replica_recovery};
+use blockd_runtime::{ObjectStore, PeerNet, Runtime, install_replica_recovery};
 
 mod support;
 
@@ -77,13 +77,26 @@ async fn durable_cluster(
     let roots = std::array::from_fn(|host| support::temp_root(&format!("{tag}-{host}")));
     let gcs = support::test_gcs(tag).await;
     let store = gcs.store.clone();
-    let mut runtimes = Vec::new();
-    for host in 0..3 {
-        let mut config =
-            support::three_host_runtime_config(host, roots[usize::from(host)].clone(), addresses);
-        config.daemon.cache_pages = cache_pages;
-        runtimes.push(Some(Runtime::new(&config, store.clone()).await));
-    }
+    let configs = (0u32..3)
+        .map(|host| {
+            let mut config = support::three_host_runtime_config(
+                host,
+                roots[usize::try_from(host).expect("test host index")].clone(),
+                addresses,
+            );
+            config.daemon.cache_pages = cache_pages;
+            config
+        })
+        .collect::<Vec<_>>();
+    let runtimes = futures_util::future::join_all(
+        configs
+            .iter()
+            .map(|config| Runtime::new(config, store.clone())),
+    )
+    .await
+    .into_iter()
+    .map(|runtime| Some(runtime.expect("runtime startup")))
+    .collect();
     (addresses, roots, gcs, runtimes)
 }
 
@@ -93,7 +106,7 @@ fn page(volume: u8, number: u32) -> PageId {
 
 fn volume_page(volume: VolumeId, number: u32) -> PageId {
     PageId {
-        volume: volume,
+        volume,
         page: PageNo(number),
     }
 }
@@ -204,6 +217,80 @@ async fn persistent_guest_page_read_refaults_after_backing_eviction() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn runtime_new_discovers_synced_volume_and_services_first_fault_after_restart() {
+    support::local(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (addresses, roots, gcs, mut runtimes) =
+                durable_cluster("runtime-new-restart-fault", 8).await;
+            for runtime in runtimes.iter().flatten() {
+                support::wait_for_peer_membership(runtime, 2).await;
+            }
+            let placement_ready = tokio::time::timeout(Duration::from_secs(15), async {
+                while !runtimes[0].as_ref().expect("primary").is_ready() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                placement_ready.is_ok(),
+                "primary placement did not become ready: {:?}",
+                runtimes[0].as_ref().expect("primary").readiness()
+            );
+            let mut primary = runtimes[0].take().expect("primary");
+            let config = VolumeConfig::data(4);
+            let restored_page = page(1, 0);
+            let expected = 0x1827_3645_5463_7281;
+
+            primary.create_volume(VOLUME, config).await;
+            primary.guest_write(VOLUME, restored_page, expected).await;
+            assert!(primary.guest_sync(VOLUME).await);
+            primary.shutdown().await.expect("first runtime shutdown");
+            drop(primary);
+
+            let restart_config = support::three_host_runtime_config(0, roots[0].clone(), addresses);
+            let mut restarted = Runtime::new(&restart_config, gcs.store.clone())
+                .await
+                .expect("runtime startup");
+            let before_fault = restarted.fault_reader_metrics();
+            assert_eq!(before_fault.readers_started, 1);
+
+            let guest = restarted.guest_access(VOLUME);
+            let bytes = tokio::task::spawn_blocking(move || {
+                let operation = guest.try_begin().expect("guest operation starts");
+                operation.read_page(restored_page)
+            })
+            .await
+            .expect("guest fault worker");
+
+            assert_eq!(
+                u64::from_ne_bytes(bytes[..8].try_into().expect("word")),
+                expected
+            );
+            let after_fault = restarted.fault_reader_metrics();
+            assert!(after_fault.events_read > before_fault.events_read);
+            assert!(after_fault.events_injected > before_fault.events_injected);
+            assert_eq!(after_fault.events_read, after_fault.events_injected);
+            assert_eq!(after_fault.terminal_errors, 0);
+            assert_eq!(after_fault.injection_failures, 0);
+            assert!(restarted.incidents().is_empty());
+
+            restarted
+                .shutdown()
+                .await
+                .expect("restarted runtime shutdown");
+            drop(restarted);
+            drop(runtimes);
+            for root in roots {
+                std::fs::remove_dir_all(root).expect("cleanup root");
+            }
+        })
+        .await
+        .expect("runtime restart fault regression completed");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn four_volumes_complete_concurrent_cold_faults_with_balanced_delivery() {
     support::local(async {
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -297,17 +384,22 @@ async fn independently_snapshotted_volumes_recover_their_own_state() {
                 (data_b, data_config),
             ]),
         )
-        .await;
-        assert!(immediate.is_empty());
+        .await
+        .expect("runtime startup");
         assert_eq!(
-            recovered.wait_recovered(memory).await,
-            Verdict::Resume {
-                epoch: blockd_core::types::Epoch(1),
-                vmstate,
-            }
+            immediate,
+            BTreeMap::from([
+                (
+                    memory,
+                    Verdict::Resume {
+                        epoch: blockd_core::types::Epoch(1),
+                        vmstate,
+                    },
+                ),
+                (data_a, Verdict::ColdBoot),
+                (data_b, Verdict::ColdBoot),
+            ])
         );
-        assert_eq!(recovered.wait_recovered(data_a).await, Verdict::ColdBoot);
-        assert_eq!(recovered.wait_recovered(data_b).await, Verdict::ColdBoot);
         assert_eq!(read_word(&recovered, volume_page(data_a, 3)).await, 0x1111);
         assert_eq!(read_word(&recovered, volume_page(data_b, 7)).await, 0x2222);
         assert_eq!(read_word(&recovered, volume_page(memory, 5)).await, 0xAAAA);
@@ -359,11 +451,16 @@ async fn synced_data_recovers_while_unsnapshotted_memory_is_discarded() {
                 (data_b, data_config),
             ]),
         )
-        .await;
-        assert!(immediate.is_empty());
-        assert_eq!(recovered.wait_recovered(memory).await, Verdict::ColdBoot);
-        assert_eq!(recovered.wait_recovered(data_a).await, Verdict::ColdBoot);
-        assert_eq!(recovered.wait_recovered(data_b).await, Verdict::ColdBoot);
+        .await
+        .expect("runtime startup");
+        assert_eq!(
+            immediate,
+            BTreeMap::from([
+                (memory, Verdict::ColdBoot),
+                (data_a, Verdict::ColdBoot),
+                (data_b, Verdict::ColdBoot),
+            ])
+        );
         assert_eq!(read_word(&recovered, volume_page(data_a, 2)).await, 0x1234);
         assert_eq!(read_word(&recovered, volume_page(data_b, 9)).await, 0x5678);
         assert!(
@@ -436,16 +533,25 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
     ];
     let gcs = support::test_gcs("replica-recover").await;
     let store = gcs.store.clone();
-    let a_config = support::three_host_runtime_config(0, roots[0].clone(), addresses);
-    let a = Runtime::new(&a_config, store.clone()).await;
-    let b = Runtime::new(
-        &support::three_host_runtime_config(1, roots[1].clone(), addresses),
-        store.clone(),
-    ).await;
-    let c = Runtime::new(
-        &support::three_host_runtime_config(2, roots[2].clone(), addresses),
-        store.clone(),
-    ).await;
+    let configs = (0u32..3)
+        .map(|host| {
+            support::three_host_runtime_config(
+                host,
+                roots[usize::try_from(host).expect("test host index")].clone(),
+                addresses,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut started = futures_util::future::join_all(
+        configs
+            .iter()
+            .map(|config| Runtime::new(config, store.clone())),
+    )
+    .await
+    .into_iter();
+    let a = started.next().expect("host 0 result").expect("host 0");
+    let b = started.next().expect("host 1 result").expect("host 1");
+    let c = started.next().expect("host 2 result").expect("host 2");
     for runtime in [&a, &b, &c] {
         support::wait_for_peer_membership(runtime, 2).await;
     }
@@ -474,19 +580,20 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
     drop(a);
     tokio::time::sleep(Duration::from_millis(100)).await;
     std::fs::remove_dir_all(&roots[0]).expect("delete primary durable root");
-    let active_root = &roots[usize::from(active.0)];
-    let spool_paths = spool_files(active_root, HostId(0), VOLUME);
+    let active_root = &roots[usize::try_from(active.get()).expect("test host index")];
+    let spool_paths = spool_files(active_root, HostId::new(0), VOLUME);
     assert!(!spool_paths.is_empty(), "peer spool exists");
     let mut spool = Vec::new();
     for (_, spool_path) in spool_paths {
         spool.extend(std::fs::read(spool_path).expect("read peer spool"));
     }
     let export = export_replica_recovery(
-        HostId(0),
+        blockd_core::types::HostId::new(0),
         VOLUME,
         head_version,
         &head,
         &[ReplicaResidue {
+            source: blockd_core::types::HostId::new(0),
             peer: active,
             assignment_epoch: 1,
             bytes: &spool,
@@ -498,7 +605,7 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
     install_replica_recovery(
         &roots[0],
         store.clone(),
-        HostId(0),
+        blockd_core::types::HostId::new(0),
         VOLUME,
         head_version,
         &export,
@@ -510,12 +617,10 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         &support::three_host_runtime_config(0, roots[0].clone(), addresses),
         store.clone(),
         &BTreeMap::from([(VOLUME, config)]),
-    ).await;
-    assert!(
-        verdicts.is_empty(),
-        "backed recovery waits for head refresh"
-    );
-    let _ = recovered.wait_recovered(VOLUME).await;
+    )
+    .await
+    .expect("runtime startup");
+    assert_eq!(verdicts, BTreeMap::from([(VOLUME, Verdict::ColdBoot)]));
     let bytes = recovered.guest_read(VOLUME, page).await;
     assert_eq!(
         u64::from_ne_bytes(bytes[..8].try_into().expect("word")),
@@ -526,12 +631,12 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
     // Wait for both observable sides of the asynchronous release.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let active_counters = if active == HostId(1) {
+        let active_counters = if active == HostId::new(1) {
             b.counters()
         } else {
             c.counters()
         };
-        if spool_files(active_root, HostId(0), VOLUME).is_empty()
+        if spool_files(active_root, HostId::new(0), VOLUME).is_empty()
             && active_counters.replica_unlinks > 0
         {
             break;
@@ -539,27 +644,27 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         assert!(
             Instant::now() < deadline,
             "peer spool was not released: passive={:?} passive_counters={:?} passive_connections={:?} passive_dropped={} spools={:?} recovered_replica={:?} recovered_counters={:?} connections={:?} dropped={} incidents={:?}",
-            if active == HostId(1) {
+            if active == HostId::new(1) {
                 b.replica_spool_metrics()
             } else {
                 c.replica_spool_metrics()
             },
-            if active == HostId(1) {
+            if active == HostId::new(1) {
                 b.counters()
             } else {
                 c.counters()
             },
-            if active == HostId(1) {
+            if active == HostId::new(1) {
                 b.peer_connections()
             } else {
                 c.peer_connections()
             },
-            if active == HostId(1) {
+            if active == HostId::new(1) {
                 b.peer_dropped_sends()
             } else {
                 c.peer_dropped_sends()
             },
-            spool_files(active_root, HostId(0), VOLUME),
+            spool_files(active_root, HostId::new(0), VOLUME),
             recovered.replica_metrics(),
             recovered.counters(),
             recovered.peer_connections(),
@@ -568,7 +673,7 @@ async fn peer_commit_recovers_a_deleted_primary_root_then_publishes_and_unlinks(
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let active_counters = if active == HostId(1) {
+    let active_counters = if active == HostId::new(1) {
         b.counters()
     } else {
         c.counters()
@@ -601,20 +706,24 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
         ];
         let gcs = support::test_gcs("replica-replace").await;
         let store = gcs.store.clone();
-        let mut runtimes: Vec<Option<Runtime>> = Vec::new();
-        for host in 0..3 {
-            runtimes.push(Some(
-                Runtime::new(
-                    &support::three_host_runtime_config(
-                        host,
-                        roots[usize::from(host)].clone(),
-                        addresses,
-                    ),
-                    store.clone(),
+        let configs = (0u32..3)
+            .map(|host| {
+                support::three_host_runtime_config(
+                    host,
+                    roots[usize::try_from(host).expect("test host index")].clone(),
+                    addresses,
                 )
-                .await,
-            ));
-        }
+            })
+            .collect::<Vec<_>>();
+        let mut runtimes = futures_util::future::join_all(
+            configs
+                .iter()
+                .map(|config| Runtime::new(config, store.clone())),
+        )
+        .await
+        .into_iter()
+        .map(|runtime| Some(runtime.expect("runtime startup")))
+        .collect::<Vec<_>>();
         let config = VolumeConfig {
             kind: blockd_core::journal::VolumeKind::Data,
             pages: 8,
@@ -632,7 +741,7 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             .expect("head");
         let initial_head = HeadRecord::decode(VOLUME, &initial_head_bytes).expect("valid head");
         let failed_peer = initial_head.stash.expect("stash").active_peer;
-        assert_ne!(failed_peer, HostId(0));
+        assert_ne!(failed_peer, HostId::new(0));
 
         gcs.fake.data_outage.store(true, Ordering::SeqCst);
         let page = PageId {
@@ -644,21 +753,22 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             assert!(primary.guest_sync(VOLUME).await);
         }
 
-        drop(runtimes[usize::from(failed_peer.0)].take());
+        drop(runtimes[usize::try_from(failed_peer.get()).expect("test host index")].take());
         tokio::time::sleep(Duration::from_millis(100)).await;
         let primary = runtimes[0].as_ref().expect("primary remains");
         primary.guest_write(VOLUME, page, 4).await;
         assert!(primary.guest_sync(VOLUME).await);
-        let replacement = [HostId(1), HostId(2)]
+        let replacement = [HostId::new(1), HostId::new(2)]
             .into_iter()
             .find(|peer| *peer != failed_peer)
             .expect("one replacement candidate");
-        let replacement_root = &roots[usize::from(replacement.0)];
+        let replacement_root =
+            &roots[usize::try_from(replacement.get()).expect("test host index")];
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let counters = primary.counters();
             if counters.replica_replacement_bytes > 0
-                && !spool_files(replacement_root, HostId(0), VOLUME).is_empty()
+                && !spool_files(replacement_root, HostId::new(0), VOLUME).is_empty()
             {
                 assert_eq!(counters.replica_nonactive_bytes, 0);
                 break;
@@ -670,19 +780,15 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        drop(runtimes[0].take());
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        std::fs::remove_dir_all(&roots[0]).expect("delete primary durable root");
-        let spool_paths = spool_files(replacement_root, HostId(0), VOLUME);
+        let spool_paths = spool_files(replacement_root, HostId::new(0), VOLUME);
         assert!(
             !spool_paths.is_empty(),
-            "replacement retained recovery residue"
+            "replacement retained recovery residue during the outage"
         );
         let mut spool = Vec::new();
         for (_, path) in spool_paths {
             spool.extend(std::fs::read(path).expect("read replacement spool"));
         }
-        gcs.fake.data_outage.store(false, Ordering::SeqCst);
         let (head_version, head_bytes) = store
             .clone()
             .get(layout::head_key(VOLUME))
@@ -690,12 +796,17 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             .expect("head get")
             .expect("head");
         let head = HeadRecord::decode(VOLUME, &head_bytes).expect("valid stale assignment head");
+        drop(runtimes[0].take());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        std::fs::remove_dir_all(&roots[0]).expect("delete primary durable root");
+        gcs.fake.data_outage.store(false, Ordering::SeqCst);
         let export = export_replica_recovery(
-            HostId(0),
+            blockd_core::types::HostId::new(0),
             VOLUME,
             head_version,
             &head,
             &[ReplicaResidue {
+                source: blockd_core::types::HostId::new(0),
                 peer: replacement,
                 assignment_epoch: 2,
                 bytes: &spool,
@@ -707,21 +818,44 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
         install_replica_recovery(
             &roots[0],
             store.clone(),
-            HostId(0),
+            blockd_core::types::HostId::new(0),
             VOLUME,
             head_version,
             &export,
         )
         .await
         .expect("install fenced replacement recovery");
+
+        let bootstrap_peer = PeerNet::start(
+            configs[0].peer.as_ref().expect("host 0 peer config"),
+            HostId::new(0),
+            store.clone(),
+            |_, _| {},
+        )
+        .await
+        .expect("temporary host 0 membership");
+        let failed_index = usize::try_from(failed_peer.get()).expect("test host index");
+        runtimes[failed_index] = Some(
+            Runtime::new(&configs[failed_index], store.clone())
+                .await
+                .expect("failed peer rejoins before RF-gated recovery"),
+        );
+        for runtime in runtimes.iter().flatten() {
+            support::wait_for_peer_membership(runtime, 2).await;
+        }
+        bootstrap_peer
+            .shutdown()
+            .await
+            .expect("withdraw temporary host 0 membership");
+
         let (recovered, verdicts) = Runtime::recover(
             &support::three_host_runtime_config(0, roots[0].clone(), addresses),
             store.clone(),
             &BTreeMap::from([(VOLUME, config)]),
         )
-        .await;
-        assert!(verdicts.is_empty());
-        let _ = recovered.wait_recovered(VOLUME).await;
+        .await
+        .expect("runtime startup");
+        assert_eq!(verdicts, BTreeMap::from([(VOLUME, Verdict::ColdBoot)]));
         let bytes = recovered.guest_read(VOLUME, page).await;
         assert_eq!(u64::from_ne_bytes(bytes[..8].try_into().expect("word")), 4);
 
@@ -729,7 +863,8 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
         // Wait for both observable sides of the asynchronous release.
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let replacement_counters = runtimes[usize::from(replacement.0)]
+            let replacement_counters = runtimes
+                [usize::try_from(replacement.get()).expect("test host index")]
                 .as_ref()
                 .expect("replacement runtime")
                 .counters();
@@ -745,7 +880,7 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
                             != (replacement, export.assignment_epoch)
                     })
                 });
-            if spool_files(replacement_root, HostId(0), VOLUME).is_empty()
+            if spool_files(replacement_root, HostId::new(0), VOLUME).is_empty()
                 && replacement_counters.replica_unlinks > 0
                 && release_cleared
             {
@@ -754,7 +889,7 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             assert!(
                 Instant::now() < deadline,
                 "replacement release did not finish: spools={:?} replacement_counters={:?} head={:?} recovered_counters={:?} recovered_replica={:?} connections={:?} dropped={} incidents={:?}",
-                spool_files(replacement_root, HostId(0), VOLUME),
+                spool_files(replacement_root, HostId::new(0), VOLUME),
                 replacement_counters,
                 release_head,
                 recovered.counters(),
@@ -765,7 +900,8 @@ async fn failed_active_peer_seeds_only_replacement_and_recovery_uses_replacement
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let replacement_counters = runtimes[usize::from(replacement.0)]
+        let replacement_counters =
+            runtimes[usize::try_from(replacement.get()).expect("test host index")]
             .as_ref()
             .expect("replacement runtime")
             .counters();

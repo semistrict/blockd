@@ -54,7 +54,7 @@ async fn main_local() {
         }
         Some(path) => {
             let cfg = config::DemodConfig::load(path).await;
-            let _telemetry = observability::init(Some(cfg.host.0));
+            let _telemetry = observability::init(Some(cfg.host.get()));
             let state = Arc::new(vm::Demod::start(cfg).await);
             api::serve(state).await;
         }

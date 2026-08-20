@@ -31,7 +31,7 @@ const PROBE_VOLUME: VolumeId = VolumeId(1000);
 
 fn pid(volume: VolumeId, page: u32) -> PageId {
     PageId {
-        volume: volume,
+        volume,
         page: PageNo(page),
     }
 }
@@ -83,6 +83,7 @@ fn operation_stat(rows: &[(&'static str, u64, u64)], name: &str) -> (u64, u64) {
         .map_or((0, 0), |(_, count, ns)| (*count, *ns))
 }
 
+#[allow(clippy::too_many_lines)] // one timed interference phase owns setup, workload, and metric sampling
 async fn run_phase(noisy: usize) -> PhaseResult {
     let addresses = [
         support::free_addr(),
@@ -92,7 +93,7 @@ async fn run_phase(noisy: usize) -> PhaseResult {
     let roots: [PathBuf; 3] = std::array::from_fn(|host| scratch_dir(&format!("k{noisy}-h{host}")));
     let mut configs: [RuntimeConfig; 3] = std::array::from_fn(|host| {
         support::three_host_runtime_config(
-            u16::try_from(host).expect("host fits"),
+            u32::try_from(host).expect("host fits"),
             roots[host].clone(),
             addresses,
         )
@@ -100,11 +101,19 @@ async fn run_phase(noisy: usize) -> PhaseResult {
     configs[0].daemon.cache_pages = 1 << 20; // isolate loop contention, not eviction pressure
     let test_gcs = support::test_gcs(&format!("loop-{noisy}")).await;
     let store = test_gcs.store.clone();
+    // A production-valid member waits for the initial RF=3 placement to
+    // reconcile. Start the complete roster together so no member waits for
+    // peers whose constructors have not been polled yet.
+    let (primary, passive_b, passive_c) = tokio::join!(
+        Runtime::new(&configs[0], store.clone()),
+        Runtime::new(&configs[1], store.clone()),
+        Runtime::new(&configs[2], store),
+    );
     let passives = vec![
-        Runtime::new(&configs[1], store.clone()).await,
-        Runtime::new(&configs[2], store.clone()).await,
+        passive_b.expect("runtime startup"),
+        passive_c.expect("runtime startup"),
     ];
-    let rt = Arc::new(Runtime::new(&configs[0], store).await);
+    let rt = Arc::new(primary.expect("runtime startup"));
     for n in 0..noisy {
         rt.create_volume(
             VolumeId(u64::try_from(n).expect("fits") + 1),
@@ -188,7 +197,7 @@ async fn run_phase(noisy: usize) -> PhaseResult {
 
 #[tokio::test(flavor = "current_thread")]
 async fn profile_probe_latency_under_noisy_neighbors() {
-    support::local(async {
+    Box::pin(support::local(async {
         eprintln!("── PROFILE: probe guest-op latency vs noisy-neighbor count ──");
         for noisy in NOISY_FLEETS {
             let result = run_phase(noisy).await;
@@ -223,6 +232,6 @@ async fn profile_probe_latency_under_noisy_neighbors() {
                 assert!(result.noisy_ops > 0, "noisy fleet did no work");
             }
         }
-    })
+    }))
     .await;
 }

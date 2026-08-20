@@ -8,10 +8,9 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{ClusterPlacementConfig, HostConfig};
 use blockd_core::journal::VolumeConfig;
 use blockd_core::layout;
-use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, millis};
 use blockd_runtime::{PeerConfig, Runtime, RuntimeConfig};
@@ -46,31 +45,24 @@ fn free_addr() -> SocketAddr {
         .expect("addr")
 }
 
-fn runtime_config(tag: &str, host: u16, peer: PeerConfig) -> RuntimeConfig {
+fn runtime_config(tag: &str, host: u32, peer: PeerConfig) -> RuntimeConfig {
     RuntimeConfig {
         daemon: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
-            host: HostId(host),
+            host: HostId::new(host),
             cache_pages: 256,
             writeback_interval: millis(5),
             backup_retry: millis(20),
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 500,
-            replica_placement: Some(ReplicaPlacementConfig {
+            cluster_placement: Some(ClusterPlacementConfig {
                 membership_epoch: 1,
-                local_failure_domain: host + 1,
-                roster: (0..2)
-                    .map(|candidate| PeerCandidate {
-                        host: HostId(candidate),
-                        weight: 1,
-                        failure_domain: candidate + 1,
-                        drained: false,
-                    })
-                    .collect(),
+                roster: (0u32..3).map(HostId::new).collect(),
                 authority: None,
             }),
         },
+        cluster_id: Some(1),
         blob_dir: temp_dir(tag),
         peer: Some(peer),
     }
@@ -181,7 +173,8 @@ impl Backend for MigrationBackend<'_> {
                         .expect_migration(volume_id(index), VolumeConfig::data(self.shape.pages));
                 }
                 join_all((1..=self.shape.disk_volumes).map(|index| {
-                    self.hosts[self.current].migrate_out(volume_id(index), HostId(to_host))
+                    self.hosts[self.current]
+                        .migrate_out(volume_id(index), HostId::new(u32::from(to_host)))
                 }))
                 .await;
                 let verdicts = join_all(
@@ -240,95 +233,108 @@ fn primary_files_under(base: &std::path::Path, dir: &std::path::Path) -> usize {
 /// former source may immediately hold a passive spool for the new primary.
 #[tokio::test(flavor = "current_thread")]
 async fn migration_moves_a_worked_volume_between_real_runtimes_over_tcp() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let addr_a = free_addr();
-            let addr_b = free_addr();
-            let peer_a = PeerConfig {
-                listen: addr_a,
-                advertise: addr_a,
-            };
-            let peer_b = PeerConfig {
-                listen: addr_b,
-                advertise: addr_b,
-            };
-            let test_gcs = support::test_gcs("migrate").await;
-            let store = test_gcs.store.clone();
-            let a = Runtime::new(&runtime_config("host-a", 0, peer_a), store.clone()).await;
-            let b = Runtime::new(&runtime_config("host-b", 1, peer_b), store.clone()).await;
+    Box::pin(tokio::task::LocalSet::new().run_until(async {
+        let addr_a = free_addr();
+        let addr_b = free_addr();
+        let addr_c = free_addr();
+        let peer_a = PeerConfig {
+            listen: addr_a,
+            advertise: addr_a,
+        };
+        let peer_b = PeerConfig {
+            listen: addr_b,
+            advertise: addr_b,
+        };
+        let peer_c = PeerConfig {
+            listen: addr_c,
+            advertise: addr_c,
+        };
+        let test_gcs = support::test_gcs("migrate").await;
+        let store = test_gcs.store.clone();
+        let config_a = runtime_config("host-a", 0, peer_a);
+        let config_b = runtime_config("host-b", 1, peer_b);
+        let config_c = runtime_config("host-c", 2, peer_c);
+        let (a, b, c) = tokio::join!(
+            Runtime::new(&config_a, store.clone()),
+            Runtime::new(&config_b, store.clone()),
+            Runtime::new(&config_c, store.clone()),
+        );
+        let a = a.expect("host A runtime startup");
+        let b = b.expect("host B runtime startup");
+        let _c = c.expect("host C runtime startup");
 
-            let spec = blockd_workload::load("migration").expect("migration workload");
-            let mut backend = MigrationBackend::new(&a, &b, spec.shape);
-            let outcome = blockd_workload::run(&spec, &mut backend)
-                .await
-                .expect("migration workload");
+        let spec = blockd_workload::load("migration").expect("migration workload");
+        let mut backend = MigrationBackend::new(&a, &b, spec.shape);
+        let outcome = blockd_workload::run(&spec, &mut backend)
+            .await
+            .expect("migration workload");
 
-            // R7.1: the whole guest-observed handoff stays far inside 500ms.
-            assert!(
-                backend.pause < Duration::from_millis(500),
-                "handoff took {:?}",
-                backend.pause
-            );
-            assert_eq!(backend.migrations, outcome.migrations);
+        // R7.1: the whole guest-observed handoff stays far inside 500ms.
+        assert!(
+            backend.pause < Duration::from_millis(500),
+            "handoff took {:?}",
+            backend.pause
+        );
+        assert_eq!(backend.migrations, outcome.migrations);
 
-            // Hydration drains the tail without the guest's help; the destination
-            // releases the source, and the source reclaims every primary-local
-            // file. A replica spool for the new primary is independent passive
-            // durability and must survive this cleanup.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let blobs = primary_files_under(a.blob_dir(), a.blob_dir());
-                if blobs == 0 {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "source never reclaimed: {blobs} blobs remain"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-
-            // Everything still verifies afterwards, from B's own storage alone.
-            backend
-                .verify(
-                    backend
-                        .verified_model
-                        .as_ref()
-                        .expect("workload performed verification"),
-                    VerifyScope::Disk,
-                )
-                .await
-                .expect("destination remains readable");
-            assert_eq!(a.incidents(), Vec::<String>::new());
-            assert_eq!(b.incidents(), Vec::<String>::new());
-            // The wire really carried the drain. Foreground demand may win the race
-            // with background hydration, so either path is valid post-copy progress.
-            let observation_deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                let peer_faults = b
-                    .fault_latency()
-                    .into_iter()
-                    .filter(|series| {
-                        (1..=backend.shape.disk_volumes)
-                            .map(volume_id)
-                            .any(|volume| series.volume == volume)
-                            && series.source == "peer"
-                    })
-                    .map(|series| series.histogram.count)
-                    .sum::<u64>();
-                if b.counters().hydrate_fills + peer_faults > 0 {
-                    break;
-                }
-                assert!(
-                    Instant::now() < observation_deadline,
-                    "no post-copy page crossed the peer wire"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        // Hydration drains the tail without the guest's help; the destination
+        // releases the source, and the source reclaims every primary-local
+        // file. A replica spool for the new primary is independent passive
+        // durability and must survive this cleanup.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let blobs = primary_files_under(a.blob_dir(), a.blob_dir());
+            if blobs == 0 {
+                break;
             }
             assert!(
-                test_gcs.fake.request_count() > 0,
-                "migration must retain the store recovery path"
+                Instant::now() < deadline,
+                "source never reclaimed: {blobs} blobs remain"
             );
-        })
-        .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Everything still verifies afterwards, from B's own storage alone.
+        backend
+            .verify(
+                backend
+                    .verified_model
+                    .as_ref()
+                    .expect("workload performed verification"),
+                VerifyScope::Disk,
+            )
+            .await
+            .expect("destination remains readable");
+        assert_eq!(a.incidents(), Vec::<String>::new());
+        assert_eq!(b.incidents(), Vec::<String>::new());
+        // The wire really carried the drain. Foreground demand may win the race
+        // with background hydration, so either path is valid post-copy progress.
+        let observation_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let peer_faults = b
+                .fault_latency()
+                .into_iter()
+                .filter(|series| {
+                    (1..=backend.shape.disk_volumes)
+                        .map(volume_id)
+                        .any(|volume| series.volume == volume)
+                        && series.source == "peer"
+                })
+                .map(|series| series.histogram.count)
+                .sum::<u64>();
+            if b.counters().hydrate_fills + peer_faults > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < observation_deadline,
+                "no post-copy page crossed the peer wire"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            test_gcs.fake.request_count() > 0,
+            "migration must retain the store recovery path"
+        );
+    }))
+    .await;
 }

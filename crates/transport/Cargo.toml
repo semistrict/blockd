@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-blockd-core = { path = "../core" }
+blockd-core = { path = "../core", version = "0.1.0" }
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [lints]

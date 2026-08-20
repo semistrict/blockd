@@ -63,14 +63,14 @@ pub async fn cleanup_local<W: Blobs>(
     state: SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
 ) -> Result<(), BlobError> {
     let (names, records_to_remove, blx_to_remove, pressure_reclaims) = {
         let host = state.borrow();
         let Some(volume_state) = host
             .volumes
             .get(&volume)
-            .filter(|volume| volume.incarnation == incarnation)
+            .filter(|volume| volume.run_generation == run_generation)
         else {
             return Ok(());
         };
@@ -127,7 +127,7 @@ pub async fn cleanup_local<W: Blobs>(
     let Some(volume_state) = host
         .volumes
         .get_mut(&volume)
-        .filter(|volume| volume.incarnation == incarnation)
+        .filter(|volume| volume.run_generation == run_generation)
     else {
         return Ok(());
     };

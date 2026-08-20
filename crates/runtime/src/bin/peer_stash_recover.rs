@@ -53,10 +53,12 @@ fn parse_args() -> Args {
         values.insert(flag, raw.next().unwrap_or_else(|| usage()));
     }
     let take = |name: &str| values.get(name).cloned().unwrap_or_else(|| usage());
-    let parse_host = |name: &str| HostId(take(name).parse::<u16>().unwrap_or_else(|_| usage()));
-    let claimant = values
+    let parse_host =
+        |name: &str| HostId::new(take(name).parse::<u32>().unwrap_or_else(|_| usage()));
+    let claimant_host = values
         .get("--claimant")
-        .map(|value| HostId(value.parse::<u16>().unwrap_or_else(|_| usage())));
+        .map(|value| HostId::new(value.parse::<u32>().unwrap_or_else(|_| usage())));
+    let claimant = claimant_host;
     let target = values.get("--target").map(PathBuf::from);
     if command == "install" && (claimant.is_none() || target.is_none()) {
         usage();
@@ -97,9 +99,9 @@ async fn scan_files(base: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
-async fn load_residues(args: &Args) -> Vec<(u64, Vec<u8>)> {
+async fn load_residues(args: &Args) -> Vec<(HostId, u64, Vec<u8>)> {
     let files = scan_files(&args.residue_root).await;
-    let mut generations: BTreeMap<u64, BTreeMap<u64, PathBuf>> = BTreeMap::new();
+    let mut generations: BTreeMap<(HostId, u64), BTreeMap<u64, PathBuf>> = BTreeMap::new();
     for (name, path) in files {
         if let Some(BlobName::ReplicaSpool {
             source,
@@ -110,18 +112,18 @@ async fn load_residues(args: &Args) -> Vec<(u64, Vec<u8>)> {
             && (source, volume) == (args.source, args.volume)
         {
             generations
-                .entry(assignment_epoch)
+                .entry((source, assignment_epoch))
                 .or_default()
                 .insert(generation, path);
         }
     }
     let mut residues = Vec::with_capacity(generations.len());
-    for (epoch, files) in generations {
+    for ((source, epoch), files) in generations {
         let mut bytes = Vec::new();
         for path in files.into_values() {
             bytes.extend(tokio::fs::read(path).await.expect("read residue spool"));
         }
-        residues.push((epoch, bytes));
+        residues.push((source, epoch, bytes));
     }
     residues
 }
@@ -142,7 +144,7 @@ fn report_json(report: &ReplicaRecoveryReport) -> String {
     format!(
         "{{\"status\":\"{status}\",\"chosen_peer\":{},\"assignment_epoch\":{},\
          \"covered_sync_through\":{},\"missing\":[{}],\"corrupt\":[{}]}}",
-        number(report.chosen_source.map(|peer| u64::from(peer.0))),
+        number(report.chosen_source.map(|peer| u64::from(peer.get()))),
         number(report.chosen_assignment_epoch),
         number(report.covered_sync_through),
         strings(&report.missing_objects),
@@ -166,12 +168,21 @@ async fn main() {
         .expect("head store available")
         .expect("fenced head exists");
     let head = HeadRecord::decode(args.volume, &head_bytes).expect("fenced head decodes");
+    let (_, source_claim) = store
+        .clone()
+        .get(layout::node_claim_key(args.source))
+        .await
+        .expect("source claim store available")
+        .expect("source claim exists");
+    assert_eq!(source_claim.len(), 16, "source claim is active");
+    let source_identity = args.source;
     let owned = load_residues(&args).await;
     assert!(!owned.is_empty(), "no matching peer residue found");
     let residues = || {
         owned
             .iter()
-            .map(|(assignment_epoch, bytes)| ReplicaResidue {
+            .map(|(source, assignment_epoch, bytes)| ReplicaResidue {
+                source: *source,
                 peer: args.peer,
                 assignment_epoch: *assignment_epoch,
                 bytes,
@@ -181,7 +192,7 @@ async fn main() {
     let mut store_objects = BTreeMap::new();
     let report = loop {
         let report = report_replica_recovery(
-            args.source,
+            source_identity,
             args.volume,
             head_version,
             &head,
@@ -218,7 +229,7 @@ async fn main() {
         "recovery incomplete"
     );
     let export = export_replica_recovery(
-        args.source,
+        source_identity,
         args.volume,
         head_version,
         &head,

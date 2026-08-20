@@ -210,8 +210,8 @@ mod tests {
             unreachable!()
         }
 
-        async fn delete(self: Arc<Self>, key: String) {
-            self.0.lock().expect("lock").remove(&key);
+        async fn delete(self: Arc<Self>, key: String) -> Result<bool, StoreFault> {
+            Ok(self.0.lock().expect("lock").remove(&key).is_some())
         }
     }
 
@@ -221,12 +221,12 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let head = HeadRecord {
             volume,
-            holder: HostId(0),
+            holder: HostId::new(0),
             fence: 1,
             manifest: None,
             stash: Some(StashAssignment {
                 assignment_epoch: 1,
-                active_peer: HostId(1),
+                active_peer: HostId::new(1),
                 active_assignment_epoch: 1,
                 transition_peer: None,
                 membership_epoch: 1,
@@ -255,7 +255,7 @@ mod tests {
         };
         let bytes = record.encode(volume);
         let export = ReplicaExport {
-            source_peer: HostId(1),
+            source_peer: HostId::new(1),
             assignment_epoch: 1,
             info: ReplicaCommitInfo {
                 writer_fence: 1,
@@ -274,8 +274,9 @@ mod tests {
             volume.0
         ));
         let _ = std::fs::remove_dir_all(&target);
+        let claimant = HostId::new(2);
         let installed =
-            install_replica_recovery(&target, store.clone(), HostId(2), volume, 1, &export)
+            install_replica_recovery(&target, store.clone(), claimant, volume, 1, &export)
                 .await
                 .expect("install");
         assert_eq!(installed.writer_fence, 2);
@@ -287,7 +288,7 @@ mod tests {
             .expect("get")
             .expect("head");
         let published = HeadRecord::decode(volume, &head_bytes).expect("head");
-        assert_eq!(published.holder, HostId(2));
+        assert_eq!(published.holder, claimant);
         assert_eq!(published.manifest.expect("manifest").fence, 2);
         assert_eq!(published.stash, None);
         assert_eq!(published.retired_stashes.len(), 1);
@@ -311,14 +312,14 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let assignment = StashAssignment {
             assignment_epoch: 1,
-            active_peer: HostId(1),
+            active_peer: HostId::new(1),
             active_assignment_epoch: 1,
             transition_peer: None,
             membership_epoch: 1,
         };
         let verified_head = HeadRecord {
             volume,
-            holder: HostId(0),
+            holder: HostId::new(0),
             fence: 1,
             manifest: None,
             stash: Some(assignment),
@@ -382,7 +383,8 @@ mod tests {
             volume.0
         ));
         let _ = std::fs::remove_dir_all(&target);
-        let result = install_replica_recovery(&target, store, HostId(2), volume, 1, &export).await;
+        let result =
+            install_replica_recovery(&target, store, HostId::new(2), volume, 1, &export).await;
         if target.exists() {
             std::fs::remove_dir_all(&target).expect("cleanup unexpected install");
         }

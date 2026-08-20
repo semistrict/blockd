@@ -9,10 +9,10 @@ rust-version.workspace = true
 test-page-size = ["blockd-core/test-page-size"]
 
 [dependencies]
-blockd-core = { path = "../core" }
-blockd-exec = { path = "../exec" }
-blockd-transport = { path = "../transport" }
-blockd-workload = { path = "../workload" }
+blockd-core = { path = "../core", version = "0.1.0" }
+blockd-exec = { path = "../exec", version = "0.1.0" }
+blockd-transport = { path = "../transport", version = "0.1.0" }
+blockd-workload = { path = "../workload", version = "0.1.0" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

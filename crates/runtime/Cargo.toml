@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Enables the shipped-binary durability harness to opt into page probes. The
+# production control protocol leaves this feature and its explicit CLI switch
+# disabled.
+shipped-test-control = []
+
 # Runtime lint settings allow the clocks, threads, and I/O forbidden in core.
 [lints.rust]
 unsafe_code = "forbid"
@@ -20,22 +26,26 @@ missing_panics_doc = "allow"
 [dependencies]
 async-trait.workspace = true
 bytes = "1.11.1"
-blockd-core = { path = "../core" }
-blockd-exec = { path = "../exec" }
-blockd-hostmem = { path = "../hostmem" }
-blockd-transport = { path = "../transport" }
+blockd-core = { path = "../core", version = "0.1.0" }
+blockd-exec = { path = "../exec", version = "0.1.0" }
+blockd-hostmem = { path = "../hostmem", version = "0.1.0" }
+blockd-transport = { path = "../transport", version = "0.1.0" }
 axum = { workspace = true, features = ["http1", "tokio"] }
 futures-util = "0.3.33"
 httpdate = "1.0.3"
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+prost = "0.14.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing.workspace = true
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 reqwest = { workspace = true, features = ["hickory-dns", "http2", "rustls"] }
 rcgen = { version = "0.14.7", default-features = false, features = ["ring"] }
-rustix = { version = "0.38.44", features = ["fs"] }
+ring = "0.17.14"
+rustix = { version = "0.38.44", features = ["fs", "process", "runtime"] }
+libc.workspace = true
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26.4"
@@ -43,6 +53,6 @@ tokio-rustls = "0.26.4"
 [dev-dependencies]
 # The differential recovery test replays simulation-produced blob sets
 # through the runtime's on-disk scan path.
-blockd-sim = { path = "../sim" }
-blockd-workload = { path = "../workload" }
+blockd-sim = { path = "../sim", version = "0.1.0" }
+blockd-workload = { path = "../workload", version = "0.1.0" }
 tempfile = "3.23.0"

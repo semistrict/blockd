@@ -28,10 +28,46 @@ macro_rules! id_type {
     };
 }
 
-id_type!(
-    /// A host in the cluster; one daemon per host (R9.1).
-    HostId(u16)
-);
+/// A host in the cluster; one daemon per host (R9.1).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostId(u32);
+
+impl HostId {
+    /// Constructs an identifier from its durable numeric representation.
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the durable numeric representation.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for HostId {
+    fn from(value: u32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<HostId> for u32 {
+    fn from(value: HostId) -> Self {
+        value.get()
+    }
+}
+
+impl fmt::Debug for HostId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HostId({})", self.0)
+    }
+}
+
+impl fmt::Display for HostId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 id_type!(
     /// One independently managed memory or block volume. Never reused (R6.5).
     VolumeId(u64)

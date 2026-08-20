@@ -27,7 +27,7 @@
     "volume_count": 3,
     "volume_kind": "data",
     "pages": 16,
-    "replica_placement": null
+    "cluster_placement": null
   },
   "workload": {
     "horizon": "2s",

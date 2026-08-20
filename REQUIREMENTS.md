@@ -131,7 +131,7 @@ implementation decisions. Requirements take precedence when the two conflict.
   record needed to cold-boot at the barrier; it is neither guest RAM nor every
   provisioned page. The peer is recovery storage, not an owner or runner.
 - **R4.3** Loss of either the primary or the active passive alone loses no
-  acknowledged sync. The passive holds the newest protected closure; loss of
+  acknowledged sync. The passive spool holds the newest committed recovery cut; loss of
   that passive pauses new sync acknowledgments only while a replacement is
   selected, seeded with a complete covering closure, and fenced as active.
   Repair has no finite retry, candidate-count, retired-peer, or archive-lag
@@ -203,15 +203,18 @@ implementation decisions. Requirements take precedence when the two conflict.
   consistency if it is a block volume: no prior local state, no reachable
   previous host, and no requirement that a checkpoint was ever taken. A
   volume whose newest protected sync is ahead of that point instead
-  requires a complete verified closure from its recorded stash assignment, or
-  from a higher assignment epoch carrying a commit by the recorded holder's
+  requires a complete verified recovery cut from its recorded replica spool,
+  or from a higher assignment epoch carrying a commit by the recorded holder's
   current writer fence (R6.6); it must never silently present the older
   object-store point as satisfying the stronger guarantee.
 - **R6.3** The system itself is the authority for which host runs a volume —
-  no consensus service, no trusted control plane. The instrument is the
-  object store's conditional head: two hosts racing to restore one volume
-  resolve to exactly one runner by CAS alone. Migration preserves the same
-  exclusion by making the handoff durable on both sides before either acts.
+  no peer consensus service and no external trusted control plane. The object
+  store is the sole shared control-plane authority: every membership,
+  placement, session, authority, per-volume head, and replica-assignment
+  transition uses a conditional operation against the exact observed object
+  version. Two hosts racing to restore one volume resolve to exactly one runner
+  by head CAS alone. Migration preserves the same exclusion by making the
+  handoff durable on both sides before either acts.
 - **R6.4** Durable state can never fork: a fenced former holder must be
   structurally unable to publish, and its guest must stop within a bounded,
   configured time. Failover after suspected host death must be safe to
@@ -228,16 +231,15 @@ implementation decisions. Requirements take precedence when the two conflict.
   write access to the prefix is the authority to join the roster.
 - **R6.6** The fenced per-volume head is also the durable authority for the one
   active stash assignment and any in-progress replacement. Health observations
-  and deterministic virtual-node rankings are placement inputs, not authority.
+  and deterministic candidate rankings are placement inputs, not authority.
   An assignment change is a rare conditional head update and never enters the
   steady-state guest sync path. During a healthy-store replacement the head
   names both the old active peer and the single transition peer. During a
-  complete store outage, the existing holder may provisionally advance to a
-  higher assignment epoch, seed exactly one deterministic replacement at a time, and
-  activate it after a complete commit. That residue is authoritative only when
-  its commit and journal carry the holder's current writer fence; recovery may
-  inventory such higher epochs and must reject every stale-fence residue. The
-  provisional assignment is reconciled by head CAS when the store returns.
+  complete store outage, the existing assignment remains fixed: the holder may
+  continue using that already-authorized peer only while its own authority
+  remains valid, but replacement, activation, and every other assignment
+  transition wait for the store. Peers may retain fenced transfer residue, but
+  it has no control-plane authority until an exact head CAS publishes it.
   Assignment epochs map cyclically across eligible candidates rather than
   consuming a finite roster, and a covering activation supersedes obsolete
   retired-peer authority so an unreachable former peer cannot exhaust future

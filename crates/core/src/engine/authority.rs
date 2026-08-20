@@ -1,8 +1,6 @@
-use crate::authority::{
-    AuthorityProof, HostSessionRecord, PlacementProof, PlacementRecord, VnodeAuthority,
-    valid_placement_transition,
-};
+use crate::authority::{HostSessionRecord, PlacementProof, valid_placement_transition};
 use crate::layout;
+use crate::placement::ClusterPlacement;
 use crate::types::HostId;
 use crate::world::{Store, StoreError};
 
@@ -17,6 +15,7 @@ pub enum AuthorityError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VersionedSession {
+    pub host: HostId,
     pub store_version: u64,
     pub record: HostSessionRecord,
 }
@@ -29,13 +28,14 @@ impl VersionedSession {
     ) -> Result<Self, AuthorityError> {
         let store_version = Store::put_cas(
             world,
-            layout::host_session_key(record.host()),
+            layout::host_session_key(self.host),
             Some(self.store_version),
             record.encode(),
         )
         .await
         .map_err(map_store_error)?;
         Ok(Self {
+            host: self.host,
             store_version,
             record,
         })
@@ -57,13 +57,12 @@ impl VersionedSession {
     async fn challenge<W: Store>(
         self,
         world: &W,
-        challenger: HostId,
         nonce: u64,
         challenged_at: u64,
     ) -> Result<Self, AuthorityError> {
         let next = self
             .record
-            .challenge(challenger, nonce, challenged_at)
+            .challenge(nonce, challenged_at)
             .map_err(|_| AuthorityError::Fenced)?;
         self.replace(world, next).await
     }
@@ -98,7 +97,7 @@ pub async fn read_placement<W: Store>(world: &W) -> Result<Option<PlacementProof
     else {
         return Ok(None);
     };
-    let placement = PlacementRecord::decode(&bytes).map_err(|_| AuthorityError::Corrupt)?;
+    let placement = ClusterPlacement::decode(&bytes).ok_or(AuthorityError::Corrupt)?;
     Ok(Some(PlacementProof {
         store_version,
         placement,
@@ -108,9 +107,9 @@ pub async fn read_placement<W: Store>(world: &W) -> Result<Option<PlacementProof
 pub async fn cas_placement<W: Store>(
     world: &W,
     expected: Option<&PlacementProof>,
-    next: PlacementRecord,
+    next: ClusterPlacement,
 ) -> Result<PlacementProof, AuthorityError> {
-    next.validate().map_err(|_| AuthorityError::Invalid)?;
+    next.validate().ok_or(AuthorityError::Invalid)?;
     match expected {
         None if next.epoch != 1 => return Err(AuthorityError::Invalid),
         Some(previous) => valid_placement_transition(&previous.placement, &next)
@@ -136,12 +135,13 @@ pub async fn create_host_session<W: Store>(
     host: HostId,
     session: u64,
 ) -> Result<VersionedSession, AuthorityError> {
-    let record = HostSessionRecord::initial(host, session).map_err(|_| AuthorityError::Invalid)?;
+    let record = HostSessionRecord::initial(session).map_err(|_| AuthorityError::Invalid)?;
     let store_version =
         Store::put_cas(world, layout::host_session_key(host), None, record.encode())
             .await
             .map_err(map_store_error)?;
     Ok(VersionedSession {
+        host,
         store_version,
         record,
     })
@@ -158,10 +158,8 @@ pub async fn read_host_session<W: Store>(
         return Ok(None);
     };
     let record = HostSessionRecord::decode(&bytes).map_err(|_| AuthorityError::Corrupt)?;
-    if record.host() != host {
-        return Err(AuthorityError::Corrupt);
-    }
     Ok(Some(VersionedSession {
+        host,
         store_version,
         record,
     }))
@@ -177,16 +175,14 @@ pub async fn poll_or_defend_host_session<W: Store>(
         .ok_or(AuthorityError::Fenced)?;
     match observed.record {
         HostSessionRecord::Active {
-            host: found,
             session: found_session,
             ..
-        } if found == host && found_session == session => Ok(PollSession::Active(observed)),
+        } if found_session == session => Ok(PollSession::Active(observed)),
         HostSessionRecord::Challenge {
-            host: found,
             session: found_session,
             nonce,
             ..
-        } if found == host && found_session == session => Ok(PollSession::Defended(
+        } if found_session == session => Ok(PollSession::Defended(
             observed.defend(world, session, nonce).await?,
         )),
         _ => Err(AuthorityError::Fenced),
@@ -196,7 +192,6 @@ pub async fn poll_or_defend_host_session<W: Store>(
 pub async fn challenge_host_session<W: Store>(
     world: &W,
     host: HostId,
-    challenger: HostId,
     nonce: u64,
     challenged_at: u64,
 ) -> Result<VersionedSession, AuthorityError> {
@@ -206,9 +201,7 @@ pub async fn challenge_host_session<W: Store>(
     if matches!(observed.record, HostSessionRecord::Challenge { .. }) {
         return Ok(observed);
     }
-    observed
-        .challenge(world, challenger, nonce, challenged_at)
-        .await
+    observed.challenge(world, nonce, challenged_at).await
 }
 
 pub async fn revoke_host_session<W: Store>(
@@ -225,94 +218,6 @@ pub async fn activate_host_session<W: Store>(
     session: u64,
 ) -> Result<VersionedSession, AuthorityError> {
     revoked.activate(world, session).await
-}
-
-pub async fn verify_authority_proof<W: Store>(
-    world: &W,
-    placement: &PlacementRecord,
-    proof: AuthorityProof,
-) -> Result<(), AuthorityError> {
-    proof
-        .authority
-        .validate(placement)
-        .map_err(|_| AuthorityError::Invalid)?;
-    let Some((store_version, bytes)) =
-        Store::get(world, &layout::vnode_authority_key(proof.authority.vnode))
-            .await
-            .map_err(map_store_error)?
-    else {
-        return Err(AuthorityError::Fenced);
-    };
-    let observed = VnodeAuthority::decode(&bytes).map_err(|_| AuthorityError::Corrupt)?;
-    if store_version != proof.store_version || observed != proof.authority {
-        return Err(AuthorityError::Fenced);
-    }
-    Ok(())
-}
-
-pub async fn read_vnode_authority<W: Store>(
-    world: &W,
-    placement: &PlacementRecord,
-    vnode: crate::authority::VnodeId,
-) -> Result<Option<AuthorityProof>, AuthorityError> {
-    let Some((store_version, bytes)) = Store::get(world, &layout::vnode_authority_key(vnode))
-        .await
-        .map_err(map_store_error)?
-    else {
-        return Ok(None);
-    };
-    let authority = VnodeAuthority::decode(&bytes).map_err(|_| AuthorityError::Corrupt)?;
-    authority
-        .validate(placement)
-        .map_err(|_| AuthorityError::Invalid)?;
-    Ok(Some(AuthorityProof {
-        store_version,
-        authority,
-    }))
-}
-
-pub async fn cas_vnode_authority<W: Store>(
-    world: &W,
-    placement: &PlacementRecord,
-    expected: Option<AuthorityProof>,
-    next: VnodeAuthority,
-) -> Result<AuthorityProof, AuthorityError> {
-    next.validate(placement)
-        .map_err(|_| AuthorityError::Invalid)?;
-    let primary_session = read_host_session(world, next.primary)
-        .await?
-        .ok_or(AuthorityError::Fenced)?;
-    if !matches!(
-        primary_session.record,
-        HostSessionRecord::Active { session, epoch, .. }
-            if session == next.primary_session && epoch == next.primary_host_epoch
-    ) {
-        return Err(AuthorityError::Fenced);
-    }
-    match expected {
-        None if next.generation != 1 => return Err(AuthorityError::Invalid),
-        Some(previous)
-            if previous.authority.vnode != next.vnode
-                || previous.authority.cluster_id != next.cluster_id
-                || previous.authority.placement_epoch != next.placement_epoch
-                || previous.authority.generation.checked_add(1) != Some(next.generation) =>
-        {
-            return Err(AuthorityError::Invalid);
-        }
-        _ => {}
-    }
-    let store_version = Store::put_cas(
-        world,
-        layout::vnode_authority_key(next.vnode),
-        expected.map(|proof| proof.store_version),
-        next.encode(),
-    )
-    .await
-    .map_err(map_store_error)?;
-    Ok(AuthorityProof {
-        store_version,
-        authority: next,
-    })
 }
 
 fn map_store_error(error: StoreError) -> AuthorityError {

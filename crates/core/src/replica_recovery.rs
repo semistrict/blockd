@@ -18,6 +18,7 @@ pub type ReplicaStoreObjects = Vec<(String, Vec<u8>)>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReplicaResidue<'a> {
+    pub source: HostId,
     pub peer: HostId,
     pub assignment_epoch: u64,
     pub bytes: &'a [u8],
@@ -72,7 +73,7 @@ impl ReplicaRecoveryReport {
             (ReplicaRecoveryStatus::Complete, Some(peer), Some(epoch), Some(through)) => {
                 format!(
                     "complete: peer {}, assignment {epoch}, sync watermark {through}",
-                    peer.0
+                    peer.get()
                 )
             }
             _ => format!(
@@ -371,7 +372,8 @@ pub fn report_replica_recovery(
             }
             Err(_) => report.corrupt_objects.push(format!(
                 "peer:{}/assignment:{}",
-                residue.peer.0, residue.assignment_epoch
+                residue.peer.get(),
+                residue.assignment_epoch
             )),
         }
     }
@@ -390,7 +392,7 @@ pub fn report_replica_recovery(
         Err(ReplicaRecoveryError::MissingObject { key }) => report.missing_objects.push(key),
         Err(ReplicaRecoveryError::CorruptObject { key }) => report.corrupt_objects.push(key),
         Err(ReplicaRecoveryError::CorruptSpool { peer }) => {
-            report.corrupt_objects.push(format!("peer:{}", peer.0));
+            report.corrupt_objects.push(format!("peer:{}", peer.get()));
         }
         Err(_) => {}
     }
@@ -555,15 +557,17 @@ fn verify_scan_identity(
     residue: ReplicaResidue<'_>,
     scan: &ReplicaSpoolScan,
 ) -> Result<(), ReplicaRecoveryError> {
-    let identity_ok = scan.artifacts.values().all(|frame| {
-        frame.source == source
-            && frame.volume == volume
-            && frame.assignment_epoch == residue.assignment_epoch
-    }) && scan.commits.iter().all(|commit| {
-        commit.source == source
-            && commit.volume == volume
-            && commit.assignment_epoch == residue.assignment_epoch
-    });
+    let identity_ok = residue.source == source
+        && scan.artifacts.values().all(|frame| {
+            frame.source == residue.source
+                && frame.volume == volume
+                && frame.assignment_epoch == residue.assignment_epoch
+        })
+        && scan.commits.iter().all(|commit| {
+            commit.source == residue.source
+                && commit.volume == volume
+                && commit.assignment_epoch == residue.assignment_epoch
+        });
     if identity_ok {
         Ok(())
     } else {
@@ -639,17 +643,32 @@ fn artifact_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const fn id(host: u32) -> HostId {
+        HostId::new(host)
+    }
     use crate::head::StashAssignment;
     use crate::journal::{RecordKind, VolumeConfig};
     use crate::page_file::PageBatchBuilder;
     use crate::replica_spool::{seal_replica_artifact, seal_replica_commit};
-    use crate::types::{Gen, JournalSeq, ObjectId, PageId, PageNo, page_size};
+    use crate::types::{Gen, HostId, JournalSeq, ObjectId, PageId, PageNo, page_size};
 
     fn file_ref(bytes: &[u8]) -> crate::manifest::ObjectRef {
         crate::manifest::ObjectRef::from_blx(&BlxObject::open(bytes).expect("valid BLX"))
     }
 
     fn recovery_spool(
+        source: HostId,
+        volume: VolumeId,
+        assignment_epoch: u64,
+        seq: u64,
+        covered: u64,
+        fill: u8,
+    ) -> (Vec<u8>, Vec<u8>, JournalRecord) {
+        recovery_spool_identity(source, volume, assignment_epoch, seq, covered, fill)
+    }
+
+    fn recovery_spool_identity(
         source: HostId,
         volume: VolumeId,
         assignment_epoch: u64,
@@ -706,8 +725,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn lost_primary_exports_a_complete_normal_local_recovery_set() {
-        let source = HostId(0);
-        let peer = HostId(1);
+        let source = id(0);
+        let peer = id(1);
         let volume = VolumeId(7);
         let page = PageId {
             volume,
@@ -768,6 +787,7 @@ mod tests {
             head.fence,
             &head,
             &[ReplicaResidue {
+                source,
                 peer,
                 assignment_epoch: 1,
                 bytes: &spool,
@@ -783,6 +803,7 @@ mod tests {
             head.fence,
             &head,
             &[ReplicaResidue {
+                source,
                 peer,
                 assignment_epoch: 1,
                 bytes: &spool,
@@ -791,9 +812,9 @@ mod tests {
         );
         assert_eq!(report.status, ReplicaRecoveryStatus::Complete);
         assert!(report.human_summary().starts_with("complete:"));
-        let claim = prepare_replica_recovery_claim(9, &head, HostId(3), &export);
+        let claim = prepare_replica_recovery_claim(9, &head, id(3), &export);
         assert_eq!(claim.expected_version, 9);
-        assert_eq!(claim.head.holder, HostId(3));
+        assert_eq!(claim.head.holder, id(3));
         assert_eq!(claim.head.stash.expect("verified source").active_peer, peer);
         let refenced = refence_replica_export(volume, &export, 10).expect("fresh writer fence");
         let (_, journal) = refenced
@@ -828,12 +849,12 @@ mod tests {
         let volume = VolumeId(7);
         let head = HeadRecord {
             volume,
-            holder: HostId(0),
+            holder: id(0),
             fence: 1,
             manifest: None,
             stash: Some(StashAssignment {
                 assignment_epoch: 1,
-                active_peer: HostId(1),
+                active_peer: id(1),
                 active_assignment_epoch: 1,
                 transition_peer: None,
                 membership_epoch: 6,
@@ -842,25 +863,26 @@ mod tests {
         };
         assert_eq!(
             export_replica_recovery(
-                HostId(0),
+                id(0),
                 volume,
                 head.fence,
                 &head,
                 &[ReplicaResidue {
-                    peer: HostId(2),
+                    source: id(0),
+                    peer: id(2),
                     assignment_epoch: 1,
                     bytes: &[],
                 }],
                 &BTreeMap::new(),
             ),
-            Err(ReplicaRecoveryError::UnnamedPeer { peer: HostId(2) })
+            Err(ReplicaRecoveryError::UnnamedPeer { peer: id(2) })
         );
     }
 
     #[test]
     fn recovery_accepts_a_complete_offline_replacement_from_the_current_writer_fence() {
-        let source = HostId(0);
-        let replacement = HostId(2);
+        let source = id(0);
+        let replacement = id(2);
         let volume = VolumeId(17);
         let (spool, _, _) = recovery_spool(source, volume, 2, 8, 12, 0xA5);
         let head = HeadRecord {
@@ -870,7 +892,7 @@ mod tests {
             manifest: None,
             stash: Some(StashAssignment {
                 assignment_epoch: 1,
-                active_peer: HostId(1),
+                active_peer: id(1),
                 active_assignment_epoch: 1,
                 transition_peer: None,
                 membership_epoch: 6,
@@ -883,6 +905,7 @@ mod tests {
             head.fence,
             &head,
             &[ReplicaResidue {
+                source,
                 peer: replacement,
                 assignment_epoch: 2,
                 bytes: &spool,
@@ -897,8 +920,8 @@ mod tests {
 
     #[test]
     fn recovery_rejects_an_offline_replacement_from_a_stale_writer_fence() {
-        let source = HostId(0);
-        let replacement = HostId(2);
+        let source = id(0);
+        let replacement = id(2);
         let volume = VolumeId(18);
         let (spool, _, _) = recovery_spool(source, volume, 2, 8, 12, 0xA5);
         let head = HeadRecord {
@@ -908,7 +931,7 @@ mod tests {
             manifest: None,
             stash: Some(StashAssignment {
                 assignment_epoch: 1,
-                active_peer: HostId(1),
+                active_peer: id(1),
                 active_assignment_epoch: 1,
                 transition_peer: None,
                 membership_epoch: 6,
@@ -922,6 +945,7 @@ mod tests {
                 head.fence,
                 &head,
                 &[ReplicaResidue {
+                    source,
                     peer: replacement,
                     assignment_epoch: 2,
                     bytes: &spool,
@@ -937,8 +961,8 @@ mod tests {
 
     #[test]
     fn recovery_refuses_peer_residue_older_than_the_store_manifest() {
-        let source = HostId(0);
-        let peer = HostId(1);
+        let source = id(0);
+        let peer = id(1);
         let volume = VolumeId(8);
         let config = VolumeConfig {
             kind: crate::journal::VolumeKind::Data,
@@ -1009,6 +1033,7 @@ mod tests {
                 head.fence,
                 &head,
                 &[ReplicaResidue {
+                    source,
                     peer,
                     assignment_epoch: 1,
                     bytes: &spool,
@@ -1022,7 +1047,7 @@ mod tests {
 
     #[test]
     fn recovery_after_activation_selects_the_new_active_and_exact_bytes() {
-        let source = HostId(0);
+        let source = id(0);
         let volume = VolumeId(19);
         let (old_spool, old_blx, _) = recovery_spool(source, volume, 8, 80, 80, 0x18);
         let (active_spool, active_blx, active_record) =
@@ -1035,13 +1060,13 @@ mod tests {
             manifest: None,
             stash: Some(StashAssignment {
                 assignment_epoch: 9,
-                active_peer: HostId(3),
+                active_peer: id(3),
                 active_assignment_epoch: 9,
                 transition_peer: None,
                 membership_epoch: 6,
             }),
             retired_stashes: vec![crate::head::RetiredStash {
-                peer: HostId(2),
+                peer: id(2),
                 assignment_epoch: 8,
                 through: ReplicaCommitInfo {
                     writer_fence: 4,
@@ -1052,12 +1077,14 @@ mod tests {
         };
         let residues = [
             ReplicaResidue {
-                peer: HostId(2),
+                source,
+                peer: id(2),
                 assignment_epoch: 8,
                 bytes: &old_spool,
             },
             ReplicaResidue {
-                peer: HostId(3),
+                source,
+                peer: id(3),
                 assignment_epoch: 9,
                 bytes: &active_spool,
             },
@@ -1071,7 +1098,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .expect("new active is a complete recovery source");
-        assert_eq!(export.source_peer, HostId(3));
+        assert_eq!(export.source_peer, id(3));
         assert_eq!(export.assignment_epoch, 9);
         assert_eq!(export.sync_covered_through, 90);
         assert!(export.blobs.iter().any(|(name, bytes)| {
@@ -1092,7 +1119,7 @@ mod tests {
 
     #[test]
     fn recovery_during_transition_uses_only_a_complete_covering_cut() {
-        let source = HostId(0);
+        let source = id(0);
         let volume = VolumeId(20);
         let (active_spool, _, active_record) = recovery_spool(source, volume, 11, 110, 110, 0x11);
         let (transition_spool, transition_blx, transition_record) =
@@ -1104,9 +1131,9 @@ mod tests {
             manifest: None,
             stash: Some(StashAssignment {
                 assignment_epoch: 12,
-                active_peer: HostId(1),
+                active_peer: id(1),
                 active_assignment_epoch: 11,
-                transition_peer: Some(HostId(2)),
+                transition_peer: Some(id(2)),
                 membership_epoch: 6,
             }),
             retired_stashes: Vec::new(),
@@ -1118,14 +1145,15 @@ mod tests {
             head.fence,
             &head,
             &[ReplicaResidue {
-                peer: HostId(1),
+                source,
+                peer: id(1),
                 assignment_epoch: 11,
                 bytes: &active_spool,
             }],
             &BTreeMap::new(),
         )
         .expect("incomplete replacement leaves old active authoritative");
-        assert_eq!(active_only.source_peer, HostId(1));
+        assert_eq!(active_only.source_peer, id(1));
         assert_eq!(active_only.sync_covered_through, 110);
         let (_, journal) = active_only
             .blobs
@@ -1143,12 +1171,14 @@ mod tests {
             &head,
             &[
                 ReplicaResidue {
-                    peer: HostId(1),
+                    source,
+                    peer: id(1),
                     assignment_epoch: 11,
                     bytes: &active_spool,
                 },
                 ReplicaResidue {
-                    peer: HostId(2),
+                    source,
+                    peer: id(2),
                     assignment_epoch: 12,
                     bytes: &transition_spool,
                 },
@@ -1156,7 +1186,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .expect("complete replacement is the newest protected cut");
-        assert_eq!(transition_complete.source_peer, HostId(2));
+        assert_eq!(transition_complete.source_peer, id(2));
         assert_eq!(transition_complete.sync_covered_through, 120);
         assert!(transition_complete.blobs.iter().any(|(name, bytes)| {
             name == &layout::blx_blob(volume, 4, ObjectId(120)) && bytes == &transition_blx

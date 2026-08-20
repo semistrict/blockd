@@ -2,14 +2,15 @@
 //! record names the complete BLX file set needed for recovery and carries the
 //! checksum of that exact logical state. Recovery rebuilds its block lookup
 //! from BLX footers; no durable page-to-file map is encoded. Migration may
-//! append a separate in-memory lookup index to its wire message, but that
-//! index is never written to either journal.
+//! append a separate lookup sidecar to its wire message and temporary local
+//! migration journals. The sidecar is discarded once post-copy hydration no
+//! longer depends on the source.
 
 use std::collections::BTreeMap;
 
 use crate::blx::{BlockKey, BlockSpace};
 use crate::format::{Dec, DecodeError, Enc, open_frame, seal_frame};
-use crate::manifest::ObjectRef;
+use crate::manifest::{BaseRef, ObjectRef};
 use crate::page_file::PageFileLoc;
 use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, PageNo, VolumeId, page_size};
 
@@ -17,6 +18,12 @@ pub const MAGIC_JOURNAL: u32 = u32::from_le_bytes(*b"BJR1");
 const MAGIC_MIGRATION_INDEX: u32 = u32::from_le_bytes(*b"BMIX");
 
 pub type MigrationBlockChecksums = BTreeMap<BlockKey, (Gen, u64)>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MigrationArchiveClosure {
+    pub objects: Vec<ObjectRef>,
+    pub base: Option<BaseRef>,
+}
 
 /// The immutable consistency/lifecycle kind of a volume (R1.1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,7 +95,7 @@ pub struct MigrationSource {
 pub struct JournalRecord {
     pub config: VolumeConfig,
     pub seq: JournalSeq,
-    /// The writer incarnation (head CAS version at claim, R6.3/R6.4).
+    /// The writer fence (head CAS version at claim, R6.3/R6.4).
     pub fence: u64,
     pub kind: RecordKind,
     /// The volume mutation counter at the capture instant.
@@ -160,13 +167,10 @@ impl JournalRecord {
         e.u64(self.sync_covered_through);
         e.u64(self.post_state_checksum);
         match self.migrated_from {
-            None => {
-                e.u8(0);
-                e.u16(0);
-            }
+            None => e.u8(0),
             Some(source) => {
                 e.u8(1);
-                e.u16(source.host.0);
+                e.u32(source.host.get());
             }
         }
         match self.migrated_from.and_then(|source| source.offer_fence) {
@@ -203,6 +207,15 @@ impl JournalRecord {
         volume: VolumeId,
         block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
     ) -> Vec<u8> {
+        self.encode_migration_state(volume, block_checksums, &MigrationArchiveClosure::default())
+    }
+
+    pub fn encode_migration_state(
+        &self,
+        volume: VolumeId,
+        block_checksums: &BTreeMap<BlockKey, (Gen, u64)>,
+        archive: &MigrationArchiveClosure,
+    ) -> Vec<u8> {
         let durable = self.encode(volume);
         let mut index = Enc::new();
         index.u32(
@@ -224,6 +237,25 @@ impl JournalRecord {
             index.u32(key.block);
             index.u64(generation.0);
             index.u64(*checksum);
+        }
+        index.u32(u32::try_from(archive.objects.len()).expect("archive object count fits u32"));
+        for object in &archive.objects {
+            object.encode_into(&mut index);
+        }
+        match archive.base {
+            None => {
+                index.u8(0);
+                for _ in 0..4 {
+                    index.u64(0);
+                }
+            }
+            Some(base) => {
+                index.u8(1);
+                index.u64(base.base_id);
+                index.u64(base.manifest_id);
+                index.u64(base.manifest_checksum);
+                index.u64(base.post_state_checksum);
+            }
         }
         let index = seal_frame(MAGIC_MIGRATION_INDEX, &index.finish());
         let mut bytes = Vec::with_capacity(8 + durable.len() + index.len());
@@ -270,9 +302,9 @@ impl JournalRecord {
         let capture_seq = d.u64()?;
         let sync_covered_through = d.u64()?;
         let post_state_checksum = d.u64()?;
-        let migrated_host = match (d.u8()?, d.u16()?) {
-            (0, 0) => None,
-            (1, source) => Some(HostId(source)),
+        let migrated_host = match d.u8()? {
+            0 => None,
+            1 => Some(HostId::new(d.u32()?)),
             _ => return Err(DecodeError),
         };
         let offered_fence = match (d.u8()?, d.u64()?) {
@@ -331,6 +363,21 @@ impl JournalRecord {
         volume: VolumeId,
         bytes: &[u8],
     ) -> Result<(JournalRecord, MigrationBlockChecksums), DecodeError> {
+        Self::decode_migration_state(volume, bytes)
+            .map(|(record, checksums, _)| (record, checksums))
+    }
+
+    pub fn decode_migration_state(
+        volume: VolumeId,
+        bytes: &[u8],
+    ) -> Result<
+        (
+            JournalRecord,
+            MigrationBlockChecksums,
+            MigrationArchiveClosure,
+        ),
+        DecodeError,
+    > {
         let prefix = bytes.get(..8).ok_or(DecodeError)?;
         let durable_len = usize::try_from(u64::from_le_bytes(
             prefix.try_into().map_err(|_| DecodeError)?,
@@ -398,15 +445,54 @@ impl JournalRecord {
                 return Err(DecodeError);
             }
         }
+        let archive = decode_migration_archive(&mut d)?;
         d.finish()?;
         record.runtime_page_index = runtime_page_index;
-        Ok((record, block_checksums))
+        Ok((record, block_checksums, archive))
     }
+}
+
+fn decode_migration_archive(d: &mut Dec<'_>) -> Result<MigrationArchiveClosure, DecodeError> {
+    let archive_count = d.u32()?;
+    // The sidecar frame is peer-controlled. Decode incrementally so an
+    // impossible count in a tiny frame cannot trigger a count-sized
+    // allocation before the decoder proves the entries exist.
+    let mut objects = Vec::new();
+    for _ in 0..archive_count {
+        objects.push(ObjectRef::decode_from(d)?);
+    }
+    crate::manifest::validate_object_refs(&objects)?;
+    let present = d.u8()?;
+    let base = BaseRef {
+        base_id: d.u64()?,
+        manifest_id: d.u64()?,
+        manifest_checksum: d.u64()?,
+        post_state_checksum: d.u64()?,
+    };
+    let base = match present {
+        0 if base
+            == (BaseRef {
+                base_id: 0,
+                manifest_id: 0,
+                manifest_checksum: 0,
+                post_state_checksum: 0,
+            }) =>
+        {
+            None
+        }
+        1 => Some(base),
+        _ => return Err(DecodeError),
+    };
+    Ok(MigrationArchiveClosure { objects, base })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const fn id(host: u32) -> HostId {
+        HostId::new(host)
+    }
     use crate::blx::{BlockKey, BlockSpace, NamespaceKind};
     use crate::format::{crc32c, open_frame, seal_frame};
     use crate::manifest::ObjectIdentity;
@@ -465,7 +551,7 @@ mod tests {
             files: Vec::new(),
             runtime_page_index: pages,
             migrated_from: Some(MigrationSource {
-                host: HostId(2),
+                host: id(2),
                 offer_fence: Some(5),
             }),
         }
@@ -480,8 +566,7 @@ mod tests {
         assert_eq!(JournalRecord::decode(VolumeId(0xA1), &bytes), Ok(durable));
         // Byte pin (R10.2): any change here is a storage format change.
         let expected = match page_size() {
-            4096 => (113, 0x468A_9C73),
-            16_384 => (113, 0xAC8B_6E78),
+            4096 | 16_384 => (115, 0x7552_69CC),
             size => panic!("byte pin missing for {size}-byte pages"),
         };
         assert_eq!((bytes.len(), crc32c(&bytes)), expected);
@@ -501,6 +586,71 @@ mod tests {
                 .map(|(decoded, _)| decoded),
             Ok(record)
         );
+    }
+
+    #[test]
+    fn migration_archive_count_cannot_force_an_unbounded_allocation() {
+        let mut record = sample_record();
+        record.runtime_page_index.clear();
+        let mut bytes = record.encode_migration(VolumeId(0xA1));
+        let durable_len = usize::try_from(u64::from_le_bytes(
+            bytes[..8].try_into().expect("durable length prefix"),
+        ))
+        .expect("durable length fits usize");
+        let durable_end = 8 + durable_len;
+        let mut payload = open_frame(MAGIC_MIGRATION_INDEX, &bytes[durable_end..])
+            .expect("migration sidecar")
+            .to_vec();
+        // Empty page and checksum maps put the archive count at byte 8.
+        payload[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes.truncate(durable_end);
+        bytes.extend_from_slice(&seal_frame(MAGIC_MIGRATION_INDEX, &payload));
+
+        assert!(JournalRecord::decode_migration_state(VolumeId(0xA1), &bytes).is_err());
+    }
+
+    #[test]
+    fn migration_archive_closure_round_trips_in_the_sidecar() {
+        let record = sample_record();
+        let archive = MigrationArchiveClosure {
+            objects: vec![ObjectRef {
+                identity: ObjectIdentity {
+                    namespace_kind: NamespaceKind::Volume,
+                    namespace_id: 0xA1,
+                    writer_fence: 4,
+                    object_id: 9,
+                },
+                min_seq: 1,
+                max_seq: 1,
+                batch_id: 1,
+                chunk_index: 0,
+                chunk_count: 1,
+                first_key: BlockKey {
+                    space: BlockSpace::Memory,
+                    block: 2,
+                },
+                last_key: BlockKey {
+                    space: BlockSpace::Memory,
+                    block: 2,
+                },
+                pre_state_checksum: 3,
+                post_state_checksum: 4,
+                size: 100,
+                footer_offset: 50,
+                footer_length: 25,
+                object_checksum: 5,
+            }],
+            base: Some(BaseRef {
+                base_id: 7,
+                manifest_id: 8,
+                manifest_checksum: 9,
+                post_state_checksum: 10,
+            }),
+        };
+        let bytes = record.encode_migration_state(VolumeId(0xA1), &BTreeMap::new(), &archive);
+        let (_, _, decoded) = JournalRecord::decode_migration_state(VolumeId(0xA1), &bytes)
+            .expect("migration archive closure");
+        assert_eq!(decoded, archive);
     }
 
     #[test]

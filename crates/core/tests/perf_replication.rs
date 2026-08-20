@@ -49,7 +49,7 @@ fn artifact_bytes() -> (VolumeId, ReplicaArtifact, Vec<u8>) {
 
 fn prepare(volume: VolumeId, artifact: ReplicaArtifact, checksum: u32, bytes: &[u8]) -> Vec<u8> {
     assert_eq!(crc32c(bytes), checksum);
-    seal_verified_replica_artifact(HostId(3), volume, 5, artifact, checksum, bytes)
+    seal_verified_replica_artifact(HostId::new(3), volume, 5, artifact, checksum, bytes)
         .expect("valid benchmark artifact")
 }
 

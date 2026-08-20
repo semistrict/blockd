@@ -62,6 +62,23 @@ impl Blobs for MemoryBlobs {
         Ok(())
     }
 
+    async fn replace_tail_if_len(
+        &self,
+        name: String,
+        expected_total_len: u64,
+        valid_prefix_len: u64,
+        bytes: Vec<u8>,
+    ) -> Result<bool, BlobError> {
+        let mut blobs = self.blobs.borrow_mut();
+        let entry = blobs.entry(name).or_default();
+        if entry.len() as u64 != expected_total_len {
+            return Ok(false);
+        }
+        entry.truncate(usize::try_from(valid_prefix_len).map_err(|_| BlobError::Io)?);
+        entry.extend(bytes);
+        Ok(true)
+    }
+
     async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError> {
         if let Some(bytes) = self.blobs.borrow_mut().get_mut(name) {
             bytes.truncate(usize::try_from(len).map_err(|_| BlobError::Io)?);

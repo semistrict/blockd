@@ -51,10 +51,21 @@ tests=(
     "blockd-runtime:migrate_e2e_linux"
     "blockd-runtime:part_fetch_linux"
     "blockd-runtime:loop_interference_linux"
+    "blockd-runtime:blockd_shipped_linux"
 )
 
 for spec in "${tests[@]}"; do
     IFS=: read -r package target <<<"$spec"
     echo "running $package/$target"
-    cargo test -p "$package" --test "$target" -- --test-threads=1
+    if [[ "$target" == "blockd_shipped_linux" ]]; then
+        cargo test -p "$package" --features shipped-test-control --test "$target" -- --test-threads=1
+    else
+        cargo test -p "$package" --test "$target" -- --test-threads=1
+    fi
 done
+
+echo "running blockd-runtime library regressions"
+cargo test -p blockd-runtime --lib -- --test-threads=1
+
+echo "running blockd production daemon regressions"
+cargo test -p blockd-runtime --bin blockd -- --test-threads=1

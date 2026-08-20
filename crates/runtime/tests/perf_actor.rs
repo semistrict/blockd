@@ -18,7 +18,7 @@ fn config(volumes: u16, pages: u32) -> HarnessConfig {
     HarnessConfig {
         host: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
-            host: HostId(0),
+            host: HostId::new(0),
             cache_pages: usize::from(volumes)
                 .saturating_mul(pages as usize)
                 .saturating_mul(2)
@@ -28,7 +28,7 @@ fn config(volumes: u16, pages: u32) -> HarnessConfig {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 500,
-            replica_placement: None,
+            cluster_placement: None,
         },
         passive_disk_capacity: None,
         blobs: BlobDevConfig {

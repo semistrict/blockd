@@ -56,6 +56,7 @@ pub struct RuntimeLifecycleBackend {
     passive_runtimes: Vec<Runtime>,
     volume: VolumeId,
     volume_configs: BTreeMap<VolumeId, VolumeConfig>,
+    checkpoint_epochs: BTreeMap<VolumeId, u64>,
     metrics: RuntimeWorkloadMetrics,
 }
 
@@ -63,16 +64,18 @@ impl RuntimeLifecycleBackend {
     pub fn new(
         config: RuntimeConfig,
         store: Arc<dyn ObjectStore>,
+        runtime: Runtime,
         passive_runtimes: Vec<Runtime>,
         volume: VolumeId,
     ) -> Self {
         Self {
             config,
             store,
-            runtime: None,
+            runtime: Some(runtime),
             passive_runtimes,
             volume,
             volume_configs: BTreeMap::new(),
+            checkpoint_epochs: BTreeMap::new(),
             metrics: RuntimeWorkloadMetrics::default(),
         }
     }
@@ -135,12 +138,12 @@ impl Backend for RuntimeLifecycleBackend {
                 let started = Instant::now();
                 let shape = model.shape();
                 let configs = volume_configs(self.volume, shape.disk_volumes, shape.pages);
-                let runtime = Runtime::new(&self.config, self.store.clone()).await;
+                let runtime = self.runtime.as_ref().expect("runtime starts joined");
                 for (&volume, &config) in &configs {
                     runtime.create_volume(volume, config).await;
                 }
+                self.checkpoint_epochs = configs.keys().map(|&volume| (volume, 0)).collect();
                 self.volume_configs = configs;
-                self.runtime = Some(runtime);
                 self.metrics.create_time += started.elapsed();
                 self.metrics.creates += 1;
             }
@@ -173,16 +176,22 @@ impl Backend for RuntimeLifecycleBackend {
             }
             Operation::Checkpoint => {
                 let started = Instant::now();
-                let expected = self.metrics.checkpoints + 1;
+                let volumes = self.volume_configs.keys().copied().collect::<Vec<_>>();
                 let epochs = join_all(
-                    self.volume_configs
-                        .keys()
+                    volumes
+                        .iter()
                         .copied()
                         .map(|volume| self.runtime().checkpoint(volume)),
                 )
                 .await;
-                if epochs.iter().any(|&epoch| epoch != expected) {
-                    return Err(format!("checkpoint epochs {epochs:?}, expected {expected}"));
+                for (volume, epoch) in volumes.into_iter().zip(epochs) {
+                    let expected = self.checkpoint_epochs[&volume] + 1;
+                    if epoch != expected {
+                        return Err(format!(
+                            "checkpoint epoch for {volume:?} was {epoch}, expected {expected}"
+                        ));
+                    }
+                    self.checkpoint_epochs.insert(volume, epoch);
                 }
                 self.metrics.checkpoint_time += started.elapsed();
                 self.metrics.checkpoints += 1;
@@ -193,25 +202,33 @@ impl Backend for RuntimeLifecycleBackend {
             }
             Operation::Restore => {
                 let started = Instant::now();
-                let (runtime, immediate) =
-                    Runtime::recover(&self.config, self.store.clone(), &self.volume_configs).await;
+                let (runtime, mut immediate) =
+                    Runtime::recover(&self.config, self.store.clone(), &self.volume_configs)
+                        .await
+                        .expect("runtime startup");
+                for (&volume, config) in &self.volume_configs {
+                    let verdict = match immediate.remove(&volume) {
+                        Some(verdict) => verdict,
+                        None => runtime.wait_recovered(volume).await,
+                    };
+                    match (config.is_memory(), verdict) {
+                        (true, Verdict::Resume { epoch, .. }) => {
+                            self.checkpoint_epochs.insert(volume, epoch.0);
+                        }
+                        (false, Verdict::ColdBoot) => {
+                            self.checkpoint_epochs.insert(volume, 0);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "unexpected restore verdict for {volume:?}: {verdict:?}"
+                            ));
+                        }
+                    }
+                }
                 if !immediate.is_empty() {
                     return Err(format!(
-                        "recovery unexpectedly completed synchronously: {immediate:?}"
+                        "recovery returned verdicts for unknown volumes: {immediate:?}"
                     ));
-                }
-                for (&volume, config) in &self.volume_configs {
-                    let verdict = runtime.wait_recovered(volume).await;
-                    let expected = if config.is_memory() {
-                        matches!(verdict, Verdict::Resume { .. })
-                    } else {
-                        verdict == Verdict::ColdBoot
-                    };
-                    if !expected {
-                        return Err(format!(
-                            "unexpected restore verdict for {volume:?}: {verdict:?}"
-                        ));
-                    }
                 }
                 self.runtime = Some(runtime);
                 self.metrics.restore_time += started.elapsed();

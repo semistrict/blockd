@@ -4,21 +4,24 @@ use std::rc::Rc;
 use blockd_exec::channel::{OneReceiver, Sender, TrySendError, bounded, oneshot};
 use blockd_exec::{Either, TaskSet, delay, select2, timeout, yield_now};
 
-use super::capture::{capture_migration, recovery_files, write_record_copies};
+use super::capture::{
+    capture_migration, recovery_files, write_record_copies, write_record_copies_with_archive,
+};
 use super::ctx::{HostCtx, VolumeCtx};
 use super::keyed_queue::KeyedQueue;
 use super::recovery_policy::record_verdict;
 use super::state::MutationOwner;
 use super::store_retry;
 use super::{SharedHost, VolumeState, replica_message, replicate_latest};
-use super::{adopt_vnode_generation, commit_vnode_closure, read_vnode_closure};
 use crate::blx::{
     BlockKey, BlockSpace, BlxEntry, BlxFooter, BlxObject, EntryKind, NamespaceKind,
     replace_state_block,
 };
 use crate::format::{Dec, DecodeError, Enc, checksum64, open_frame, seal_frame};
 use crate::head::HeadRecord;
-use crate::journal::{JournalRecord, MigrationSource, RecordKind, VolumeKind};
+use crate::journal::{
+    JournalRecord, MigrationArchiveClosure, MigrationSource, RecordKind, VolumeKind,
+};
 use crate::layout;
 use crate::manifest::{ObjectIdentity, ObjectRef};
 use crate::page_file::{PageBatchBuilder, PageFileLoc, open_entry};
@@ -40,7 +43,7 @@ const PEER_INGRESS_BATCH: usize = 64;
 
 enum PeerStorageRequest {
     Range {
-        from: HostId,
+        from: crate::types::HostId,
         io: crate::protocol::PeerRequestId,
         volume: VolumeId,
         replica_assignment_epoch: Option<u64>,
@@ -87,23 +90,23 @@ struct InboundMigration<W> {
 struct MigrationLease {
     state: SharedHost,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     active: bool,
 }
 
 struct HydrationLease {
     state: SharedHost,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     active: bool,
 }
 
 impl HydrationLease {
-    fn new(state: &SharedHost, volume: VolumeId, incarnation: u64) -> Self {
+    fn new(state: &SharedHost, volume: VolumeId, run_generation: u64) -> Self {
         Self {
             state: Rc::clone(state),
             volume,
-            incarnation,
+            run_generation,
             active: true,
         }
     }
@@ -117,17 +120,17 @@ impl HydrationLease {
 impl Drop for HydrationLease {
     fn drop(&mut self) {
         if self.active {
-            finish_hydration(&self.state, self.volume, self.incarnation);
+            finish_hydration(&self.state, self.volume, self.run_generation);
         }
     }
 }
 
 impl MigrationLease {
-    fn new(state: &SharedHost, volume: VolumeId, incarnation: u64) -> Self {
+    fn new(state: &SharedHost, volume: VolumeId, run_generation: u64) -> Self {
         Self {
             state: Rc::clone(state),
             volume,
-            incarnation,
+            run_generation,
             active: true,
         }
     }
@@ -146,7 +149,7 @@ impl Drop for MigrationLease {
                 .borrow_mut()
                 .volumes
                 .get_mut(&self.volume)
-                .filter(|volume_state| volume_state.incarnation == self.incarnation)
+                .filter(|volume_state| volume_state.run_generation == self.run_generation)
         {
             volume_state.operations.finish_migration();
         }
@@ -168,7 +171,7 @@ impl Handoff {
         let mut encoder = Enc::new();
         encoder.u16(1);
         encoder.u64(self.volume.0);
-        encoder.u16(self.to.0);
+        encoder.u32(self.to.get());
         seal_frame(MAGIC_HANDOFF, &encoder.finish())
     }
 
@@ -178,9 +181,28 @@ impl Handoff {
         if decoder.u16()? != 1 || decoder.u64()? != volume.0 {
             return Err(DecodeError);
         }
-        let to = HostId(decoder.u16()?);
+        let to = HostId::new(decoder.u32()?);
         decoder.finish()?;
         Ok(Self { volume, to })
+    }
+}
+
+impl VolumeState {
+    /// Encode one exact post-copy offer from a logical record and the live page
+    /// lookup state. Ordinary journals may omit this index because local
+    /// recovery reconstructs it from BLX files; a migration destination needs
+    /// it to demand-fetch every page from the source.
+    fn encode_migration_offer(&self, volume: VolumeId, record: &JournalRecord) -> Vec<u8> {
+        let mut offered = record.clone();
+        offered.runtime_page_index = self.page_locs.clone();
+        offered.encode_migration_state(
+            volume,
+            &self.block_checksums,
+            &MigrationArchiveClosure {
+                objects: self.archive_objects.clone(),
+                base: self.archive_base,
+            },
+        )
     }
 }
 
@@ -219,12 +241,18 @@ where
         let state = Rc::clone(self.host().state());
         let world = Rc::clone(self.host().world());
         let volume = self.id();
-        let (incarnation, publication) = loop {
+        let to = state
+            .borrow()
+            .config
+            .cluster_placement
+            .as_ref()
+            .and_then(|placement| placement.roster.contains(&to).then_some(to))?;
+        let (run_generation, publication) = loop {
             enum Decision {
                 Invalid,
                 Hydrating(OneReceiver<bool>),
                 Reserved {
-                    incarnation: u64,
+                    run_generation: u64,
                     publication: Option<OneReceiver<()>>,
                 },
             }
@@ -239,11 +267,16 @@ where
                     && !volume_state.operations.guest_resume_pending();
                 if !allowed {
                     Decision::Invalid
-                } else if volume_state.peer_source.is_some()
-                    && volume_state.page_locs.values().any(|(_, location)| {
-                        location.base == 0 && location.fence < volume_state.fence
-                    })
+                } else if volume_state.peer_source.is_some_and(|source| source == to)
+                    || (volume_state.peer_source.is_some()
+                        && volume_state.page_locs.values().any(|(_, location)| {
+                            location.base == 0 && location.fence < volume_state.fence
+                        }))
                 {
+                    // A local tail is not enough to return to the prior source:
+                    // wait until Released/ReleasedAck proves that exact host
+                    // removed its old resident state. Migration to another host
+                    // still needs only the normal hydration safety boundary.
                     let (wake, wait) = oneshot();
                     volume_state.hydration_waiters.push(wake);
                     host.schedule_volume(volume);
@@ -256,7 +289,7 @@ where
                         wait
                     });
                     Decision::Reserved {
-                        incarnation: volume_state.incarnation,
+                        run_generation: volume_state.run_generation,
                         publication,
                     }
                 }
@@ -269,18 +302,26 @@ where
                     }
                 }
                 Decision::Reserved {
-                    incarnation,
+                    run_generation,
                     publication,
-                } => break (incarnation, publication),
+                } => break (run_generation, publication),
             }
         };
-        let lease = MigrationLease::new(&state, volume, incarnation);
+        let lease = MigrationLease::new(&state, volume, run_generation);
         if let Some(wait) = publication
             && wait.await.is_err()
         {
             return Some(Err(AdminError::Unavailable));
         }
-        let kind = state.borrow().volumes[&volume].config.kind;
+        let Some(kind) = state
+            .borrow()
+            .volumes
+            .get(&volume)
+            .filter(|volume_state| volume_state.run_generation == run_generation)
+            .map(|volume_state| volume_state.config.kind)
+        else {
+            return Some(Err(AdminError::Unavailable));
+        };
 
         // Do not enter the pause unless a passive has already been assigned. No
         // network operation belongs between capture_migration and commit below.
@@ -288,6 +329,7 @@ where
             .borrow()
             .volumes
             .get(&volume)
+            .filter(|volume_state| volume_state.run_generation == run_generation)
             .and_then(|volume_state| volume_state.stash_assignment)
             .is_none()
         {
@@ -326,6 +368,7 @@ where
                 .borrow()
                 .volumes
                 .get(&volume)
+                .filter(|volume_state| volume_state.run_generation == run_generation)
                 .is_some_and(|volume_state| {
                     volume_state.peer_committed.is_some_and(|committed| {
                         (
@@ -382,15 +425,24 @@ where
         {
             let mut host = state.borrow_mut();
             host.record_blob(handoff_name, handoff_bytes.len() as u64);
-            let volume_state = host.volumes.get_mut(&volume)?;
+            let volume_state = host
+                .volumes
+                .get_mut(&volume)
+                .filter(|volume_state| volume_state.run_generation == run_generation)?;
             volume_state.ready = false;
             volume_state.outbound = Some(to);
         }
         if let Some(paused) = paused.take() {
             paused.disarm();
         }
-        let checksums = state.borrow().volumes.get(&volume)?.block_checksums.clone();
-        let encoded = record.encode_migration_with_checksums(volume, &checksums);
+        let encoded = {
+            let host = state.borrow();
+            let volume_state = host
+                .volumes
+                .get(&volume)
+                .filter(|volume_state| volume_state.run_generation == run_generation)?;
+            volume_state.encode_migration_offer(volume, &record)
+        };
         let inline_vmstate = offered_vmstate.filter(|vmstate| {
             encoded
                 .len()
@@ -398,17 +450,24 @@ where
                 .and_then(|size| size.checked_add(32))
                 .is_some_and(|size| size <= crate::peer::MAX_PEER_PAYLOAD as usize)
         });
-        while !offer_once(
-            &state,
-            world.as_ref(),
-            volume,
-            to,
-            record.fence,
-            encoded.clone(),
-            inline_vmstate.clone(),
-        )
-        .await
-        {}
+        loop {
+            if ensure_outbound_head(&state, world.as_ref(), volume, to, record.fence).await
+                && offer_once(
+                    &state,
+                    world.as_ref(),
+                    volume,
+                    to,
+                    record.fence,
+                    encoded.clone(),
+                    inline_vmstate.clone(),
+                )
+                .await
+            {
+                break;
+            }
+            let retry = state.borrow().config.backup_retry;
+            delay(retry).await;
+        }
         lease.commit();
         Some(Ok(AdminSuccess::MigratedOut { volume }))
     }
@@ -429,11 +488,11 @@ async fn offer_once<W: Peers>(
         .await
 }
 
-pub async fn reoffer_outbound<W: Peers>(state: SharedHost, world: Rc<W>, volume: VolumeId) {
+pub async fn reoffer_outbound<W: Peers + Store>(state: SharedHost, world: Rc<W>, volume: VolumeId) {
     HostCtx::new(state, world).volume(volume).reoffer().await;
 }
 
-impl<W: Peers> VolumeCtx<W> {
+impl<W: Peers + Store> VolumeCtx<W> {
     pub(super) async fn reoffer(&self) {
         let state = self.host().state();
         let world = self.host().world();
@@ -448,19 +507,58 @@ impl<W: Peers> VolumeCtx<W> {
                     Some((
                         volume_state.outbound?,
                         record.fence,
-                        record
-                            .encode_migration_with_checksums(volume, &volume_state.block_checksums),
+                        volume_state.encode_migration_offer(volume, record),
                     ))
                 })
         else {
             return;
         };
-        let _ = offer_once(state, world.as_ref(), volume, to, offer_fence, record, None).await;
+        if ensure_outbound_head(state, world.as_ref(), volume, to, offer_fence).await {
+            let _ = offer_once(state, world.as_ref(), volume, to, offer_fence, record, None).await;
+        }
         state.borrow_mut().schedule_volume(volume);
     }
 }
 
-#[allow(clippy::too_many_lines)]
+async fn ensure_outbound_head<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    volume: VolumeId,
+    destination: HostId,
+    ownership_fence: u64,
+) -> bool {
+    let Ok(Some((version, bytes))) = Store::get(world, &layout::head_key(volume)).await else {
+        return false;
+    };
+    let Ok(head) = HeadRecord::decode(volume, &bytes) else {
+        return false;
+    };
+    if head.holder == destination {
+        return true;
+    }
+    if head.holder != state.borrow().config.host {
+        return false;
+    }
+    if head.fence == ownership_fence {
+        return true;
+    }
+    if head.fence != 0 {
+        return false;
+    }
+    let finalized = HeadRecord {
+        fence: ownership_fence,
+        ..head
+    };
+    Store::put_cas(
+        world,
+        layout::head_key(volume),
+        Some(version),
+        finalized.encode(),
+    )
+    .await
+    .is_ok()
+}
+
 pub async fn peer_source<W>(state: SharedHost, world: Rc<W>)
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
@@ -502,7 +600,7 @@ where
                 });
                 send
             })
-            .collect::<Vec<Sender<(HostId, PeerMsg)>>>();
+            .collect::<Vec<Sender<(crate::types::HostId, PeerMsg)>>>();
         let (replica_reply_send, mut replica_reply_receive) = bounded(REPLICA_ROUTE_CAPACITY);
         {
             let state = Rc::clone(&state);
@@ -551,84 +649,6 @@ where
                 }
             };
             match message {
-                PeerMsg::VnodeAdopt { io, proof } => {
-                    let placement = state.borrow().authority.placement.clone();
-                    let member = state.borrow().config.host;
-                    if let Some(placement) = placement
-                        && let Ok(receipt) =
-                            adopt_vnode_generation(world.as_ref(), &placement, member, proof).await
-                    {
-                        state.borrow_mut().counters.vnode_adoptions += 1;
-                        Peers::send(
-                            world.as_ref(),
-                            from,
-                            PeerMsg::VnodeAdoptAck {
-                                io,
-                                proof: receipt.proof,
-                                closures: receipt.closures,
-                            },
-                        )
-                        .await;
-                    }
-                }
-                PeerMsg::VnodeAdoptAck {
-                    io,
-                    proof,
-                    closures,
-                } => {
-                    state
-                        .borrow_mut()
-                        .peer_client
-                        .resolve_adoption(io, from, proof, closures);
-                }
-                PeerMsg::VnodeFetchClosure { io, vnode, closure } => {
-                    let bytes = read_vnode_closure(world.as_ref(), vnode, closure)
-                        .await
-                        .ok();
-                    Peers::send(world.as_ref(), from, PeerMsg::VnodeClosure { io, bytes }).await;
-                }
-                PeerMsg::VnodeClosure { io, bytes } => {
-                    state
-                        .borrow_mut()
-                        .peer_client
-                        .resolve_vnode_closure(io, from, bytes);
-                }
-                PeerMsg::VnodeCommit {
-                    io,
-                    proof,
-                    volume,
-                    sequence,
-                    bytes,
-                } => {
-                    let placement = state.borrow().authority.placement.clone();
-                    if from == proof.authority.primary
-                        && let Some(placement) = placement
-                        && let Ok(closure) = commit_vnode_closure(
-                            world.as_ref(),
-                            &placement,
-                            proof.authority,
-                            volume,
-                            sequence,
-                            bytes,
-                        )
-                        .await
-                    {
-                        Peers::send(
-                            world.as_ref(),
-                            from,
-                            PeerMsg::VnodeCommitAck { io, closure },
-                        )
-                        .await;
-                    } else {
-                        state.borrow_mut().counters.vnode_stale_rejections += 1;
-                    }
-                }
-                PeerMsg::VnodeCommitAck { io, closure } => {
-                    state
-                        .borrow_mut()
-                        .peer_client
-                        .resolve_vnode_commit(io, from, closure);
-                }
                 PeerMsg::MigrateOffer {
                     volume,
                     record,
@@ -652,17 +672,7 @@ where
                     volume,
                     offer_fence,
                 } => {
-                    let accepted = state
-                        .borrow()
-                        .volumes
-                        .get(&volume)
-                        .is_some_and(|volume_state| volume_state.outbound == Some(from));
-                    if accepted {
-                        state
-                            .borrow()
-                            .peer_client
-                            .resolve_migration(volume, from, offer_fence);
-                    }
+                    resolve_migration_accept(&state, from, volume, offer_fence);
                 }
                 PeerMsg::FetchRange {
                     io,
@@ -759,6 +769,17 @@ where
     }
 }
 
+fn resolve_migration_accept(state: &SharedHost, from: HostId, volume: VolumeId, offer_fence: u64) {
+    // The destination can hydrate and release the source before a delayed
+    // MigrateAccept reaches this actor. The peer client still binds an active
+    // retry to the exact authenticated host, volume, and offer fence, so local
+    // volume residency is neither necessary nor valid authorization here.
+    state
+        .borrow()
+        .peer_client
+        .resolve_migration(volume, from, offer_fence);
+}
+
 async fn handle_peer_lifecycle<W>(state: SharedHost, world: Rc<W>, request: PeerLifecycleRequest)
 where
     W: Blobs + Store + Peers + GuestMem + AdminIo + 'static,
@@ -783,13 +804,15 @@ where
 }
 
 fn peer_storage_route(from: HostId, volume: VolumeId) -> usize {
-    usize::try_from((u64::from(from.0).wrapping_mul(31) ^ volume.0) % PEER_STORAGE_SHARDS as u64)
-        .expect("peer storage route fits")
+    usize::try_from(
+        (u64::from(from.get()).wrapping_mul(31) ^ volume.0) % PEER_STORAGE_SHARDS as u64,
+    )
+    .expect("peer storage route fits")
 }
 
 fn replica_route((from, volume, assignment_epoch): (HostId, VolumeId, u64)) -> usize {
     usize::try_from(
-        (u64::from(from.0).wrapping_mul(31) ^ volume.0.wrapping_mul(17) ^ assignment_epoch)
+        (u64::from(from.get()).wrapping_mul(31) ^ volume.0.wrapping_mul(17) ^ assignment_epoch)
             % REPLICA_ROUTE_SHARDS as u64,
     )
     .expect("replica route fits")
@@ -949,8 +972,8 @@ where
             record: bytes,
             inline_vmstate,
         } = self;
-        let Ok((offered, offered_checksums)) =
-            JournalRecord::decode_migration_with_checksums(volume, &bytes)
+        let Ok((offered, offered_checksums, offered_archive)) =
+            JournalRecord::decode_migration_state(volume, &bytes)
         else {
             return;
         };
@@ -964,12 +987,15 @@ where
             return;
         }
         let existing = state.borrow().volumes.get(&volume).map(|existing| {
-            existing.peer_source == Some(from)
-                && existing.ready
-                && existing.peer_source_offer_fence == Some(offered.fence)
+            let duplicate = existing.peer_source == Some(from)
+                && existing.peer_source_offer_fence == Some(offered.fence);
+            let replaceable_stale_outbound =
+                !existing.ready && existing.outbound.is_some() && offered.fence > existing.fence;
+            (duplicate, replaceable_stale_outbound)
         });
-        if let Some(ready) = existing {
-            if ready {
+        let mut replacing_stale_outbound = false;
+        if let Some((duplicate, is_replaceable_stale_outbound)) = existing {
+            if duplicate {
                 Peers::send(
                     world.as_ref(),
                     from,
@@ -980,7 +1006,24 @@ where
                 )
                 .await;
             }
-            return;
+            if !duplicate
+                && !is_replaceable_stale_outbound
+                && offer_was_superseded(&state, world.as_ref(), from, volume, offered.fence).await
+            {
+                Peers::send(
+                    world.as_ref(),
+                    from,
+                    PeerMsg::MigrateAccept {
+                        volume,
+                        offer_fence: offered.fence,
+                    },
+                )
+                .await;
+            }
+            if !is_replaceable_stale_outbound {
+                return;
+            }
+            replacing_stale_outbound = true;
         }
         if !state.borrow_mut().inbound_migrations.insert(volume) {
             return;
@@ -989,6 +1032,23 @@ where
             state: Rc::clone(&state),
             volume,
         };
+        // Reject a delayed offer before fetching its VMM image or writing any
+        // destination state. The final head CAS below remains the fence, but
+        // this preflight keeps a backlog of superseded retries from starving
+        // the source's current tenure.
+        if !current_offer_matches_head(&state, world.as_ref(), from, volume, offered.fence).await {
+            return;
+        }
+        if replacing_stale_outbound {
+            let handoff = layout::handoff_blob(volume);
+            if Blobs::delete(world.as_ref(), &handoff).await.is_err() {
+                state
+                    .borrow_mut()
+                    .fail("superseded migration handoff cleanup failed");
+                return;
+            }
+            state.borrow_mut().forget_blobs(std::iter::once(&handoff));
+        }
         let verdict = record_verdict(&offered);
         let vmstate = if offered.config.kind == VolumeKind::Memory {
             let Verdict::Resume { .. } = verdict else {
@@ -1048,7 +1108,7 @@ where
         let Some(fence) = available_inbound_fence(&state, volume, offered.fence) else {
             return;
         };
-        let incarnation = state.borrow_mut().allocate_incarnation();
+        let run_generation = state.borrow_mut().allocate_run_generation();
         let local_vmm = if let Some(loaded) = vmstate.as_ref() {
             let mut builder = PageBatchBuilder::new_with_checksums(
                 offered.config.kind,
@@ -1107,10 +1167,22 @@ where
             host: from,
             offer_fence: Some(offered.fence),
         });
-        if !write_record_copies(&state, world.as_ref(), volume, &record, &offered_checksums).await {
+        if !write_record_copies_with_archive(
+            &state,
+            world.as_ref(),
+            volume,
+            &record,
+            &offered_checksums,
+            &offered_archive,
+        )
+        .await
+        {
             state
                 .borrow_mut()
                 .fail("inbound migration journal write failed");
+            return;
+        }
+        if !AdminIo::prepare_recovered_volume(world.as_ref(), volume, offered.config).await {
             return;
         }
         if let Some(loaded) = vmstate.as_ref()
@@ -1120,12 +1192,15 @@ where
         {
             return;
         }
-        {
+        let stale_resident = {
             let mut host = state.borrow_mut();
-            if host.volumes.contains_key(&volume) {
+            let replaceable_stale_outbound = host.volumes.get(&volume).is_some_and(|existing| {
+                !existing.ready && existing.outbound.is_some() && offered.fence > existing.fence
+            });
+            if host.volumes.contains_key(&volume) && !replaceable_stale_outbound {
                 return;
             }
-            let mut incoming = VolumeState::fresh(record.config, incarnation);
+            let mut incoming = VolumeState::fresh(record.config, run_generation);
             incoming.ready = false;
             incoming.peer_source = Some(from);
             incoming.peer_source_offer_fence = Some(offered.fence);
@@ -1136,6 +1211,11 @@ where
             incoming.mutation_seq = record.capture_seq;
             incoming.state_checksum = record.post_state_checksum;
             incoming.block_checksums = offered_checksums;
+            incoming.install_archive_closure(
+                volume,
+                &offered_archive.objects,
+                offered_archive.base,
+            );
             incoming.local_covered_through = record.sync_covered_through;
             incoming.sync_ack_through = record.sync_covered_through;
             // The source does not offer this cut until its passive has committed
@@ -1186,10 +1266,33 @@ where
                     .map(|(blx, _)| ObjectIdentity::volume(volume, fence, blx.0))
                     .collect(),
             );
+            // A non-duplicate inbound install starts a new guest-memory
+            // lifetime. Cache entries can outlive the old volume record after
+            // release or restart, and retaining them would make faults treat
+            // stale pages as resident instead of following the offered index.
+            let stale_resident = host.cache.purge_volume(volume);
             host.volumes.insert(volume, incoming);
             host.counters.records_written += 1;
+            stale_resident
+        };
+        for page in stale_resident {
+            if GuestMem::evict(world.as_ref(), page).await.is_err() {
+                state
+                    .borrow_mut()
+                    .fail("stale page eviction failed during inbound migration");
+                return;
+            }
         }
-        if !claim_migrated_head(&state, world.as_ref(), from, volume, incarnation, &offered).await {
+        if !claim_migrated_head(
+            &state,
+            world.as_ref(),
+            from,
+            volume,
+            run_generation,
+            &offered,
+        )
+        .await
+        {
             state.borrow_mut().volumes.remove(&volume);
             return;
         }
@@ -1218,6 +1321,50 @@ where
     }
 }
 
+async fn offer_was_superseded<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    source: HostId,
+    volume: VolumeId,
+    offer_fence: u64,
+) -> bool {
+    let Ok(Some((version, bytes))) =
+        store_retry::get(state, world, &layout::head_key(volume)).await
+    else {
+        return false;
+    };
+    let Ok(head) = HeadRecord::decode(volume, &bytes) else {
+        return false;
+    };
+    let effective_fence = if head.fence == 0 { version } else { head.fence };
+    head.holder != source && effective_fence > offer_fence
+}
+
+async fn current_offer_matches_head<W: Store>(
+    state: &SharedHost,
+    world: &W,
+    source: HostId,
+    volume: VolumeId,
+    offer_fence: u64,
+) -> bool {
+    let Ok(Some((version, bytes))) =
+        store_retry::get(state, world, &layout::head_key(volume)).await
+    else {
+        return false;
+    };
+    let Ok(head) = HeadRecord::decode(volume, &bytes) else {
+        return false;
+    };
+    let local = state.borrow().config.host;
+    let effective_fence = if head.fence == 0 { version } else { head.fence };
+    (head.holder == source && effective_fence == offer_fence)
+        // A prior attempt may have committed this destination's provisional
+        // claim and then lost the response or crashed before finalization.
+        // Retrying its durable inbound journal is the only path that can
+        // finish that exact local claim.
+        || (head.holder == local && head.fence == 0)
+}
+
 pub(super) fn available_inbound_fence(
     state: &SharedHost,
     volume: VolumeId,
@@ -1235,7 +1382,7 @@ async fn claim_migrated_head<W>(
     world: &W,
     source: HostId,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     offered: &JournalRecord,
 ) -> bool
 where
@@ -1256,6 +1403,21 @@ where
         };
         if head.holder != local && head.holder != source {
             return false;
+        }
+        // An offer fence names one exact ownership tenure, not merely one
+        // host allocation. If the same source becomes holder again later, a
+        // delayed offer from its earlier tenure must not reclaim the head.
+        if head.holder == source {
+            // A newly created head retains the provisional zero in its body;
+            // its object-store version is the holder's effective fence.
+            let source_fence = if head.fence == 0 {
+                current.0
+            } else {
+                head.fence
+            };
+            if source_fence != offered.fence {
+                return false;
+            }
         }
         let locally_held = head.holder == local;
         let stash = if locally_held {
@@ -1321,7 +1483,7 @@ where
         .borrow()
         .volumes
         .get(&volume)
-        .filter(|volume_state| volume_state.incarnation == incarnation)
+        .filter(|volume_state| volume_state.run_generation == run_generation)
         .map(|volume_state| volume_state.block_checksums.clone())
         .unwrap_or_default();
     if !write_record_copies(state, world, volume, &claimed, &checksums).await {
@@ -1335,7 +1497,7 @@ where
         let Some(volume_state) = host
             .volumes
             .get_mut(&volume)
-            .filter(|volume_state| volume_state.incarnation == incarnation)
+            .filter(|volume_state| volume_state.run_generation == run_generation)
         else {
             return false;
         };
@@ -1401,7 +1563,7 @@ where
     let Some(volume_state) = host
         .volumes
         .get_mut(&volume)
-        .filter(|volume_state| volume_state.incarnation == incarnation)
+        .filter(|volume_state| volume_state.run_generation == run_generation)
     else {
         return false;
     };
@@ -1598,7 +1760,7 @@ where
         let state = Rc::clone(self.host().state());
         let world = Rc::clone(self.host().world());
         let volume = self.id();
-        let Some((incarnation, source, fence, first_object, pages)) = ({
+        let Some((run_generation, source, fence, first_object, pages)) = ({
             let mut host = state.borrow_mut();
             host.volumes.get_mut(&volume).and_then(|volume_state| {
                 let source = volume_state.peer_source?;
@@ -1616,7 +1778,7 @@ where
                     .collect::<Vec<_>>();
                 if pages.is_empty() {
                     return Some((
-                        volume_state.incarnation,
+                        volume_state.run_generation,
                         source,
                         volume_state.fence,
                         crate::types::ObjectId(volume_state.next_object_id),
@@ -1629,7 +1791,7 @@ where
                         .try_start_mutation(MutationOwner::Hydration)
                 );
                 Some((
-                    volume_state.incarnation,
+                    volume_state.run_generation,
                     source,
                     volume_state.fence,
                     crate::types::ObjectId(volume_state.next_object_id),
@@ -1651,7 +1813,7 @@ where
             .await;
             return;
         }
-        let lease = HydrationLease::new(&state, volume, incarnation);
+        let lease = HydrationLease::new(&state, volume, run_generation);
         let mut workers = TaskSet::new();
         let mut outcomes = Vec::with_capacity(pages.len());
         for (page, (generation, location)) in pages {
@@ -1698,7 +1860,7 @@ where
             let host = state.borrow();
             host.volumes
                 .get(&volume)
-                .filter(|volume_state| volume_state.incarnation == incarnation)
+                .filter(|volume_state| volume_state.run_generation == run_generation)
                 .map(|volume_state| {
                     let generations = fetched
                         .iter()
@@ -1713,7 +1875,7 @@ where
                             )
                         })
                         .collect::<BTreeMap<_, _>>();
-                    let mut staged = VolumeState::fresh(volume_state.config, incarnation);
+                    let mut staged = VolumeState::fresh(volume_state.config, run_generation);
                     staged.fence = volume_state.fence;
                     staged.page_locs = volume_state.page_locs.clone();
                     staged.block_checksums = volume_state.block_checksums.clone();
@@ -1841,7 +2003,7 @@ where
             let Some(volume_state) = host
                 .volumes
                 .get_mut(&volume)
-                .filter(|volume_state| volume_state.incarnation == incarnation)
+                .filter(|volume_state| volume_state.run_generation == run_generation)
             else {
                 return;
             };
@@ -1903,13 +2065,13 @@ where
     }
 }
 
-pub(super) fn finish_hydration(state: &SharedHost, volume: VolumeId, incarnation: u64) {
+pub(super) fn finish_hydration(state: &SharedHost, volume: VolumeId, run_generation: u64) {
     let (hydration_waiters, mutation_waiters) = {
         let mut host = state.borrow_mut();
         let Some(volume_state) = host
             .volumes
             .get_mut(&volume)
-            .filter(|volume_state| volume_state.incarnation == incarnation)
+            .filter(|volume_state| volume_state.run_generation == run_generation)
         else {
             return;
         };
@@ -1929,13 +2091,34 @@ pub(super) fn finish_hydration(state: &SharedHost, volume: VolumeId, incarnation
     }
 }
 
-async fn release_source<W: Blobs + Peers + GuestMem>(
+async fn send_released_ack<W: Peers>(world: &W, to: HostId, volume: VolumeId, release_fence: u64) {
+    Peers::send(
+        world,
+        to,
+        PeerMsg::ReleasedAck {
+            volume,
+            release_fence,
+        },
+    )
+    .await;
+}
+
+async fn release_source<W: Blobs + Peers + GuestMem + AdminIo>(
     state: &SharedHost,
     world: &W,
     from: HostId,
     volume: VolumeId,
     release_fence: u64,
 ) {
+    if state
+        .borrow()
+        .released_migration_fences
+        .get(&volume)
+        .is_some_and(|released| *released >= release_fence)
+    {
+        send_released_ack(world, from, volume, release_fence).await;
+        return;
+    }
     let authorized = state
         .borrow()
         .volumes
@@ -1994,6 +2177,12 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
         state.borrow_mut().forget_blobs(&names);
     }
     if authorized {
+        state
+            .borrow_mut()
+            .released_migration_fences
+            .entry(volume)
+            .and_modify(|released| *released = (*released).max(release_fence))
+            .or_insert(release_fence);
         for (index, page) in resident.into_iter().enumerate() {
             if GuestMem::evict(world, page).await.is_err() {
                 state
@@ -2005,15 +2194,8 @@ async fn release_source<W: Blobs + Peers + GuestMem>(
                 yield_now().await;
             }
         }
-        Peers::send(
-            world,
-            from,
-            PeerMsg::ReleasedAck {
-                volume,
-                release_fence,
-            },
-        )
-        .await;
+        AdminIo::volume_released(world, volume).await;
+        send_released_ack(world, from, volume, release_fence).await;
     }
 }
 
@@ -2023,10 +2205,106 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use blockd_exec::{FaultConfig, simulation_scope};
+
     use super::*;
     use crate::engine::HostState;
     use crate::hostmeta::HostConfig;
     use crate::journal::VolumeConfig;
+
+    struct AcceptAfterSourceRelease {
+        state: SharedHost,
+        offer_fence: u64,
+    }
+
+    impl Peers for AcceptAfterSourceRelease {
+        async fn send(&self, to: HostId, message: PeerMsg) {
+            let PeerMsg::MigrateOffer { volume, .. } = message else {
+                return;
+            };
+            assert!(self.state.borrow().volumes.is_empty());
+            resolve_migration_accept(&self.state, to, volume, self.offer_fence);
+        }
+
+        async fn recv(&self) -> Option<(HostId, PeerMsg)> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn migration_accept_survives_source_release_before_reply() {
+        let state = Rc::new(RefCell::new(HostState::new(HostConfig {
+            archive: Default::default(),
+            host: HostId::new(1),
+            cache_pages: 1,
+            writeback_interval: 1,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: None,
+        })));
+        let destination = HostId::new(2);
+        let volume = VolumeId(7);
+        let offer_fence = 11;
+        let client = state.borrow().peer_client.clone();
+        let peers = AcceptAfterSourceRelease {
+            state: Rc::clone(&state),
+            offer_fence,
+        };
+
+        let accepted = simulation_scope(
+            31,
+            FaultConfig::default(),
+            client.offer_migration_once(&peers, destination, volume, offer_fence, vec![1], None),
+        )
+        .await;
+
+        assert!(accepted);
+    }
+
+    #[test]
+    fn memory_migration_offer_carries_the_live_page_index() {
+        let volume = VolumeId(8);
+        let page = crate::types::PageId {
+            volume,
+            page: crate::types::PageNo(3),
+        };
+        let location = PageFileLoc {
+            base: 0,
+            fence: 17,
+            object: ObjectId(4),
+            offset: 31,
+            len: 47,
+        };
+        let mut state = VolumeState::fresh(VolumeConfig::memory(8), 1);
+        state.page_locs.insert(page, (Gen(6), location));
+        let record = JournalRecord {
+            config: state.config,
+            seq: crate::types::JournalSeq(9),
+            fence: 17,
+            kind: RecordKind::Checkpoint {
+                epoch: crate::types::Epoch(2),
+                vmstate: 0,
+                vmstate_logical_length: 0,
+            },
+            capture_seq: 5,
+            sync_covered_through: 5,
+            post_state_checksum: 0,
+            files: Vec::new(),
+            runtime_page_index: BTreeMap::new(),
+            migrated_from: None,
+        };
+
+        let (offered, _, _) = JournalRecord::decode_migration_state(
+            volume,
+            &state.encode_migration_offer(volume, &record),
+        )
+        .expect("migration offer");
+
+        assert_eq!(offered.runtime_page_index, state.page_locs);
+        assert!(record.runtime_page_index.is_empty());
+    }
 
     #[test]
     fn inline_vmstate_is_validated_and_reconstructs_block_checksums() {
@@ -2052,19 +2330,19 @@ mod tests {
     fn successful_hydration_preserves_an_overlapping_migration_reservation() {
         let state = Rc::new(RefCell::new(HostState::new(HostConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let volume = VolumeId(1);
-        let incarnation = {
+        let run_generation = {
             let mut host = state.borrow_mut();
-            let incarnation = host.insert_fresh(volume, VolumeConfig::data(1));
+            let run_generation = host.insert_fresh(volume, VolumeConfig::data(1));
             let operations = &mut host
                 .volumes
                 .get_mut(&volume)
@@ -2073,10 +2351,10 @@ mod tests {
             assert!(operations.try_start_mutation(MutationOwner::Hydration));
             assert!(operations.start_migration());
             operations.finish_mutation(MutationOwner::Hydration);
-            incarnation
+            run_generation
         };
 
-        HydrationLease::new(&state, volume, incarnation).commit();
+        HydrationLease::new(&state, volume, run_generation).commit();
 
         let mut host = state.borrow_mut();
         let operations = &mut host

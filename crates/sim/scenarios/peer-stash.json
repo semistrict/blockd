@@ -6,10 +6,8 @@
   "kind": "cluster",
   "topology": {
     "volume_count": 3,
-    "replica_placement": {
-      "mode": "weighted-hosts",
-      "membership_epoch": 1,
-      "local_failure_domain": 1
+    "cluster_placement": {
+      "membership_epoch": 1
     }
   },
   "workload": {

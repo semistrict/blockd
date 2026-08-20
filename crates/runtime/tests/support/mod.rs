@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
-use blockd_core::placement::PeerCandidate;
+use blockd_core::hostmeta::{ClusterPlacementConfig, HostConfig};
 use blockd_core::types::HostId;
 use blockd_core::types::millis;
 use blockd_runtime::fakegcs::{FakeGcs, FakeGcsServer};
@@ -74,49 +73,44 @@ pub(crate) fn temp_root(tag: &str) -> PathBuf {
 }
 
 #[allow(dead_code)]
-pub(crate) fn base_daemon_config(host: u16) -> HostConfig {
+pub(crate) fn base_daemon_config(host: u32) -> HostConfig {
     HostConfig {
         archive: blockd_core::hostmeta::ArchivePolicy::default(),
-        host: HostId(host),
+        host: HostId::new(host),
         cache_pages: 64,
         writeback_interval: millis(5),
         backup_retry: millis(20),
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 500,
-        replica_placement: None,
+        cluster_placement: None,
     }
 }
 
 #[allow(dead_code)]
 pub(crate) fn three_host_runtime_config(
-    host: u16,
+    host: u32,
     blob_dir: PathBuf,
     addresses: [SocketAddr; MAX_TEST_HOSTS],
 ) -> RuntimeConfig {
     let mut daemon = base_daemon_config(host);
-    daemon.replica_placement = Some(ReplicaPlacementConfig {
+    daemon.cluster_placement = Some(ClusterPlacementConfig {
         membership_epoch: 1,
-        local_failure_domain: host + 1,
         roster: (0..MAX_TEST_HOSTS)
             .map(|candidate| {
-                let candidate = u16::try_from(candidate).expect("fits");
-                PeerCandidate {
-                    host: HostId(candidate),
-                    weight: 1,
-                    failure_domain: candidate + 1,
-                    drained: false,
-                }
+                let candidate = u32::try_from(candidate).expect("fits");
+                HostId::new(candidate)
             })
             .collect(),
         authority: None,
     });
     RuntimeConfig {
         daemon,
+        cluster_id: Some(1),
         blob_dir,
         peer: Some(PeerConfig {
-            listen: addresses[usize::from(host)],
-            advertise: addresses[usize::from(host)],
+            listen: addresses[usize::try_from(host).expect("test host index fits usize")],
+            advertise: addresses[usize::try_from(host).expect("test host index fits usize")],
         }),
     }
 }

@@ -11,9 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{ClusterPlacementConfig, HostConfig};
 use blockd_core::journal::VolumeConfig;
-use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::Verdict;
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, millis};
 use blockd_runtime::fc::{FcVm, ShmemServer, rss_pss_of_pid, upload_mem_parts_async};
@@ -46,7 +45,7 @@ fn volume_config() -> VolumeConfig {
 
 fn disk_page(volume: VolumeId, page: u32) -> PageId {
     PageId {
-        volume: volume,
+        volume,
         page: PageNo(page),
     }
 }
@@ -106,11 +105,7 @@ impl Demod {
             endpoint: cfg.gcs_endpoint.clone(),
             metadata_endpoint: cfg.gcs_metadata.clone(),
         }));
-        let roster: Vec<PeerCandidate> = cfg.placement.clone();
-        let local_failure_domain = roster
-            .iter()
-            .find(|candidate| candidate.host == cfg.host)
-            .map_or(cfg.host.0, |candidate| candidate.failure_domain);
+        let roster = cfg.placement.clone();
         let runtime_config = RuntimeConfig {
             daemon: HostConfig {
                 archive: blockd_core::hostmeta::ArchivePolicy {
@@ -126,22 +121,24 @@ impl Demod {
                 disk_capacity: cfg.disk_capacity_bytes,
                 disk_headroom: cfg.disk_headroom_bytes,
                 wedge_ticks: cfg.wedge_ticks,
-                replica_placement: Some(ReplicaPlacementConfig {
+                cluster_placement: Some(ClusterPlacementConfig {
                     membership_epoch: 1,
-                    local_failure_domain,
                     roster,
                     authority: None,
                 }),
             },
+            cluster_id: Some(1),
             blob_dir: cfg.blob_dir.clone(),
             peer: Some(PeerConfig {
                 listen: cfg.peer_listen,
                 advertise: cfg.peer_listen,
             }),
         };
-        let rt = Runtime::new(&runtime_config, store.clone()).await;
+        let rt = Runtime::new(&runtime_config, store.clone())
+            .await
+            .expect("runtime startup");
         Demod {
-            next_vm: AtomicU64::new(u64::from(cfg.host.0) * 1000 + 1),
+            next_vm: AtomicU64::new(u64::from(cfg.host.get()) * 1000 + 1),
             cfg,
             rt,
             store,
@@ -246,7 +243,7 @@ impl Demod {
         cell.get_or_init(|| async {
             let tag = format!(
                 "{}-{}",
-                self.cfg.host.0,
+                self.cfg.host.get(),
                 self.next_server.fetch_add(1, Ordering::Relaxed)
             );
             let sock = self.cfg.scratch.join(format!("fill-{tag}.sock"));
@@ -510,7 +507,9 @@ impl Demod {
         };
         let handoff = async {
             let handoff_started = Instant::now();
-            self.rt.migrate_out(VolumeId(id), HostId(to)).await;
+            self.rt
+                .migrate_out(VolumeId(id), HostId::new(u32::from(to)))
+                .await;
             handoff_started.elapsed().as_millis()
         };
         let (publish_ms, handoff_ms) = tokio::join!(publish, handoff);

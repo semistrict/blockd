@@ -1,0 +1,21 @@
+[Unit]
+Description=blockd object-store archive collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=blockd-gc
+Group=blockd-gc
+EnvironmentFile=/etc/blockd/collector.env
+ExecStart=/usr/local/bin/blockd_gc ${BLOCKD_STORE} --interval-secs ${BLOCKD_GC_INTERVAL_SECONDS} --grace-secs ${BLOCKD_GC_GRACE_SECONDS}
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

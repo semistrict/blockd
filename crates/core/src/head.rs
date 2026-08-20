@@ -88,7 +88,7 @@ impl HeadRecord {
         assert!(self.retired_stashes.len() <= MAX_RETIRED_STASHES);
         e.u16(version);
         e.u64(self.volume.0);
-        e.u16(self.holder.0);
+        encode_identity(&mut e, self.holder);
         e.u64(self.fence);
         match &self.manifest {
             None => e.u8(0),
@@ -106,16 +106,13 @@ impl HeadRecord {
             Some(stash) => {
                 e.u8(1);
                 e.u64(stash.assignment_epoch);
-                e.u16(stash.active_peer.0);
+                encode_identity(&mut e, stash.active_peer);
                 e.u64(stash.active_assignment_epoch);
                 match stash.transition_peer {
-                    None => {
-                        e.u8(0);
-                        e.u16(0);
-                    }
+                    None => e.u8(0),
                     Some(peer) => {
                         e.u8(1);
-                        e.u16(peer.0);
+                        encode_identity(&mut e, peer);
                     }
                 }
                 e.u64(stash.membership_epoch);
@@ -123,7 +120,7 @@ impl HeadRecord {
         }
         e.u8(u8::try_from(self.retired_stashes.len()).expect("bounded history"));
         for retired in &self.retired_stashes {
-            e.u16(retired.peer.0);
+            encode_identity(&mut e, retired.peer);
             e.u64(retired.assignment_epoch);
             e.u64(retired.through.writer_fence);
             e.u64(retired.through.seq.0);
@@ -143,7 +140,7 @@ impl HeadRecord {
         if d.u64()? != volume.0 {
             return Err(DecodeError);
         }
-        let holder = HostId(d.u16()?);
+        let holder = decode_identity(&mut d)?;
         let fence = d.u64()?;
         let manifest = match d.u8()? {
             0 => None,
@@ -160,11 +157,11 @@ impl HeadRecord {
             0 => None,
             1 => {
                 let assignment_epoch = d.u64()?;
-                let active_peer = HostId(d.u16()?);
+                let active_peer = decode_identity(&mut d)?;
                 let active_assignment_epoch = d.u64()?;
-                let transition_peer = match (d.u8()?, d.u16()?) {
-                    (0, 0) => None,
-                    (1, peer) => Some(HostId(peer)),
+                let transition_peer = match d.u8()? {
+                    0 => None,
+                    1 => Some(decode_identity(&mut d)?),
                     _ => return Err(DecodeError),
                 };
                 let membership_epoch = d.u64()?;
@@ -191,7 +188,7 @@ impl HeadRecord {
         let mut retired_stashes = Vec::with_capacity(count);
         for _ in 0..count {
             retired_stashes.push(RetiredStash {
-                peer: HostId(d.u16()?),
+                peer: decode_identity(&mut d)?,
                 assignment_epoch: d.u64()?,
                 through: ReplicaCommitInfo {
                     writer_fence: d.u64()?,
@@ -212,15 +209,27 @@ impl HeadRecord {
     }
 }
 
+fn encode_identity(e: &mut Enc, identity: HostId) {
+    e.u32(identity.get());
+}
+
+fn decode_identity(d: &mut Dec<'_>) -> Result<HostId, DecodeError> {
+    Ok(HostId::new(d.u32()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::format::crc32c;
 
+    const fn id(host: u32) -> HostId {
+        HostId::new(host)
+    }
+
     fn sample() -> HeadRecord {
         HeadRecord {
             volume: VolumeId(0xA1),
-            holder: HostId(3),
+            holder: id(3),
             fence: 4,
             manifest: Some(ManifestPtr {
                 fence: 2,
@@ -231,9 +240,9 @@ mod tests {
             }),
             stash: Some(StashAssignment {
                 assignment_epoch: 8,
-                active_peer: HostId(5),
+                active_peer: id(5),
                 active_assignment_epoch: 8,
-                transition_peer: Some(HostId(7)),
+                transition_peer: Some(id(7)),
                 membership_epoch: 3,
             }),
             retired_stashes: Vec::new(),
@@ -245,8 +254,8 @@ mod tests {
         let bytes = sample().encode();
         assert_eq!(HeadRecord::decode(VolumeId(0xA1), &bytes), Ok(sample()));
         // Byte pin (R10.2): any change here is a storage format change.
-        assert_eq!(bytes.len(), 104);
-        assert_eq!(crc32c(&bytes), 0x7943_6F92);
+        assert_eq!(bytes.len(), 110);
+        assert_eq!(crc32c(&bytes), 0x837F_138A);
     }
 
     #[test]
@@ -266,7 +275,7 @@ mod tests {
     fn heads_without_manifest_round_trip() {
         let head = HeadRecord {
             volume: VolumeId(0xA1),
-            holder: HostId(0),
+            holder: id(0),
             fence: 1,
             manifest: None,
             stash: None,
@@ -293,7 +302,7 @@ mod tests {
         let mut head = sample();
         head.stash.as_mut().expect("stash").active_assignment_epoch = 7;
         head.retired_stashes.push(RetiredStash {
-            peer: HostId(2),
+            peer: id(2),
             assignment_epoch: 6,
             through: ReplicaCommitInfo {
                 writer_fence: 4,

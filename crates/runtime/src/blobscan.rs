@@ -4,6 +4,11 @@
 //! recovery test can prove on any OS that this walk and the simulation's
 //! in-memory scan hand recovery identical worlds.
 
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use blockd_core::layout::{self, BlobName};
@@ -20,39 +25,74 @@ pub(crate) struct ScannedBlob {
 /// by the recovery actor.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn scan_blob_dir_for_recovery(root: &Path) -> Vec<ScannedBlob> {
-    let mut out = Vec::new();
-    scan_recovery_blobs(root, root, &mut out);
-    out
+    let root = super::world::open_root_for_scan(root).expect("secure recovery root");
+    scan_blob_fd_for_recovery(&root).expect("secure recovery scan")
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn scan_recovery_blobs(root: &Path, dir: &Path, out: &mut Vec<ScannedBlob>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            scan_recovery_blobs(root, &path, out);
+pub(crate) fn scan_blob_fd_for_recovery(root: &File) -> std::io::Result<Vec<ScannedBlob>> {
+    let mut out = Vec::new();
+    scan_recovery_blobs(root, "", &mut out)?;
+    Ok(out)
+}
+
+fn scan_recovery_blobs(
+    directory: &File,
+    prefix: &str,
+    out: &mut Vec<ScannedBlob>,
+) -> std::io::Result<()> {
+    let entries = rustix::fs::Dir::read_from(directory).map_err(std::io::Error::from)?;
+    for entry in entries {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let name = entry.file_name().to_bytes();
+        if matches!(name, b"." | b"..") {
             continue;
         }
-        let name = path
-            .strip_prefix(root)
-            .expect("under root")
+        let component = OsStr::from_bytes(name);
+        let descriptor = rustix::fs::openat(
+            directory,
+            component,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let mut file = File::from(descriptor);
+        let metadata = file.metadata()?;
+        crate::world::validate_owner(metadata.uid())?;
+        let component = component
             .to_str()
-            .expect("utf8")
-            .to_owned();
-        let Some(kind) = layout::parse_blob(&name) else {
+            .ok_or_else(|| std::io::Error::other("non-UTF-8 blob name"))?;
+        let relative = if prefix.is_empty() {
+            component.to_owned()
+        } else {
+            format!("{prefix}/{component}")
+        };
+        if metadata.is_dir() {
+            scan_recovery_blobs(&file, &relative, out)?;
+            continue;
+        }
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(std::io::Error::other(
+                "unsafe recovery blob type or link count",
+            ));
+        }
+        let Some(kind) = layout::parse_blob(&relative) else {
             continue;
         };
-        let len = entry.metadata().expect("blob metadata").len();
+        let len = metadata.len();
         let bytes = if matches!(kind, BlobName::Blx { .. }) {
             Vec::new()
         } else {
-            std::fs::read(&path).expect("blob read")
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            bytes
         };
-        out.push(ScannedBlob { name, bytes, len });
+        out.push(ScannedBlob {
+            name: relative,
+            bytes,
+            len,
+        });
     }
+    Ok(())
 }
 
 #[allow(clippy::items_after_test_module)]

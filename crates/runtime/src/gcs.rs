@@ -27,7 +27,7 @@ use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::metrics::{AtomicHistogram, LatencySeries};
-use crate::store::{GetResult, ObjectStore};
+use crate::store::{GetResult, ListedObject, ObjectStore};
 
 /// Refresh the token while this much of its lifetime remains.
 const TOKEN_SLACK: Duration = Duration::from_mins(5);
@@ -205,7 +205,17 @@ struct GcsResponse {
 }
 
 fn abort(context: &str, detail: &str) -> ! {
+    use std::io::Write as _;
+
     tracing::error!(gcs_context = context, detail, "fatal GCS error");
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "fatal GCS error: context={context:?} detail={detail:?}"
+    );
+    let _ = stderr.flush();
+    drop(stderr);
+    crate::flush_fatal_records();
     std::process::abort()
 }
 
@@ -225,10 +235,19 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 
 impl GcsStore {
     pub fn new(cfg: GcsConfig) -> GcsStore {
+        Self::with_request_timeout(cfg, Duration::from_secs(30))
+    }
+
+    #[doc(hidden)]
+    pub fn with_request_timeout(cfg: GcsConfig, request_timeout: Duration) -> GcsStore {
+        assert!(
+            !request_timeout.is_zero(),
+            "GCS request timeout must be positive"
+        );
         let make_client = || {
             reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(30))
+                .timeout(request_timeout)
                 .pool_max_idle_per_host(8)
                 .build()
                 .expect("GCS HTTP client")
@@ -485,8 +504,16 @@ impl ObjectStore for GcsStore {
         GcsStore::get_range(&self, &key, offset, len).await
     }
 
-    async fn delete(self: std::sync::Arc<Self>, key: String) {
-        GcsStore::delete(&self, &key).await;
+    async fn delete(self: std::sync::Arc<Self>, key: String) -> Result<bool, StoreFault> {
+        GcsStore::delete(&self, &key).await
+    }
+
+    async fn delete_cas(
+        self: std::sync::Arc<Self>,
+        key: String,
+        expected: u64,
+    ) -> Result<bool, StoreFault> {
+        GcsStore::delete_cas(&self, &key, expected).await
     }
 
     async fn list_prefix(
@@ -494,6 +521,13 @@ impl ObjectStore for GcsStore {
         prefix: String,
     ) -> Result<Vec<String>, StoreFault> {
         GcsStore::list_prefix(&self, &prefix).await
+    }
+
+    async fn list_prefix_versioned(
+        self: std::sync::Arc<Self>,
+        prefix: String,
+    ) -> Result<Vec<ListedObject>, StoreFault> {
+        GcsStore::list_prefix_versioned(&self, &prefix).await
     }
 }
 
@@ -535,20 +569,51 @@ impl GcsStore {
         result
     }
 
-    pub async fn delete(&self, key: &str) {
+    pub async fn delete(&self, key: &str) -> Result<bool, StoreFault> {
+        self.delete_inner(key, None).await
+    }
+
+    pub async fn delete_cas(&self, key: &str, expected: u64) -> Result<bool, StoreFault> {
+        self.delete_inner(key, Some(expected)).await
+    }
+
+    async fn delete_inner(&self, key: &str, expected: Option<u64>) -> Result<bool, StoreFault> {
         let started = Instant::now();
         self.stats.deletes.fetch_add(1, Ordering::SeqCst);
-        // Fire-and-forget (R4.5): a failed delete leaks one superseded
-        // object; the daemon never re-drives deletes, so neither do we.
-        let result = self.request("DELETE", key, &[], None).await.map(|_| ());
+        let headers = expected
+            .into_iter()
+            .map(|generation| ("x-goog-if-generation-match", generation.to_string()))
+            .collect::<Vec<_>>();
+        let result = match self.request("DELETE", key, &headers, None).await {
+            Ok(response) if matches!(response.status, 200 | 202 | 204) => Ok(true),
+            Ok(response) if response.status == 404 => Ok(false),
+            Ok(response) if response.status == 412 => Err(StoreFault::CasConflict {
+                actual: self.head_generation(key).await?,
+            }),
+            Ok(_) => Err(StoreFault::Unavailable),
+            Err(error) => Err(error),
+        };
         self.stats
             .observe(4, outcome_of(&result), started.elapsed());
+        result
     }
 
     pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreFault> {
+        Ok(self
+            .list_prefix_versioned(prefix)
+            .await?
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect())
+    }
+
+    pub async fn list_prefix_versioned(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<ListedObject>, StoreFault> {
         let full_prefix = format!("{}{prefix}", self.cfg.prefix);
         let mut continuation = None::<String>;
-        let mut keys = Vec::new();
+        let mut objects = Vec::new();
         loop {
             let mut url = format!(
                 "{}/{}?list-type=2&max-keys=1000&prefix={}",
@@ -565,12 +630,35 @@ impl GcsStore {
                 return Err(StoreFault::Unavailable);
             }
             let body = String::from_utf8(response.body).map_err(|_| StoreFault::Unavailable)?;
-            for key in xml_text(&body, "Key") {
+            let keys = xml_text(&body, "Key");
+            let generations = xml_text(&body, "Generation");
+            // XML API ETags detect content/metadata changes and remain the
+            // content digest for blockd's ordinary single-request uploads.
+            // Treat an omitted ETag conservatively rather than reusing bytes.
+            let fingerprints = xml_text(&body, "ETag");
+            if keys.len() != generations.len()
+                || (!fingerprints.is_empty() && keys.len() != fingerprints.len())
+                || fingerprints.iter().any(String::is_empty)
+            {
+                return Err(StoreFault::Unavailable);
+            }
+            let fingerprints = if fingerprints.is_empty() {
+                vec![None; keys.len()]
+            } else {
+                fingerprints.into_iter().map(Some).collect()
+            };
+            for ((key, generation), fingerprint) in
+                keys.into_iter().zip(generations).zip(fingerprints)
+            {
                 let Some(key) = key.strip_prefix(&self.cfg.prefix) else {
                     return Err(StoreFault::Unavailable);
                 };
                 if key.starts_with(prefix) {
-                    keys.push(key.to_owned());
+                    objects.push(ListedObject {
+                        key: key.to_owned(),
+                        generation: generation.parse().map_err(|_| StoreFault::Unavailable)?,
+                        fingerprint,
+                    });
                 }
             }
             let truncated = xml_text(&body, "IsTruncated")
@@ -584,9 +672,9 @@ impl GcsStore {
                 return Err(StoreFault::Unavailable);
             }
         }
-        keys.sort();
-        keys.dedup();
-        Ok(keys)
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        objects.dedup_by(|left, right| left.key == right.key);
+        Ok(objects)
     }
 
     async fn put_inner(&self, key: &str, bytes: Bytes) -> Result<u64, StoreFault> {
@@ -724,7 +812,7 @@ mod tests {
             "v/000000000badcafe/p/0000000000000002-000000000000001f",
             "b/000000000badcafe/root",
             "b/000000000badcafe/m/0000000000000007.manifest",
-            "cluster/tls/public-keys/0002.member",
+            "cluster/tls/public-keys/00000002.member",
         ] {
             assert_eq!(encode_key(key), key);
         }

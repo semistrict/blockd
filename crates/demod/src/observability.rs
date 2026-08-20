@@ -101,7 +101,7 @@ impl Drop for TelemetryGuard {
 /// Install JSON logging and, when explicitly configured, batched OTLP/HTTP
 /// trace export. The exporter uses an asynchronous HTTP client; request
 /// handlers only enqueue completed spans.
-pub fn init(host: Option<u16>) -> TelemetryGuard {
+pub fn init(host: Option<u32>) -> TelemetryGuard {
     global::set_text_map_propagator(TraceContextPropagator::new());
 
     let filter =
@@ -225,12 +225,12 @@ impl Drop for RequestMetrics {
 }
 
 pub struct MetricsSnapshot {
-    pub host: u16,
+    pub host: u32,
     pub vms: BTreeMap<String, u64>,
     pub runtime: Counters,
     pub store: StoreMetrics,
     pub peer_dropped_sends: u64,
-    pub peer_connections: Vec<(u16, bool)>,
+    pub peer_connections: Vec<(u32, bool)>,
     pub incidents: u64,
     pub daemon: DaemonStats,
     pub capacity: CapacitySignal,
@@ -1188,6 +1188,7 @@ mod tests {
                     role: VolumeRole::Hydrating,
                     fence: 8,
                     dirty_pages: 3,
+                    pages_dirtied_total: 3,
                     unstable_pages: 4,
                     pending_syncs: 2,
                     hydration_remaining_pages: 9,

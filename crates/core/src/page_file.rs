@@ -16,7 +16,7 @@ pub struct PageFileLoc {
     /// 0 for the volume's own namespace; otherwise the base id whose shared
     /// BLX objects hold this page (R5.3: forks reference, never copy).
     pub base: u64,
-    /// The writer incarnation that produced the object (its namespace).
+    /// The writer fence that produced the object (its namespace).
     pub fence: u64,
     pub object: ObjectId,
     pub offset: u32,

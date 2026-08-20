@@ -92,6 +92,15 @@ pub trait Blobs {
     async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError>;
     async fn write(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError>;
     async fn append(&self, name: String, bytes: Vec<u8>) -> Result<(), BlobError>;
+    /// Atomically replace a crash tail and append only if the durable file
+    /// still has `expected_total_len`. A false result is a clean RMW conflict.
+    async fn replace_tail_if_len(
+        &self,
+        name: String,
+        expected_total_len: u64,
+        valid_prefix_len: u64,
+        bytes: Vec<u8>,
+    ) -> Result<bool, BlobError>;
     async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError>;
     async fn read(&self, name: &str) -> Result<Option<Vec<u8>>, BlobError>;
     async fn read_range(
@@ -213,6 +222,14 @@ pub trait GuestMem {
 pub trait AdminIo {
     async fn next_admin(&self) -> Option<AdminRequest>;
     async fn emit_admin_event(&self, event: AdminEvent);
+    async fn prepare_recovered_volume(
+        &self,
+        _volume: VolumeId,
+        _config: crate::journal::VolumeConfig,
+    ) -> bool {
+        true
+    }
+    async fn volume_released(&self, _volume: VolumeId) {}
     async fn host_failed(&self, failure: HostFatal);
 }
 

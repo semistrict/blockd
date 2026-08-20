@@ -12,7 +12,6 @@ use crate::page_file::PageFileLoc;
 use crate::protocol::{PeerMsg, PeerRequestId, ReplicaArtifact, ReplicaCommitInfo};
 use crate::types::{HostId, JournalSeq, VolumeId};
 use crate::world::Peers;
-use crate::{authority::AuthorityProof, vnode_member::ProtectedClosureRef};
 
 type ReplicaStatusKey = (HostId, VolumeId, u64);
 type ReplicaPutKey = (HostId, VolumeId, u64, ReplicaArtifact, u32);
@@ -57,16 +56,12 @@ enum PendingReply {
     Page(OneSender<Option<Vec<u8>>>),
     Unit(OneSender<()>),
     Status(OneSender<Option<ReplicaCommitInfo>>),
-    Adoption(OneSender<(AuthorityProof, Vec<ProtectedClosureRef>)>),
-    VnodeCommit(OneSender<ProtectedClosureRef>),
 }
 
 enum PendingValue {
     Page(Option<Vec<u8>>),
     Unit,
     Status(Option<ReplicaCommitInfo>),
-    Adoption(AuthorityProof, Vec<ProtectedClosureRef>),
-    VnodeCommit(ProtectedClosureRef),
 }
 
 impl PendingReply {
@@ -75,12 +70,6 @@ impl PendingReply {
             (Self::Page(reply), PendingValue::Page(value)) => reply.send(value).is_ok(),
             (Self::Unit(reply), PendingValue::Unit) => reply.send(()).is_ok(),
             (Self::Status(reply), PendingValue::Status(value)) => reply.send(value).is_ok(),
-            (Self::Adoption(reply), PendingValue::Adoption(proof, closures)) => {
-                reply.send((proof, closures)).is_ok()
-            }
-            (Self::VnodeCommit(reply), PendingValue::VnodeCommit(value)) => {
-                reply.send(value).is_ok()
-            }
             _ => false,
         }
     }
@@ -93,9 +82,6 @@ enum PendingKey {
     Status(ReplicaStatusKey),
     Put(ReplicaPutKey),
     Commit(ReplicaCommitKey),
-    Adoption(PeerRequestId),
-    VnodeClosure(PeerRequestId),
-    VnodeCommit(PeerRequestId),
 }
 
 #[derive(Default)]
@@ -251,6 +237,11 @@ impl PeerClient {
         )
         .await;
         matches!(timeout(self.migration_retry, receive).await, Ok(Ok(())))
+            || self.take_delayed_migration_accept(key)
+    }
+
+    fn take_delayed_migration_accept(&self, key: MigrationKey) -> bool {
+        self.broker.borrow_mut().accepted_migrations.remove(&key)
     }
 
     pub async fn replica_status<W: Peers>(
@@ -358,154 +349,6 @@ impl PeerClient {
                 return Err(PeerRpcError { attempts });
             }
         }
-    }
-
-    pub async fn adopt_vnode<W: Peers>(
-        &self,
-        world: &W,
-        target: HostId,
-        proof: AuthorityProof,
-    ) -> Result<Vec<ProtectedClosureRef>, PeerRpcError> {
-        let mut attempts = 0_u8;
-        loop {
-            attempts = attempts.saturating_add(1);
-            let (io, receive) = self.register_adoption(target);
-            Peers::send(world, target, PeerMsg::VnodeAdopt { io, proof }).await;
-            if let Ok(Ok((received, closures))) = timeout(self.retry, receive).await
-                && received == proof
-            {
-                return Ok(closures);
-            }
-            if attempts >= 3 {
-                return Err(PeerRpcError { attempts });
-            }
-        }
-    }
-
-    fn register_adoption(
-        &self,
-        target: HostId,
-    ) -> (
-        PeerRequestId,
-        PeerReply<(AuthorityProof, Vec<ProtectedClosureRef>)>,
-    ) {
-        let request = self.broker.borrow_mut().allocate_request();
-        let reply = self.pending(
-            target,
-            PendingKey::Adoption(request),
-            false,
-            PendingReply::Adoption,
-        );
-        (request, reply)
-    }
-
-    pub fn resolve_adoption(
-        &self,
-        request: PeerRequestId,
-        from: HostId,
-        proof: AuthorityProof,
-        closures: Vec<ProtectedClosureRef>,
-    ) {
-        self.broker.borrow_mut().resolve(
-            PendingKey::Adoption(request),
-            from,
-            PendingValue::Adoption(proof, closures),
-        );
-    }
-
-    pub async fn fetch_vnode_closure<W: Peers>(
-        &self,
-        world: &W,
-        target: HostId,
-        vnode: crate::authority::VnodeId,
-        closure: ProtectedClosureRef,
-    ) -> Option<Vec<u8>> {
-        for _ in 0..3 {
-            let request = self.broker.borrow_mut().allocate_request();
-            let receive = self.pending(
-                target,
-                PendingKey::VnodeClosure(request),
-                false,
-                PendingReply::Page,
-            );
-            Peers::send(
-                world,
-                target,
-                PeerMsg::VnodeFetchClosure {
-                    io: request,
-                    vnode,
-                    closure,
-                },
-            )
-            .await;
-            if let Ok(Ok(Some(bytes))) = timeout(self.retry, receive).await {
-                return Some(bytes);
-            }
-        }
-        None
-    }
-
-    pub fn resolve_vnode_closure(
-        &self,
-        request: PeerRequestId,
-        from: HostId,
-        bytes: Option<Vec<u8>>,
-    ) {
-        self.broker.borrow_mut().resolve(
-            PendingKey::VnodeClosure(request),
-            from,
-            PendingValue::Page(bytes),
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn commit_vnode_closure<W: Peers>(
-        &self,
-        world: &W,
-        target: HostId,
-        proof: AuthorityProof,
-        volume: VolumeId,
-        sequence: u64,
-        bytes: Vec<u8>,
-    ) -> Option<ProtectedClosureRef> {
-        for _ in 0..3 {
-            let request = self.broker.borrow_mut().allocate_request();
-            let receive = self.pending(
-                target,
-                PendingKey::VnodeCommit(request),
-                false,
-                PendingReply::VnodeCommit,
-            );
-            Peers::send(
-                world,
-                target,
-                PeerMsg::VnodeCommit {
-                    io: request,
-                    proof,
-                    volume,
-                    sequence,
-                    bytes: bytes.clone(),
-                },
-            )
-            .await;
-            if let Ok(Ok(closure)) = timeout(self.retry, receive).await {
-                return Some(closure);
-            }
-        }
-        None
-    }
-
-    pub fn resolve_vnode_commit(
-        &self,
-        request: PeerRequestId,
-        from: HostId,
-        closure: ProtectedClosureRef,
-    ) {
-        self.broker.borrow_mut().resolve(
-            PendingKey::VnodeCommit(request),
-            from,
-            PendingValue::VnodeCommit(closure),
-        );
     }
 
     #[cfg(test)]
@@ -696,10 +539,6 @@ impl Broker {
                 PendingValue::Page(value) => PendingValue::Page(value.clone()),
                 PendingValue::Unit => PendingValue::Unit,
                 PendingValue::Status(value) => PendingValue::Status(*value),
-                PendingValue::Adoption(proof, closures) => {
-                    PendingValue::Adoption(*proof, closures.clone())
-                }
-                PendingValue::VnodeCommit(value) => PendingValue::VnodeCommit(*value),
             };
             let _ = entry.reply.send(cloned);
         }
@@ -715,6 +554,10 @@ mod tests {
     use blockd_exec::{FaultConfig, join2, simulation_scope};
 
     use super::*;
+
+    const fn id(host: u32) -> HostId {
+        crate::types::HostId::new(host)
+    }
 
     const CURRENT_MIGRATION_FENCE: u64 = 7;
 
@@ -751,7 +594,7 @@ mod tests {
             }
         }
 
-        async fn recv(&self) -> Option<(HostId, PeerMsg)> {
+        async fn recv(&self) -> Option<(crate::types::HostId, PeerMsg)> {
             std::future::pending().await
         }
     }
@@ -759,11 +602,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn page_reply_requires_the_authenticated_source_and_resolves_once() {
         let client = PeerClient::default();
-        let (request, receive) = client.page(HostId(2));
+        let (request, receive) = client.page(id(2));
 
-        client.resolve_page(request, HostId(3), Some(vec![3]));
-        client.resolve_page(request, HostId(2), Some(vec![2]));
-        client.resolve_page(request, HostId(2), Some(vec![4]));
+        client.resolve_page(request, id(3), Some(vec![3]));
+        client.resolve_page(request, id(2), Some(vec![2]));
+        client.resolve_page(request, id(2), Some(vec![4]));
 
         assert_eq!(
             simulation_scope(1, FaultConfig::default(), receive).await,
@@ -774,19 +617,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stale_waiter_cleanup_cannot_remove_a_newer_retry() {
         let client = PeerClient::default();
-        let stale = client.status(HostId(2), VolumeId(7), 11);
-        let current = client.status(HostId(2), VolumeId(7), 11);
+        let stale = client.status(id(2), VolumeId(7), 11);
+        let current = client.status(id(2), VolumeId(7), 11);
 
         drop(stale);
-        client.resolve_status(HostId(3), VolumeId(7), 11, None);
+        client.resolve_status(id(3), VolumeId(7), 11, None);
         assert!(
             client
                 .broker
                 .borrow()
                 .pending
-                .contains_key(&PendingKey::Status((HostId(2), VolumeId(7), 11)))
+                .contains_key(&PendingKey::Status((id(2), VolumeId(7), 11)))
         );
-        client.resolve_status(HostId(2), VolumeId(7), 11, None);
+        client.resolve_status(id(2), VolumeId(7), 11, None);
 
         assert_eq!(
             simulation_scope(2, FaultConfig::default(), current).await,
@@ -797,15 +640,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn equivalent_replica_rpcs_to_one_host_resolve_every_waiter() {
         let client = PeerClient::default();
-        let first = client.status(HostId(2), VolumeId(7), 11);
-        let second = client.status(HostId(2), VolumeId(7), 11);
+        let first = client.status(id(2), VolumeId(7), 11);
+        let second = client.status(id(2), VolumeId(7), 11);
         assert_eq!(client.broker.borrow().pending.len(), 1);
         assert_eq!(
-            client.broker.borrow().pending[&PendingKey::Status((HostId(2), VolumeId(7), 11))].len(),
+            client.broker.borrow().pending[&PendingKey::Status((id(2), VolumeId(7), 11))].len(),
             2
         );
 
-        client.resolve_status(HostId(2), VolumeId(7), 11, None);
+        client.resolve_status(id(2), VolumeId(7), 11, None);
         assert_eq!(
             simulation_scope(6, FaultConfig::default(), join2(first, second)).await,
             (Ok(None), Ok(None))
@@ -816,12 +659,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn equivalent_replica_rpcs_to_different_hosts_keep_independent_waiters() {
         let client = PeerClient::default();
-        let first = client.status(HostId(2), VolumeId(7), 11);
-        let second = client.status(HostId(3), VolumeId(7), 11);
+        let first = client.status(id(2), VolumeId(7), 11);
+        let second = client.status(id(3), VolumeId(7), 11);
         assert_eq!(client.broker.borrow().pending.len(), 2);
 
-        client.resolve_status(HostId(3), VolumeId(7), 11, None);
-        client.resolve_status(HostId(2), VolumeId(7), 11, None);
+        client.resolve_status(id(3), VolumeId(7), 11, None);
+        client.resolve_status(id(2), VolumeId(7), 11, None);
         assert_eq!(
             simulation_scope(5, FaultConfig::default(), join2(first, second)).await,
             (Ok(None), Ok(None))
@@ -841,7 +684,7 @@ mod tests {
             let peers = Rc::clone(&peers);
             async move {
                 client
-                    .replica_status(peers.as_ref(), HostId(2), VolumeId(7), 11)
+                    .replica_status(peers.as_ref(), id(2), VolumeId(7), 11)
                     .await
             }
         })
@@ -869,7 +712,7 @@ mod tests {
                     if client
                         .offer_migration_once(
                             peers.as_ref(),
-                            HostId(2),
+                            id(2),
                             VolumeId(7),
                             CURRENT_MIGRATION_FENCE,
                             vec![1, 2, 3],
@@ -907,7 +750,7 @@ mod tests {
                 client
                     .offer_migration_once(
                         peers.as_ref(),
-                        HostId(2),
+                        id(2),
                         VolumeId(7),
                         CURRENT_MIGRATION_FENCE,
                         vec![1, 2, 3],
@@ -925,6 +768,51 @@ mod tests {
         assert!(broker.active_migrations.is_empty());
     }
 
+    #[test]
+    fn delayed_exact_accept_is_consumed_at_the_timeout_boundary() {
+        let client = PeerClient::default();
+        let key = (VolumeId(7), id(2), CURRENT_MIGRATION_FENCE);
+        let call = MigrationCall {
+            broker: Rc::downgrade(&client.broker),
+            key,
+        };
+        client.broker.borrow_mut().active_migrations.insert(key);
+        let timed_out = client.migration(key.0, key.1, key.2);
+        drop(timed_out);
+        client.resolve_migration(key.0, key.1, key.2);
+        assert!(client.broker.borrow().accepted_migrations.contains(&key));
+        let accepted = client.take_delayed_migration_accept(key);
+        drop(call);
+
+        assert!(accepted);
+        let broker = client.broker.borrow();
+        assert!(broker.pending.is_empty());
+        assert!(broker.active_migrations.is_empty());
+        assert!(broker.accepted_migrations.is_empty());
+    }
+
+    #[test]
+    fn cancelled_migration_attempt_discards_a_racing_accept() {
+        let client = PeerClient::default();
+        let key = (VolumeId(7), id(2), CURRENT_MIGRATION_FENCE);
+        let call = MigrationCall {
+            broker: Rc::downgrade(&client.broker),
+            key,
+        };
+        client.broker.borrow_mut().active_migrations.insert(key);
+        let cancelled = client.migration(key.0, key.1, key.2);
+        drop(cancelled);
+        client.resolve_migration(key.0, key.1, key.2);
+        assert!(client.broker.borrow().accepted_migrations.contains(&key));
+
+        drop(call);
+
+        let broker = client.broker.borrow();
+        assert!(broker.pending.is_empty());
+        assert!(broker.active_migrations.is_empty());
+        assert!(broker.accepted_migrations.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn delayed_prior_accept_cannot_complete_a_new_offer() {
         let client = PeerClient::default();
@@ -940,7 +828,7 @@ mod tests {
                 client
                     .offer_migration_once(
                         peers.as_ref(),
-                        HostId(2),
+                        id(2),
                         VolumeId(7),
                         CURRENT_MIGRATION_FENCE,
                         vec![4, 5, 6],

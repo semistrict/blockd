@@ -29,7 +29,7 @@ pub(super) async fn claim_new_head_with_stash<W: Store>(
     state: &SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     stash: Option<StashAssignment>,
 ) -> Option<u64> {
     let head = HeadRecord {
@@ -83,7 +83,7 @@ pub(super) async fn claim_new_head_with_stash<W: Store>(
                                 .borrow()
                                 .volumes
                                 .get(&volume)
-                                .is_some_and(|volume| volume.incarnation == incarnation)
+                                .is_some_and(|volume| volume.run_generation == run_generation)
                         {
                             return Some(version);
                         }
@@ -117,27 +117,27 @@ where
         let state = Rc::clone(self.host().state());
         let world = Rc::clone(self.host().world());
         let volume = self.id();
-        let Some((incarnation, retry)) = ({
+        let Some((run_generation, retry)) = ({
             let mut host = state.borrow_mut();
             let retry = host.config.backup_retry;
             host.volumes.get_mut(&volume).and_then(|volume_state| {
                 volume_state
                     .operations
                     .try_start_publication()
-                    .then_some((volume_state.incarnation, retry))
+                    .then_some((volume_state.run_generation, retry))
             })
         }) else {
             return;
         };
-        let run = self.pin(incarnation);
-        let lease = PublishLease::new(&state, volume, run.incarnation());
-        'publish: while let Some(snapshot) = publish_snapshot(&state, volume, incarnation) {
+        let run = self.pin(run_generation);
+        let lease = PublishLease::new(&state, volume, run.run_generation());
+        'publish: while let Some(snapshot) = publish_snapshot(&state, volume, run_generation) {
             if run.interrupted() {
                 break;
             }
             {
                 let mut host = state.borrow_mut();
-                let Some(volume_state) = host.volume_at_mut(volume, incarnation) else {
+                let Some(volume_state) = host.volume_at_mut(volume, run_generation) else {
                     return;
                 };
                 volume_state
@@ -175,7 +175,7 @@ where
                 &state,
                 world.as_ref(),
                 volume,
-                incarnation,
+                run_generation,
                 prepared.pointer,
                 retry,
             )
@@ -184,7 +184,7 @@ where
                 PublishHead::Published(version) => {
                     {
                         let mut host = state.borrow_mut();
-                        let Some(volume_state) = host.volume_at_mut(volume, incarnation) else {
+                        let Some(volume_state) = host.volume_at_mut(volume, run_generation) else {
                             return;
                         };
                         volume_state.head_version = Some(version);
@@ -201,7 +201,7 @@ where
                     run.volume().retry_releases().await;
                 }
                 PublishHead::Fenced => {
-                    fence_volume(&state, world.as_ref(), volume, Some(incarnation)).await;
+                    fence_volume(&state, world.as_ref(), volume, Some(run_generation)).await;
                     return;
                 }
                 PublishHead::Fatal => {
@@ -237,6 +237,38 @@ where
                     fence_volume(&state, world.as_ref(), volume, None).await;
                     return None;
                 };
+                let local_host = state.borrow().config.host;
+                let recovered_fence = state
+                    .borrow()
+                    .volumes
+                    .get(&volume)
+                    .map(|volume_state| volume_state.fence);
+                if head.holder == local_host && head.fence == 0 && recovered_fence == Some(version)
+                {
+                    let finalized = HeadRecord {
+                        fence: version,
+                        ..head
+                    };
+                    match Store::put_cas(
+                        world.as_ref(),
+                        layout::head_key(volume),
+                        Some(version),
+                        finalized.encode(),
+                    )
+                    .await
+                    {
+                        Ok(_) | Err(StoreError::Fault(StoreFault::CasConflict { .. })) => continue,
+                        Err(StoreError::Fault(StoreFault::Unavailable)) => {
+                            state.borrow_mut().counters.store_retries += 1;
+                            delay(retry).await;
+                            continue;
+                        }
+                        Err(StoreError::TooLarge) => {
+                            fence_volume(&state, world.as_ref(), volume, None).await;
+                            return None;
+                        }
+                    }
+                }
                 let Some((archive_objects, archive_base)) =
                     load_archive_closure(&state, world.as_ref(), volume, head.manifest).await
                 else {
@@ -244,7 +276,6 @@ where
                     return None;
                 };
                 if head.stash.is_none() {
-                    let local_host = state.borrow().config.host;
                     let Some(stash) = super::replica::initial_stash(&state, volume) else {
                         fence_volume(&state, world.as_ref(), volume, None).await;
                         return None;
@@ -253,11 +284,10 @@ where
                         fence_volume(&state, world.as_ref(), volume, None).await;
                         return None;
                     }
-                    let (incarnation, fence) = state
-                        .borrow()
-                        .volumes
-                        .get(&volume)
-                        .map(|volume_state| (volume_state.incarnation, volume_state.fence))?;
+                    let (run_generation, fence) =
+                        state.borrow().volumes.get(&volume).map(|volume_state| {
+                            (volume_state.run_generation, volume_state.fence)
+                        })?;
                     let upgraded = HeadRecord {
                         volume,
                         holder: local_host,
@@ -287,7 +317,7 @@ where
                                 let mut host = state.borrow_mut();
                                 let volume_state =
                                     host.volumes.get_mut(&volume).filter(|volume_state| {
-                                        volume_state.incarnation == incarnation
+                                        volume_state.run_generation == run_generation
                                     })?;
                                 volume_state.head_version = Some(upgraded_version);
                                 volume_state.backed = upgraded.manifest;
@@ -329,13 +359,22 @@ where
                         }
                     }
                 }
-                let expected_membership = state
+                let durable_membership = head.stash.map(|stash| stash.membership_epoch);
+                let current_membership = state
                     .borrow()
                     .config
-                    .replica_placement
+                    .cluster_placement
                     .as_ref()
                     .map(|placement| placement.membership_epoch);
-                if head.stash.map(|stash| stash.membership_epoch) != expected_membership {
+                if durable_membership
+                    .zip(current_membership)
+                    .is_some_and(|(durable, current)| durable > current)
+                {
+                    state.borrow_mut().counters.store_retries += 1;
+                    delay(retry).await;
+                    continue;
+                }
+                if durable_membership.is_some() && current_membership.is_none() {
                     fence_volume(&state, world.as_ref(), volume, None).await;
                     return None;
                 }
@@ -352,9 +391,7 @@ where
                         let behind = head.manifest.is_some_and(|manifest| {
                             (manifest.capture_seq, manifest.journal_seq) > local
                         });
-                        head.holder == local_host
-                            && (head.fence == 0 || head.fence == volume_state.fence)
-                            && !behind
+                        head.holder == local_host && head.fence == volume_state.fence && !behind
                     })
                 };
                 let peer_published = if publication_is_ours {
@@ -376,10 +413,7 @@ where
                     let behind = head.manifest.is_some_and(|manifest| {
                         (manifest.capture_seq, manifest.journal_seq) > local
                     });
-                    if head.holder != local_host
-                        || (head.fence != 0 && head.fence != volume_state.fence)
-                        || behind
-                    {
+                    if head.holder != local_host || head.fence != volume_state.fence || behind {
                         RecoveryDecision::Fence
                     } else {
                         volume_state.head_version = Some(version);
@@ -592,13 +626,13 @@ struct PublishSnapshot {
 fn publish_snapshot(
     state: &SharedHost,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
 ) -> Option<PublishSnapshot> {
     let host = state.borrow();
     let volume_state = host
         .volumes
         .get(&volume)
-        .filter(|volume| volume.incarnation == incarnation)?;
+        .filter(|volume| volume.run_generation == run_generation)?;
     let record = if volume_state.stash_assignment.is_some() {
         volume_state.peer_committed_record.as_ref()?
     } else {
@@ -921,7 +955,7 @@ async fn publish_head<W: Store>(
     state: &SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     pointer: ManifestPtr,
     retry: u64,
 ) -> PublishHead {
@@ -930,7 +964,7 @@ async fn publish_head<W: Store>(
             let host = state.borrow();
             host.volumes
                 .get(&volume)
-                .filter(|volume| volume.incarnation == incarnation)
+                .filter(|volume| volume.run_generation == run_generation)
                 .and_then(|volume_state| {
                     Some((
                         volume_state.head_version?,
@@ -1018,20 +1052,19 @@ async fn fence_volume<W: GuestMem>(
     state: &SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: Option<u64>,
+    run_generation: Option<u64>,
 ) {
-    let pages =
-        {
-            let mut host = state.borrow_mut();
-            if host.volumes.get(&volume).is_none_or(|volume| {
-                incarnation.is_some_and(|expected| volume.incarnation != expected)
-            }) {
-                return;
-            }
-            host.volumes.remove(&volume);
-            host.counters.fenced += 1;
-            host.cache.purge_volume(volume)
-        };
+    let pages = {
+        let mut host = state.borrow_mut();
+        if host.volumes.get(&volume).is_none_or(|volume| {
+            run_generation.is_some_and(|expected| volume.run_generation != expected)
+        }) {
+            return;
+        }
+        host.volumes.remove(&volume);
+        host.counters.fenced += 1;
+        host.cache.purge_volume(volume)
+    };
     if GuestMem::fence(world, volume).await.is_err() {
         state.borrow_mut().fail("guest fence notification failed");
         return;
@@ -1047,16 +1080,16 @@ async fn fence_volume<W: GuestMem>(
 struct PublishLease {
     state: SharedHost,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     active: bool,
 }
 
 impl PublishLease {
-    fn new(state: &SharedHost, volume: VolumeId, incarnation: u64) -> Self {
+    fn new(state: &SharedHost, volume: VolumeId, run_generation: u64) -> Self {
         Self {
             state: Rc::clone(state),
             volume,
-            incarnation,
+            run_generation,
             active: true,
         }
     }
@@ -1073,7 +1106,7 @@ impl PublishLease {
             let Some(volume) = host
                 .volumes
                 .get_mut(&self.volume)
-                .filter(|volume| volume.incarnation == self.incarnation)
+                .filter(|volume| volume.run_generation == self.run_generation)
             else {
                 return;
             };

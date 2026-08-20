@@ -59,7 +59,7 @@ impl ObjectStore for UploadProbe {
         unreachable!()
     }
 
-    async fn delete(self: Arc<Self>, _key: String) {
+    async fn delete(self: Arc<Self>, _key: String) -> Result<bool, StoreFault> {
         unreachable!()
     }
 }

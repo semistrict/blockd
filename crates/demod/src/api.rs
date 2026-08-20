@@ -50,7 +50,7 @@ struct ApiState {
 
 pub async fn serve(daemon: Arc<Demod>) {
     let address = daemon.cfg.api;
-    let host_id = daemon.cfg.host.0;
+    let host_id = daemon.cfg.host.get();
     let state = ApiState {
         daemon,
         operation_slots: Arc::new(Semaphore::new(MAX_OPERATION_CONCURRENCY)),
@@ -438,7 +438,7 @@ fn metrics_text(state: &Arc<Demod>) -> String {
     let store = &state.store.stats;
     let loop_stats = state.rt.loop_stats();
     let snapshot = MetricsSnapshot {
-        host: state.cfg.host.0,
+        host: state.cfg.host.get(),
         vms,
         runtime: state.rt.counters(),
         store: StoreMetrics {
@@ -458,7 +458,7 @@ fn metrics_text(state: &Arc<Demod>) -> String {
             .rt
             .peer_connections()
             .into_iter()
-            .map(|(peer, connected)| (peer.0, connected))
+            .map(|(peer, connected)| (peer.get(), connected))
             .collect(),
         incidents: u64::try_from(state.rt.incidents().len()).unwrap_or(u64::MAX),
         daemon: state.rt.daemon_stats(),
@@ -510,7 +510,7 @@ fn status_value(state: &Arc<Demod>) -> Value {
     let capacity = state.rt.capacity_signal();
     let store = &state.store.stats;
     json!({
-        "host": state.cfg.host.0,
+        "host": state.cfg.host.get(),
         "vms": vms,
         "capacity": capacity_value(capacity),
         "counters": {

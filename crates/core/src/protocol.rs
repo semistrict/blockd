@@ -11,7 +11,7 @@ use crate::types::{Epoch, HostId, ObjectId, VolumeId};
 /// overhead for payloads whose unframed contract is 64 MiB.
 pub const MAX_OBJECT_BYTES: u32 = 64 * 1024 * 1024 + 4096;
 
-/// Actor-issued peer request id, unique per host incarnation.
+/// Actor-issued peer request id, unique within one host process session.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PeerRequestId(pub u64);
 
@@ -156,37 +156,6 @@ pub enum PeerMsg {
         assignment_epoch: u64,
         through: ReplicaCommitInfo,
     },
-    /// Cold-path vnode failover. The receiver independently GETs and verifies
-    /// the object-store proof before durably adopting its generation.
-    VnodeAdopt {
-        io: PeerRequestId,
-        proof: crate::authority::AuthorityProof,
-    },
-    VnodeAdoptAck {
-        io: PeerRequestId,
-        proof: crate::authority::AuthorityProof,
-        closures: Vec<crate::vnode_member::ProtectedClosureRef>,
-    },
-    VnodeFetchClosure {
-        io: PeerRequestId,
-        vnode: crate::authority::VnodeId,
-        closure: crate::vnode_member::ProtectedClosureRef,
-    },
-    VnodeClosure {
-        io: PeerRequestId,
-        bytes: Option<Vec<u8>>,
-    },
-    VnodeCommit {
-        io: PeerRequestId,
-        proof: crate::authority::AuthorityProof,
-        volume: VolumeId,
-        sequence: u64,
-        bytes: Vec<u8>,
-    },
-    VnodeCommitAck {
-        io: PeerRequestId,
-        closure: crate::vnode_member::ProtectedClosureRef,
-    },
 }
 
 impl PeerMsg {
@@ -207,12 +176,6 @@ impl PeerMsg {
             Self::ReplicaStatusReply { .. } => 13,
             Self::ReplicaRelease { .. } => 15,
             Self::ReplicaReleaseAck { .. } => 16,
-            Self::VnodeAdopt { .. } => 18,
-            Self::VnodeAdoptAck { .. } => 19,
-            Self::VnodeFetchClosure { .. } => 20,
-            Self::VnodeClosure { .. } => 21,
-            Self::VnodeCommit { .. } => 22,
-            Self::VnodeCommitAck { .. } => 23,
         }
     }
 }
@@ -222,11 +185,10 @@ impl PeerMsg {
 /// idempotency.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AdminCall {
-    /// Replace the live replica-placement roster. The actor retains prior
-    /// rosters so assignments made before a membership change remain
-    /// authorized while their fenced transition completes.
-    UpdateReplicaPlacement {
-        placement: crate::hostmeta::ReplicaPlacementConfig,
+    /// Replace the actor's live view of the single CAS-serialized cluster
+    /// placement. Durable heads authorize already assigned replica spools.
+    UpdateClusterPlacement {
+        placement: crate::hostmeta::ClusterPlacementConfig,
     },
     CreateVolume {
         volume: VolumeId,
@@ -256,7 +218,7 @@ pub enum AdminCall {
 /// Successful completion of an in-process administrative operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdminSuccess {
-    ReplicaPlacementUpdated,
+    ClusterPlacementUpdated,
     VolumeCreated { volume: VolumeId },
     CheckpointDone { volume: VolumeId, epoch: Epoch },
     VolumeRestored { volume: VolumeId, verdict: Verdict },

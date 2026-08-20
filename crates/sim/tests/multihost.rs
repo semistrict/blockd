@@ -2,7 +2,7 @@
 
 use blockd_core::journal::VolumeConfig;
 use blockd_core::types::{VolumeId, millis, secs};
-use blockd_sim::cluster::{ClusterConfig, ClusterReport, FaultPoint, run};
+use blockd_sim::cluster::{ClusterConfig, ClusterReport, FaultPoint, PeerKind, run};
 use blockd_sim::scenario::RealizedScenario;
 
 fn assert_clean(report: &ClusterReport) {
@@ -119,8 +119,8 @@ fn lossy_duplicating_links_preserve_migration_and_replay() {
         peer_dup: (1, 8),
         ..migration_config()
     };
-    let first = run(71, config());
-    let replay = run(71, config());
+    let first = run(15, config());
+    let replay = run(15, config());
     assert_eq!(first, replay);
     assert_clean(&first);
     assert_eq!(first.migrations, 1, "{first:?}");
@@ -143,6 +143,25 @@ fn return_migration_and_crash_preserve_every_page() {
     assert_eq!(report.migrations, 2, "{report:?}");
     assert!(report.releases >= 2, "{report:?}");
     assert_eq!(report.host_crashes, 2);
+}
+
+#[test]
+fn return_migration_waits_until_the_exact_prior_source_is_released() {
+    let mut config = migration_config();
+    config.migrate_at = vec![(millis(400), VolumeId(1), 1), (millis(800), VolumeId(1), 0)];
+    config.drop_peer = Some((PeerKind::Released, millis(400), millis(1_200)));
+    config.horizon = secs(3);
+
+    let report = run(1, config);
+
+    assert_clean(&report);
+    assert_eq!(report.migrations, 2, "{report:?}");
+    assert!(
+        report.nemesis_drops > 0,
+        "release blackout was not exercised"
+    );
+    assert!(report.releases >= 2, "{report:?}");
+    assert_eq!(report.guest_deaths, 0);
 }
 
 #[test]
@@ -261,7 +280,7 @@ fn forced_replica_fault_point_is_hit_and_idempotent() {
 }
 
 #[test]
-fn injected_replica_crash_cancels_and_recovers_the_host_actor_tree() {
+fn injected_primary_crash_cancels_and_recovers_the_host_actor_tree() {
     let mut config = blockd_sim::presets::peer_stash_chaos();
     config.peer_drop = (0, 1);
     config.peer_dup = (0, 1);
@@ -269,7 +288,8 @@ fn injected_replica_crash_cancels_and_recovers_the_host_actor_tree() {
     config.volume_count = 1;
     config.horizon = millis(800);
     config.think = (millis(2), millis(4));
-    let point = FaultPoint::CrashPrimaryAfterClosureCapture;
+    config.guest_sync_share = Some(blockd_exec::rng::Ppm::ALWAYS);
+    let point = FaultPoint::CrashPrimaryBeforeClosureCapture;
     config.fault_points = vec![point];
     let report = run(139, config);
     assert_clean(&report);

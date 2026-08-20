@@ -9,6 +9,13 @@ cargo test --doc --workspace
 
 If nextest is unavailable, use `cargo test --workspace`.
 
+The required merge checks are the macOS portable workflow's lint, workspace
+tests, workspace documentation tests, deterministic dynamic-membership sweep,
+and dependency-policy job, plus the Linux-kernel and simulation jobs. The
+Linux-kernel job also runs the runtime library, production daemon, and HostId
+lifecycle regressions that are compiled out on macOS. Dependency exceptions
+follow `DEPENDENCY_POLICY.md`.
+
 ## Linux integration
 
 The Linux suite covers userfaultfd, durable replica recovery, peer transport,

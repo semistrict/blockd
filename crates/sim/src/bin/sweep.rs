@@ -46,6 +46,8 @@ struct Coverage {
     peer_drops: u64,
     peer_dups: u64,
     peer_faults: u64,
+    certificate_auth_drops: u64,
+    certificate_renewed_frames: u64,
     replica_commits: u64,
     store_unavailable: u64,
     nvme_reclaims: u64,
@@ -79,6 +81,8 @@ impl Coverage {
         self.peer_drops += other.peer_drops;
         self.peer_dups += other.peer_dups;
         self.peer_faults += other.peer_faults;
+        self.certificate_auth_drops += other.certificate_auth_drops;
+        self.certificate_renewed_frames += other.certificate_renewed_frames;
         self.replica_commits += other.replica_commits;
         self.store_unavailable += other.store_unavailable;
         self.nvme_reclaims += other.nvme_reclaims;
@@ -119,6 +123,8 @@ impl Coverage {
                     .copied()
                     .unwrap_or(0)
             }),
+            CoverageMetric::CertificateAuthDrop => self.certificate_auth_drops,
+            CoverageMetric::CertificateRenewedFrame => self.certificate_renewed_frames,
             CoverageMetric::ReplicaCommit => self.replica_commits,
             CoverageMetric::StoreUnavailable => self.store_unavailable,
             CoverageMetric::NvmeReclaim => self.nvme_reclaims,
@@ -249,6 +255,8 @@ fn run_one(scenario: &Scenario, seed: u64) -> Outcome {
                 peer_drops: report.peer_drops,
                 peer_dups: report.peer_dups,
                 peer_faults: report.fault_coverage.values().sum(),
+                certificate_auth_drops: report.peer_certificate_authorization_drops,
+                certificate_renewed_frames: report.peer_renewed_certificate_frames,
                 replica_commits: report.replica_commits,
                 store_unavailable: report.store_unavailable,
                 guest_deaths: report.guest_deaths,

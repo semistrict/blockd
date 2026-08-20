@@ -1,0 +1,30 @@
+[Unit]
+Description=blockd storage host
+After=network-online.target local-fs.target
+Wants=network-online.target
+RequiresMountsFor=/var/opt/blockd/blobs
+ConditionPathIsMountPoint=/var/opt/blockd/blobs
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/blockd/blockd.env
+ExecStart=/usr/local/bin/blockd serve ${BLOCKD_STORE} --data-dir /var/opt/blockd --capacity-bytes ${BLOCKD_CAPACITY_BYTES} --headroom-bytes ${BLOCKD_HEADROOM_BYTES} --firecracker ${BLOCKD_FIRECRACKER} --firecracker-sha256 ${BLOCKD_FIRECRACKER_SHA256} --peer ${BLOCKD_PEER} --health ${BLOCKD_HEALTH} --control-socket /run/blockd/control.sock
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=1048576
+TasksMax=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RuntimeDirectory=blockd
+RuntimeDirectoryMode=0700
+ReadWritePaths=/var/opt/blockd /run/blockd
+
+[Install]
+WantedBy=multi-user.target

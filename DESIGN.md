@@ -50,6 +50,26 @@ artifact the holder writes — journal records, BLX files, manifests — lives
 under that fence in its names. A fenced former holder's writes dangle
 unreachably (R6.4) without any revocation protocol.
 
+### Object storage is the control plane
+
+The object store is the sole shared authority for membership and every
+control-plane transition. Joining, renewing or removing membership; changing
+placement or sessions; claiming authority; updating a per-volume head; and
+changing a replica assignment all use conditional operations against exact
+observed object versions. Peer protocols carry fenced data and observations,
+but never vote on or independently advance control state. An object-store
+outage therefore freezes control-plane changes: already-authorized data-plane
+work may continue only within its explicit validity bound, after which the
+holder self-fences. This deliberately trades control-plane availability for
+one split-brain mechanism rather than embedding a second consensus system.
+
+Small structured control records use bounded, canonical protobuf payloads
+inside the project's checksummed frames. This includes the single cluster and
+authority placement record, host sessions, peer membership, cluster/node/claim
+identity metadata, and routed peer-control envelopes. Protobuf defines their
+shape; object-store CAS remains the authority for every membership and
+control-plane state transition.
+
 ### Shared-memory fault handling
 
 Guest memory is shared memory the daemon populates; faults resolve by
@@ -92,7 +112,7 @@ wholly covered sealed spool files without entering the guest sync path.
 The per-volume head remains the global authority. Besides holder and writer
 fence, a peer-stashed head records one active stash, an assignment epoch, and
 at most one transition stash. Hosts derive an ordered candidate list from a
-versioned authenticated roster with deterministic weighted rendezvous hashing;
+versioned authenticated roster with deterministic rendezvous hashing;
 the list is placement preference, never replication. A failed active stash
 puts the volume in degraded mode: new sync replies queue, one replacement is
 named by head CAS, only the outstanding closure is seeded there, and a second

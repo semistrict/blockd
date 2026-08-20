@@ -10,14 +10,14 @@
 
 use std::fmt;
 
-use blockd_core::hostmeta::{HostConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{ClusterPlacementConfig, HostConfig};
 use blockd_core::journal::VolumeConfig;
-use blockd_core::placement::{PeerCandidate, rank_stash_candidates};
+use blockd_core::placement::rank_stash_candidates;
 use blockd_core::types::{HostId, VolumeId};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::cluster::{ClusterConfig, FaultPoint, PeerKind};
+use crate::cluster::{ClusterConfig, FaultPoint, MembershipEvent, PeerKind, RestartClass};
 use crate::harness::{FaultPlan, HarnessConfig};
 use crate::hash::Fnv64;
 use crate::model::{BlobDevConfig, StoreConfig};
@@ -75,6 +75,10 @@ const DOCUMENTS: &[(&str, &str)] = &[
         "peer-transition-after-active",
         include_str!("../scenarios/peer-transition-after-active.json"),
     ),
+    (
+        "dynamic-membership",
+        include_str!("../scenarios/dynamic-membership.json"),
+    ),
 ];
 
 /// Stable names accepted by the sweep runner.
@@ -94,6 +98,7 @@ pub const SWEEP_SCENARIOS: &[&str] = &[
     "peer-transition-before-cas",
     "peer-transition-after-seed",
     "peer-transition-after-active",
+    "dynamic-membership",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +139,8 @@ pub enum CoverageMetric {
     PeerDrop,
     PeerDuplicate,
     PeerFault,
+    CertificateAuthDrop,
+    CertificateRenewedFrame,
     ReplicaCommit,
     StoreUnavailable,
     NvmeReclaim,
@@ -344,14 +351,14 @@ impl Scenario {
                     interval: blockd_core::types::secs(1),
                     ..Default::default()
                 },
-                host: HostId(0),
+                host: HostId::new(0),
                 cache_pages,
                 writeback_interval,
                 backup_retry,
                 disk_capacity,
                 disk_headroom,
                 wedge_ticks: r.count(&daemon.wedge_ticks, "daemon.wedge-ticks")?,
-                replica_placement: None,
+                cluster_placement: None,
             },
             bdev,
             store,
@@ -372,9 +379,9 @@ impl Scenario {
                 "single-host scenarios cannot set cluster topology fields",
             ));
         }
-        if self.spec.topology.replica_placement.is_some() {
+        if self.spec.topology.cluster_placement.is_some() {
             return Err(ScenarioError::new(
-                "single-host scenarios cannot configure replica placement",
+                "single-host scenarios cannot configure cluster placement",
             ));
         }
         let nemeses = &self.spec.nemeses;
@@ -462,10 +469,10 @@ impl Scenario {
                 "cluster scenarios require at least two hosts",
             ));
         }
-        common.daemon.replica_placement = self
+        common.daemon.cluster_placement = self
             .spec
             .topology
-            .replica_placement
+            .cluster_placement
             .as_ref()
             .map(|placement| placement.realize(hosts, r))
             .transpose()?;
@@ -523,6 +530,7 @@ impl Scenario {
             migrate_at: Vec::new(),
             sabotage: None,
             guest_sync_share: common.guest_sync_share,
+            membership_events: Vec::new(),
         };
         config.kill_hosts_at =
             Self::resolve_scheduled_hosts(&config, r, &nemeses.kill_hosts, "nemeses.kill-hosts")?;
@@ -564,6 +572,94 @@ impl Scenario {
             .transpose()?
             .into_iter()
             .collect();
+        config.membership_events = nemeses
+            .membership_events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let at = r.duration(&event.at, &format!("nemeses.membership-events.{index}.at"))?;
+                let host = event
+                    .host
+                    .as_ref()
+                    .map(|host| r.u16(host, "membership event host"))
+                    .transpose()?;
+                if host.is_some_and(|host| host >= config.hosts) {
+                    return Err(ScenarioError::new(
+                        "membership event host is outside the topology",
+                    ));
+                }
+                let required_host =
+                    || host.ok_or_else(|| ScenarioError::new("membership event requires host"));
+                Ok(match event.action {
+                    MembershipActionSpec::Claim => MembershipEvent::Claim {
+                        at,
+                        host: required_host()?,
+                        token: r.count(
+                            event.token.as_ref().ok_or_else(|| {
+                                ScenarioError::new("membership claim requires token")
+                            })?,
+                            "membership event token",
+                        )?,
+                        commit_response_lost: event.commit_response_lost,
+                    },
+                    MembershipActionSpec::Publish => MembershipEvent::Publish {
+                        at,
+                        host: required_host()?,
+                        lease_duration: r.duration(
+                            event.lease_duration.as_ref().ok_or_else(|| {
+                                ScenarioError::new("membership publication requires lease-duration")
+                            })?,
+                            "membership event lease-duration",
+                        )?,
+                        certificate_generation: r.count(
+                            event.certificate_generation.as_ref().ok_or_else(|| {
+                                ScenarioError::new(
+                                    "membership publication requires certificate-generation",
+                                )
+                            })?,
+                            "membership certificate generation",
+                        )?,
+                        commit_response_lost: event.commit_response_lost,
+                    },
+                    MembershipActionSpec::Discover => MembershipEvent::Discover {
+                        at,
+                        observer: required_host()?,
+                        reverse_list: event.reverse_list,
+                        reverse_gets: event.reverse_gets,
+                    },
+                    MembershipActionSpec::RotateCertificate => MembershipEvent::RotateCertificate {
+                        at,
+                        host: required_host()?,
+                        certificate_generation: r.count(
+                            event.certificate_generation.as_ref().ok_or_else(|| {
+                                ScenarioError::new(
+                                    "certificate rotation requires certificate-generation",
+                                )
+                            })?,
+                            "membership certificate generation",
+                        )?,
+                        commit_response_lost: event.commit_response_lost,
+                    },
+                    MembershipActionSpec::Restart => MembershipEvent::Restart {
+                        at,
+                        host: required_host()?,
+                        downtime: r.duration(
+                            event.downtime.as_ref().ok_or_else(|| {
+                                ScenarioError::new("membership restart requires downtime")
+                            })?,
+                            "membership restart downtime",
+                        )?,
+                        class: match event.class.ok_or_else(|| {
+                            ScenarioError::new("membership restart requires class")
+                        })? {
+                            RestartClassSpec::Fast => RestartClass::Fast,
+                            RestartClassSpec::Slow => RestartClass::Slow,
+                            RestartClassSpec::Rolling => RestartClass::Rolling,
+                        },
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, ScenarioError>>()?;
         Ok(config)
     }
 
@@ -800,7 +896,7 @@ struct TopologySpec {
     volume_count: CountSpec,
     volume_kind: VolumeKindSpec,
     pages: CountSpec,
-    replica_placement: Option<PlacementSpec>,
+    cluster_placement: Option<PlacementSpec>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -813,41 +909,22 @@ enum VolumeKindSpec {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlacementSpec {
-    mode: PlacementMode,
     membership_epoch: CountSpec,
-    local_failure_domain: CountSpec,
 }
 
 impl PlacementSpec {
-    fn realize(&self, hosts: u16, r: &Realizer) -> Result<ReplicaPlacementConfig, ScenarioError> {
-        match self.mode {
-            PlacementMode::WeightedHosts => Ok(ReplicaPlacementConfig {
-                membership_epoch: r.count(
-                    &self.membership_epoch,
-                    "topology.replica-placement.membership-epoch",
-                )?,
-                local_failure_domain: r.u16(
-                    &self.local_failure_domain,
-                    "topology.replica-placement.local-failure-domain",
-                )?,
-                roster: (0..hosts)
-                    .map(|host| PeerCandidate {
-                        host: HostId(host),
-                        weight: host + 1,
-                        failure_domain: host + 1,
-                        drained: false,
-                    })
-                    .collect(),
-                authority: None,
-            }),
-        }
+    fn realize(&self, hosts: u16, r: &Realizer) -> Result<ClusterPlacementConfig, ScenarioError> {
+        Ok(ClusterPlacementConfig {
+            membership_epoch: r.count(
+                &self.membership_epoch,
+                "topology.cluster-placement.membership-epoch",
+            )?,
+            roster: (0..hosts)
+                .map(|host| HostId::new(u32::from(host)))
+                .collect(),
+            authority: None,
+        })
     }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum PlacementMode {
-    WeightedHosts,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -887,6 +964,44 @@ struct NemesisSpec {
     drop_peer: Option<DropPeerSpec>,
     race_restore: bool,
     migrate_at: Option<MigrateAtSpec>,
+    membership_events: Vec<MembershipEventSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipEventSpec {
+    at: DurationSpec,
+    action: MembershipActionSpec,
+    host: Option<CountSpec>,
+    token: Option<CountSpec>,
+    lease_duration: Option<DurationSpec>,
+    certificate_generation: Option<CountSpec>,
+    downtime: Option<DurationSpec>,
+    class: Option<RestartClassSpec>,
+    #[serde(default)]
+    commit_response_lost: bool,
+    #[serde(default)]
+    reverse_list: bool,
+    #[serde(default)]
+    reverse_gets: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum MembershipActionSpec {
+    Claim,
+    Publish,
+    Discover,
+    RotateCertificate,
+    Restart,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RestartClassSpec {
+    Fast,
+    Slow,
+    Rolling,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -942,7 +1057,6 @@ pub enum FaultPointSpec {
     CrashPrimaryAfterSeedBeforeActiveCas,
     CrashPrimaryAfterActiveCasBeforeCommit,
     CrashPrimaryBeforeClosureCapture,
-    CrashPrimaryAfterClosureCapture,
     CrashPrimaryDuringArtifactTransfer,
     CrashPeerAfterDataFlushBeforeCommit,
 }
@@ -968,7 +1082,6 @@ impl FaultPointSpec {
                 FaultPoint::CrashPrimaryAfterActiveCasBeforeCommit
             }
             Self::CrashPrimaryBeforeClosureCapture => FaultPoint::CrashPrimaryBeforeClosureCapture,
-            Self::CrashPrimaryAfterClosureCapture => FaultPoint::CrashPrimaryAfterClosureCapture,
             Self::CrashPrimaryDuringArtifactTransfer => {
                 FaultPoint::CrashPrimaryDuringArtifactTransfer
             }
@@ -1010,12 +1123,6 @@ enum PeerKindSpec {
     ReplicaStatusReply,
     ReplicaRelease,
     ReplicaReleaseAck,
-    VnodeAdopt,
-    VnodeAdoptAck,
-    VnodeFetchClosure,
-    VnodeClosure,
-    VnodeCommit,
-    VnodeCommitAck,
 }
 
 impl From<PeerKindSpec> for PeerKind {
@@ -1035,12 +1142,6 @@ impl From<PeerKindSpec> for PeerKind {
             PeerKindSpec::ReplicaStatusReply => Self::ReplicaStatusReply,
             PeerKindSpec::ReplicaRelease => Self::ReplicaRelease,
             PeerKindSpec::ReplicaReleaseAck => Self::ReplicaReleaseAck,
-            PeerKindSpec::VnodeAdopt => Self::VnodeAdopt,
-            PeerKindSpec::VnodeAdoptAck => Self::VnodeAdoptAck,
-            PeerKindSpec::VnodeFetchClosure => Self::VnodeFetchClosure,
-            PeerKindSpec::VnodeClosure => Self::VnodeClosure,
-            PeerKindSpec::VnodeCommit => Self::VnodeCommit,
-            PeerKindSpec::VnodeCommitAck => Self::VnodeCommitAck,
         }
     }
 }
@@ -1240,19 +1341,20 @@ fn resolve_host(
         HostSelector::Id(value) => r.u16(value, path)?,
         HostSelector::StashRank { stash_rank } => {
             let rank = r.usize(stash_rank, &format!("{path}.stash-rank"))?;
-            let placement = config.daemon.replica_placement.as_ref().ok_or_else(|| {
-                ScenarioError::new(format!("{path}: stash-rank requires replica placement"))
+            let placement = config.daemon.cluster_placement.as_ref().ok_or_else(|| {
+                ScenarioError::new(format!("{path}: stash-rank requires cluster placement"))
             })?;
             rank_stash_candidates(
                 placement.membership_epoch,
                 config.daemon.host,
-                placement.local_failure_domain,
                 VolumeId(1),
                 &placement.roster,
             )
             .get(rank)
             .ok_or_else(|| ScenarioError::new(format!("{path}: stash rank {rank} is unavailable")))?
-            .0
+            .get()
+            .try_into()
+            .map_err(|_| ScenarioError::new(format!("{path}: host ID does not fit topology")))?
         }
     };
     if host >= config.hosts {

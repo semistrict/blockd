@@ -18,9 +18,9 @@ macro_rules! simulate {
 }
 
 use super::{
-    ADMIN_CONCURRENCY, FAULT_CONCURRENCY, admin_source, fault_source, handle_admin, host_actor,
-    host_actor_with_state, reclaim_backed_blx_files, reconcile_backed_volumes,
-    schedule_volume_work, scheduled_work_source, sync_source, work_ready,
+    ADMIN_CONCURRENCY, CriticalChildSource, FAULT_CONCURRENCY, admin_source, fault_source,
+    handle_admin, host_actor, host_actor_with_state, reclaim_backed_blx_files,
+    reconcile_backed_volumes, schedule_volume_work, scheduled_work_source, sync_source, work_ready,
 };
 use crate::blx::{BlockKey, BlxObject};
 use crate::engine::migration::{available_inbound_fence, migrate_in};
@@ -28,11 +28,12 @@ use crate::engine::peer_source;
 use crate::engine::state::{CaptureKind, MutationOwner, PendingSync, ReplicaKey, ReplicaState};
 use crate::engine::{HostFatal, HostState, capture_local, checkpoint_local, cleanup_local};
 use crate::head::{HeadRecord, StashAssignment};
-use crate::hostmeta::{HostConfig as DaemonConfig, ReplicaPlacementConfig};
+use crate::hostmeta::{AuthorityHostConfig, ClusterPlacementConfig, HostConfig as DaemonConfig};
 use crate::journal::{JournalRecord, RecordKind, VolumeConfig};
 use crate::layout;
-use crate::manifest::{Manifest, RecoveryKind};
+use crate::manifest::{BaseManifest, Manifest, RecoveryKind};
 use crate::page_file::{PageFileLoc, open_entry};
+use crate::placement::ClusterPlacement;
 use crate::protocol::{
     AdminCall, AdminError, AdminEvent, AdminResult, AdminSuccess, PeerMsg, PeerRequestId,
     ReplicaArtifact, ReplicaCommitInfo, ReqId, StoreFault,
@@ -44,28 +45,23 @@ use crate::world::{
 };
 
 type ModelStore = Rc<RefCell<BTreeMap<String, (u64, Vec<u8>)>>>;
-const TEST_PASSIVE: HostId = HostId(u16::MAX);
+const TEST_PASSIVE: HostId = HostId::new(u32::MAX);
 
-fn test_replica_placement(local: HostId) -> Option<ReplicaPlacementConfig> {
-    use crate::placement::PeerCandidate;
+fn test_cluster_placement(local: HostId) -> Option<ClusterPlacementConfig> {
+    test_cluster_placement_with(local, &[])
+}
 
-    Some(ReplicaPlacementConfig {
+fn test_cluster_placement_with(
+    local: HostId,
+    additional: &[HostId],
+) -> Option<ClusterPlacementConfig> {
+    let mut roster = vec![local, TEST_PASSIVE];
+    roster.extend_from_slice(additional);
+    roster.sort_unstable();
+    roster.dedup();
+    Some(ClusterPlacementConfig {
         membership_epoch: 1,
-        local_failure_domain: local.0,
-        roster: vec![
-            PeerCandidate {
-                host: local,
-                weight: 1,
-                failure_domain: local.0,
-                drained: false,
-            },
-            PeerCandidate {
-                host: TEST_PASSIVE,
-                weight: 1,
-                failure_domain: TEST_PASSIVE.0,
-                drained: false,
-            },
-        ],
+        roster,
         authority: None,
     })
 }
@@ -80,6 +76,7 @@ struct ModelWorld {
     sync_ok: Rc<RefCell<Vec<ReqId>>>,
     cancel_sync_replies: Cell<bool>,
     blobs: RefCell<BTreeMap<String, Vec<u8>>>,
+    blob_scans: Cell<u64>,
     blob_write_delay: Cell<u64>,
     blob_read_delay: Cell<u64>,
     guest_read_delay: Cell<u64>,
@@ -91,6 +88,7 @@ struct ModelWorld {
     slow_guest_volume: Cell<Option<VolumeId>>,
     store: ModelStore,
     next_store_version: Rc<Cell<u64>>,
+    store_unavailable: Cell<bool>,
     store_get_delay: Cell<u64>,
     store_get_inflight: Cell<usize>,
     store_get_max_inflight: Cell<usize>,
@@ -103,6 +101,7 @@ struct ModelWorld {
     peer_inbox: RefCell<VecDeque<(HostId, PeerMsg)>>,
     peer_outbox: RefCell<Vec<(HostId, PeerMsg)>>,
     peer_send_delay: Cell<u64>,
+    write_protected: RefCell<Vec<PageId>>,
     unprotected: RefCell<Vec<PageId>>,
     remapped: RefCell<Vec<(PageId, bool)>>,
     writes_after_unprotect: RefCell<BTreeMap<PageId, Vec<u8>>>,
@@ -133,8 +132,36 @@ fn deliver(from: HostId, source: &ModelWorld, destination: &ModelWorld, to: Host
     }
 }
 
+fn publish_replica_authorizing_head(
+    world: &ModelWorld,
+    source: HostId,
+    passive: HostId,
+    volume: VolumeId,
+    assignment_epoch: u64,
+) {
+    let head = HeadRecord {
+        volume,
+        holder: source,
+        fence: 1,
+        manifest: None,
+        stash: Some(StashAssignment {
+            assignment_epoch,
+            active_peer: passive,
+            active_assignment_epoch: assignment_epoch,
+            transition_peer: None,
+            membership_epoch: 1,
+        }),
+        retired_stashes: Vec::new(),
+    };
+    world
+        .store
+        .borrow_mut()
+        .insert(layout::head_key(volume), (1, head.encode()));
+}
+
 impl Blobs for ModelWorld {
     async fn scan(&self) -> Result<Vec<BlobEntry>, BlobError> {
+        self.blob_scans.set(self.blob_scans.get() + 1);
         Ok(self
             .blobs
             .borrow()
@@ -160,6 +187,23 @@ impl Blobs for ModelWorld {
             .or_default()
             .extend_from_slice(&bytes);
         Ok(())
+    }
+
+    async fn replace_tail_if_len(
+        &self,
+        name: String,
+        expected_total_len: u64,
+        valid_prefix_len: u64,
+        bytes: Vec<u8>,
+    ) -> Result<bool, BlobError> {
+        let mut blobs = self.blobs.borrow_mut();
+        let entry = blobs.entry(name).or_default();
+        if entry.len() as u64 != expected_total_len {
+            return Ok(false);
+        }
+        entry.truncate(usize::try_from(valid_prefix_len).map_err(|_| BlobError::Io)?);
+        entry.extend_from_slice(&bytes);
+        Ok(true)
     }
 
     async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError> {
@@ -200,6 +244,9 @@ impl Blobs for ModelWorld {
 
 impl Store for ModelWorld {
     async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
+        if self.store_unavailable.get() {
+            return Err(StoreFault::Unavailable.into());
+        }
         let version = self.next_store_version.get() + 1;
         self.next_store_version.set(version);
         self.store.borrow_mut().insert(key, (version, bytes));
@@ -212,6 +259,9 @@ impl Store for ModelWorld {
         expected: Option<u64>,
         bytes: Vec<u8>,
     ) -> Result<u64, StoreError> {
+        if self.store_unavailable.get() {
+            return Err(StoreFault::Unavailable.into());
+        }
         let actual = self.store.borrow().get(&key).map(|(version, _)| *version);
         if actual != expected {
             return Err(StoreError::Fault(StoreFault::CasConflict { actual }));
@@ -223,6 +273,9 @@ impl Store for ModelWorld {
     }
 
     async fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        if self.store_unavailable.get() {
+            return Err(StoreFault::Unavailable.into());
+        }
         self.store_gets.borrow_mut().push(key.to_owned());
         let inflight = self.store_get_inflight.get() + 1;
         self.store_get_inflight.set(inflight);
@@ -243,6 +296,9 @@ impl Store for ModelWorld {
         offset: u64,
         len: u64,
     ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        if self.store_unavailable.get() {
+            return Err(StoreFault::Unavailable.into());
+        }
         self.store_range_gets.borrow_mut().push(key.to_owned());
         Ok(self.store.borrow().get(key).map(|(version, bytes)| {
             let start = usize::try_from(offset.min(bytes.len() as u64)).expect("fits");
@@ -252,10 +308,16 @@ impl Store for ModelWorld {
     }
 
     async fn delete(&self, key: &str) -> Result<bool, StoreError> {
+        if self.store_unavailable.get() {
+            return Err(StoreFault::Unavailable.into());
+        }
         Ok(self.store.borrow_mut().remove(key).is_some())
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        if self.store_unavailable.get() {
+            return Err(StoreFault::Unavailable.into());
+        }
         Ok(self
             .store
             .borrow()
@@ -272,6 +334,9 @@ impl Peers for ModelWorld {
             delay(self.peer_send_delay.get()).await;
         }
         if to == TEST_PASSIVE {
+            if self.store_unavailable.get() {
+                return;
+            }
             match message {
                 PeerMsg::ReplicaStatus {
                     volume,
@@ -339,7 +404,8 @@ impl Peers for ModelWorld {
     }
 
     async fn recv(&self) -> Option<(HostId, PeerMsg)> {
-        Some(next(&self.peer_inbox).await)
+        let (from, message) = next(&self.peer_inbox).await;
+        Some((from, message))
     }
 }
 
@@ -355,10 +421,11 @@ impl GuestMem for ModelWorld {
             .unwrap_or_else(|| vec![0; page_size()])
     }
 
-    async fn arm_write_protect(&self, _pages: &[PageId]) -> Result<(), GuestMemoryError> {
+    async fn arm_write_protect(&self, pages: &[PageId]) -> Result<(), GuestMemoryError> {
         if self.fail_write_protect.get() {
             Err(GuestMemoryError::Unavailable)
         } else {
+            self.write_protected.borrow_mut().extend_from_slice(pages);
             Ok(())
         }
     }
@@ -520,40 +587,129 @@ impl AdminIo for ModelWorld {
 }
 
 #[tokio::test(start_paused = true)]
-async fn live_membership_update_becomes_current_and_retains_prior_authorization() {
+async fn live_membership_update_becomes_current_without_retaining_prior_roster() {
     simulate!(27, async move {
-        let initial = test_replica_placement(HostId(1)).expect("initial placement");
+        let initial = test_cluster_placement(HostId::new(1)).expect("initial placement");
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 4,
             writeback_interval: 5,
             backup_retry: 5,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(initial.clone()),
+            cluster_placement: Some(initial.clone()),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         let world = Rc::new(ModelWorld::default());
         let mut updated = initial.clone();
         updated.membership_epoch = 2;
-        updated.roster.push(crate::placement::PeerCandidate {
-            host: HostId(7),
-            weight: 1,
-            failure_domain: 7,
-            drained: false,
-        });
-        updated.roster.sort_by_key(|candidate| candidate.host);
-        let (update, reply) = request(AdminCall::UpdateReplicaPlacement {
+        updated.roster.push(HostId::new(7));
+        updated.roster.sort_unstable();
+        let (update, reply) = request(AdminCall::UpdateClusterPlacement {
             placement: updated.clone(),
         });
         handle_admin(Rc::clone(&state), world, update).await;
 
-        assert_eq!(reply.await, Ok(Ok(AdminSuccess::ReplicaPlacementUpdated)));
+        assert_eq!(reply.await, Ok(Ok(AdminSuccess::ClusterPlacementUpdated)));
         let host = state.borrow();
-        assert_eq!(host.config.replica_placement.as_ref(), Some(&updated));
-        assert_eq!(host.replica_placement_history, [initial]);
+        assert_eq!(host.config.cluster_placement.as_ref(), Some(&updated));
+    });
+}
+
+/// PROD-016: membership churn replaces one constant-size current snapshot;
+/// authorization never retains or scans prior rosters.
+#[tokio::test(start_paused = true)]
+async fn placement_churn_replaces_one_bounded_snapshot() {
+    simulate!(28, async move {
+        let initial = test_cluster_placement(HostId::new(1)).expect("initial placement");
+        let config = DaemonConfig {
+            archive: Default::default(),
+            host: HostId::new(1),
+            cache_pages: 4,
+            writeback_interval: 5,
+            backup_retry: 5,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: Some(initial),
+        };
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        let world = Rc::new(ModelWorld::default());
+        for membership_epoch in 2..=512 {
+            let mut placement = test_cluster_placement(HostId::new(1)).expect("placement");
+            placement.membership_epoch = membership_epoch;
+            let (update, reply) = request(AdminCall::UpdateClusterPlacement { placement });
+            handle_admin(Rc::clone(&state), Rc::clone(&world), update).await;
+            assert_eq!(reply.await, Ok(Ok(AdminSuccess::ClusterPlacementUpdated)));
+        }
+
+        assert_eq!(
+            state
+                .borrow()
+                .config
+                .cluster_placement
+                .as_ref()
+                .map(|placement| placement.membership_epoch),
+            Some(512)
+        );
+        assert!(state.borrow().replicas.is_empty());
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn durable_replica_retry_does_not_retain_roster_history() {
+    simulate!(29, async move {
+        let initial = test_cluster_placement(HostId::new(1)).expect("initial placement");
+        let config = DaemonConfig {
+            archive: Default::default(),
+            host: HostId::new(1),
+            cache_pages: 4,
+            writeback_interval: 5,
+            backup_retry: 5,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: Some(initial),
+        };
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        let world = Rc::new(ModelWorld::default());
+        let durable = ReplicaKey {
+            source: HostId::new(7),
+            volume: VolumeId(99),
+            assignment_epoch: 1,
+        };
+
+        for membership_epoch in 2..=8 {
+            let mut placement = test_cluster_placement(HostId::new(1)).expect("placement");
+            placement.membership_epoch = membership_epoch;
+            if membership_epoch == 4 {
+                placement.roster.push(durable.source);
+                placement.roster.sort_unstable();
+            }
+            let (update, reply) = request(AdminCall::UpdateClusterPlacement { placement });
+            handle_admin(Rc::clone(&state), Rc::clone(&world), update).await;
+            assert_eq!(reply.await, Ok(Ok(AdminSuccess::ClusterPlacementUpdated)));
+            if membership_epoch == 4 {
+                state
+                    .borrow_mut()
+                    .replicas
+                    .insert(durable, ReplicaState::default());
+            }
+        }
+
+        assert_eq!(
+            state
+                .borrow()
+                .config
+                .cluster_placement
+                .as_ref()
+                .map(|placement| placement.membership_epoch),
+            Some(8)
+        );
+        assert!(state.borrow().replicas.contains_key(&durable));
+        state.borrow_mut().replicas.remove(&durable);
     });
 }
 
@@ -562,14 +718,14 @@ async fn child_fatal_signal_reaches_the_root_and_stops_the_actor_tree() {
     simulate!(9, async move {
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 4,
             writeback_interval: 5,
             backup_retry: 5,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         let world = Rc::new(ModelWorld::default());
@@ -587,19 +743,112 @@ async fn child_fatal_signal_reaches_the_root_and_stops_the_actor_tree() {
     });
 }
 
+fn critical_child_config(authority: bool) -> DaemonConfig {
+    let host = HostId::new(1);
+    let mut cluster_placement = test_cluster_placement(host).expect("placement");
+    if authority {
+        cluster_placement.authority = Some(AuthorityHostConfig {
+            cluster_id: 7,
+            poll_interval: 2,
+            max_poll_staleness: 10,
+            challenge_interval: 20,
+        });
+    }
+    DaemonConfig {
+        archive: Default::default(),
+        host,
+        cache_pages: 4,
+        writeback_interval: 5,
+        backup_retry: 5,
+        disk_capacity: None,
+        disk_headroom: 0,
+        wedge_ticks: 0,
+        cluster_placement: Some(cluster_placement),
+    }
+}
+
+async fn assert_critical_child_termination(source: CriticalChildSource) {
+    let authority = matches!(source, CriticalChildSource::SessionMonitor);
+    let config = critical_child_config(authority);
+    let state = Rc::new(RefCell::new(HostState::new(config)));
+    state.borrow_mut().inject_critical_child_failure(source);
+    let world = Rc::new(ModelWorld::default());
+    if authority {
+        let placement =
+            ClusterPlacement::new(7, 1, vec![HostId::new(1), HostId::new(2), HostId::new(3)])
+                .expect("authority placement");
+        world
+            .store
+            .borrow_mut()
+            .insert(layout::placement_key(), (1, placement.encode()));
+        world.next_store_version.set(1);
+    }
+
+    let actor = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+    blockd_exec::run_ready().await;
+
+    assert_eq!(
+        *world.host_failures.borrow(),
+        [HostFatal::new(source.fatal_reason())]
+    );
+    assert_eq!(actor.await, Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_monitor_termination_is_host_fatal_when_authority_is_enabled() {
+    simulate!(97, async move {
+        assert_critical_child_termination(CriticalChildSource::SessionMonitor).await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn admin_source_termination_is_host_fatal() {
+    simulate!(98, async move {
+        assert_critical_child_termination(CriticalChildSource::Admin).await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn fault_source_termination_is_host_fatal() {
+    simulate!(99, async move {
+        assert_critical_child_termination(CriticalChildSource::Fault).await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn sync_source_termination_is_host_fatal() {
+    simulate!(100, async move {
+        assert_critical_child_termination(CriticalChildSource::Sync).await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn peer_source_termination_is_host_fatal() {
+    simulate!(101, async move {
+        assert_critical_child_termination(CriticalChildSource::Peer).await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn scheduled_work_source_termination_is_host_fatal() {
+    simulate!(102, async move {
+        assert_critical_child_termination(CriticalChildSource::ScheduledWork).await;
+    });
+}
+
 fn pressure_reclaim_fixture() -> (Rc<RefCell<HostState>>, Rc<ModelWorld>, VolumeId, u64) {
     let volume = VolumeId(70);
     let stale_blx = ObjectId(1);
     let config = DaemonConfig {
         archive: Default::default(),
-        host: HostId(1),
+        host: HostId::new(1),
         cache_pages: 1,
         writeback_interval: 1,
         backup_retry: 1,
         disk_capacity: Some(100),
         disk_headroom: 10,
         wedge_ticks: 0,
-        replica_placement: test_replica_placement(HostId(1)),
+        cluster_placement: test_cluster_placement(HostId::new(1)),
     };
     let state = Rc::new(RefCell::new(HostState::new(config)));
     let world = Rc::new(ModelWorld::default());
@@ -616,8 +865,8 @@ fn pressure_reclaim_fixture() -> (Rc<RefCell<HostState>>, Rc<ModelWorld>, Volume
         host.disk_reclaim_requested = true;
     }
     world.blobs.borrow_mut().insert(stale_name, vec![0; 20]);
-    let incarnation = state.borrow().volumes[&volume].incarnation;
-    (state, world, volume, incarnation)
+    let run_generation = state.borrow().volumes[&volume].run_generation;
+    (state, world, volume, run_generation)
 }
 
 #[tokio::test(start_paused = true)]
@@ -640,11 +889,11 @@ async fn partial_backed_reclaim_keeps_pressure_above_the_data_watermark() {
 #[tokio::test(start_paused = true)]
 async fn partial_cleanup_keeps_pressure_above_the_data_watermark() {
     simulate!(94, async move {
-        let (state, world, volume, incarnation) = pressure_reclaim_fixture();
+        let (state, world, volume, run_generation) = pressure_reclaim_fixture();
         let task_state = Rc::clone(&state);
         let task_world = Rc::clone(&world);
 
-        cleanup_local(task_state, task_world.as_ref(), volume, incarnation)
+        cleanup_local(task_state, task_world.as_ref(), volume, run_generation)
             .await
             .expect("cleanup succeeds");
 
@@ -661,27 +910,27 @@ async fn peer_fetch_replies_only_wake_the_expected_source_waiter() {
         let state = Rc::new(RefCell::new(super::super::state::HostState::new(
             DaemonConfig {
                 archive: Default::default(),
-                host: HostId(1),
+                host: HostId::new(1),
                 cache_pages: 1,
                 writeback_interval: 1,
                 backup_retry: 1,
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 0,
-                replica_placement: test_replica_placement(HostId(1)),
+                cluster_placement: test_cluster_placement(HostId::new(1)),
             },
         )));
-        let (io, receive) = state.borrow().peer_client.page(HostId(9));
+        let (io, receive) = state.borrow().peer_client.page(HostId::new(9));
         world.peer_inbox.borrow_mut().extend([
             (
-                HostId(8),
+                HostId::new(8),
                 PeerMsg::Page {
                     io,
                     bytes: Some(vec![8]),
                 },
             ),
             (
-                HostId(9),
+                HostId::new(9),
                 PeerMsg::Page {
                     io,
                     bytes: Some(vec![9]),
@@ -702,14 +951,14 @@ async fn slow_peer_storage_does_not_block_an_unrelated_reply() {
         world.blob_read_delay.set(50);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         })));
         let volume = VolumeId(7);
         {
@@ -717,12 +966,12 @@ async fn slow_peer_storage_does_not_block_an_unrelated_reply() {
             host.insert_fresh(volume, VolumeConfig::data(1));
             let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
             volume_state.ready = true;
-            volume_state.outbound = Some(HostId(2));
+            volume_state.outbound = Some(HostId::new(2));
         }
-        let (reply_io, reply) = state.borrow().peer_client.page(HostId(9));
+        let (reply_io, reply) = state.borrow().peer_client.page(HostId::new(9));
         world.peer_inbox.borrow_mut().extend([
             (
-                HostId(2),
+                HostId::new(2),
                 PeerMsg::FetchRange {
                     io: PeerRequestId(100),
                     volume,
@@ -734,7 +983,7 @@ async fn slow_peer_storage_does_not_block_an_unrelated_reply() {
                 },
             ),
             (
-                HostId(9),
+                HostId::new(9),
                 PeerMsg::Page {
                     io: reply_io,
                     bytes: Some(vec![9]),
@@ -756,7 +1005,7 @@ async fn slow_peer_storage_does_not_block_an_unrelated_reply() {
 async fn passive_range_reads_require_the_committed_assignment() {
     simulate!(94, async move {
         let world = Rc::new(ModelWorld::default());
-        let source = HostId(2);
+        let source = HostId::new(2);
         let volume = VolumeId(7);
         let assignment_epoch = 9;
         let artifact = ReplicaArtifact::Blx {
@@ -766,14 +1015,14 @@ async fn passive_range_reads_require_the_committed_assignment() {
         let bytes = vec![10, 11, 12, 13, 14];
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         })));
         state.borrow_mut().replicas.insert(
             ReplicaKey {
@@ -846,14 +1095,14 @@ async fn peer_storage_ingress_defers_overload_without_false_missing_data() {
         world.blob_read_delay.set(50);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         })));
         let volume = VolumeId(7);
         {
@@ -861,11 +1110,11 @@ async fn peer_storage_ingress_defers_overload_without_false_missing_data() {
             host.insert_fresh(volume, VolumeConfig::data(1));
             let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
             volume_state.ready = true;
-            volume_state.outbound = Some(HostId(2));
+            volume_state.outbound = Some(HostId::new(2));
         }
         world.peer_inbox.borrow_mut().extend((0..80).map(|io| {
             (
-                HostId(2),
+                HostId::new(2),
                 PeerMsg::FetchRange {
                     io: PeerRequestId(io),
                     volume,
@@ -891,12 +1140,11 @@ async fn peer_storage_ingress_defers_overload_without_false_missing_data() {
 #[tokio::test(start_paused = true)]
 async fn saturated_replica_route_defers_to_retry_without_blocking_unrelated_replies() {
     simulate!(96, async move {
-        use crate::placement::PeerCandidate;
-
-        let source = HostId(2);
-        let local = HostId(1);
+        let source = HostId::new(2);
+        let local = HostId::new(1);
         let volume = VolumeId(7);
         let world = Rc::new(ModelWorld::default());
+        publish_replica_authorizing_head(&world, source, local, volume, 1);
         world.peer_send_delay.set(5);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
@@ -907,28 +1155,17 @@ async fn saturated_replica_route_defers_to_retry_without_blocking_unrelated_repl
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(ReplicaPlacementConfig {
+            cluster_placement: Some(ClusterPlacementConfig {
                 membership_epoch: 1,
-                local_failure_domain: 1,
-                roster: vec![
-                    PeerCandidate {
-                        host: source,
-                        weight: 1,
-                        failure_domain: 2,
-                        drained: false,
-                    },
-                    PeerCandidate {
-                        host: local,
-                        weight: 1,
-                        failure_domain: 1,
-                        drained: false,
-                    },
-                ],
+                roster: vec![local, source],
                 authority: None,
             }),
         })));
-        let (page_io, page_reply) = state.borrow().peer_client.page(HostId(9));
-        let replica_reply = state.borrow().peer_client.status(HostId(9), VolumeId(9), 1);
+        let (page_io, page_reply) = state.borrow().peer_client.page(HostId::new(9));
+        let replica_reply = state
+            .borrow()
+            .peer_client
+            .status(HostId::new(9), VolumeId(9), 1);
         world.peer_inbox.borrow_mut().extend((0..300).map(|_| {
             (
                 source,
@@ -939,14 +1176,14 @@ async fn saturated_replica_route_defers_to_retry_without_blocking_unrelated_repl
             )
         }));
         world.peer_inbox.borrow_mut().push_back((
-            HostId(9),
+            HostId::new(9),
             PeerMsg::Page {
                 io: page_io,
                 bytes: Some(vec![9]),
             },
         ));
         world.peer_inbox.borrow_mut().push_back((
-            HostId(9),
+            HostId::new(9),
             PeerMsg::ReplicaStatusReply {
                 volume: VolumeId(9),
                 assignment_epoch: 1,
@@ -986,14 +1223,14 @@ async fn administrative_ingress_stops_at_the_actor_limit() {
         );
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         })));
         let mut actor = spawn(admin_source(Rc::clone(&state), Rc::clone(&world)));
         blockd_exec::advance_to(2).await;
@@ -1010,14 +1247,14 @@ async fn guest_fault_ingress_stops_at_the_actor_limit() {
         world.guest_fill_delay.set(100);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: FAULT_CONCURRENCY + 1,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -1055,14 +1292,14 @@ async fn slow_sync_capture_does_not_block_ingestion_for_another_volume() {
         world.guest_read_delay.set(50);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 4,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         })));
         let first_page = PageId {
             volume: VolumeId(1),
@@ -1119,14 +1356,14 @@ async fn sync_durability_waiters_apply_backpressure_at_the_global_cap() {
         let volume = VolumeId(1);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -1166,14 +1403,14 @@ async fn cancelled_sync_callers_release_admission_for_later_requests() {
         let volume = VolumeId(1);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -1212,14 +1449,14 @@ async fn scheduled_work_refills_capacity_within_one_writeback_cadence() {
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 100,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let (resolved, _resolutions) = unbounded();
         {
@@ -1267,14 +1504,14 @@ async fn host_wide_pressure_never_asks_the_passive_to_archive() {
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 1,
             backup_retry: 1,
             disk_capacity: Some(1),
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let volume = VolumeId(1);
         {
@@ -1283,7 +1520,7 @@ async fn host_wide_pressure_never_asks_the_passive_to_archive() {
             let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
             volume_state.stash_assignment = Some(StashAssignment {
                 assignment_epoch: 3,
-                active_peer: HostId(2),
+                active_peer: HostId::new(2),
                 active_assignment_epoch: 3,
                 transition_peer: None,
                 membership_epoch: 1,
@@ -1314,14 +1551,14 @@ async fn scheduler_keeps_capacity_wakeups_that_race_with_handle_reaping() {
         world.blob_write_delay.set(100);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 100,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let (resolved, _resolutions) = unbounded();
         {
@@ -1377,14 +1614,14 @@ async fn stalled_maintenance_attempts_cannot_monopolize_scheduler_capacity() {
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 100,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let (resolved, _resolutions) = unbounded();
         {
@@ -1399,7 +1636,7 @@ async fn stalled_maintenance_attempts_cannot_monopolize_scheduler_capacity() {
                 let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
                 volume_state.ready = true;
                 volume_state.fence = 2;
-                volume_state.peer_source = Some(HostId(2));
+                volume_state.peer_source = Some(HostId::new(2));
                 volume_state.page_locs.insert(
                     page,
                     (
@@ -1451,14 +1688,14 @@ async fn multi_work_volumes_do_not_count_unadmitted_later_ids_as_examined() {
         world.blob_write_delay.set(10);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 100,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let (resolved, _resolutions) = unbounded();
         {
@@ -1480,7 +1717,7 @@ async fn multi_work_volumes_do_not_count_unadmitted_later_ids_as_examined() {
                     ));
                 }
                 if number <= 32 {
-                    volume_state.peer_source = Some(HostId(2));
+                    volume_state.peer_source = Some(HostId::new(2));
                 }
                 host.schedule_volume(volume);
             }
@@ -1509,14 +1746,14 @@ async fn capacity_requeued_work_finishes_in_the_same_scheduler_cadence() {
         world.blob_write_delay.set(10);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 100,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let (resolved, _resolutions) = unbounded();
         {
@@ -1536,7 +1773,7 @@ async fn capacity_requeued_work_finishes_in_the_same_scheduler_cadence() {
                     resolved.clone(),
                 ));
                 if number == 64 {
-                    volume_state.peer_source = Some(HostId(2));
+                    volume_state.peer_source = Some(HostId::new(2));
                 }
                 host.schedule_volume(volume);
             }
@@ -1571,14 +1808,14 @@ async fn no_progress_maintenance_retries_once_per_cadence_under_saturation() {
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 1,
             writeback_interval: 100,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -1587,7 +1824,7 @@ async fn no_progress_maintenance_retries_once_per_cadence_under_saturation() {
                 host.insert_fresh(volume, VolumeConfig::data(1));
                 let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
                 volume_state.ready = true;
-                volume_state.peer_source = Some(HostId(2));
+                volume_state.peer_source = Some(HostId::new(2));
                 host.schedule_volume(volume);
             }
         }
@@ -1620,14 +1857,14 @@ async fn idle_ten_thousand_volumes_schedule_no_child_work_in_bounded_polls() {
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 4,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         })));
         {
             let mut host = state.borrow_mut();
@@ -1671,14 +1908,14 @@ async fn idle_ten_thousand_volumes_schedule_no_child_work_in_bounded_polls() {
 fn scheduled_volume_batches_rotate_past_continuously_rescheduled_low_ids() {
     let mut host = HostState::new(DaemonConfig {
         archive: Default::default(),
-        host: HostId(1),
+        host: HostId::new(1),
         cache_pages: 4,
         writeback_interval: 1_000,
         backup_retry: 1,
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 0,
-        replica_placement: test_replica_placement(HostId(1)),
+        cluster_placement: test_cluster_placement(HostId::new(1)),
     });
     for number in 1..=128 {
         let volume = VolumeId(number);
@@ -1702,14 +1939,14 @@ fn published_record_is_not_replicated_again_until_local_state_advances() {
     let config = VolumeConfig::data(8);
     let mut host = HostState::new(DaemonConfig {
         archive: Default::default(),
-        host: HostId(1),
+        host: HostId::new(1),
         cache_pages: 4,
         writeback_interval: 1_000,
         backup_retry: 1,
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 0,
-        replica_placement: test_replica_placement(HostId(1)),
+        cluster_placement: test_cluster_placement(HostId::new(1)),
     });
     host.insert_fresh(volume, config);
     let record = JournalRecord {
@@ -1767,14 +2004,14 @@ async fn startup_reconciliation_is_bounded_and_emits_in_volume_order() {
         world.store_get_delay.set(10);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(1),
+            host: HostId::new(1),
             cache_pages: 4,
             writeback_interval: 1_000,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(1)),
+            cluster_placement: test_cluster_placement(HostId::new(1)),
         })));
         let volumes = (1..=65).map(VolumeId).collect::<Vec<_>>();
         {
@@ -1810,6 +2047,149 @@ async fn startup_reconciliation_is_bounded_and_emits_in_volume_order() {
     });
 }
 
+/// Regression PROD-003: startup must not fence a healthy durable volume merely
+/// because the daemon has not installed the live membership epoch yet.
+#[tokio::test(start_paused = true)]
+async fn startup_waits_for_live_placement_before_reconciling_a_newer_stash_epoch() {
+    simulate!(96, async move {
+        let volume = VolumeId(96);
+        let world = Rc::new(ModelWorld::default());
+        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
+            archive: Default::default(),
+            host: HostId::new(1),
+            cache_pages: 4,
+            writeback_interval: 1_000,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: test_cluster_placement(HostId::new(1)),
+        })));
+        {
+            let mut host = state.borrow_mut();
+            host.insert_fresh(volume, VolumeConfig::data(1));
+            host.volumes
+                .get_mut(&volume)
+                .expect("inserted volume")
+                .operations
+                .set_recovery(crate::protocol::Verdict::ColdBoot);
+        }
+        world.store.borrow_mut().insert(
+            layout::head_key(volume),
+            (
+                1,
+                HeadRecord {
+                    volume,
+                    holder: HostId::new(1),
+                    fence: 0,
+                    manifest: None,
+                    stash: Some(StashAssignment {
+                        assignment_epoch: 1,
+                        active_peer: TEST_PASSIVE,
+                        active_assignment_epoch: 1,
+                        transition_peer: None,
+                        membership_epoch: 9,
+                    }),
+                    retired_stashes: Vec::new(),
+                }
+                .encode(),
+            ),
+        );
+
+        let reconcile_state = Rc::clone(&state);
+        let reconcile_world = Rc::clone(&world);
+        let reconcile = blockd_exec::spawn(async move {
+            reconcile_backed_volumes(&reconcile_state, &reconcile_world, &[volume]).await
+        });
+        delay(1).await;
+        state
+            .borrow_mut()
+            .config
+            .cluster_placement
+            .as_mut()
+            .expect("placement")
+            .membership_epoch = 9;
+        reconcile
+            .await
+            .expect("reconciliation task")
+            .expect("reconciliation remains available");
+
+        assert!(
+            state.borrow().volumes.contains_key(&volume),
+            "placeholder membership fenced a healthy durable volume"
+        );
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovered_destination_finalizes_its_provisional_head_before_serving() {
+    simulate!(97, async move {
+        let volume = VolumeId(97);
+        let local = HostId::new(1);
+        let passive = TEST_PASSIVE;
+        let ownership_fence = 17;
+        let world = Rc::new(ModelWorld::default());
+        world.next_store_version.set(ownership_fence);
+        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
+            archive: Default::default(),
+            host: local,
+            cache_pages: 4,
+            writeback_interval: 1_000,
+            backup_retry: 1,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: test_cluster_placement(local),
+        })));
+        {
+            let mut host = state.borrow_mut();
+            host.insert_fresh(volume, VolumeConfig::memory(1));
+            let recovered = host.volumes.get_mut(&volume).expect("inserted volume");
+            recovered.fence = ownership_fence;
+            recovered
+                .operations
+                .set_recovery(crate::protocol::Verdict::ColdBoot);
+        }
+        world.store.borrow_mut().insert(
+            layout::head_key(volume),
+            (
+                ownership_fence,
+                HeadRecord {
+                    volume,
+                    holder: local,
+                    fence: 0,
+                    manifest: None,
+                    stash: Some(StashAssignment {
+                        assignment_epoch: 1,
+                        active_peer: passive,
+                        active_assignment_epoch: 1,
+                        transition_peer: None,
+                        membership_epoch: 1,
+                    }),
+                    retired_stashes: Vec::new(),
+                }
+                .encode(),
+            ),
+        );
+
+        reconcile_backed_volumes(&state, &world, &[volume])
+            .await
+            .expect("reconciliation succeeds");
+
+        let (_, bytes) = world.store.borrow()[&layout::head_key(volume)].clone();
+        let head = HeadRecord::decode(volume, &bytes).expect("head decodes");
+        assert_eq!(head.fence, ownership_fence);
+        assert!(state.borrow().volumes[&volume].ready);
+        assert_eq!(
+            *world.events.borrow(),
+            [AdminEvent::VolumeRecovered {
+                volume,
+                verdict: crate::protocol::Verdict::ColdBoot,
+            }]
+        );
+    });
+}
+
 #[tokio::test(start_paused = true)]
 #[allow(clippy::too_many_lines)]
 async fn create_fault_and_checkpoint_form_one_durable_memory_volume_scenario() {
@@ -1827,14 +2207,14 @@ async fn create_fault_and_checkpoint_form_one_durable_memory_volume_scenario() {
         });
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(0),
+            host: HostId::new(0),
             cache_pages: 4,
             writeback_interval: 5,
             backup_retry: 5,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(0)),
+            cluster_placement: test_cluster_placement(HostId::new(0)),
         };
         let actor_world = Rc::clone(&world);
         let actor_state = Rc::new(RefCell::new(HostState::new(config.clone())));
@@ -1883,6 +2263,10 @@ async fn create_fault_and_checkpoint_form_one_durable_memory_volume_scenario() {
             );
             blockd_exec::advance_to(blockd_exec::now().saturating_add(1)).await;
         }
+        assert!(
+            world.write_protected.borrow().contains(&page),
+            "a memory page made durable by writeback must be protected before a later write"
+        );
         let checkpoint_expected = vec![0xa5; page_size()];
         world
             .writes_after_unprotect
@@ -2151,6 +2535,168 @@ async fn create_fault_and_checkpoint_form_one_durable_memory_volume_scenario() {
         blockd_exec::run_ready().await;
     });
 }
+
+#[tokio::test(start_paused = true)]
+async fn create_reply_waits_for_initial_replica_and_retries_after_store_outage() {
+    simulate!(73, async move {
+        let volume = VolumeId(73);
+        let world = Rc::new(ModelWorld {
+            blob_write_delay: Cell::new(10),
+            peer_send_delay: Cell::new(10),
+            ..ModelWorld::default()
+        });
+        world.admin.borrow_mut().push_back(AdminCall::CreateVolume {
+            volume,
+            config: VolumeConfig::data(8),
+            from_base: None,
+        });
+        let config = DaemonConfig {
+            archive: Default::default(),
+            host: HostId::new(73),
+            cache_pages: 4,
+            writeback_interval: 5,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: test_cluster_placement(HostId::new(73)),
+        };
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        let actor = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+
+        blockd_exec::advance_to(1).await;
+        assert!(world.store.borrow().contains_key(&layout::head_key(volume)));
+        assert!(world.replies.borrow().is_empty());
+        world.store_unavailable.set(true);
+        blockd_exec::advance_to(40).await;
+        assert!(world.replies.borrow().is_empty());
+        assert!(!state.borrow().volumes[&volume].ready);
+        assert_eq!(state.borrow().volumes[&volume].peer_committed, None);
+
+        world.store_unavailable.set(false);
+        for horizon in 41..90 {
+            blockd_exec::advance_to(horizon).await;
+            if !world.replies.borrow().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            *world.replies.borrow(),
+            [Ok(AdminSuccess::VolumeCreated { volume })]
+        );
+        {
+            let host = state.borrow();
+            let volume_state = &host.volumes[&volume];
+            assert!(volume_state.ready);
+            assert_eq!(
+                volume_state.peer_committed,
+                volume_state
+                    .best_record
+                    .as_ref()
+                    .map(JournalRecord::commit_info)
+            );
+        }
+
+        drop(actor);
+        blockd_exec::run_ready().await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn fork_reply_waits_for_initial_replica_and_retries_after_store_outage() {
+    simulate!(74, async move {
+        let volume = VolumeId(74);
+        let base_id = 740;
+        let config = VolumeConfig::data(8);
+        let base = BaseManifest {
+            base_id,
+            manifest_id: 1,
+            capture_seq: 0,
+            sync_covered_through: 0,
+            recovery_kind: RecoveryKind::DiskOnly,
+            checkpoint_epoch: crate::types::Epoch(0),
+            config,
+            vmstate_logical_length: 0,
+            post_state_checksum: 0,
+            metadata_checksum: 0,
+            objects: Vec::new(),
+        };
+        let base_bytes = base.encode();
+        let base_root = base.root();
+        let world = Rc::new(ModelWorld {
+            peer_send_delay: Cell::new(10),
+            ..ModelWorld::default()
+        });
+        world.store.borrow_mut().insert(
+            layout::base_manifest_key(base_id, base.manifest_id),
+            (1, base_bytes),
+        );
+        world
+            .store
+            .borrow_mut()
+            .insert(layout::base_root_key(base_id), (2, base_root.encode()));
+        world.next_store_version.set(2);
+        world.admin.borrow_mut().push_back(AdminCall::CreateVolume {
+            volume,
+            config,
+            from_base: Some(base_id),
+        });
+        let daemon = DaemonConfig {
+            archive: Default::default(),
+            host: HostId::new(74),
+            cache_pages: 4,
+            writeback_interval: 5,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: test_cluster_placement(HostId::new(74)),
+        };
+        let state = Rc::new(RefCell::new(HostState::new(daemon)));
+        let actor = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+
+        blockd_exec::advance_to(5).await;
+        let head = HeadRecord::decode(volume, &world.store.borrow()[&layout::head_key(volume)].1)
+            .expect("fork head");
+        assert!(head.manifest.is_some());
+        assert!(world.replies.borrow().is_empty());
+        world.store_unavailable.set(true);
+        blockd_exec::advance_to(30).await;
+        assert!(world.replies.borrow().is_empty());
+        assert!(!state.borrow().volumes[&volume].ready);
+
+        world.store_unavailable.set(false);
+        for horizon in 31..90 {
+            blockd_exec::advance_to(horizon).await;
+            if !world.replies.borrow().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            *world.replies.borrow(),
+            [Ok(AdminSuccess::VolumeForked {
+                volume,
+                verdict: crate::protocol::Verdict::ColdBoot,
+            })]
+        );
+        {
+            let host = state.borrow();
+            let volume_state = &host.volumes[&volume];
+            assert!(volume_state.ready);
+            assert_eq!(
+                volume_state.peer_committed,
+                volume_state
+                    .best_record
+                    .as_ref()
+                    .map(JournalRecord::commit_info)
+            );
+        }
+
+        drop(actor);
+        blockd_exec::run_ready().await;
+    });
+}
+
 #[tokio::test(start_paused = true)]
 async fn backed_creation_claims_and_publishes_a_fenced_head() {
     simulate!(5, async move {
@@ -2166,14 +2712,14 @@ async fn backed_creation_claims_and_publishes_a_fenced_head() {
                 interval: 1,
                 ..Default::default()
             },
-            host: HostId(3),
+            host: HostId::new(3),
             cache_pages: 4,
             writeback_interval: 5,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(3)),
+            cluster_placement: test_cluster_placement(HostId::new(3)),
         };
         let actor = spawn(host_actor(config.clone(), Rc::clone(&world)));
         blockd_exec::advance_to(100).await;
@@ -2186,7 +2732,7 @@ async fn backed_creation_claims_and_publishes_a_fenced_head() {
             let store = world.store.borrow();
             let (_, head_bytes) = &store[&layout::head_key(volume)];
             let head = HeadRecord::decode(volume, head_bytes).expect("valid head");
-            assert_eq!(head.holder, HostId(3));
+            assert_eq!(head.holder, HostId::new(3));
             assert_eq!(head.fence, 1);
             let manifest = head.manifest.expect("initial record published");
             assert_eq!(manifest.fence, 1);
@@ -2222,8 +2768,8 @@ async fn backed_creation_claims_and_publishes_a_fenced_head() {
             .borrow_mut()
             .push_back(AdminCall::RestoreVolume { volume });
         let restore_config = DaemonConfig {
-            host: HostId(4),
-            replica_placement: test_replica_placement(HostId(4)),
+            host: HostId::new(4),
+            cluster_placement: test_cluster_placement(HostId::new(4)),
             ..config
         };
         let restored = spawn(host_actor(restore_config, Rc::clone(&world)));
@@ -2233,7 +2779,7 @@ async fn backed_creation_claims_and_publishes_a_fenced_head() {
             let store = world.store.borrow();
             let (_, head_bytes) = &store[&layout::head_key(volume)];
             let head = HeadRecord::decode(volume, head_bytes).expect("valid retained head");
-            assert_eq!(head.holder, HostId(3));
+            assert_eq!(head.holder, HostId::new(3));
             assert_eq!(head.manifest, Some(manifest));
         }
         drop(restored);
@@ -2253,14 +2799,14 @@ async fn failed_backed_fork_does_not_leave_a_head_claim() {
         });
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(3),
+            host: HostId::new(3),
             cache_pages: 4,
             writeback_interval: 5,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(3)),
+            cluster_placement: test_cluster_placement(HostId::new(3)),
         };
         let actor = spawn(host_actor(config, Rc::clone(&world)));
         blockd_exec::advance_to(8).await;
@@ -2287,14 +2833,14 @@ async fn restore_data_volume_reads_metadata_then_only_the_faulted_blx_file() {
                 interval: 1,
                 ..Default::default()
             },
-            host: HostId(5),
+            host: HostId::new(5),
             cache_pages: 300,
             writeback_interval: 10,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(5)),
+            cluster_placement: test_cluster_placement(HostId::new(5)),
         };
         let actor = spawn(host_actor(config, Rc::clone(&world)));
         blockd_exec::advance_to(4).await;
@@ -2368,14 +2914,14 @@ async fn restore_data_volume_reads_metadata_then_only_the_faulted_blx_file() {
             .push_back(AdminCall::RestoreVolume { volume });
         let restore_config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(6),
+            host: HostId::new(6),
             cache_pages: 16,
             writeback_interval: 10,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(6)),
+            cluster_placement: test_cluster_placement(HostId::new(6)),
         };
         let restored = spawn(host_actor(restore_config, Rc::clone(&world)));
         blockd_exec::advance_to(105).await;
@@ -2387,7 +2933,9 @@ async fn restore_data_volume_reads_metadata_then_only_the_faulted_blx_file() {
             })]
         );
         assert!(world.blobs.borrow().is_empty());
-        assert_eq!(world.store_gets.borrow().len(), 3);
+        // Restore reads the head once to claim it and once more to finalize
+        // the stable ownership fence before the volume can serve.
+        assert_eq!(world.store_gets.borrow().len(), 4);
         assert!(world.store_range_gets.borrow().is_empty());
 
         let faulted = pages[42];
@@ -2426,14 +2974,14 @@ async fn whole_restore_seeds_vmm_checksum_state() {
                 interval: 1,
                 ..Default::default()
             },
-            host: HostId(20),
+            host: HostId::new(20),
             cache_pages: 8,
             writeback_interval: 10,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(20)),
+            cluster_placement: test_cluster_placement(HostId::new(20)),
         };
         let source = spawn(host_actor(source_config, Rc::clone(&world)));
         blockd_exec::advance_to(4).await;
@@ -2475,14 +3023,14 @@ async fn whole_restore_seeds_vmm_checksum_state() {
             .push_back(AdminCall::RestoreVolume { volume });
         let restore_config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(21),
+            host: HostId::new(21),
             cache_pages: 8,
             writeback_interval: 10,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(21)),
+            cluster_placement: test_cluster_placement(HostId::new(21)),
         };
         let restored_state = Rc::new(RefCell::new(HostState::new(restore_config)));
         let restored = spawn(host_actor_with_state(
@@ -2549,14 +3097,14 @@ async fn independently_pinned_data_volume_becomes_a_faultable_fork_base() {
         });
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(7),
+            host: HostId::new(7),
             cache_pages: 8,
             writeback_interval: 20,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(7)),
+            cluster_placement: test_cluster_placement(HostId::new(7)),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         let actor = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
@@ -2667,8 +3215,8 @@ async fn independently_pinned_data_volume_becomes_a_faultable_fork_base() {
 async fn migration_accepts_only_after_the_destination_record_is_durable() {
     simulate!(8, async move {
         let volume = VolumeId(15);
-        let source_host = HostId(8);
-        let destination_host = HostId(9);
+        let source_host = HostId::new(8);
+        let destination_host = HostId::new(9);
         let page = PageId {
             volume,
             page: PageNo(1),
@@ -2700,7 +3248,7 @@ async fn migration_accepts_only_after_the_destination_record_is_durable() {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(host),
+            cluster_placement: test_cluster_placement_with(host, &[source_host, destination_host]),
         };
         let source_actor = spawn(host_actor(config(source_host), Rc::clone(&source)));
         let destination_state = Rc::new(RefCell::new(HostState::new(config(destination_host))));
@@ -2709,28 +3257,54 @@ async fn migration_accepts_only_after_the_destination_record_is_durable() {
             Rc::clone(&destination),
         ));
         blockd_exec::advance_to(5).await;
+        let mut tick = 6;
+        for _ in 0..20 {
+            deliver(source_host, &source, &destination, destination_host);
+            blockd_exec::advance_to(tick).await;
+            tick += 2;
+            deliver(destination_host, &destination, &source, source_host);
+            blockd_exec::advance_to(tick).await;
+            tick += 2;
+            if source
+                .replies
+                .borrow()
+                .contains(&Ok(AdminSuccess::VolumeCreated { volume }))
+            {
+                break;
+            }
+        }
+        assert!(
+            source
+                .replies
+                .borrow()
+                .contains(&Ok(AdminSuccess::VolumeCreated { volume })),
+            "migration begins only after the initial replica is protected"
+        );
         source.faults.borrow_mut().push_back(GuestFault {
             page,
             write: true,
             wp: false,
             minor: false,
         });
-        blockd_exec::advance_to(8).await;
+        blockd_exec::advance_to(tick).await;
+        tick += 3;
         let expected = vec![0xc4; page_size()];
         source.memory.borrow_mut().insert(page, expected.clone());
         source.admin.borrow_mut().push_back(AdminCall::MigrateOut {
             volume,
             to: destination_host,
         });
-        blockd_exec::advance_to(15).await;
+        blockd_exec::advance_to(tick).await;
+        tick += 7;
         source.peer_inbox.borrow_mut().push_back((
-            HostId(77),
+            HostId::new(77),
             PeerMsg::MigrateAccept {
                 volume,
                 offer_fence: 0,
             },
         ));
-        blockd_exec::advance_to(16).await;
+        blockd_exec::advance_to(tick).await;
+        tick += 1;
         assert!(
             !source
                 .replies
@@ -2749,7 +3323,7 @@ async fn migration_accepts_only_after_the_destination_record_is_durable() {
                     },
                 })
         };
-        let mut tick = 20;
+        tick += 4;
         for _ in 0..20 {
             deliver(source_host, &source, &destination, destination_host);
             blockd_exec::advance_to(tick).await;
@@ -2855,18 +3429,18 @@ async fn migration_accepts_only_after_the_destination_record_is_durable() {
 async fn duplicate_migration_accept_requires_the_installed_offer_fence() {
     simulate!(103, async move {
         let volume = VolumeId(16);
-        let source = HostId(8);
+        let source = HostId::new(8);
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(9),
+            host: HostId::new(9),
             cache_pages: 1,
             writeback_interval: 100,
             backup_retry: 1,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -2929,18 +3503,18 @@ async fn duplicate_migration_accept_requires_the_installed_offer_fence() {
 async fn outbound_migration_waits_across_retries_and_cancellation_releases_its_slot() {
     simulate!(80, async move {
         let volume = VolumeId(150);
-        let destination = HostId(9);
+        let destination = HostId::new(9);
         let world = Rc::new(ModelWorld::default());
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 8,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(8)),
+            cluster_placement: test_cluster_placement_with(HostId::new(8), &[destination]),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         world.admin.borrow_mut().push_back(AdminCall::CreateVolume {
@@ -3004,21 +3578,120 @@ async fn outbound_migration_waits_across_retries_and_cancellation_releases_its_s
 }
 
 #[tokio::test(start_paused = true)]
-async fn migration_reservation_failure_releases_the_operation_for_retry() {
-    simulate!(81, async move {
-        let volume = VolumeId(151);
-        let destination = HostId(9);
+async fn initial_data_migration_offer_carries_the_live_page_index() {
+    simulate!(104, async move {
+        let volume = VolumeId(154);
+        let destination = HostId::new(9);
+        let page = PageId {
+            volume,
+            page: PageNo(3),
+        };
         let world = Rc::new(ModelWorld::default());
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
+            cache_pages: 8,
+            writeback_interval: 5,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: test_cluster_placement_with(HostId::new(8), &[destination]),
+        };
+        world.admin.borrow_mut().push_back(AdminCall::CreateVolume {
+            volume,
+            config: VolumeConfig::data(8),
+            from_base: None,
+        });
+        let state = Rc::new(RefCell::new(HostState::new(config)));
+        let actor = spawn(host_actor_with_state(Rc::clone(&state), Rc::clone(&world)));
+        blockd_exec::advance_to(15).await;
+
+        world.faults.borrow_mut().push_back(GuestFault {
+            page,
+            write: true,
+            wp: false,
+            minor: false,
+        });
+        blockd_exec::advance_to(20).await;
+        world
+            .memory
+            .borrow_mut()
+            .insert(page, vec![0xa5; page_size()]);
+        world.syncs.borrow_mut().push_back(GuestSync {
+            req: ReqId(104),
+            volume,
+        });
+        for tick in 21..100 {
+            blockd_exec::advance_to(tick).await;
+            if world.sync_ok.borrow().contains(&ReqId(104)) {
+                break;
+            }
+        }
+        assert!(world.sync_ok.borrow().contains(&ReqId(104)));
+        let expected_index = state.borrow().volumes[&volume].page_locs.clone();
+        assert_eq!(expected_index.len(), 1);
+        assert!(
+            state.borrow().volumes[&volume]
+                .best_record
+                .as_ref()
+                .is_some_and(|record| record.runtime_page_index.is_empty()),
+            "ordinary durable journals must not make this test pass by retaining the sidecar"
+        );
+
+        world.peer_outbox.borrow_mut().clear();
+        world.admin.borrow_mut().push_back(AdminCall::MigrateOut {
+            volume,
+            to: destination,
+        });
+        let mut offered = None;
+        for tick in 100..180 {
+            blockd_exec::advance_to(tick).await;
+            offered = world.peer_outbox.borrow().iter().find_map(|(to, message)| {
+                if *to != destination {
+                    return None;
+                }
+                match message {
+                    PeerMsg::MigrateOffer {
+                        volume: found,
+                        record,
+                        ..
+                    } if *found == volume => Some(record.clone()),
+                    _ => None,
+                }
+            });
+            if offered.is_some() {
+                break;
+            }
+        }
+        let (record, _, _) = JournalRecord::decode_migration_state(
+            volume,
+            &offered.expect("initial migration offer"),
+        )
+        .expect("migration sidecar");
+        assert_eq!(record.runtime_page_index, expected_index);
+
+        drop(actor);
+        blockd_exec::run_ready().await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn migration_reservation_failure_releases_the_operation_for_retry() {
+    simulate!(81, async move {
+        let volume = VolumeId(151);
+        let destination = HostId::new(9);
+        let world = Rc::new(ModelWorld::default());
+        let config = DaemonConfig {
+            archive: Default::default(),
+            host: HostId::new(8),
             cache_pages: 8,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(8)),
+            cluster_placement: test_cluster_placement_with(HostId::new(8), &[destination]),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         world.admin.borrow_mut().push_back(AdminCall::CreateVolume {
@@ -3079,14 +3752,14 @@ async fn migration_capture_failure_resumes_the_compute_guest() {
         world.memory.borrow_mut().insert(page, vec![1; page_size()]);
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 8,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(8)),
+            cluster_placement: test_cluster_placement_with(HostId::new(8), &[HostId::new(9)]),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         world.admin.borrow_mut().push_back(AdminCall::CreateVolume {
@@ -3108,7 +3781,7 @@ async fn migration_capture_failure_resumes_the_compute_guest() {
         state.borrow_mut().config.disk_capacity = Some(0);
         world.admin.borrow_mut().push_back(AdminCall::MigrateOut {
             volume,
-            to: HostId(9),
+            to: HostId::new(9),
         });
         blockd_exec::advance_to(25).await;
 
@@ -3143,14 +3816,14 @@ async fn failed_writeback_keeps_the_mutation_slot_until_pages_are_unprotected() 
         world.guest_unprotect_delay.set(10);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: Some(0),
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -3186,14 +3859,14 @@ fn inbound_fence_is_above_every_surviving_local_artifact_namespace() {
     let volume = VolumeId(156);
     let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
         archive: Default::default(),
-        host: HostId(8),
+        host: HostId::new(8),
         cache_pages: 1,
         writeback_interval: 100_000_000,
         backup_retry: 2,
         disk_capacity: None,
         disk_headroom: 0,
         wedge_ticks: 0,
-        replica_placement: None,
+        cluster_placement: None,
     })));
     state
         .borrow_mut()
@@ -3210,18 +3883,18 @@ fn inbound_fence_is_above_every_surviving_local_artifact_namespace() {
 async fn release_ack_requires_the_current_source_and_destination_fence() {
     simulate!(85, async move {
         let volume = VolumeId(157);
-        let source = HostId(7);
+        let source = HostId::new(7);
         let world = Rc::new(ModelWorld::default());
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let hydration_done = {
             let mut host = state.borrow_mut();
@@ -3238,7 +3911,7 @@ async fn release_ack_requires_the_current_source_and_destination_fence() {
 
         world.peer_inbox.borrow_mut().extend([
             (
-                HostId(6),
+                HostId::new(6),
                 PeerMsg::ReleasedAck {
                     volume,
                     release_fence: 9,
@@ -3271,6 +3944,70 @@ async fn release_ack_requires_the_current_source_and_destination_fence() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn duplicate_release_ack_does_not_repeat_source_cleanup() {
+    simulate!(105, async move {
+        let volume = VolumeId(158);
+        let destination = HostId::new(7);
+        let world = Rc::new(ModelWorld::default());
+        let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
+            archive: Default::default(),
+            host: HostId::new(8),
+            cache_pages: 1,
+            writeback_interval: 100_000_000,
+            backup_retry: 2,
+            disk_capacity: None,
+            disk_headroom: 0,
+            wedge_ticks: 0,
+            cluster_placement: None,
+        })));
+        {
+            let mut host = state.borrow_mut();
+            host.insert_fresh(volume, VolumeConfig::memory(1));
+            let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
+            volume_state.ready = false;
+            volume_state.fence = 5;
+            volume_state.outbound = Some(destination);
+        }
+        let actor = spawn(peer_source(Rc::clone(&state), Rc::clone(&world)));
+
+        for tick in 1..=2 {
+            world.peer_inbox.borrow_mut().push_back((
+                destination,
+                PeerMsg::Released {
+                    volume,
+                    release_fence: 6,
+                },
+            ));
+            blockd_exec::advance_to(tick).await;
+        }
+
+        assert!(!state.borrow().volumes.contains_key(&volume));
+        assert_eq!(world.blob_scans.get(), 1);
+        assert_eq!(
+            world
+                .peer_outbox
+                .borrow()
+                .iter()
+                .filter(|(to, message)| {
+                    *to == destination
+                        && matches!(
+                            message,
+                            PeerMsg::ReleasedAck {
+                                volume: found,
+                                release_fence: 6,
+                            } if *found == volume
+                        )
+                })
+                .count(),
+            2
+        );
+
+        drop(actor);
+        blockd_exec::run_ready().await;
+    });
+}
+
+#[tokio::test(start_paused = true)]
 async fn checkpoint_capture_failure_resumes_the_compute_guest() {
     simulate!(84, async move {
         let volume = VolumeId(155);
@@ -3283,14 +4020,14 @@ async fn checkpoint_capture_failure_resumes_the_compute_guest() {
         world.memory.borrow_mut().insert(page, vec![1; page_size()]);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -3324,14 +4061,14 @@ async fn cancelling_a_checkpoint_orders_resume_before_readmission() {
         world.memory.borrow_mut().insert(page, vec![1; page_size()]);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -3410,14 +4147,14 @@ async fn cancelling_after_early_resume_unprotects_abandoned_pages() {
         world.memory.borrow_mut().insert(page, vec![1; page_size()]);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         {
             let mut host = state.borrow_mut();
@@ -3464,14 +4201,14 @@ async fn cancelling_an_outbound_migration_resumes_the_paused_guest() {
         world.memory.borrow_mut().insert(page, vec![1; page_size()]);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: test_cluster_placement_with(HostId::new(8), &[HostId::new(9)]),
         })));
         {
             let mut host = state.borrow_mut();
@@ -3493,7 +4230,7 @@ async fn cancelling_an_outbound_migration_resumes_the_paused_guest() {
             Rc::clone(&state),
             Rc::clone(&world),
             volume,
-            HostId(9),
+            HostId::new(9),
         ));
         blockd_exec::advance_to(2).await;
         assert!(world.paused_volumes.borrow().contains(&volume));
@@ -3525,22 +4262,22 @@ async fn failed_hydration_resolves_the_waiting_outbound_migration() {
         };
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: test_cluster_placement_with(HostId::new(8), &[HostId::new(9)]),
         })));
-        let incarnation = {
+        let run_generation = {
             let mut host = state.borrow_mut();
-            let incarnation = host.insert_fresh(volume, VolumeConfig::data(1));
+            let run_generation = host.insert_fresh(volume, VolumeConfig::data(1));
             let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
             volume_state.ready = true;
             volume_state.fence = 2;
-            volume_state.peer_source = Some(HostId(7));
+            volume_state.peer_source = Some(HostId::new(7));
             volume_state.page_locs.insert(
                 page,
                 (
@@ -3554,17 +4291,17 @@ async fn failed_hydration_resolves_the_waiting_outbound_migration() {
                     },
                 ),
             );
-            incarnation
+            run_generation
         };
         let world = Rc::new(ModelWorld::default());
         let migration = spawn(crate::engine::migrate_out(
             Rc::clone(&state),
             world,
             volume,
-            HostId(9),
+            HostId::new(9),
         ));
         blockd_exec::run_ready().await;
-        crate::engine::migration::finish_hydration(&state, volume, incarnation);
+        crate::engine::migration::finish_hydration(&state, volume, run_generation);
 
         assert_eq!((migration).await, Ok(Some(Err(AdminError::Unavailable))));
         assert!(state.borrow().volumes[&volume].hydration_waiters.is_empty());
@@ -3577,19 +4314,19 @@ async fn hydration_completion_wakes_shared_mutation_waiters() {
         let volume = VolumeId(157);
         let state = Rc::new(RefCell::new(HostState::new(DaemonConfig {
             archive: Default::default(),
-            host: HostId(8),
+            host: HostId::new(8),
             cache_pages: 1,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: None,
+            cluster_placement: None,
         })));
         let (waiter, wake) = oneshot();
-        let incarnation = {
+        let run_generation = {
             let mut host = state.borrow_mut();
-            let incarnation = host.insert_fresh(volume, VolumeConfig::data(1));
+            let run_generation = host.insert_fresh(volume, VolumeConfig::data(1));
             let volume_state = host.volumes.get_mut(&volume).expect("inserted volume");
             assert!(
                 volume_state
@@ -3597,10 +4334,10 @@ async fn hydration_completion_wakes_shared_mutation_waiters() {
                     .try_start_mutation(MutationOwner::Hydration)
             );
             volume_state.mutation_waiters.push(waiter);
-            incarnation
+            run_generation
         };
 
-        crate::engine::migration::finish_hydration(&state, volume, incarnation);
+        crate::engine::migration::finish_hydration(&state, volume, run_generation);
         assert_eq!((wake).await, Ok(()));
         assert!(state.borrow().volumes[&volume].mutation_waiters.is_empty());
     });
@@ -3610,9 +4347,9 @@ async fn hydration_completion_wakes_shared_mutation_waiters() {
 async fn migration_replaces_a_stale_local_handoff_marker() {
     simulate!(82, async move {
         let volume = VolumeId(152);
-        let source = HostId(8);
-        let old_destination = HostId(7);
-        let destination = HostId(9);
+        let source = HostId::new(8);
+        let old_destination = HostId::new(7);
+        let destination = HostId::new(9);
         let world = Rc::new(ModelWorld::default());
         let config = DaemonConfig {
             archive: Default::default(),
@@ -3623,7 +4360,7 @@ async fn migration_replaces_a_stale_local_handoff_marker() {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(source),
+            cluster_placement: test_cluster_placement_with(source, &[destination]),
         };
         let state = Rc::new(RefCell::new(HostState::new(config)));
         world.admin.borrow_mut().push_back(AdminCall::CreateVolume {
@@ -3682,14 +4419,14 @@ async fn recovered_handoff_reoffers_without_resuming_the_source() {
         });
         let config = DaemonConfig {
             archive: Default::default(),
-            host: HostId(10),
+            host: HostId::new(10),
             cache_pages: 4,
             writeback_interval: 100_000_000,
             backup_retry: 2,
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: test_replica_placement(HostId(10)),
+            cluster_placement: test_cluster_placement_with(HostId::new(10), &[HostId::new(11)]),
         };
         let actor = spawn(host_actor(config.clone(), Rc::clone(&world)));
         blockd_exec::advance_to(4).await;
@@ -3706,7 +4443,7 @@ async fn recovered_handoff_reoffers_without_resuming_the_source() {
             .insert(page, vec![0xd1; page_size()]);
         world.admin.borrow_mut().push_back(AdminCall::MigrateOut {
             volume,
-            to: HostId(11),
+            to: HostId::new(11),
         });
         for tick in 15..80 {
             blockd_exec::advance_to(tick).await;
@@ -3731,7 +4468,7 @@ async fn recovered_handoff_reoffers_without_resuming_the_source() {
             let mut store = world.store.borrow_mut();
             let (_, bytes) = store.get_mut(&layout::head_key(volume)).expect("head");
             let mut head = HeadRecord::decode(volume, bytes).expect("valid head");
-            head.holder = HostId(11);
+            head.holder = HostId::new(11);
             *bytes = head.encode();
         }
 
@@ -3747,7 +4484,7 @@ async fn recovered_handoff_reoffers_without_resuming_the_source() {
             *world.replies.borrow()
         );
         assert!(world.peer_outbox.borrow().iter().any(|(to, message)| {
-            *to == HostId(11)
+            *to == HostId::new(11)
                 && matches!(message, PeerMsg::MigrateOffer { volume: offered, .. } if *offered == volume)
         }));
 
@@ -3763,11 +4500,10 @@ async fn passive_replica_acks_only_after_artifact_and_commit_appends() {
         use crate::format::crc32c;
         use crate::journal::{RecordKind, VolumeKind};
         use crate::page_file::PageBatchBuilder;
-        use crate::placement::PeerCandidate;
         use crate::protocol::{ReplicaArtifact, ReplicaCommitInfo};
 
-        let source = HostId(20);
-        let receiver = HostId(21);
+        let source = HostId::new(20);
+        let receiver = HostId::new(21);
         let volume = VolumeId(17);
         let assignment_epoch = 1;
         let page = PageId {
@@ -3805,6 +4541,7 @@ async fn passive_replica_acks_only_after_artifact_and_commit_appends() {
             sync_covered_through: 1,
         };
         let world = Rc::new(ModelWorld::default());
+        publish_replica_authorizing_head(&world, source, receiver, volume, assignment_epoch);
         let config = DaemonConfig {
             archive: Default::default(),
             host: receiver,
@@ -3814,23 +4551,9 @@ async fn passive_replica_acks_only_after_artifact_and_commit_appends() {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(crate::hostmeta::ReplicaPlacementConfig {
+            cluster_placement: Some(crate::hostmeta::ClusterPlacementConfig {
                 membership_epoch: 7,
-                local_failure_domain: 2,
-                roster: vec![
-                    PeerCandidate {
-                        host: source,
-                        weight: 1,
-                        failure_domain: 1,
-                        drained: false,
-                    },
-                    PeerCandidate {
-                        host: receiver,
-                        weight: 1,
-                        failure_domain: 2,
-                        drained: false,
-                    },
-                ],
+                roster: vec![source, receiver],
                 authority: None,
             }),
         };
@@ -3883,30 +4606,15 @@ async fn passive_replica_acks_only_after_artifact_and_commit_appends() {
 async fn peer_stashed_sync_waits_for_the_exact_passive_commit() {
     simulate!(11, async move {
         use crate::journal::VolumeKind;
-        use crate::placement::PeerCandidate;
-
-        let primary_host = HostId(30);
-        let passive_host = HostId(31);
+        let primary_host = HostId::new(30);
+        let passive_host = HostId::new(31);
         let volume = VolumeId(18);
         let page = PageId {
             volume,
             page: PageNo(0),
         };
-        let roster = vec![
-            PeerCandidate {
-                host: primary_host,
-                weight: 1,
-                failure_domain: 1,
-                drained: false,
-            },
-            PeerCandidate {
-                host: passive_host,
-                weight: 1,
-                failure_domain: 2,
-                drained: false,
-            },
-        ];
-        let config = |host, domain| DaemonConfig {
+        let roster = vec![primary_host, passive_host];
+        let config = |host| DaemonConfig {
             archive: crate::hostmeta::ArchivePolicy {
                 interval: 1,
                 ..Default::default()
@@ -3918,15 +4626,18 @@ async fn peer_stashed_sync_waits_for_the_exact_passive_commit() {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(crate::hostmeta::ReplicaPlacementConfig {
+            cluster_placement: Some(crate::hostmeta::ClusterPlacementConfig {
                 membership_epoch: 9,
-                local_failure_domain: domain,
                 roster: roster.clone(),
                 authority: None,
             }),
         };
         let primary = Rc::new(ModelWorld::default());
-        let passive = Rc::new(ModelWorld::default());
+        let passive = Rc::new(ModelWorld {
+            store: Rc::clone(&primary.store),
+            next_store_version: Rc::clone(&primary.next_store_version),
+            ..ModelWorld::default()
+        });
         primary
             .admin
             .borrow_mut()
@@ -3938,16 +4649,39 @@ async fn peer_stashed_sync_waits_for_the_exact_passive_commit() {
                 },
                 from_base: None,
             });
-        let primary_actor = spawn(host_actor(config(primary_host, 1), Rc::clone(&primary)));
-        let passive_actor = spawn(host_actor(config(passive_host, 2), Rc::clone(&passive)));
-        blockd_exec::advance_to(4).await;
+        let primary_actor = spawn(host_actor(config(primary_host), Rc::clone(&primary)));
+        let passive_actor = spawn(host_actor(config(passive_host), Rc::clone(&passive)));
+        for horizon in 1..30 {
+            blockd_exec::advance_to(horizon).await;
+            if !primary.peer_outbox.borrow().is_empty() {
+                deliver(primary_host, &primary, &passive, passive_host);
+            }
+            if !passive.peer_outbox.borrow().is_empty() {
+                deliver(passive_host, &passive, &primary, primary_host);
+            }
+            if primary
+                .replies
+                .borrow()
+                .contains(&Ok(AdminSuccess::VolumeCreated { volume }))
+            {
+                break;
+            }
+        }
+        assert!(
+            primary
+                .replies
+                .borrow()
+                .contains(&Ok(AdminSuccess::VolumeCreated { volume })),
+            "create must wait for the initial passive commit"
+        );
+        let start = blockd_exec::now();
         primary.faults.borrow_mut().push_back(GuestFault {
             page,
             write: true,
             wp: false,
             minor: false,
         });
-        blockd_exec::advance_to(7).await;
+        blockd_exec::advance_to(start.saturating_add(3)).await;
         primary
             .memory
             .borrow_mut()
@@ -3956,10 +4690,10 @@ async fn peer_stashed_sync_waits_for_the_exact_passive_commit() {
             req: ReqId(61),
             volume: page.volume,
         });
-        blockd_exec::advance_to(9).await;
+        blockd_exec::advance_to(start.saturating_add(5)).await;
         assert!(primary.sync_ok.borrow().is_empty());
 
-        for horizon in 10..50 {
+        for horizon in start.saturating_add(6)..start.saturating_add(50) {
             blockd_exec::advance_to(horizon).await;
             if !primary.peer_outbox.borrow().is_empty() {
                 deliver(primary_host, &primary, &passive, passive_host);
@@ -4008,44 +4742,20 @@ async fn peer_stashed_sync_waits_for_the_exact_passive_commit() {
 async fn unreachable_stash_is_seeded_and_activated_before_sync_ack() {
     simulate!(72, async move {
         use crate::journal::VolumeKind;
-        use crate::placement::{PeerCandidate, rank_stash_candidates};
+        use crate::placement::rank_stash_candidates;
 
-        let primary_host = HostId(50);
-        let candidates = [HostId(51), HostId(52)];
+        let primary_host = HostId::new(50);
+        let candidates = [HostId::new(51), HostId::new(52)];
         let volume = VolumeId(72);
         let page = PageId {
             volume,
             page: PageNo(0),
         };
-        let roster = vec![
-            PeerCandidate {
-                host: primary_host,
-                weight: 1,
-                failure_domain: 1,
-                drained: false,
-            },
-            PeerCandidate {
-                host: candidates[0],
-                weight: 1,
-                failure_domain: 2,
-                drained: false,
-            },
-            PeerCandidate {
-                host: candidates[1],
-                weight: 1,
-                failure_domain: 3,
-                drained: false,
-            },
-        ];
-        let ranked = rank_stash_candidates(10, primary_host, 1, volume, &roster);
+        let roster = vec![primary_host, candidates[0], candidates[1]];
+        let ranked = rank_stash_candidates(10, primary_host, volume, &roster);
         let unreachable = ranked[0];
         let replacement_host = ranked[1];
-        let domain = roster
-            .iter()
-            .find(|candidate| candidate.host == replacement_host)
-            .expect("replacement in roster")
-            .failure_domain;
-        let config = |host, local_failure_domain| DaemonConfig {
+        let config = |host| DaemonConfig {
             archive: Default::default(),
             host,
             cache_pages: 8,
@@ -4054,9 +4764,8 @@ async fn unreachable_stash_is_seeded_and_activated_before_sync_ack() {
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 0,
-            replica_placement: Some(crate::hostmeta::ReplicaPlacementConfig {
+            cluster_placement: Some(crate::hostmeta::ClusterPlacementConfig {
                 membership_epoch: 10,
-                local_failure_domain,
                 roster: roster.clone(),
                 authority: None,
             }),
@@ -4078,19 +4787,63 @@ async fn unreachable_stash_is_seeded_and_activated_before_sync_ack() {
                 },
                 from_base: None,
             });
-        let primary_actor = spawn(host_actor(config(primary_host, 1), Rc::clone(&primary)));
+        let primary_actor = spawn(host_actor(config(primary_host), Rc::clone(&primary)));
         let replacement_actor = spawn(host_actor(
-            config(replacement_host, domain),
+            config(replacement_host),
             Rc::clone(&replacement),
         ));
-        blockd_exec::advance_to(5).await;
+        for horizon in 1..80 {
+            blockd_exec::advance_to(horizon).await;
+            let outbound = primary
+                .peer_outbox
+                .borrow_mut()
+                .drain(..)
+                .collect::<Vec<_>>();
+            for (target, message) in outbound {
+                if target == replacement_host {
+                    replacement
+                        .peer_inbox
+                        .borrow_mut()
+                        .push_back((primary_host, message));
+                } else {
+                    assert_eq!(target, unreachable);
+                }
+            }
+            let replies = replacement
+                .peer_outbox
+                .borrow_mut()
+                .drain(..)
+                .collect::<Vec<_>>();
+            for (target, message) in replies {
+                assert_eq!(target, primary_host);
+                primary
+                    .peer_inbox
+                    .borrow_mut()
+                    .push_back((replacement_host, message));
+            }
+            if primary
+                .replies
+                .borrow()
+                .contains(&Ok(AdminSuccess::VolumeCreated { volume }))
+            {
+                break;
+            }
+        }
+        assert!(
+            primary
+                .replies
+                .borrow()
+                .contains(&Ok(AdminSuccess::VolumeCreated { volume })),
+            "create must activate and seed the reachable replacement before replying"
+        );
+        let start = blockd_exec::now();
         primary.faults.borrow_mut().push_back(GuestFault {
             page,
             write: true,
             wp: false,
             minor: false,
         });
-        blockd_exec::advance_to(7).await;
+        blockd_exec::advance_to(start.saturating_add(2)).await;
         primary
             .memory
             .borrow_mut()
@@ -4100,7 +4853,7 @@ async fn unreachable_stash_is_seeded_and_activated_before_sync_ack() {
             volume: page.volume,
         });
 
-        for horizon in 8..100 {
+        for horizon in start.saturating_add(3)..start.saturating_add(100) {
             blockd_exec::advance_to(horizon).await;
             let outbound = primary
                 .peer_outbox
@@ -4143,7 +4896,7 @@ async fn unreachable_stash_is_seeded_and_activated_before_sync_ack() {
         assert!(head.retired_stashes.iter().any(|retired| {
             retired.peer == unreachable
                 && retired.assignment_epoch == 1
-                && retired.through.sync_covered_through == 1
+                && retired.through.sync_covered_through == 0
         }));
         {
             let spool = replacement.blobs.borrow();

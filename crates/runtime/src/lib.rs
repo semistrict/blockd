@@ -12,6 +12,7 @@ mod actor_host;
 mod blobscan;
 mod capacity;
 pub mod cluster;
+mod collector;
 pub mod fakegcs;
 #[cfg(target_os = "linux")]
 pub mod fc;
@@ -25,10 +26,13 @@ mod store;
 pub mod world;
 
 #[cfg(target_os = "linux")]
-pub use actor_host::{GuestAccess, GuestOperation, Runtime, RuntimeConfig};
+pub use actor_host::{
+    GuestAccess, GuestOperation, Runtime, RuntimeConfig, RuntimeReadiness, RuntimeStartupError,
+};
 pub use capacity::{
     CapacityController, CapacityInputs, CapacityReason, CapacitySignal, CapacityState,
 };
+pub use collector::StoreCollector;
 pub use gcs::{GcsConfig, GcsStats, GcsStore};
 #[cfg(target_os = "linux")]
 pub use loopstats::LoopStats;
@@ -36,8 +40,15 @@ pub use metrics::{
     AtomicHistogram, FaultLatency, FaultReaderMetrics, FaultWorkMetrics, HistogramSnapshot,
     LATENCY_BUCKETS_NS, LatencySeries, TimingSeries,
 };
-pub use peer::{PeerConfig, PeerNet};
+pub use peer::{PeerConfig, PeerNet, PeerResourceMetrics};
 pub use replica_recovery::{
     InstallReplicaRecoveryError, InstalledReplicaRecovery, install_replica_recovery,
 };
-pub use store::{GetResult, ObjectStore};
+pub use store::{GetResult, ListedObject, ObjectStore};
+
+/// Complete synchronous stderr emission immediately before a fatal process exit.
+pub fn flush_fatal_records() {
+    use std::io::Write as _;
+
+    let _ = std::io::stderr().lock().flush();
+}

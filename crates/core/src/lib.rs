@@ -23,5 +23,4 @@ pub mod replica_recovery;
 pub mod replica_spool;
 mod replica_wire;
 pub mod types;
-pub mod vnode_member;
 pub mod world;

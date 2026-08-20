@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+getrandom = "0.3.4"
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]

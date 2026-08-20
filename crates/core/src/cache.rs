@@ -367,7 +367,7 @@ impl Cache {
 
     /// Drop every resident page of one volume. A removed volume (fenced,
     /// released, failed creation) must leave nothing behind: a stale entry
-    /// would satisfy `is_resident` for a later incarnation of the same
+    /// would satisfy `is_resident` for a later in-memory instance of the same
     /// volume on this host and vouch for bytes the host no longer maps.
     pub fn purge_volume(&mut self, volume: VolumeId) -> Vec<PageId> {
         let pages: Vec<PageId> = self

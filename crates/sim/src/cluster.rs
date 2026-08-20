@@ -5,13 +5,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
-use blockd_core::engine::{HostState, host_actor_with_state};
+use blockd_core::authority::HostSessionRecord;
+use blockd_core::engine::{
+    HostState, cas_placement, host_actor_with_state, read_host_session, read_placement,
+};
 use blockd_core::head::HeadRecord;
-use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{AuthorityHostConfig, ClusterPlacementConfig, Counters, HostConfig};
 use blockd_core::journal::VolumeConfig;
 use blockd_core::layout;
 use blockd_core::manifest::Manifest;
-use blockd_core::placement::PeerCandidate;
+use blockd_core::placement::ClusterPlacement;
 use blockd_core::protocol::{AdminCall, AdminEvent, AdminResult, AdminSuccess, ReqId, Verdict};
 use blockd_core::replica_recovery::{
     ReplicaResidue, export_replica_recovery, prepare_replica_publication,
@@ -29,7 +32,9 @@ use blockd_exec::{
 
 use crate::guest::page_pattern;
 use crate::model::{BlobDevConfig, CrashFate, StoreConfig, StoreCounters};
-use crate::peer_transport::{PeerTransport, PeerTransportFaults, PeerTransportStats};
+use crate::peer_transport::{
+    PeerAuthorization, PeerMembership, PeerTransport, PeerTransportFaults, PeerTransportStats,
+};
 use crate::world::SimWorld;
 
 type SharedState = Rc<RefCell<HostState>>;
@@ -41,12 +46,62 @@ const CHECKPOINT_CONCURRENCY: usize = crate::checkpoint_schedule::CONCURRENCY;
 const CREATION_CONCURRENCY: usize = 32;
 const MIGRATION_CONCURRENCY: usize = 8;
 const RESTORE_CONCURRENCY: usize = 32;
+const FINAL_SETTLE_TIME: u64 = millis(2_000);
+const FINAL_LIFECYCLE_DRAIN_TIMEOUT: u64 = millis(60_000);
+const FINAL_PAGE_AUDIT_TIMEOUT: u64 = millis(2_000);
+const SIMULATION_SCHEDULING_SLACK: u64 = millis(1_000);
+const DYNAMIC_AUTHORITY_CLUSTER_ID: u64 = 0x424c_4f43_4b44_5349;
+const DYNAMIC_AUTHORITY_POLL_INTERVAL: u64 = millis(50);
+const DYNAMIC_AUTHORITY_MAX_STALENESS: u64 = millis(600);
+const DYNAMIC_AUTHORITY_CHALLENGE_INTERVAL: u64 = millis(800);
 
 pub use blockd_exec::FaultPoint;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sabotage {
     EagerHandoffAck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartClass {
+    Fast,
+    Slow,
+    Rolling,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MembershipEvent {
+    Claim {
+        at: u64,
+        host: u16,
+        token: u64,
+        commit_response_lost: bool,
+    },
+    Publish {
+        at: u64,
+        host: u16,
+        lease_duration: u64,
+        certificate_generation: u64,
+        commit_response_lost: bool,
+    },
+    Discover {
+        at: u64,
+        observer: u16,
+        reverse_list: bool,
+        reverse_gets: bool,
+    },
+    RotateCertificate {
+        at: u64,
+        host: u16,
+        certificate_generation: u64,
+        commit_response_lost: bool,
+    },
+    Restart {
+        at: u64,
+        host: u16,
+        downtime: u64,
+        class: RestartClass,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,12 +121,6 @@ pub enum PeerKind {
     ReplicaStatusReply = 13,
     ReplicaRelease = 15,
     ReplicaReleaseAck = 16,
-    VnodeAdopt = 18,
-    VnodeAdoptAck = 19,
-    VnodeFetchClosure = 20,
-    VnodeClosure = 21,
-    VnodeCommit = 22,
-    VnodeCommitAck = 23,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +149,7 @@ pub struct ClusterConfig {
     pub migrate_at: Vec<(u64, VolumeId, u16)>,
     pub sabotage: Option<Sabotage>,
     pub guest_sync_share: Option<Ppm>,
+    pub membership_events: Vec<MembershipEvent>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -120,6 +170,8 @@ pub struct ClusterReport {
     pub peer_drops: u64,
     pub peer_dups: u64,
     pub peer_link_clogs: u64,
+    pub peer_certificate_authorization_drops: u64,
+    pub peer_renewed_certificate_frames: u64,
     pub host_crashes: u64,
     pub disk_crash_applied: u64,
     pub disk_crash_dropped: u64,
@@ -154,6 +206,33 @@ pub struct ClusterReport {
     pub replica_artifact_flushes: u64,
     pub replica_commit_flushes: u64,
     pub replica_rotations: u64,
+    pub membership_transitions: u64,
+    pub membership_joins: u64,
+    pub membership_leaves: u64,
+    pub membership_claims: u64,
+    pub membership_claim_retries: u64,
+    pub membership_publications: u64,
+    pub membership_committed_lost: u64,
+    pub membership_lease_expiries: u64,
+    pub membership_certificate_rotations: u64,
+    pub membership_lists: u64,
+    pub membership_gets: u64,
+    pub membership_reordered_lists: u64,
+    pub membership_reordered_gets: u64,
+    pub membership_fast_restarts: u64,
+    pub membership_slow_restarts: u64,
+    pub membership_rolling_restarts: u64,
+    pub membership_lease_preserved_restarts: u64,
+    pub durable_placement_writes: u64,
+    pub placement_epoch_initial: u64,
+    pub placement_epoch_final: u64,
+    pub placement_recovered_after_restart: u64,
+    pub placement_owner_recovered_after_restart: u64,
+    pub placement_owner_first_faults_after_restart: u64,
+    pub authority_transfers: u64,
+    pub stash_recoveries: u64,
+    pub protected_sync_volumes: u64,
+    pub continuous_volumes: u64,
     pub replica_capacity_backpressure: u64,
     pub published_blx_bytes: u64,
     pub published_live_entry_bytes: u64,
@@ -171,6 +250,11 @@ enum HostCommand {
     Bounce(HostId, OneSender<()>),
 }
 
+struct RestartOutcome {
+    retired_state: SharedState,
+    affected_volumes: Vec<VolumeId>,
+}
+
 #[derive(Default)]
 struct GuestState {
     completed: Cell<u64>,
@@ -181,14 +265,17 @@ struct GuestState {
     recovering: RefCell<BTreeSet<PageId>>,
     volume_sequences: RefCell<BTreeMap<VolumeId, u64>>,
     violations: RefCell<Vec<String>>,
+    post_restart_fault_pending: Cell<bool>,
+    post_restart_faults: Cell<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MigrationAttempt {
     from: u16,
     to: u16,
-    from_incarnation: u64,
-    to_incarnation: u64,
+    offer_fence: u64,
+    from_run_generation: u64,
+    to_run_generation: u64,
     started: u64,
 }
 
@@ -211,32 +298,135 @@ struct Control {
     retired_counters: Vec<Counters>,
 }
 
-fn migration_pause_ns(attempt: MigrationAttempt, worlds: &[Rc<SimWorld>]) -> u64 {
-    worlds[usize::from(attempt.from)]
-        .max_pause_ns()
-        .max(now().saturating_sub(attempt.started))
+const MEMBERSHIP_CLAIM_PREFIX: &str = "cluster/membership/claims/";
+const MEMBERSHIP_MEMBER_PREFIX: &str = "cluster/membership/members/";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MembershipRecord {
+    host: HostId,
+    token: u64,
+    lease_expires_at: u64,
+    certificate_generation: u64,
+}
+
+impl MembershipRecord {
+    fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(28);
+        bytes.extend_from_slice(&self.host.get().to_le_bytes());
+        bytes.extend_from_slice(&self.token.to_le_bytes());
+        bytes.extend_from_slice(&self.lease_expires_at.to_le_bytes());
+        bytes.extend_from_slice(&self.certificate_generation.to_le_bytes());
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let host = HostId::new(u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?));
+        let token = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?);
+        let lease_expires_at = u64::from_le_bytes(bytes.get(12..20)?.try_into().ok()?);
+        let certificate_generation = u64::from_le_bytes(bytes.get(20..28)?.try_into().ok()?);
+        (bytes.len() == 28 && token != 0 && certificate_generation != 0).then_some(Self {
+            host,
+            token,
+            lease_expires_at,
+            certificate_generation,
+        })
+    }
+}
+
+#[derive(Default)]
+struct MembershipModel {
+    claims: BTreeMap<HostId, u64>,
+    member_versions: BTreeMap<HostId, u64>,
+    observed_records: BTreeMap<HostId, MembershipRecord>,
+    placement_version: Option<u64>,
+    placement_epoch: u64,
+}
+
+type PlacementSlots = Rc<RefCell<Vec<ClusterPlacementConfig>>>;
+
+fn host_index(host: HostId) -> usize {
+    usize::try_from(host.get()).expect("configured host ID fits usize")
+}
+
+fn host_id(host: u16) -> HostId {
+    HostId::new(u32::from(host))
+}
+
+fn dynamic_authority_config() -> AuthorityHostConfig {
+    AuthorityHostConfig {
+        cluster_id: DYNAMIC_AUTHORITY_CLUSTER_ID,
+        poll_interval: DYNAMIC_AUTHORITY_POLL_INTERVAL,
+        max_poll_staleness: DYNAMIC_AUTHORITY_MAX_STALENESS,
+        challenge_interval: DYNAMIC_AUTHORITY_CHALLENGE_INTERVAL,
+    }
+}
+
+fn initial_cluster_placement(config: &ClusterConfig) -> ClusterPlacement {
+    assert!(
+        config.hosts >= 4,
+        "dynamic authority requires at least four hosts"
+    );
+    let mut placement = ClusterPlacement {
+        cluster_id: DYNAMIC_AUTHORITY_CLUSTER_ID,
+        epoch: config
+            .daemon
+            .cluster_placement
+            .as_ref()
+            .expect("cluster placement is initialized")
+            .membership_epoch,
+        roster: config
+            .daemon
+            .cluster_placement
+            .as_ref()
+            .expect("cluster placement is initialized")
+            .roster
+            .clone(),
+    };
+    placement.roster.sort_unstable();
+    placement
+        .validate()
+        .expect("valid initial cluster placement");
+    placement
+}
+
+fn migration_pause_ns(attempt: MigrationAttempt) -> u64 {
+    now().saturating_sub(attempt.started)
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
     assert!(config.hosts > 0, "cluster requires at least one host");
-    if config.daemon.replica_placement.is_none() {
-        config.daemon.replica_placement = Some(ReplicaPlacementConfig {
+    if config.daemon.cluster_placement.is_none() {
+        config.daemon.cluster_placement = Some(ClusterPlacementConfig {
             membership_epoch: 1,
-            local_failure_domain: 0,
             roster: (0..config.hosts)
-                .map(|host| PeerCandidate {
-                    host: HostId(host),
-                    weight: 1,
-                    failure_domain: host,
-                    drained: false,
-                })
+                .map(|host| HostId::new(u32::from(host)))
                 .collect(),
             authority: None,
         });
     }
-
+    if !config.membership_events.is_empty() {
+        config
+            .daemon
+            .cluster_placement
+            .as_mut()
+            .expect("cluster placement is initialized")
+            .authority = Some(dynamic_authority_config());
+    }
     let worlds = SimWorld::cluster(config.hosts, config.bdev, config.store);
+    if !config.membership_events.is_empty() {
+        let placement = initial_cluster_placement(&config);
+        worlds[0].seed_store_object(layout::placement_key(), placement.encode());
+    }
+    let initial_identities = config
+        .daemon
+        .cluster_placement
+        .as_ref()
+        .expect("cluster placement is initialized")
+        .roster
+        .clone();
+    for world in &worlds {
+        world.replace_peer_identities(initial_identities.iter().copied());
+    }
     let worlds = Rc::new(worlds);
     if config.sabotage == Some(Sabotage::EagerHandoffAck) {
         for world in worlds.iter() {
@@ -270,20 +460,28 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
         live: vec![true; usize::from(config.hosts)],
         up: vec![true; usize::from(config.hosts)],
         workload_end: Cell::new(0),
-        report: ClusterReport::default(),
+        report: ClusterReport {
+            placement_epoch_initial: config
+                .daemon
+                .cluster_placement
+                .as_ref()
+                .map_or(1, |placement| placement.membership_epoch),
+            placement_epoch_final: config
+                .daemon
+                .cluster_placement
+                .as_ref()
+                .map_or(1, |placement| placement.membership_epoch),
+            ..ClusterReport::default()
+        },
         sync_latencies: Vec::new(),
         retired_counters: Vec::new(),
     }));
-    let mut fault_config = FaultConfig::disabled();
-    for &point in &config.fault_points {
-        fault_config.force(point, [true]);
-    }
     let contexts = Rc::new(
         (0..=config.hosts)
             .map(|host| {
                 SimulationContext::new(
                     seed.wrapping_add(u64::from(host).wrapping_mul(0x9e37_79b9)),
-                    fault_config.clone(),
+                    FaultConfig::disabled(),
                 )
                 .semantic_trace_only()
             })
@@ -291,22 +489,61 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
     );
     let commands: HostCommands = Rc::new(RefCell::new(VecDeque::new()));
     let peer_stats = Rc::new(PeerTransportStats::default());
+    let peer_membership: PeerMembership = Rc::new(RefCell::new(
+        (0..config.hosts)
+            .map(|host| {
+                let identity = host_id(host);
+                (identity, PeerAuthorization::new(identity, 1))
+            })
+            .collect(),
+    ));
+    let placement_slots: PlacementSlots = Rc::new(RefCell::new(
+        (0..config.hosts)
+            .map(|host| {
+                host_config(&config, host)
+                    .cluster_placement
+                    .expect("cluster placement is initialized")
+            })
+            .collect(),
+    ));
+    let membership_model = Rc::new(RefCell::new(MembershipModel {
+        placement_version: (!config.membership_events.is_empty()).then_some(1),
+        placement_epoch: config
+            .daemon
+            .cluster_placement
+            .as_ref()
+            .map_or(1, |placement| placement.membership_epoch),
+        ..MembershipModel::default()
+    }));
     let peer_roster = (0..config.hosts)
-        .map(|host| (HostId(host), format!("host-{host}")))
+        .map(|host| (host_id(host), format!("host-{host}")))
         .collect::<BTreeMap<_, _>>();
     let peer_faults = PeerTransportFaults {
         duplicate_odds: config.peer_dup,
         targeted_drop: config
             .drop_peer
             .map(|(kind, begin, end)| (kind as u8, begin, end)),
-        max_frames_per_connection: 1,
+        max_frames_per_connection: 64,
     };
     let config = Rc::new(config);
 
     // One conceptual millisecond per outer step lets lifecycle commands reach
     // Turmoil between host polls without changing the actor clock's nanosecond API.
     let tick = Duration::from_millis(millis(1));
-    let duration = Duration::from_millis(config.horizon.saturating_add(5 * millis(1_000)));
+    // The final audit waits independently for every page. Derive the Turmoil
+    // bound from that worst case so alternate page-size profiles cannot turn
+    // valid fault timeouts into a harness-duration abort.
+    let audit_timeout = u64::from(config.volume_count)
+        .saturating_mul(u64::from(config.volume_config.pages))
+        .saturating_mul(FINAL_PAGE_AUDIT_TIMEOUT);
+    let duration = Duration::from_millis(
+        config
+            .horizon
+            .saturating_add(FINAL_SETTLE_TIME)
+            .saturating_add(FINAL_LIFECYCLE_DRAIN_TIMEOUT)
+            .saturating_add(audit_timeout)
+            .saturating_add(SIMULATION_SCHEDULING_SLACK),
+    );
     let output = Rc::new(RefCell::new(None));
     let client_output = Rc::clone(&output);
     let fail_rate = if config.peer_drop.1 == 0 {
@@ -341,25 +578,40 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
         let context = contexts[usize::from(host) + 1].clone();
         let roster = peer_roster.clone();
         let transport_stats = Rc::clone(&peer_stats);
+        let membership = Rc::clone(&peer_membership);
         sim.host(host_name, move || {
-            let state = Rc::new(RefCell::new(HostState::new(host_config(&config, host))));
-            *states[usize::from(host)].borrow_mut() = Rc::clone(&state);
+            let states = Rc::clone(&states);
             let world = Rc::clone(&world);
             let context = context.clone();
             let config = Rc::clone(&config);
             let roster = roster.clone();
             let transport_stats = Rc::clone(&transport_stats);
+            let membership = Rc::clone(&membership);
             async move {
-                let transport = PeerTransport::start(
-                    host_config(&config, host).host,
-                    roster,
-                    peer_faults,
-                    transport_stats,
-                )
-                .await?;
-                let _attachment = world.attach_peer_transport(transport);
-                context.scope(host_actor_with_state(state, world)).await;
-                Ok(())
+                context
+                    .scope(async move {
+                        // Startup placement is a durable input. In particular, a
+                        // bounced host must not inherit the controller's in-memory
+                        // placement slot: production restart has only the object
+                        // store and must install its epoch before recovery begins.
+                        let placement = load_startup_placement(&world, &config, host).await;
+                        let state = Rc::new(RefCell::new(HostState::new(
+                            host_config_with_placement(&config, host, placement),
+                        )));
+                        *states[usize::from(host)].borrow_mut() = Rc::clone(&state);
+                        let transport = PeerTransport::start_with_membership(
+                            host_id(host),
+                            roster,
+                            peer_faults,
+                            transport_stats,
+                            membership,
+                        )
+                        .await?;
+                        let _attachment = world.attach_peer_transport(transport);
+                        host_actor_with_state(state, world).await;
+                        Ok(())
+                    })
+                    .await
             }
         });
     }
@@ -372,6 +624,9 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
     let client_commands = Rc::clone(&commands);
     let client_contexts = Rc::clone(&contexts);
     let client_peer_stats = Rc::clone(&peer_stats);
+    let client_peer_membership = Rc::clone(&peer_membership);
+    let client_placement_slots = Rc::clone(&placement_slots);
+    let client_membership_model = Rc::clone(&membership_model);
     sim.client("cluster-controller", async move {
         let report = client_context
             .scope(run_inner(
@@ -382,6 +637,9 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
                 client_commands,
                 client_contexts,
                 client_peer_stats,
+                client_peer_membership,
+                client_placement_slots,
+                client_membership_model,
             ))
             .await;
         *client_output.borrow_mut() = Some(report);
@@ -395,11 +653,11 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
         while let Some(command) = commands.borrow_mut().pop_front() {
             match command {
                 HostCommand::Crash(host, complete) => {
-                    sim.crash(format!("host-{}", host.0));
+                    sim.crash(format!("host-{}", host.get()));
                     let _ = complete.send(());
                 }
                 HostCommand::Bounce(host, complete) => {
-                    sim.bounce(format!("host-{}", host.0));
+                    sim.bounce(format!("host-{}", host.get()));
                     let _ = complete.send(());
                 }
             }
@@ -415,6 +673,7 @@ pub fn run(seed: u64, mut config: ClusterConfig) -> ClusterReport {
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     config: Rc<ClusterConfig>,
     worlds: Rc<Vec<Rc<SimWorld>>>,
@@ -423,6 +682,9 @@ async fn run_inner(
     commands: HostCommands,
     contexts: Rc<Vec<SimulationContext>>,
     peer_stats: Rc<PeerTransportStats>,
+    peer_membership: PeerMembership,
+    placement_slots: PlacementSlots,
+    membership_model: Rc<RefCell<MembershipModel>>,
 ) -> ClusterReport {
     let guest_slots = Rc::clone(&control.borrow().guests);
 
@@ -446,11 +708,25 @@ async fn run_inner(
         .detach();
     }
 
+    wait_for_initial_authority(&config, &states).await;
+
     let initial_volumes =
         create_initial_volumes(Rc::clone(&config), Rc::clone(&worlds), Rc::clone(&control)).await;
+    // Forced actor failures exercise operating hosts. Creation now includes
+    // passive protection, so arming these points earlier would intentionally
+    // abort the initial create rather than the runtime behavior under test.
+    if !config.fault_points.is_empty() {
+        let mut faults = FaultConfig::disabled();
+        for &point in &config.fault_points {
+            faults.force(point, [true]);
+        }
+        for context in contexts.iter().skip(1) {
+            context.set_fault_config(faults.clone());
+        }
+    }
     let workload_end = now().saturating_add(config.horizon);
     control.borrow().workload_end.set(workload_end);
-    let simulation_end = workload_end.saturating_add(2 * millis(1_000));
+    let simulation_end = workload_end.saturating_add(FINAL_SETTLE_TIME);
 
     spawn_schedules(
         &config,
@@ -459,6 +735,9 @@ async fn run_inner(
         Rc::clone(&control),
         Rc::clone(&commands),
         Rc::clone(&peer_stats),
+        peer_membership,
+        Rc::clone(&placement_slots),
+        Rc::clone(&membership_model),
     );
     let guest_config = Rc::clone(&config);
     let guest_worlds = Rc::clone(&worlds);
@@ -470,6 +749,19 @@ async fn run_inner(
     }
     .await;
     delay(simulation_end.saturating_sub(now())).await;
+    if !wait_for_lifecycle_drain(&control, &worlds, &states, &config).await {
+        control.borrow_mut().report.violations.push(
+            "final audit could not drain in-flight migration lifecycle within its bound".to_owned(),
+        );
+    }
+
+    verify_membership_convergence(
+        &config,
+        &states,
+        &control,
+        &placement_slots,
+        &membership_model,
+    );
 
     let audit = audit_cluster(
         Rc::clone(&config),
@@ -478,22 +770,52 @@ async fn run_inner(
         Rc::clone(&control),
     )
     .await;
+    if !config.membership_events.is_empty() {
+        audit_dynamic_authority(&config, &worlds, &states, &control).await;
+    }
     {
         let mut control = control.borrow_mut();
         control.report.audit_runs = 1;
         control.report.audited_volumes = audit.volumes;
         control.report.audited_pages = audit.pages;
+        control.report.protected_sync_volumes = audit.protected_sync_volumes;
+        control.report.continuous_volumes = audit.volumes;
         control.report.violations.extend(audit.violations);
     }
+
+    // Freeze every host-owned background actor before yielding to cancelled
+    // guests and taking the final trace/counter snapshot. In particular, a
+    // host-session monitor records its GET before the simulated store latency;
+    // leaving host roots live here made that final maintenance read land on
+    // either side of the report boundary depending on unrelated peer wakeups.
+    stop_running_hosts_for_report(config.hosts, &control, &commands).await;
 
     for guest in guest_slots.borrow_mut().values_mut() {
         if let Some(mut guest) = guest.take() {
             guest.cancel();
         }
     }
+    let frozen_store = worlds[0].store_metrics();
+    let frozen_traces = contexts
+        .iter()
+        .map(SimulationContext::trace_hash)
+        .collect::<Vec<_>>();
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }
+    assert_eq!(
+        worlds[0].store_metrics(),
+        frozen_store,
+        "store activity continued after final host/guest quiescence"
+    );
+    assert_eq!(
+        contexts
+            .iter()
+            .map(SimulationContext::trace_hash)
+            .collect::<Vec<_>>(),
+        frozen_traces,
+        "semantic trace changed after final host/guest quiescence"
+    );
 
     let mut control = control.borrow_mut();
     control.report.trace_hash = contexts.iter().fold(0, |trace, context| {
@@ -509,6 +831,11 @@ async fn run_inner(
         .values()
         .map(|guest| guest.total_completed.get())
         .sum();
+    control.report.placement_owner_first_faults_after_restart = control
+        .guest_state
+        .values()
+        .map(|guest| guest.post_restart_faults.get())
+        .sum();
     let violations = control
         .guest_state
         .values()
@@ -518,14 +845,18 @@ async fn run_inner(
     let mut counters = control.retired_counters.clone();
     counters.extend(states.iter().map(|state| state.borrow().borrow().counters));
     summarize_counters(&mut control.report, &counters);
+    control.report.store_retries = control
+        .report
+        .store_retries
+        .saturating_add(control.report.membership_claim_retries);
     control.report.parked_end = states
         .iter()
-        .filter(|state| control.live[usize::from(state.borrow().borrow().config.host.0)])
+        .filter(|state| control.live[host_index(state.borrow().borrow().config.host)])
         .map(|state| state.borrow().borrow().stats().pressure_waiting_faults)
         .sum();
     control.report.hydrating_end = states
         .iter()
-        .filter(|state| control.live[usize::from(state.borrow().borrow().config.host.0)])
+        .filter(|state| control.live[host_index(state.borrow().borrow().config.host)])
         .map(|state| {
             state
                 .borrow()
@@ -546,6 +877,9 @@ async fn run_inner(
     control.report.peer_drops = drops;
     control.report.peer_dups = dups;
     control.report.peer_link_clogs = clogs;
+    control.report.peer_certificate_authorization_drops =
+        peer_stats.certificate_authorization_drops();
+    control.report.peer_renewed_certificate_frames = peer_stats.renewed_certificate_frames();
     control.report.nemesis_drops = targeted;
     control.report.releases = releases;
     let (unavailable, conflicts) = worlds[0].store_counters();
@@ -567,10 +901,149 @@ async fn run_inner(
     std::mem::take(&mut control.report)
 }
 
+async fn stop_running_hosts_for_report(
+    hosts: u16,
+    control: &Rc<RefCell<Control>>,
+    commands: &HostCommands,
+) {
+    let running = (0..hosts)
+        .filter(|host| control.borrow().up[usize::from(*host)])
+        .collect::<Vec<_>>();
+    let mut completed = Vec::with_capacity(running.len());
+    {
+        let mut commands = commands.borrow_mut();
+        for host in running {
+            let (complete, completion) = oneshot();
+            commands.push_back(HostCommand::Crash(HostId::new(u32::from(host)), complete));
+            completed.push(completion);
+        }
+    }
+    for completion in completed {
+        let _ = completion.await;
+    }
+}
+
+async fn wait_for_initial_authority(config: &ClusterConfig, states: &StateSlots) {
+    if config.membership_events.is_empty() {
+        return;
+    }
+    let deadline = now().saturating_add(millis(10_000));
+    let expected_epoch = config
+        .daemon
+        .cluster_placement
+        .as_ref()
+        .expect("cluster placement is initialized")
+        .membership_epoch;
+    loop {
+        let ready = (1..=config.volume_count).all(|number| {
+            let volume = VolumeId(u64::from(number));
+            let host = usize::from((number - 1) % config.hosts);
+            let state = states[host].borrow();
+            let state = state.borrow();
+            state.authority_ready()
+                && state.authority_placement_epoch() == expected_epoch
+                && state.volume_authorized(volume)
+        });
+        if ready {
+            return;
+        }
+        assert!(
+            now() < deadline,
+            "initial store-backed authority did not become ready"
+        );
+        delay(millis(1)).await;
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn audit_dynamic_authority(
+    config: &ClusterConfig,
+    worlds: &[Rc<SimWorld>],
+    states: &StateSlots,
+    control: &Rc<RefCell<Control>>,
+) {
+    let Ok(Some(placement)) = read_placement(worlds[0].as_ref()).await else {
+        control
+            .borrow_mut()
+            .report
+            .violations
+            .push("final authority audit found no durable placement".to_owned());
+        return;
+    };
+    let expected_epoch = control.borrow().report.placement_epoch_final;
+    if placement.placement.epoch != expected_epoch {
+        control.borrow_mut().report.violations.push(format!(
+            "authority and actor placement views diverged: authority {}, actor {expected_epoch}",
+            placement.placement.epoch,
+        ));
+    }
+    for host in 0..config.hosts {
+        let identity = host_id(host);
+        let session = read_host_session(worlds[0].as_ref(), identity).await;
+        let expected_active = placement.placement.contains(identity);
+        match session {
+            Ok(Some(session))
+                if expected_active
+                    && matches!(session.record, HostSessionRecord::Active { .. }) => {}
+            Ok(Some(_)) if !expected_active => {}
+            other => control.borrow_mut().report.violations.push(format!(
+                "final authority session for {identity:?} did not match liveness: {other:?}"
+            )),
+        }
+        if expected_active && control.borrow().up[usize::from(host)] {
+            let state = states[usize::from(host)].borrow();
+            let state = state.borrow();
+            if state.authority_placement_epoch() != placement.placement.epoch {
+                control.borrow_mut().report.violations.push(format!(
+                    "host {host} cached authority placement epoch {}, expected {}",
+                    state.authority_placement_epoch(),
+                    placement.placement.epoch
+                ));
+            }
+        }
+    }
+}
+
+async fn wait_for_lifecycle_drain(
+    control: &Rc<RefCell<Control>>,
+    worlds: &Rc<Vec<Rc<SimWorld>>>,
+    states: &StateSlots,
+    config: &Rc<ClusterConfig>,
+) -> bool {
+    let deadline = now().saturating_add(FINAL_LIFECYCLE_DRAIN_TIMEOUT);
+    loop {
+        let attempts = control
+            .borrow()
+            .migrations
+            .iter()
+            .map(|(&volume, &attempt)| (volume, attempt))
+            .collect::<Vec<_>>();
+        for (volume, attempt) in attempts {
+            reconcile_accepted_migration(volume, attempt, control, worlds, states, config);
+        }
+        let drained = {
+            let control = control.borrow();
+            control.migrations.is_empty()
+                && control.quiescing_guests.is_empty()
+                && control.migration_cuts.is_empty()
+                && control.deferred_source_recoveries.is_empty()
+                && control.deferred_destination_recoveries.is_empty()
+        };
+        if drained {
+            return true;
+        }
+        if now() >= deadline {
+            return false;
+        }
+        delay(millis(1)).await;
+    }
+}
+
 #[derive(Default)]
 struct AuditReport {
     volumes: u64,
     pages: u64,
+    protected_sync_volumes: u64,
     violations: Vec<String>,
 }
 
@@ -675,17 +1148,19 @@ async fn audit_cluster(
                     "final audit found protected coverage {protected_through} behind acknowledged sync {} for {volume:?}",
                     volume_state.sync_ack_through
                 ));
+            } else if volume_state.sync_ack_through > 0 {
+                audit.protected_sync_volumes = audit.protected_sync_volumes.saturating_add(1);
             }
         }
 
         if let Some(head_bytes) = store.get(&layout::head_key(volume)) {
             match HeadRecord::decode(volume, head_bytes) {
                 Ok(head) => {
-                    if head.holder != HostId(placed) {
+                    if head.holder != host_id(placed) {
                         audit.violations.push(format!(
                             "final audit head for {volume:?} names {:?}, placement names {:?}",
                             head.holder,
-                            HostId(placed)
+                            host_id(placed)
                         ));
                     }
                     if let Some(pointer) = head.manifest {
@@ -725,18 +1200,27 @@ async fn audit_cluster(
                     volume,
                     page: PageNo(page_number),
                 };
-                let fault_failure =
-                    match select2(world.fault(page, false), delay(millis(2_000))).await {
-                        Either::First(true) => None,
-                        Either::First(false) => Some("was rejected"),
-                        Either::Second(()) => Some("timed out"),
-                    };
+                let fault_failure = match select2(
+                    world.fault(page, false),
+                    delay(FINAL_PAGE_AUDIT_TIMEOUT),
+                )
+                .await
+                {
+                    Either::First(true) => None,
+                    Either::First(false) => Some("was rejected"),
+                    Either::Second(()) => Some("timed out"),
+                };
                 world.set_vmstate(volume, guest.completed.get());
                 if let Some(reason) = fault_failure {
                     audit.violations.push(format!(
                         "final audit fault {reason} for {page:?} on authority {authority}"
                     ));
                     continue;
+                }
+                if guest.post_restart_fault_pending.replace(false) {
+                    guest
+                        .post_restart_faults
+                        .set(guest.post_restart_faults.get().saturating_add(1));
                 }
                 audit.pages = audit.pages.saturating_add(1);
                 let actual = world
@@ -771,31 +1255,98 @@ async fn abort_monitor(
 }
 
 fn host_config(config: &ClusterConfig, host: u16) -> HostConfig {
+    let placement = config
+        .daemon
+        .cluster_placement
+        .as_ref()
+        .expect("cluster placement is initialized")
+        .clone();
+    host_config_with_placement(config, host, placement)
+}
+
+async fn load_startup_placement(
+    world: &SimWorld,
+    config: &ClusterConfig,
+    host: u16,
+) -> ClusterPlacementConfig {
+    let configured = host_config(config, host)
+        .cluster_placement
+        .expect("cluster placement is initialized");
+    if config.membership_events.is_empty() {
+        return configured;
+    }
+    let Some((_, bytes)) =
+        retry_get(world, &layout::placement_key(), config.daemon.backup_retry).await
+    else {
+        return configured;
+    };
+    let durable = ClusterPlacement::decode(&bytes)
+        .filter(|placement| placement.cluster_id == DYNAMIC_AUTHORITY_CLUSTER_ID)
+        .expect("durable cluster placement is canonical and belongs to this cluster");
+    ClusterPlacementConfig {
+        membership_epoch: durable.epoch,
+        roster: durable.roster,
+        authority: configured.authority,
+    }
+}
+
+fn host_config_with_placement(
+    config: &ClusterConfig,
+    host: u16,
+    placement: ClusterPlacementConfig,
+) -> HostConfig {
     HostConfig {
         archive: config.daemon.archive,
-        host: HostId(host),
+        host: HostId::new(u32::from(host)),
         cache_pages: config.daemon.cache_pages,
         writeback_interval: config.daemon.writeback_interval,
         backup_retry: config.daemon.backup_retry,
         disk_capacity: config.daemon.disk_capacity,
         disk_headroom: config.daemon.disk_headroom,
         wedge_ticks: config.daemon.wedge_ticks,
-        replica_placement: config.daemon.replica_placement.as_ref().map(|placement| {
-            let local_failure_domain = placement
-                .roster
-                .iter()
-                .find(|candidate| candidate.host == HostId(host))
-                .map_or(placement.local_failure_domain, |candidate| {
-                    candidate.failure_domain
-                });
-            ReplicaPlacementConfig {
-                membership_epoch: placement.membership_epoch,
-                local_failure_domain,
-                roster: placement.roster.clone(),
-                authority: placement.authority,
-            }
-        }),
+        cluster_placement: Some(placement),
     }
+}
+
+fn verify_membership_convergence(
+    config: &ClusterConfig,
+    states: &StateSlots,
+    control: &Rc<RefCell<Control>>,
+    placements: &PlacementSlots,
+    model: &Rc<RefCell<MembershipModel>>,
+) {
+    if config.membership_events.is_empty() {
+        return;
+    }
+    let final_epoch = model.borrow().placement_epoch;
+    let active = model
+        .borrow()
+        .observed_records
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for host in 0..config.hosts {
+        if !active.contains(&HostId::new(u32::from(host)))
+            || !control.borrow().up[usize::from(host)]
+        {
+            continue;
+        }
+        let slot_epoch = placements.borrow()[usize::from(host)].membership_epoch;
+        let state_epoch = states[usize::from(host)]
+            .borrow()
+            .borrow()
+            .config
+            .cluster_placement
+            .as_ref()
+            .map(|placement| placement.membership_epoch);
+        if slot_epoch != final_epoch || state_epoch != Some(final_epoch) {
+            control.borrow_mut().report.violations.push(format!(
+                "membership placement did not converge on host {host}: slot {slot_epoch}, state {state_epoch:?}, expected {final_epoch}"
+            ));
+        }
+    }
+    let mut control = control.borrow_mut();
+    control.report.placement_epoch_final = final_epoch;
 }
 
 fn volume_config(config: &ClusterConfig, _volume: VolumeId) -> blockd_core::journal::VolumeConfig {
@@ -889,10 +1440,12 @@ async fn lifecycle_actor(
                         control.accepted_migrations.remove(&volume);
                         control.deferred_destination_recoveries.remove(&volume);
                         control.report.migrations = control.report.migrations.saturating_add(1);
+                        control.report.authority_transfers =
+                            control.report.authority_transfers.saturating_add(1);
                         control.report.max_migration_pause_ns = control
                             .report
                             .max_migration_pause_ns
-                            .max(migration_pause_ns(attempt, &worlds));
+                            .max(migration_pause_ns(attempt));
                     }
                     control.placement.insert(volume, host);
                 }
@@ -905,7 +1458,7 @@ async fn lifecycle_actor(
                     let control = control.borrow();
                     control.migrations.get(&volume).copied().filter(|attempt| {
                         attempt.to == host
-                            && world.incarnation() != attempt.to_incarnation
+                            && world.run_generation() != attempt.to_run_generation
                             && (control.uncertain_migrations.contains(&volume)
                                 || control.accepted_migrations.contains(&volume))
                     })
@@ -922,7 +1475,7 @@ async fn lifecycle_actor(
                     .get(&volume)
                     .copied()
                     .is_some_and(|attempt| {
-                        attempt.to == host && world.incarnation() != attempt.to_incarnation
+                        attempt.to == host && world.run_generation() != attempt.to_run_generation
                     });
                 if pending_destination {
                     control
@@ -935,7 +1488,7 @@ async fn lifecycle_actor(
                     let control = control.borrow();
                     control.migrations.get(&volume).copied().filter(|attempt| {
                         attempt.from == host
-                            && world.incarnation() != attempt.from_incarnation
+                            && world.run_generation() != attempt.from_run_generation
                             && control.uncertain_migrations.contains(&volume)
                     })
                 };
@@ -962,7 +1515,8 @@ async fn lifecycle_actor(
                     // simulator starts a migration. The request completion or
                     // migration lifecycle event owns the resulting placement;
                     // this older notification must not start another runner.
-                    if attempt.from == host && world.incarnation() != attempt.from_incarnation {
+                    if attempt.from == host && world.run_generation() != attempt.from_run_generation
+                    {
                         control
                             .borrow_mut()
                             .deferred_source_recoveries
@@ -970,6 +1524,19 @@ async fn lifecycle_actor(
                     }
                     continue;
                 }
+                let orphan_recovery = config
+                    .daemon
+                    .cluster_placement
+                    .as_ref()
+                    .and_then(|placement| placement.authority)
+                    .is_some()
+                    && control
+                        .borrow()
+                        .placement
+                        .get(&volume)
+                        .is_some_and(|&placed| {
+                            placed != host && !control.borrow().live[usize::from(placed)]
+                        });
                 let already_elsewhere =
                     control
                         .borrow()
@@ -1000,9 +1567,29 @@ async fn lifecycle_actor(
                     control.report.recoveries = control.report.recoveries.saturating_add(1);
                     if runnable {
                         control.placement.insert(volume, host);
+                        if orphan_recovery {
+                            control.report.restores = control.report.restores.saturating_add(1);
+                            if world
+                                .store_bytes(&layout::head_key(volume))
+                                .and_then(|bytes| HeadRecord::decode(volume, &bytes).ok())
+                                .is_some_and(|head| head.stash.is_some())
+                            {
+                                // Recovery preserves the durable passive assignment.
+                                control.report.stash_recoveries =
+                                    control.report.stash_recoveries.saturating_add(1);
+                            }
+                        }
                     }
                 }
-                if runnable {
+                let authority_quiesced = config
+                    .daemon
+                    .cluster_placement
+                    .as_ref()
+                    .and_then(|placement| placement.authority)
+                    .is_some()
+                    && control.borrow().quiescing_guests.contains(&volume)
+                    && !control.borrow().migrations.contains_key(&volume);
+                if runnable && !authority_quiesced {
                     start_guest(volume, host, &control, &worlds, &config);
                 }
             }
@@ -1013,7 +1600,7 @@ async fn lifecycle_actor(
 #[derive(Clone, Copy)]
 struct RestoreTarget {
     host: u16,
-    incarnation: u64,
+    run_generation: u64,
 }
 
 async fn restore_completion(
@@ -1031,7 +1618,7 @@ async fn restore_completion(
             let control = control.borrow();
             control.live[usize::from(target.host)]
                 && control.up[usize::from(target.host)]
-                && worlds[usize::from(target.host)].incarnation() == target.incarnation
+                && worlds[usize::from(target.host)].run_generation() == target.run_generation
         };
         if host_is_current {
             break (target, result);
@@ -1053,7 +1640,7 @@ async fn restore_completion(
         };
         target = RestoreTarget {
             host,
-            incarnation: worlds[usize::from(host)].incarnation(),
+            run_generation: worlds[usize::from(host)].run_generation(),
         };
         reply = worlds[usize::from(host)].request_admin(AdminCall::RestoreVolume { volume });
     };
@@ -1091,6 +1678,7 @@ async fn restore_completion(
         let mut control = control.borrow_mut();
         control.placement.insert(volume, target.host);
         control.report.restores = control.report.restores.saturating_add(1);
+        control.report.authority_transfers = control.report.authority_transfers.saturating_add(1);
         control.report.loss_bound_verified = control.report.loss_bound_verified.saturating_add(1);
         control.report.max_restore_ns = control
             .report
@@ -1103,6 +1691,12 @@ async fn restore_completion(
 }
 
 struct MigrationCompletionSignal(Option<OneSender<()>>);
+
+struct MigrationCompletionContext {
+    control: Rc<RefCell<Control>>,
+    worlds: Rc<Vec<Rc<SimWorld>>>,
+    config: Rc<ClusterConfig>,
+}
 
 impl Drop for MigrationCompletionSignal {
     fn drop(&mut self) {
@@ -1117,10 +1711,13 @@ async fn migration_completion(
     attempt: MigrationAttempt,
     reply: Response<AdminResult>,
     completed: OneSender<()>,
-    control: Rc<RefCell<Control>>,
-    worlds: Rc<Vec<Rc<SimWorld>>>,
-    config: Rc<ClusterConfig>,
+    context: MigrationCompletionContext,
 ) {
+    let MigrationCompletionContext {
+        control,
+        worlds,
+        config,
+    } = context;
     let _completed = MigrationCompletionSignal(Some(completed));
     let result = reply.await;
     let succeeded = matches!(
@@ -1210,6 +1807,62 @@ async fn migration_completion(
     }
 }
 
+fn reconcile_accepted_migration(
+    volume: VolumeId,
+    attempt: MigrationAttempt,
+    control: &Rc<RefCell<Control>>,
+    worlds: &Rc<Vec<Rc<SimWorld>>>,
+    states: &StateSlots,
+    config: &Rc<ClusterConfig>,
+) {
+    if control.borrow().migrations.get(&volume) != Some(&attempt) {
+        return;
+    }
+    let authority = worlds[0]
+        .store_bytes(&layout::head_key(volume))
+        .and_then(|bytes| HeadRecord::decode(volume, &bytes).ok())
+        .and_then(|head| {
+            (0..config.hosts).find(|&host| {
+                host_id(host) == head.holder
+                    && head.holder != host_id(attempt.from)
+                    && head.fence != 0
+                    && states[usize::from(host)]
+                        .borrow()
+                        .borrow()
+                        .volumes
+                        .get(&volume)
+                        .is_some_and(|state| state.ready && state.fence == head.fence)
+            })
+        });
+    if let Some(authority) = authority {
+        let migrated = control.borrow().guest_state[&volume]
+            .expected
+            .borrow()
+            .clone();
+        *control.borrow().guest_state[&volume].durable.borrow_mut() = migrated;
+        {
+            let mut control = control.borrow_mut();
+            if control.migrations.get(&volume) != Some(&attempt) {
+                return;
+            }
+            control.migrations.remove(&volume);
+            control.uncertain_migrations.remove(&volume);
+            control.accepted_migrations.remove(&volume);
+            control.deferred_source_recoveries.remove(&volume);
+            control.deferred_destination_recoveries.remove(&volume);
+            control.placement.insert(volume, authority);
+            control.report.migrations = control.report.migrations.saturating_add(1);
+            control.report.authority_transfers =
+                control.report.authority_transfers.saturating_add(1);
+            control.report.max_migration_pause_ns = control
+                .report
+                .max_migration_pause_ns
+                .max(migration_pause_ns(attempt));
+        }
+        start_guest(volume, authority, control, worlds, config);
+    }
+}
+
 fn restart_source_after_migration_refusal(
     volume: VolumeId,
     attempt: MigrationAttempt,
@@ -1223,8 +1876,8 @@ fn restart_source_after_migration_refusal(
         control.placement.get(&volume) == Some(&attempt.from)
             && control.up[usize::from(attempt.from)]
     };
-    let source_reconciled = worlds[usize::from(attempt.from)].incarnation()
-        == attempt.from_incarnation
+    let source_reconciled = worlds[usize::from(attempt.from)].run_generation()
+        == attempt.from_run_generation
         || deferred_recovery.is_some();
     if !source_ready || !source_reconciled {
         return;
@@ -1351,10 +2004,11 @@ fn finalize_destination_migration(
         control.deferred_destination_recoveries.remove(&volume);
         control.placement.insert(volume, host);
         control.report.migrations = control.report.migrations.saturating_add(1);
+        control.report.authority_transfers = control.report.authority_transfers.saturating_add(1);
         control.report.max_migration_pause_ns = control
             .report
             .max_migration_pause_ns
-            .max(migration_pause_ns(attempt, worlds));
+            .max(migration_pause_ns(attempt));
     }
     if runnable {
         start_guest(volume, host, control, worlds, config);
@@ -1474,6 +2128,11 @@ async fn guest_actor(
             control.report.guest_deaths = control.report.guest_deaths.saturating_add(1);
             return;
         }
+        if state.post_restart_fault_pending.replace(false) {
+            state
+                .post_restart_faults
+                .set(state.post_restart_faults.get().saturating_add(1));
+        }
         if write {
             let sequence = {
                 let mut sequences = state.volume_sequences.borrow_mut();
@@ -1581,7 +2240,642 @@ fn choose_page(config: &ClusterConfig, volume: VolumeId) -> PageId {
     }
 }
 
+fn membership_claim_key(host: HostId) -> String {
+    format!("{MEMBERSHIP_CLAIM_PREFIX}{:08x}", host.get())
+}
+
+fn membership_member_key(host: HostId) -> String {
+    format!("{MEMBERSHIP_MEMBER_PREFIX}{:08x}", host.get())
+}
+
+fn encode_claim(host: HostId, token: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(10);
+    bytes.extend_from_slice(&host.get().to_le_bytes());
+    bytes.extend_from_slice(&token.to_le_bytes());
+    bytes
+}
+
+fn placement_bytes(epoch: u64, roster: Vec<HostId>) -> Vec<u8> {
+    ClusterPlacement {
+        cluster_id: DYNAMIC_AUTHORITY_CLUSTER_ID,
+        epoch,
+        roster,
+    }
+    .encode()
+}
+
+async fn retry_get(world: &SimWorld, key: &str, retry: u64) -> Option<(u64, Vec<u8>)> {
+    loop {
+        match Store::get(world, key).await {
+            Ok(found) => return found,
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                delay(retry).await;
+            }
+            Err(StoreError::TooLarge | StoreError::Fault(_)) => return None,
+        }
+    }
+}
+
+async fn membership_cas(
+    world: &SimWorld,
+    key: String,
+    expected: Option<u64>,
+    bytes: Vec<u8>,
+    retry: u64,
+    commit_response_lost: bool,
+    control: &Rc<RefCell<Control>>,
+) -> Option<u64> {
+    let committed = loop {
+        match Store::put_cas(world, key.clone(), expected, bytes.clone()).await {
+            Ok(version) => break version,
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                {
+                    let mut control = control.borrow_mut();
+                    control.report.membership_claim_retries =
+                        control.report.membership_claim_retries.saturating_add(1);
+                }
+                delay(retry).await;
+            }
+            Err(StoreError::TooLarge | StoreError::Fault(_)) => return None,
+        }
+    };
+    if !commit_response_lost {
+        return Some(committed);
+    }
+    {
+        let mut control = control.borrow_mut();
+        control.report.membership_committed_lost =
+            control.report.membership_committed_lost.saturating_add(1);
+    }
+    match Store::put_cas(world, key.clone(), expected, bytes.clone()).await {
+        Err(StoreError::Fault(blockd_core::protocol::StoreFault::CasConflict { .. })) => {
+            let mut control = control.borrow_mut();
+            control.report.membership_claim_retries =
+                control.report.membership_claim_retries.saturating_add(1);
+        }
+        _ => return None,
+    }
+    retry_get(world, &key, retry)
+        .await
+        .filter(|(_, found)| *found == bytes)
+        .map(|(version, _)| version)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_membership_event(
+    event: MembershipEvent,
+    config: &ClusterConfig,
+    worlds: &[Rc<SimWorld>],
+    states: &StateSlots,
+    control: &Rc<RefCell<Control>>,
+    commands: &HostCommands,
+    membership: &PeerMembership,
+    placements: &PlacementSlots,
+    model: &Rc<RefCell<MembershipModel>>,
+) {
+    let at = match event {
+        MembershipEvent::Claim { at, .. }
+        | MembershipEvent::Publish { at, .. }
+        | MembershipEvent::Discover { at, .. }
+        | MembershipEvent::RotateCertificate { at, .. }
+        | MembershipEvent::Restart { at, .. } => at,
+    };
+    delay(at).await;
+    match event {
+        MembershipEvent::Claim {
+            host,
+            token,
+            commit_response_lost,
+            ..
+        } => {
+            let host = HostId::new(u32::from(host));
+            let key = membership_claim_key(host);
+            let bytes = encode_claim(host, token);
+            if membership_cas(
+                worlds[0].as_ref(),
+                key,
+                None,
+                bytes,
+                config.daemon.backup_retry,
+                commit_response_lost,
+                control,
+            )
+            .await
+            .is_some()
+            {
+                let mut model = model.borrow_mut();
+                model.claims.insert(host, token);
+                let mut control = control.borrow_mut();
+                control.report.membership_claims =
+                    control.report.membership_claims.saturating_add(1);
+            }
+        }
+        MembershipEvent::Publish {
+            host,
+            lease_duration,
+            certificate_generation,
+            commit_response_lost,
+            ..
+        } => {
+            publish_member(
+                HostId::new(u32::from(host)),
+                now().saturating_add(lease_duration),
+                certificate_generation,
+                commit_response_lost,
+                config,
+                worlds[0].as_ref(),
+                control,
+                model,
+            )
+            .await;
+        }
+        MembershipEvent::RotateCertificate {
+            host,
+            certificate_generation,
+            commit_response_lost,
+            ..
+        } => {
+            let host = HostId::new(u32::from(host));
+            send_certificate_probe(host, worlds, control, membership, true);
+            let expiry = model.borrow().observed_records.get(&host).map_or_else(
+                || now().saturating_add(config.horizon),
+                |record| record.lease_expires_at,
+            );
+            publish_member(
+                host,
+                expiry,
+                certificate_generation,
+                commit_response_lost,
+                config,
+                worlds[0].as_ref(),
+                control,
+                model,
+            )
+            .await;
+            let mut control = control.borrow_mut();
+            control.report.membership_certificate_rotations = control
+                .report
+                .membership_certificate_rotations
+                .saturating_add(1);
+        }
+        MembershipEvent::Discover {
+            observer,
+            reverse_list,
+            reverse_gets,
+            ..
+        } => {
+            discover_membership(
+                observer,
+                reverse_list,
+                reverse_gets,
+                config,
+                worlds,
+                control,
+                membership,
+                placements,
+                model,
+            )
+            .await;
+        }
+        MembershipEvent::Restart {
+            host,
+            downtime,
+            class,
+            ..
+        } => {
+            let restarts_owner = control
+                .borrow()
+                .placement
+                .values()
+                .any(|placed| *placed == host);
+            // Poison the shortcut used by the old harness. A rolling restart
+            // that owns data can succeed only if its new HostState is built
+            // from the durable placement object rather than this stale slot.
+            let poisoned_slot = (class == RestartClass::Rolling && restarts_owner).then(|| {
+                let current = placements.borrow()[usize::from(host)].clone();
+                let mut stale = current.clone();
+                stale.membership_epoch = stale.membership_epoch.saturating_sub(1).max(1);
+                assert_ne!(stale.membership_epoch, current.membership_epoch);
+                placements.borrow_mut()[usize::from(host)] = stale;
+                current
+            });
+            let outcome =
+                restart_host_for(host, downtime, config, worlds, states, control, commands).await;
+            let preserved = model
+                .borrow()
+                .observed_records
+                .get(&HostId::new(u32::from(host)))
+                .is_some_and(|record| {
+                    record.lease_expires_at > now()
+                        && membership
+                            .borrow()
+                            .contains_key(&HostId::new(u32::from(host)))
+                });
+            let placement_epoch = model.borrow().placement_epoch;
+            let durable_placement = retry_get(
+                worlds[0].as_ref(),
+                &layout::placement_key(),
+                config.daemon.backup_retry,
+            )
+            .await
+            .and_then(|(_, bytes)| ClusterPlacement::decode(&bytes))
+            .filter(|placement| {
+                placement.cluster_id == DYNAMIC_AUTHORITY_CLUSTER_ID
+                    && placement.epoch == placement_epoch
+            });
+            let recovered_placement = match (outcome.as_ref(), durable_placement.as_ref()) {
+                (Some(outcome), Some(durable)) => {
+                    wait_for_restarted_placement(
+                        states,
+                        host,
+                        &outcome.retired_state,
+                        durable,
+                        config.daemon.backup_retry,
+                    )
+                    .await
+                }
+                _ => false,
+            };
+            if let Some(slot) = poisoned_slot {
+                placements.borrow_mut()[usize::from(host)] = slot;
+            }
+            let mut control = control.borrow_mut();
+            match class {
+                RestartClass::Fast => {
+                    control.report.membership_fast_restarts =
+                        control.report.membership_fast_restarts.saturating_add(1);
+                }
+                RestartClass::Slow => {
+                    control.report.membership_slow_restarts =
+                        control.report.membership_slow_restarts.saturating_add(1);
+                }
+                RestartClass::Rolling => {
+                    control.report.membership_rolling_restarts =
+                        control.report.membership_rolling_restarts.saturating_add(1);
+                }
+            }
+            if preserved {
+                control.report.membership_lease_preserved_restarts = control
+                    .report
+                    .membership_lease_preserved_restarts
+                    .saturating_add(1);
+            }
+            if recovered_placement {
+                control.report.placement_recovered_after_restart = control
+                    .report
+                    .placement_recovered_after_restart
+                    .saturating_add(1);
+                if outcome
+                    .as_ref()
+                    .is_some_and(|outcome| !outcome.affected_volumes.is_empty())
+                {
+                    control.report.placement_owner_recovered_after_restart = control
+                        .report
+                        .placement_owner_recovered_after_restart
+                        .saturating_add(1);
+                }
+            } else {
+                control.report.violations.push(format!(
+                    "restarted host {host} did not install durable cluster placement epoch {placement_epoch} before actor startup"
+                ));
+            }
+        }
+    }
+}
+
+async fn wait_for_restarted_placement(
+    states: &StateSlots,
+    host: u16,
+    retired: &SharedState,
+    durable: &ClusterPlacement,
+    retry: u64,
+) -> bool {
+    for _ in 0..32 {
+        let current = Rc::clone(&states[usize::from(host)].borrow());
+        if !Rc::ptr_eq(&current, retired) {
+            let state = current.borrow();
+            if state
+                .config
+                .cluster_placement
+                .as_ref()
+                .is_some_and(|placement| {
+                    placement.membership_epoch == durable.epoch
+                        && placement.roster == durable.roster
+                })
+            {
+                return true;
+            }
+        }
+        delay(retry).await;
+    }
+    false
+}
+
+fn send_certificate_probe(
+    from: HostId,
+    worlds: &[Rc<SimWorld>],
+    control: &Rc<RefCell<Control>>,
+    membership: &PeerMembership,
+    delayed: bool,
+) {
+    if !control
+        .borrow()
+        .up
+        .get(host_index(from))
+        .copied()
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let target = membership
+        .borrow()
+        .values()
+        .find(|authorization| authorization.identity != from)
+        .map(|authorization| authorization.identity);
+    if let Some(target) = target {
+        let world = &worlds[host_index(from)];
+        if delayed {
+            let _ = world.hold_peer_authentication_probe(target);
+        } else {
+            let _ = world.release_peer_authentication_probe();
+            let _ = world.send_peer_authentication_probe(target);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_member(
+    host: HostId,
+    lease_expires_at: u64,
+    certificate_generation: u64,
+    commit_response_lost: bool,
+    config: &ClusterConfig,
+    world: &SimWorld,
+    control: &Rc<RefCell<Control>>,
+    model: &Rc<RefCell<MembershipModel>>,
+) {
+    let Some(token) = model.borrow().claims.get(&host).copied() else {
+        control.borrow_mut().report.violations.push(format!(
+            "membership publication for {host:?} had no durable claim"
+        ));
+        return;
+    };
+    let record = MembershipRecord {
+        host,
+        token,
+        lease_expires_at,
+        certificate_generation,
+    };
+    let expected = model.borrow().member_versions.get(&host).copied();
+    if let Some(version) = membership_cas(
+        world,
+        membership_member_key(host),
+        expected,
+        record.encode(),
+        config.daemon.backup_retry,
+        commit_response_lost,
+        control,
+    )
+    .await
+    {
+        model.borrow_mut().member_versions.insert(host, version);
+        let mut control = control.borrow_mut();
+        control.report.membership_publications =
+            control.report.membership_publications.saturating_add(1);
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn discover_membership(
+    observer: u16,
+    reverse_list: bool,
+    reverse_gets: bool,
+    config: &ClusterConfig,
+    worlds: &[Rc<SimWorld>],
+    control: &Rc<RefCell<Control>>,
+    membership: &PeerMembership,
+    placements: &PlacementSlots,
+    model: &Rc<RefCell<MembershipModel>>,
+) {
+    let mut keys = loop {
+        match Store::list_prefix(
+            worlds[usize::from(observer)].as_ref(),
+            MEMBERSHIP_MEMBER_PREFIX,
+        )
+        .await
+        {
+            Ok(keys) => break keys,
+            Err(StoreError::Fault(blockd_core::protocol::StoreFault::Unavailable)) => {
+                delay(config.daemon.backup_retry).await;
+            }
+            Err(StoreError::TooLarge | StoreError::Fault(_)) => return,
+        }
+    };
+    {
+        let mut control = control.borrow_mut();
+        control.report.membership_lists = control.report.membership_lists.saturating_add(1);
+        if reverse_list {
+            control.report.membership_reordered_lists =
+                control.report.membership_reordered_lists.saturating_add(1);
+        }
+        if reverse_gets {
+            control.report.membership_reordered_gets =
+                control.report.membership_reordered_gets.saturating_add(1);
+        }
+    }
+    if reverse_list {
+        keys.reverse();
+    }
+    if reverse_gets && keys.len() > 1 {
+        keys.rotate_left(1);
+    }
+
+    let previous_records = model.borrow().observed_records.clone();
+    let current_membership = membership.borrow().keys().copied().collect::<BTreeSet<_>>();
+    let mut records = BTreeMap::new();
+    let mut expired = 0u64;
+    for key in keys {
+        let Some((version, bytes)) = retry_get(
+            worlds[usize::from(observer)].as_ref(),
+            &key,
+            config.daemon.backup_retry,
+        )
+        .await
+        else {
+            continue;
+        };
+        {
+            let mut control = control.borrow_mut();
+            control.report.membership_gets = control.report.membership_gets.saturating_add(1);
+        }
+        let Some(record) = MembershipRecord::decode(&bytes) else {
+            control
+                .borrow_mut()
+                .report
+                .violations
+                .push(format!("membership discovery decoded corrupt object {key}"));
+            continue;
+        };
+        model
+            .borrow_mut()
+            .member_versions
+            .insert(record.host, version);
+        if record.lease_expires_at <= now() {
+            if current_membership.contains(&record.host) {
+                expired = expired.saturating_add(1);
+            }
+            continue;
+        }
+        let claim = retry_get(
+            worlds[usize::from(observer)].as_ref(),
+            &membership_claim_key(record.host),
+            config.daemon.backup_retry,
+        )
+        .await;
+        {
+            let mut control = control.borrow_mut();
+            control.report.membership_gets = control.report.membership_gets.saturating_add(1);
+        }
+        if claim
+            .as_ref()
+            .is_some_and(|(_, bytes)| *bytes == encode_claim(record.host, record.token))
+        {
+            records.insert(record.host, record);
+        }
+    }
+    let rotated_hosts = records
+        .iter()
+        .filter_map(|(host, current)| {
+            previous_records
+                .get(host)
+                .is_some_and(|old| current.certificate_generation > old.certificate_generation)
+                .then_some(*host)
+        })
+        .collect::<Vec<_>>();
+    let next = records.keys().copied().collect::<BTreeSet<_>>();
+    let next_authorizations = records
+        .values()
+        .map(|record| {
+            let identity = record.host;
+            (
+                identity,
+                PeerAuthorization::new(identity, record.certificate_generation),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let previous = current_membership;
+    let joins = next.difference(&previous).count() as u64;
+    let leaves = previous.difference(&next).count() as u64;
+    {
+        let mut model = model.borrow_mut();
+        model.observed_records = records;
+    }
+    {
+        let mut control = control.borrow_mut();
+        control.report.membership_lease_expiries = control
+            .report
+            .membership_lease_expiries
+            .saturating_add(expired);
+    }
+    if next == previous {
+        if *membership.borrow() != next_authorizations {
+            membership.borrow_mut().clone_from(&next_authorizations);
+            let roster = (0..config.hosts).map(|host| {
+                model
+                    .borrow()
+                    .observed_records
+                    .get(&HostId::new(u32::from(host)))
+                    .map_or_else(|| host_id(host), |record| record.host)
+            });
+            let roster = roster.collect::<Vec<_>>();
+            for world in worlds {
+                world.replace_peer_identities(roster.iter().copied());
+            }
+            for host in rotated_hosts {
+                send_certificate_probe(host, worlds, control, membership, false);
+            }
+        }
+        return;
+    }
+
+    let epoch = model
+        .borrow()
+        .placement_epoch
+        .checked_add(1)
+        .expect("membership epoch overflow");
+    let roster = next.iter().copied().collect::<Vec<_>>();
+    let expected = model.borrow().placement_version;
+    let Some(version) = membership_cas(
+        worlds[usize::from(observer)].as_ref(),
+        layout::placement_key(),
+        expected,
+        placement_bytes(epoch, roster.clone()),
+        config.daemon.backup_retry,
+        false,
+        control,
+    )
+    .await
+    else {
+        control
+            .borrow_mut()
+            .report
+            .violations
+            .push("durable membership placement CAS failed".to_owned());
+        return;
+    };
+    {
+        let mut model = model.borrow_mut();
+        model.placement_version = Some(version);
+        model.placement_epoch = epoch;
+    }
+    membership.borrow_mut().clone_from(&next_authorizations);
+    for host in &rotated_hosts {
+        send_certificate_probe(*host, worlds, control, membership, false);
+    }
+    for world in worlds {
+        world.replace_peer_identities(roster.iter().copied());
+    }
+    for host in 0..config.hosts {
+        let authority = placements.borrow()[usize::from(host)].authority;
+        placements.borrow_mut()[usize::from(host)] = ClusterPlacementConfig {
+            membership_epoch: epoch,
+            roster: roster.clone(),
+            authority,
+        };
+    }
+    for host in next.iter().copied() {
+        if !control.borrow().up[host_index(host)] {
+            continue;
+        }
+        let placement = placements.borrow()[host_index(host)].clone();
+        if !matches!(
+            worlds[host_index(host)]
+                .request_admin(AdminCall::UpdateClusterPlacement { placement })
+                .await,
+            Ok(Ok(AdminSuccess::ClusterPlacementUpdated))
+        ) {
+            control.borrow_mut().report.violations.push(format!(
+                "membership placement epoch {epoch} was rejected by host {host}"
+            ));
+        }
+    }
+    let rotations = rotated_hosts.len() as u64;
+    let mut control = control.borrow_mut();
+    control.report.membership_transitions = control.report.membership_transitions.saturating_add(1);
+    control.report.membership_joins = control.report.membership_joins.saturating_add(joins);
+    control.report.membership_leaves = control.report.membership_leaves.saturating_add(leaves);
+    control.report.membership_certificate_rotations = control
+        .report
+        .membership_certificate_rotations
+        .saturating_add(rotations);
+    control.report.durable_placement_writes =
+        control.report.durable_placement_writes.saturating_add(1);
+    control.report.placement_epoch_final = epoch;
+}
+
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_schedules(
     config: &Rc<ClusterConfig>,
     worlds: Rc<Vec<Rc<SimWorld>>>,
@@ -1589,6 +2883,9 @@ fn spawn_schedules(
     control: Rc<RefCell<Control>>,
     commands: HostCommands,
     peer_stats: Rc<PeerTransportStats>,
+    peer_membership: PeerMembership,
+    placement_slots: PlacementSlots,
+    membership_model: Rc<RefCell<MembershipModel>>,
 ) {
     for &(at, host) in &config.crash_hosts_at {
         spawn(at_crash(
@@ -1611,6 +2908,9 @@ fn spawn_schedules(
             Rc::clone(&states),
             Rc::clone(&control),
             Rc::clone(&commands),
+            Rc::clone(&peer_membership),
+            Rc::clone(&placement_slots),
+            Rc::clone(&membership_model),
         ))
         .detach();
     }
@@ -1633,6 +2933,31 @@ fn spawn_schedules(
             transport_stats.record_clog();
             delay(end.saturating_sub(begin)).await;
             turmoil::repair_oneway(format!("host-{from}"), format!("host-{to}"));
+        })
+        .detach();
+    }
+    for event in config.membership_events.clone() {
+        let config = Rc::clone(config);
+        let worlds = Rc::clone(&worlds);
+        let states = Rc::clone(&states);
+        let control = Rc::clone(&control);
+        let commands = Rc::clone(&commands);
+        let membership = Rc::clone(&peer_membership);
+        let placements = Rc::clone(&placement_slots);
+        let model = Rc::clone(&membership_model);
+        spawn(async move {
+            run_membership_event(
+                event,
+                &config,
+                &worlds,
+                &states,
+                &control,
+                &commands,
+                &membership,
+                &placements,
+                &model,
+            )
+            .await;
         })
         .detach();
     }
@@ -1703,22 +3028,39 @@ async fn crash_host(
     control: &Rc<RefCell<Control>>,
     commands: &HostCommands,
 ) {
+    let downtime = random_between(config.restart_delay.0, config.restart_delay.1);
+    let _ = restart_host_for(host, downtime, config, worlds, states, control, commands).await;
+}
+
+async fn restart_host_for(
+    host: u16,
+    downtime: u64,
+    _config: &ClusterConfig,
+    worlds: &[Rc<SimWorld>],
+    states: &StateSlots,
+    control: &Rc<RefCell<Control>>,
+    commands: &HostCommands,
+) -> Option<RestartOutcome> {
     if !control.borrow().up[usize::from(host)] {
-        return;
+        return None;
     }
+    let retired_state = Rc::clone(&states[usize::from(host)].borrow());
     control.borrow_mut().up[usize::from(host)] = false;
     host_command(commands, |complete| {
-        HostCommand::Crash(HostId(host), complete)
+        HostCommand::Crash(HostId::new(u32::from(host)), complete)
     })
     .await;
-    worlds[usize::from(host)].advance_incarnation();
+    worlds[usize::from(host)].advance_run_generation();
     let affected = control
         .borrow()
         .placement
         .iter()
         .filter_map(|(&volume, &placed)| (placed == host).then_some(volume))
         .collect::<Vec<_>>();
-    for volume in affected {
+    for &volume in &affected {
+        control.borrow().guest_state[&volume]
+            .post_restart_fault_pending
+            .set(true);
         cancel_guest(volume, control);
     }
     control
@@ -1732,20 +3074,20 @@ async fn crash_host(
         let mut control = control.borrow_mut();
         control.report.host_crashes = control.report.host_crashes.saturating_add(1);
     }
-    delay(random_between(
-        config.restart_delay.0,
-        config.restart_delay.1,
-    ))
-    .await;
+    delay(downtime).await;
     worlds[usize::from(host)].clear_abort();
     host_command(commands, |complete| {
-        HostCommand::Bounce(HostId(host), complete)
+        HostCommand::Bounce(HostId::new(u32::from(host)), complete)
     })
     .await;
     control.borrow_mut().up[usize::from(host)] = true;
+    Some(RestartOutcome {
+        retired_state,
+        affected_volumes: affected,
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn at_kill(
     at: u64,
     host: u16,
@@ -1754,34 +3096,45 @@ async fn at_kill(
     states: StateSlots,
     control: Rc<RefCell<Control>>,
     commands: HostCommands,
+    membership: PeerMembership,
+    placements: PlacementSlots,
+    model: Rc<RefCell<MembershipModel>>,
 ) {
     delay(at).await;
     if !control.borrow().up[usize::from(host)] {
         return;
     }
-    control.borrow_mut().up[usize::from(host)] = false;
-    host_command(&commands, |complete| {
-        HostCommand::Crash(HostId(host), complete)
-    })
-    .await;
-    worlds[usize::from(host)].advance_incarnation();
-    control.borrow_mut().live[usize::from(host)] = false;
-    control
-        .borrow_mut()
-        .retired_counters
-        .push(states[usize::from(host)].borrow().borrow().counters);
+    let authority_enabled = config
+        .daemon
+        .cluster_placement
+        .as_ref()
+        .and_then(|placement| placement.authority)
+        .is_some();
     let affected = control
         .borrow()
         .placement
         .iter()
         .filter_map(|(&volume, &placed)| (placed == host).then_some(volume))
         .collect::<Vec<_>>();
+    control.borrow_mut().up[usize::from(host)] = false;
+    host_command(&commands, |complete| {
+        HostCommand::Crash(HostId::new(u32::from(host)), complete)
+    })
+    .await;
+    worlds[usize::from(host)].advance_run_generation();
+    control.borrow_mut().live[usize::from(host)] = false;
+    control
+        .borrow_mut()
+        .retired_counters
+        .push(states[usize::from(host)].borrow().borrow().counters);
     let orphaned_at = now();
-    let mut restore_tasks = TaskSet::new();
-    let (restore_completed, mut restore_completions) = unbounded();
-    let mut restores_active = 0usize;
+    let mut promoted = Vec::new();
     for volume in affected {
         cancel_guest(volume, &control);
+        let had_stash = worlds[0]
+            .store_bytes(&layout::head_key(volume))
+            .and_then(|bytes| HeadRecord::decode(volume, &bytes).ok())
+            .is_some_and(|head| head.stash.is_some());
         if !promote_orphan(host, volume, &config, &worlds, &control).await {
             control
                 .borrow_mut()
@@ -1790,7 +3143,17 @@ async fn at_kill(
                 .push(format!("unable to promote orphan {volume:?}"));
             continue;
         }
+        if had_stash {
+            let mut control = control.borrow_mut();
+            control.report.stash_recoveries = control.report.stash_recoveries.saturating_add(1);
+        }
         prepare_backed_loss(&control.borrow().guest_state[&volume], volume, &worlds[0]);
+        promoted.push(volume);
+    }
+    let mut restore_tasks = TaskSet::new();
+    let (restore_completed, mut restore_completions) = unbounded();
+    let mut restores_active = 0usize;
+    for volume in promoted {
         let candidates = (0..config.hosts)
             .filter(|&candidate| candidate != host && control.borrow().live[usize::from(candidate)])
             .take(if config.race_restore { 2 } else { 1 })
@@ -1802,7 +3165,7 @@ async fn at_kill(
                 }
                 restores_active -= 1;
             }
-            let candidate_incarnation = worlds[usize::from(candidate)].incarnation();
+            let candidate_run_generation = worlds[usize::from(candidate)].run_generation();
             let reply =
                 worlds[usize::from(candidate)].request_admin(AdminCall::RestoreVolume { volume });
             let control = Rc::clone(&control);
@@ -1813,7 +3176,7 @@ async fn at_kill(
                 restore_completion(
                     RestoreTarget {
                         host: candidate,
-                        incarnation: candidate_incarnation,
+                        run_generation: candidate_run_generation,
                     },
                     volume,
                     orphaned_at,
@@ -1833,6 +3196,94 @@ async fn at_kill(
             return;
         }
         restores_active -= 1;
+    }
+    if authority_enabled {
+        reconfigure_cluster_membership(&worlds, &control, &membership, &placements, &model).await;
+    }
+}
+
+fn build_cluster_placement(
+    _worlds: &[Rc<SimWorld>],
+    control: &Rc<RefCell<Control>>,
+    membership: &PeerMembership,
+    current: &ClusterPlacement,
+) -> Result<ClusterPlacement, String> {
+    let mut roster = current
+        .roster
+        .iter()
+        .copied()
+        .filter(|&candidate| {
+            membership.borrow().contains_key(&candidate)
+                && control.borrow().live[host_index(candidate)]
+        })
+        .collect::<Vec<_>>();
+    roster.sort_unstable();
+    if roster.len() < blockd_core::placement::MIN_PLACEMENT_MEMBERS {
+        return Err("cluster placement has fewer than three live members".to_owned());
+    }
+    let next = ClusterPlacement {
+        cluster_id: DYNAMIC_AUTHORITY_CLUSTER_ID,
+        epoch: current.epoch.saturating_add(1),
+        roster,
+    };
+    next.validate()
+        .ok_or_else(|| "invalid cluster placement".to_owned())?;
+    Ok(next)
+}
+
+async fn reconfigure_cluster_membership(
+    worlds: &Rc<Vec<Rc<SimWorld>>>,
+    control: &Rc<RefCell<Control>>,
+    membership: &PeerMembership,
+    placements: &PlacementSlots,
+    model: &Rc<RefCell<MembershipModel>>,
+) {
+    let Ok(Some(placement)) = read_placement(worlds[0].as_ref()).await else {
+        control
+            .borrow_mut()
+            .report
+            .violations
+            .push("cluster placement unavailable during membership transition".to_owned());
+        return;
+    };
+    let next = match build_cluster_placement(worlds, control, membership, &placement.placement) {
+        Ok(next) => next,
+        Err(reason) => {
+            control.borrow_mut().report.violations.push(reason);
+            return;
+        }
+    };
+    if next.roster == placement.placement.roster {
+        return;
+    }
+    let Ok(committed) = cas_placement(worlds[0].as_ref(), Some(&placement), next.clone()).await
+    else {
+        control
+            .borrow_mut()
+            .report
+            .violations
+            .push("cluster placement CAS failed".to_owned());
+        return;
+    };
+    {
+        let mut model = model.borrow_mut();
+        model.placement_version = Some(committed.store_version);
+        model.placement_epoch = next.epoch;
+    }
+    let host_count = placements.borrow().len();
+    for host in 0..host_count {
+        let authority = placements.borrow()[host].authority;
+        let config = ClusterPlacementConfig {
+            membership_epoch: next.epoch,
+            roster: next.roster.clone(),
+            authority,
+        };
+        placements.borrow_mut()[host] = config.clone();
+        if control.borrow().up[host] {
+            let reply =
+                worlds[host].request_admin(AdminCall::UpdateClusterPlacement { placement: config });
+            let _ = reply.await;
+        }
     }
 }
 
@@ -1858,7 +3309,8 @@ async fn promote_orphan(
             Ok(None) | Err(StoreError::TooLarge | StoreError::Fault(_)) => return false,
         }
     };
-    if head.holder != HostId(source) {
+    let source_identity = host_id(source);
+    if head.holder != source_identity {
         return false;
     }
 
@@ -1880,8 +3332,9 @@ async fn promote_orphan(
         if !live[peer] {
             continue;
         }
-        let peer = HostId(u16::try_from(peer).expect("host index fits"));
-        let mut generations: BTreeMap<u64, BTreeMap<u64, Vec<u8>>> = BTreeMap::new();
+        let peer = host_id(u16::try_from(peer).expect("host index fits"));
+        let mut generations: BTreeMap<(blockd_core::types::HostId, u64), BTreeMap<u64, Vec<u8>>> =
+            BTreeMap::new();
         for (name, bytes) in world.durable_blobs() {
             if let Some(layout::BlobName::ReplicaSpool {
                 source: found_source,
@@ -1889,20 +3342,21 @@ async fn promote_orphan(
                 assignment_epoch,
                 generation,
             }) = layout::parse_blob(&name)
-                && (found_source, found_volume) == (HostId(source), volume)
+                && (found_source, found_volume) == (HostId::new(u32::from(source)), volume)
                 && (allowed.contains(&(peer, assignment_epoch))
                     || head
                         .stash
                         .is_some_and(|stash| assignment_epoch > stash.assignment_epoch))
             {
                 generations
-                    .entry(assignment_epoch)
+                    .entry((found_source, assignment_epoch))
                     .or_default()
                     .insert(generation, bytes);
             }
         }
-        for (assignment_epoch, generations) in generations {
+        for ((source_identity, assignment_epoch), generations) in generations {
             owned.push((
+                source_identity,
                 peer,
                 assignment_epoch,
                 generations.into_values().flatten().collect::<Vec<_>>(),
@@ -1911,7 +3365,8 @@ async fn promote_orphan(
     }
     let residues = owned
         .iter()
-        .map(|(peer, assignment_epoch, bytes)| ReplicaResidue {
+        .map(|(source, peer, assignment_epoch, bytes)| ReplicaResidue {
+            source: *source,
             peer: *peer,
             assignment_epoch: *assignment_epoch,
             bytes,
@@ -1921,7 +3376,7 @@ async fn promote_orphan(
         None
     } else {
         match export_replica_recovery(
-            HostId(source),
+            source_identity,
             volume,
             observed_version,
             &head,
@@ -1939,7 +3394,7 @@ async fn promote_orphan(
     let Some(export) = export else {
         let retired = HeadRecord {
             volume,
-            holder: HostId(source),
+            holder: source_identity,
             fence: head.fence,
             manifest: head.manifest,
             stash: None,
@@ -1962,7 +3417,7 @@ async fn promote_orphan(
             }
         };
     };
-    let claim = prepare_replica_recovery_claim(observed_version, &head, HostId(source), &export);
+    let claim = prepare_replica_recovery_claim(observed_version, &head, source_identity, &export);
     let writer_fence = loop {
         match Store::put_cas(
             worlds[0].as_ref(),
@@ -1980,7 +3435,7 @@ async fn promote_orphan(
         }
     };
     let Ok(publication) =
-        prepare_replica_publication(volume, HostId(source), writer_fence, &claim.head, &export)
+        prepare_replica_publication(volume, source_identity, writer_fence, &claim.head, &export)
     else {
         return false;
     };
@@ -2099,7 +3554,7 @@ fn rollback_quiescing_migration(
     worlds: &Rc<Vec<Rc<SimWorld>>>,
     config: &Rc<ClusterConfig>,
 ) {
-    let (source_up, original_incarnation, deferred_recovery) = {
+    let (source_up, original_run_generation, deferred_recovery) = {
         let mut control = control.borrow_mut();
         if control.migrations.get(&volume) != Some(&attempt) {
             return;
@@ -2112,11 +3567,11 @@ fn rollback_quiescing_migration(
         (
             control.up[usize::from(attempt.from)]
                 && control.placement.get(&volume) == Some(&attempt.from),
-            worlds[usize::from(attempt.from)].incarnation() == attempt.from_incarnation,
+            worlds[usize::from(attempt.from)].run_generation() == attempt.from_run_generation,
             control.deferred_source_recoveries.contains_key(&volume),
         )
     };
-    if source_up && (original_incarnation || deferred_recovery) {
+    if source_up && (original_run_generation || deferred_recovery) {
         let runnable = apply_deferred_source_recovery(volume, attempt, control, worlds, config)
             .unwrap_or(true);
         if runnable {
@@ -2152,8 +3607,13 @@ async fn start_migration(
     let attempt = MigrationAttempt {
         from,
         to,
-        from_incarnation: worlds[usize::from(from)].incarnation(),
-        to_incarnation: worlds[usize::from(to)].incarnation(),
+        offer_fence: worlds[0]
+            .store_bytes(&layout::head_key(volume))
+            .and_then(|bytes| HeadRecord::decode(volume, &bytes).ok())
+            .filter(|head| head.holder == host_id(from))?
+            .fence,
+        from_run_generation: worlds[usize::from(from)].run_generation(),
+        to_run_generation: worlds[usize::from(to)].run_generation(),
         started: now(),
     };
     {
@@ -2178,8 +3638,8 @@ async fn start_migration(
         let control = control.borrow();
         control.up[usize::from(from)]
             && control.up[usize::from(to)]
-            && worlds[usize::from(from)].incarnation() == attempt.from_incarnation
-            && worlds[usize::from(to)].incarnation() == attempt.to_incarnation
+            && worlds[usize::from(from)].run_generation() == attempt.from_run_generation
+            && worlds[usize::from(to)].run_generation() == attempt.to_run_generation
             && control.placement.get(&volume) == Some(&from)
             && control.migrations.get(&volume) == Some(&attempt)
     };
@@ -2193,7 +3653,7 @@ async fn start_migration(
     control.borrow_mut().migration_cuts.insert(volume);
     let reply = worlds[usize::from(from)].request_admin(AdminCall::MigrateOut {
         volume,
-        to: HostId(to),
+        to: HostId::new(u32::from(to)),
     });
     let (completed, completion) = oneshot();
     spawn(migration_completion(
@@ -2201,9 +3661,11 @@ async fn start_migration(
         attempt,
         reply,
         completed,
-        Rc::clone(control),
-        Rc::clone(worlds),
-        Rc::clone(config),
+        MigrationCompletionContext {
+            control: Rc::clone(control),
+            worlds: Rc::clone(worlds),
+            config: Rc::clone(config),
+        },
     ))
     .detach();
     quiescing.disarm();
@@ -2447,6 +3909,40 @@ mod tests {
         }))
     }
 
+    async fn install_test_heads(control: &Rc<RefCell<Control>>, worlds: &Rc<Vec<Rc<SimWorld>>>) {
+        let placements = control.borrow().placement.clone();
+        for (volume, host) in placements {
+            let provisional = HeadRecord {
+                volume,
+                holder: host_id(host),
+                fence: 0,
+                manifest: None,
+                stash: None,
+                retired_stashes: Vec::new(),
+            };
+            let version = Store::put_cas(
+                worlds[0].as_ref(),
+                layout::head_key(volume),
+                None,
+                provisional.encode(),
+            )
+            .await
+            .expect("install provisional test head");
+            Store::put_cas(
+                worlds[0].as_ref(),
+                layout::head_key(volume),
+                Some(version),
+                HeadRecord {
+                    fence: version,
+                    ..provisional
+                }
+                .encode(),
+            )
+            .await
+            .expect("finalize test head");
+        }
+    }
+
     fn unplaced_control(volume_count: u64, hosts: u16) -> Rc<RefCell<Control>> {
         Rc::new(RefCell::new(Control {
             placement: BTreeMap::new(),
@@ -2580,7 +4076,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn superseded_restore_retries_on_a_current_live_incarnation() {
+    async fn superseded_restore_retries_on_a_current_live_run_generation() {
         let config = Rc::new(crate::presets::migration_chaos());
         let worlds = SimWorld::cluster(config.hosts, config.bdev, config.store);
         let worlds = Rc::new(worlds);
@@ -2594,7 +4090,7 @@ mod tests {
                 verdict: Verdict::ColdBoot,
             }))
             .expect("restore completion remains live");
-        worlds[usize::from(candidate)].advance_incarnation();
+        worlds[usize::from(candidate)].advance_run_generation();
         control.borrow_mut().live[usize::from(candidate)] = false;
         control.borrow_mut().up[usize::from(candidate)] = false;
 
@@ -2606,7 +4102,7 @@ mod tests {
                 let completion = spawn(restore_completion(
                     RestoreTarget {
                         host: candidate,
-                        incarnation: 0,
+                        run_generation: 1,
                     },
                     volume,
                     0,
@@ -2684,6 +4180,7 @@ mod tests {
                     u64::try_from(MIGRATION_CONCURRENCY + 1).expect("limit fits"),
                     config.hosts,
                 );
+                install_test_heads(&control, &worlds).await;
                 for guest in control.borrow().guests.borrow_mut().values_mut() {
                     *guest = Some(spawn(async {}));
                 }
@@ -2725,6 +4222,7 @@ mod tests {
             let config = Rc::new(config);
             async move {
                 let control = control(2, config.hosts);
+                install_test_heads(&control, &worlds).await;
                 let schedule = spawn(random_migrations(
                     Rc::clone(&config),
                     Rc::clone(&worlds),
@@ -2754,6 +4252,7 @@ mod tests {
             async move {
                 let volume = VolumeId(1);
                 let control = control(1, config.hosts);
+                install_test_heads(&control, &worlds).await;
                 let mut migration = spawn({
                     let control = Rc::clone(&control);
                     let worlds = Rc::clone(&worlds);
@@ -2802,11 +4301,12 @@ mod tests {
                 let attempt = MigrationAttempt {
                     from: 1,
                     to: 0,
-                    from_incarnation: worlds[1].incarnation(),
-                    to_incarnation: worlds[0].incarnation(),
+                    offer_fence: 1,
+                    from_run_generation: worlds[1].run_generation(),
+                    to_run_generation: worlds[0].run_generation(),
                     started: 0,
                 };
-                worlds[usize::from(attempt.from)].advance_incarnation();
+                worlds[usize::from(attempt.from)].advance_run_generation();
                 {
                     let state = Rc::clone(&control.borrow().guest_state[&volume]);
                     state.completed.set(7);
@@ -2819,7 +4319,7 @@ mod tests {
                         .deferred_source_recoveries
                         .insert(volume, (1, Verdict::ColdBoot));
                 }
-                worlds[0].advance_incarnation();
+                worlds[0].advance_run_generation();
                 let lifecycle = spawn(lifecycle_actor(
                     0,
                     Rc::clone(&worlds[0]),
@@ -2857,9 +4357,11 @@ mod tests {
                     attempt,
                     result,
                     completed,
-                    Rc::clone(&control),
-                    Rc::clone(&worlds),
-                    Rc::clone(&config),
+                    MigrationCompletionContext {
+                        control: Rc::clone(&control),
+                        worlds: Rc::clone(&worlds),
+                        config: Rc::clone(&config),
+                    },
                 )
                 .await;
 
@@ -2897,11 +4399,12 @@ mod tests {
                 let attempt = MigrationAttempt {
                     from: 1,
                     to: 0,
-                    from_incarnation: worlds[1].incarnation(),
-                    to_incarnation: worlds[0].incarnation(),
+                    offer_fence: 1,
+                    from_run_generation: worlds[1].run_generation(),
+                    to_run_generation: worlds[0].run_generation(),
                     started: 0,
                 };
-                worlds[usize::from(attempt.from)].advance_incarnation();
+                worlds[usize::from(attempt.from)].advance_run_generation();
                 {
                     let mut control = control.borrow_mut();
                     control.placement.insert(volume, attempt.from);
@@ -2919,9 +4422,11 @@ mod tests {
                     attempt,
                     result,
                     completed,
-                    Rc::clone(&control),
-                    Rc::clone(&worlds),
-                    Rc::clone(&config),
+                    MigrationCompletionContext {
+                        control: Rc::clone(&control),
+                        worlds: Rc::clone(&worlds),
+                        config: Rc::clone(&config),
+                    },
                 )
                 .await;
 
@@ -2962,8 +4467,9 @@ mod tests {
                 let attempt = MigrationAttempt {
                     from: 1,
                     to: 0,
-                    from_incarnation: worlds[1].incarnation(),
-                    to_incarnation: worlds[0].incarnation(),
+                    offer_fence: 1,
+                    from_run_generation: worlds[1].run_generation(),
+                    to_run_generation: worlds[0].run_generation(),
                     started: 0,
                 };
                 {
@@ -3002,9 +4508,11 @@ mod tests {
                     attempt,
                     result,
                     completed,
-                    Rc::clone(&control),
-                    Rc::clone(&worlds),
-                    Rc::clone(&config),
+                    MigrationCompletionContext {
+                        control: Rc::clone(&control),
+                        worlds: Rc::clone(&worlds),
+                        config: Rc::clone(&config),
+                    },
                 )
                 .await;
 
@@ -3042,8 +4550,9 @@ mod tests {
                 let attempt = MigrationAttempt {
                     from: 1,
                     to: 0,
-                    from_incarnation: worlds[1].incarnation(),
-                    to_incarnation: worlds[0].incarnation(),
+                    offer_fence: 1,
+                    from_run_generation: worlds[1].run_generation(),
+                    to_run_generation: worlds[0].run_generation(),
                     started: 0,
                 };
                 {
@@ -3059,7 +4568,7 @@ mod tests {
                 assert!(control.borrow().guests.borrow()[&volume].is_none());
 
                 control.borrow_mut().up[usize::from(attempt.from)] = true;
-                worlds[usize::from(attempt.from)].advance_incarnation();
+                worlds[usize::from(attempt.from)].advance_run_generation();
                 restart_source_after_migration_refusal(
                     volume, attempt, None, &control, &worlds, &config,
                 );
@@ -3090,6 +4599,7 @@ mod tests {
             async move {
                 let volume = VolumeId(1);
                 let control = control(1, config.hosts);
+                install_test_heads(&control, &worlds).await;
                 control
                     .borrow()
                     .guests
@@ -3102,7 +4612,7 @@ mod tests {
                     async move { start_migration(volume, 1, &worlds, &control, &config).await }
                 });
                 delay(1).await;
-                worlds[0].advance_incarnation();
+                worlds[0].advance_run_generation();
                 control.borrow_mut().deferred_source_recoveries.insert(
                     volume,
                     (

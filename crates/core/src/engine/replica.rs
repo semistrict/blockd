@@ -5,7 +5,6 @@ use blockd_exec::{FaultPoint, delay, fault_point, spawn};
 
 use super::backup::claim_new_head_with_stash;
 use super::capture::finish_creation;
-use super::commit_active_vnode_quorum;
 use super::ctx::{HostCtx, VolumeCtx, VolumeRun};
 use super::peer_client::PeerRpcError;
 use super::state::{ReplicaKey, SharedHost};
@@ -21,7 +20,6 @@ use crate::replica_spool::{
     seal_replica_commit, seal_verified_replica_artifact, verify_replica_artifact,
 };
 use crate::types::{HostId, VolumeId};
-use crate::vnode_member::VnodeRecoveryClosure;
 use crate::world::{AdminIo, BlobError, Blobs, GuestMem, Peers, Store, StoreError};
 
 /// Rotation happens before an append. A single verified frame may therefore
@@ -54,57 +52,8 @@ impl<'a, W> ReplicaInbox<'a, W> {
         }
     }
 
-    fn authorized(&self) -> bool {
-        let ReplicaKey {
-            source,
-            volume,
-            assignment_epoch,
-        } = self.key;
-        if assignment_epoch == 0 {
-            return false;
-        }
-        let authorized = {
-            let host = self.state.borrow();
-            let Ok(index) = usize::try_from(assignment_epoch - 1) else {
-                return false;
-            };
-            host.config
-                .replica_placement
-                .iter()
-                .chain(host.replica_placement_history.iter())
-                .any(|placement| {
-                    let Some(source_domain) = placement
-                        .roster
-                        .iter()
-                        .find(|candidate| candidate.host == source)
-                        .map(|candidate| candidate.failure_domain)
-                    else {
-                        return false;
-                    };
-                    let candidates = rank_stash_candidates(
-                        placement.membership_epoch,
-                        source,
-                        source_domain,
-                        volume,
-                        &placement.roster,
-                    );
-                    !candidates.is_empty()
-                        && candidates[index % candidates.len()] == host.config.host
-                })
-        };
-        if !authorized {
-            return false;
-        }
-        let mut host = self.state.borrow_mut();
-        let latest = host
-            .replica_latest_epoch
-            .entry((source, volume))
-            .or_default();
-        if assignment_epoch < *latest {
-            return false;
-        }
-        *latest = (*latest).max(assignment_epoch);
-        true
+    fn has_durable_spool(&self) -> bool {
+        self.state.borrow().replicas.contains_key(&self.key)
     }
 
     fn append_plan(&self, additional: u64) -> Option<(u64, bool)> {
@@ -129,15 +78,46 @@ impl<'a, W> ReplicaInbox<'a, W> {
     }
 }
 
-impl<W: Peers> ReplicaInbox<'_, W> {
+impl<W: Store> ReplicaInbox<'_, W> {
+    async fn authorized(&self) -> bool {
+        let ReplicaKey {
+            source,
+            volume,
+            assignment_epoch,
+        } = self.key;
+        if assignment_epoch == 0 {
+            return false;
+        }
+        if self.has_durable_spool() {
+            return true;
+        }
+        let Ok(Some((_, bytes))) = Store::get(self.world, &layout::head_key(volume)).await else {
+            return false;
+        };
+        let Ok(head) = HeadRecord::decode(volume, &bytes) else {
+            return false;
+        };
+        if head.holder != source {
+            return false;
+        }
+        let local = self.state.borrow().config.host;
+        head.stash.is_some_and(|stash| {
+            (stash.active_peer == local && stash.active_assignment_epoch == assignment_epoch)
+                || (stash.transition_peer == Some(local)
+                    && stash.assignment_epoch == assignment_epoch)
+        })
+    }
+}
+
+impl<W: Store + Peers> ReplicaInbox<'_, W> {
     async fn status(&self) {
         let ReplicaKey {
             source,
             volume,
             assignment_epoch,
         } = self.key;
-        if !self.authorized() {
-            self.state.borrow_mut().counters.replica_rejected += 1;
+        if !self.authorized().await {
+            self.state.borrow_mut().record_replica_reject(volume);
             return;
         }
         let committed = self
@@ -264,11 +244,11 @@ where
                             (retired.peer, retired.assignment_epoch, retired.through)
                                 == (from, assignment_epoch, through)
                         })
-                        .map(|retired| (volume_state.incarnation, retired))
+                        .map(|retired| (volume_state.run_generation, retired))
                 })
             };
-            if let Some((incarnation, retired)) = retired {
-                let _ = remove_retired_stash(&state, world, volume, incarnation, retired).await;
+            if let Some((run_generation, retired)) = retired {
+                let _ = remove_retired_stash(&state, world, volume, run_generation, retired).await;
             }
         }
         _ => unreachable!("non-replica message"),
@@ -280,7 +260,7 @@ async fn remove_retired_stash<W>(
     state: &SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     retired: RetiredStash,
 ) -> bool
 where
@@ -293,7 +273,7 @@ where
             let volume_state = host
                 .volumes
                 .get(&volume)
-                .filter(|volume_state| volume_state.incarnation == incarnation)?;
+                .filter(|volume_state| volume_state.run_generation == run_generation)?;
             if !volume_state.retired_stashes.contains(&retired) {
                 return Some((None, None));
             }
@@ -334,7 +314,7 @@ where
             let Some(volume_state) = host
                 .volumes
                 .get_mut(&volume)
-                .filter(|volume_state| volume_state.incarnation == incarnation)
+                .filter(|volume_state| volume_state.run_generation == run_generation)
             else {
                 return false;
             };
@@ -364,24 +344,24 @@ where
         let Ok(found) = HeadRecord::decode(volume, &bytes) else {
             return false;
         };
-        let local = state.borrow().config.host;
+        let _local = state.borrow().config.host;
         let Some(fence) = state
             .borrow()
             .volumes
             .get(&volume)
-            .filter(|volume_state| volume_state.incarnation == incarnation)
+            .filter(|volume_state| volume_state.run_generation == run_generation)
             .map(|volume_state| volume_state.fence)
         else {
             return false;
         };
-        if found.holder != local || found.fence != fence {
+        if found.holder != state.borrow().config.host || found.fence != fence {
             state.borrow_mut().fail("replica release cleanup fenced");
             return false;
         }
         let removed = !found.retired_stashes.contains(&retired);
         if !state
             .borrow_mut()
-            .adopt_assignment_from_head(volume, incarnation, version, found)
+            .adopt_assignment_from_head(volume, run_generation, version, found)
         {
             return false;
         }
@@ -393,7 +373,7 @@ where
 
 impl<W> ReplicaInbox<'_, W>
 where
-    W: Blobs + Peers + AdminIo,
+    W: Blobs + Store + Peers + AdminIo,
 {
     #[allow(clippy::too_many_lines)]
     async fn put(&self, artifact: ReplicaArtifact, checksum: u32, bytes: Vec<u8>) {
@@ -404,8 +384,8 @@ where
             volume,
             assignment_epoch,
         } = self.key;
-        if !self.authorized() || crc32c(&bytes) != checksum {
-            state.borrow_mut().counters.replica_rejected += 1;
+        if !self.authorized().await || crc32c(&bytes) != checksum {
+            state.borrow_mut().record_replica_reject(volume);
             return;
         }
         let Ok(frame) = seal_verified_replica_artifact(
@@ -416,7 +396,7 @@ where
             checksum,
             &bytes,
         ) else {
-            state.borrow_mut().counters.replica_rejected += 1;
+            state.borrow_mut().record_replica_reject(volume);
             return;
         };
         let key = self.key;
@@ -443,7 +423,7 @@ where
                 )
                 .await;
             } else {
-                state.borrow_mut().counters.replica_rejected += 1;
+                state.borrow_mut().record_replica_reject(volume);
             }
             return;
         }
@@ -537,8 +517,8 @@ where
             volume,
             assignment_epoch,
         } = self.key;
-        if !self.authorized() {
-            state.borrow_mut().counters.replica_rejected += 1;
+        if !self.authorized().await {
+            state.borrow_mut().record_replica_reject(volume);
             return;
         }
         let key = self.key;
@@ -552,11 +532,11 @@ where
         let Ok(frame) =
             seal_replica_commit(source, volume, assignment_epoch, info, &required, &record)
         else {
-            state.borrow_mut().counters.replica_rejected += 1;
+            state.borrow_mut().record_replica_reject(volume);
             return;
         };
         if !complete {
-            state.borrow_mut().counters.replica_rejected += 1;
+            state.borrow_mut().record_replica_reject(volume);
             return;
         }
         let known = state
@@ -578,7 +558,7 @@ where
             return;
         }
         if known.is_some_and(|known| info <= known) {
-            state.borrow_mut().counters.replica_rejected += 1;
+            state.borrow_mut().record_replica_reject(volume);
             return;
         }
         let Some((generation, rotated)) = self.append_plan(frame.len() as u64) else {
@@ -655,7 +635,8 @@ where
     }
 }
 
-impl<W: Blobs + Peers> ReplicaInbox<'_, W> {
+impl<W: Blobs + Store + Peers> ReplicaInbox<'_, W> {
+    #[allow(clippy::too_many_lines)]
     async fn release(&self, through: ReplicaCommitInfo) {
         let state = self.state;
         let world = self.world;
@@ -664,8 +645,8 @@ impl<W: Blobs + Peers> ReplicaInbox<'_, W> {
             volume,
             assignment_epoch,
         } = self.key;
-        if !self.authorized() {
-            state.borrow_mut().counters.replica_rejected += 1;
+        if !self.authorized().await {
+            state.borrow_mut().record_replica_reject(volume);
             return;
         }
         let key = self.key;
@@ -708,7 +689,7 @@ impl<W: Blobs + Peers> ReplicaInbox<'_, W> {
                 && replica.uncommitted_artifacts.is_empty()
         });
         if !releasable {
-            state.borrow_mut().counters.replica_rejected += 1;
+            state.borrow_mut().record_replica_reject(volume);
             return;
         }
         let current_generation = state
@@ -728,7 +709,7 @@ impl<W: Blobs + Peers> ReplicaInbox<'_, W> {
             let mut host = state.borrow_mut();
             host.replicas.remove(&key);
             host.forget_blobs(&names);
-            host.counters.replica_unlinks += 1;
+            host.record_replica_cleanup(volume);
         }
         Peers::send(
             world,
@@ -874,10 +855,10 @@ where
         let Some(stash) = initial_stash(&state, volume) else {
             return Some(Err(AdminError::Unavailable));
         };
-        let incarnation = state.borrow_mut().insert_fresh(volume, config);
+        let run_generation = state.borrow_mut().insert_fresh(volume, config);
         let _ = fault_point(FaultPoint::AssignmentCasRace);
         let Some(fence) =
-            claim_new_head_with_stash(&state, world.as_ref(), volume, incarnation, Some(stash))
+            claim_new_head_with_stash(&state, world.as_ref(), volume, run_generation, Some(stash))
                 .await
         else {
             state.borrow_mut().volumes.remove(&volume);
@@ -891,20 +872,73 @@ where
             volume_state.stash_assignment = Some(stash);
             host.counters.assignment_claims += 1;
         }
-        if !finish_creation(Rc::clone(&state), world.as_ref(), volume, incarnation).await {
+        if !finish_creation(Rc::clone(&state), world.as_ref(), volume, run_generation).await {
             state
                 .borrow_mut()
                 .fail("peer-stashed journal creation failed");
             return None;
         }
+        if !self.protect_initial_replica(run_generation).await {
+            return None;
+        }
         Some(Ok(AdminSuccess::VolumeCreated { volume }))
+    }
+
+    /// A newly claimed volume is not externally usable until its initial
+    /// journal cut is durable on the assigned passive. In particular, this
+    /// keeps a successful create/fork reply from racing the first replica
+    /// message and a subsequent object-store outage.
+    pub(super) async fn protect_initial_replica(&self, run_generation: u64) -> bool {
+        let state = Rc::clone(self.host().state());
+        let retry = state.borrow().config.backup_retry;
+        loop {
+            let Some(protected) = (|| {
+                let host = state.borrow();
+                let volume_state = host.volume_at(self.id(), run_generation)?;
+                let required = volume_state.best_record.as_ref()?.commit_info();
+                Some(
+                    volume_state
+                        .peer_committed
+                        .is_some_and(|committed| committed >= required),
+                )
+            })() else {
+                return false;
+            };
+            if protected {
+                let mut host = state.borrow_mut();
+                let Some(volume_state) = host.volume_at_mut(self.id(), run_generation) else {
+                    return false;
+                };
+                volume_state.ready = true;
+                host.schedule_volume(self.id());
+                return true;
+            }
+
+            self.replicate().await;
+            if state
+                .borrow()
+                .volume_at(self.id(), run_generation)
+                .and_then(|volume_state| {
+                    let required = volume_state.best_record.as_ref()?.commit_info();
+                    Some(
+                        volume_state
+                            .peer_committed
+                            .is_some_and(|committed| committed >= required),
+                    )
+                })
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            delay(retry).await;
+        }
     }
 }
 
 struct ReplicationLease {
     state: SharedHost,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
 }
 
 struct ReplicaLink<W> {
@@ -922,7 +956,7 @@ impl<W> ReplicationRun<W> {
     fn new(run: VolumeRun<W>, target: HostId, assignment_epoch: u64) -> Self {
         let state = Rc::clone(run.volume().host().state());
         let volume = run.volume().id();
-        let incarnation = run.incarnation();
+        let run_generation = run.run_generation();
         Self {
             link: ReplicaLink {
                 run,
@@ -932,7 +966,7 @@ impl<W> ReplicationRun<W> {
             _lease: ReplicationLease {
                 state,
                 volume,
-                incarnation,
+                run_generation,
             },
         }
     }
@@ -969,7 +1003,7 @@ impl Drop for ReplicationLease {
             .borrow_mut()
             .volumes
             .get_mut(&self.volume)
-            .filter(|volume_state| volume_state.incarnation == self.incarnation)
+            .filter(|volume_state| volume_state.run_generation == self.run_generation)
         {
             volume_state.replicating_blx_files.clear();
             volume_state.operations.finish_replication();
@@ -995,7 +1029,7 @@ where
         let state = Rc::clone(self.host().state());
         let world = Rc::clone(self.host().world());
         let volume = self.id();
-        let Some((incarnation, target, assignment_epoch, record)) = ({
+        let Some((run_generation, target, assignment_epoch, record)) = ({
             let mut host = state.borrow_mut();
             host.volumes.get_mut(&volume).and_then(|volume_state| {
                 let record = volume_state.best_record.clone()?;
@@ -1015,7 +1049,7 @@ where
                         })
                         .collect();
                     Some((
-                        volume_state.incarnation,
+                        volume_state.run_generation,
                         stash.transition_peer.unwrap_or(stash.active_peer),
                         stash.assignment_epoch,
                         record,
@@ -1027,20 +1061,13 @@ where
         }) else {
             return;
         };
-        let run = ReplicationRun::new(self.pin(incarnation), target, assignment_epoch);
+        let run = ReplicationRun::new(self.pin(run_generation), target, assignment_epoch);
         let info = record.commit_info();
         let Ok(status) = run.link.status().await else {
-            let _ = transition_stash(&state, world.as_ref(), volume, incarnation).await;
+            let _ = transition_stash(&state, world.as_ref(), volume, run_generation).await;
             return;
         };
-        let vnode_authority_enabled = state
-            .borrow()
-            .config
-            .replica_placement
-            .as_ref()
-            .and_then(|placement| placement.authority)
-            .is_some();
-        if !vnode_authority_enabled && status.is_some_and(|committed| committed >= info) {
+        if status.is_some_and(|committed| committed >= info) {
             run.link.finish_primary_commit(info, record.clone());
             return;
         }
@@ -1048,14 +1075,9 @@ where
             state.borrow_mut().fail("injected primary crash");
             return;
         }
-        let Some(required) = replica_closure(&state, volume, incarnation, &record) else {
+        let Some(required) = replica_closure(&state, volume, run_generation, &record) else {
             return;
         };
-        if fault_point(FaultPoint::CrashPrimaryAfterClosureCapture) {
-            state.borrow_mut().fail("injected primary crash");
-            return;
-        }
-        let mut closure_artifacts = Vec::with_capacity(required.len());
         for batch in required.chunks(REPLICA_TRANSFER_CONCURRENCY) {
             let mut transfers = Vec::with_capacity(batch.len());
             for &artifact in batch {
@@ -1084,54 +1106,29 @@ where
                             .saturating_add(bytes.len() as u64);
                     }
                     let checksum = crc32c(&bytes);
-                    link.put(artifact, checksum, bytes.clone())
-                        .await
-                        .ok()
-                        .map(|()| (artifact, bytes))
+                    link.put(artifact, checksum, bytes).await.ok()
                 }));
             }
             let mut failed = false;
             for transfer in transfers {
                 match transfer.await {
-                    Ok(Some(artifact)) => closure_artifacts.push(artifact),
+                    Ok(Some(())) => {}
                     Ok(None) | Err(_) => failed = true,
                 }
             }
             if failed {
-                let _ = transition_stash(&state, world.as_ref(), volume, incarnation).await;
+                let _ = transition_stash(&state, world.as_ref(), volume, run_generation).await;
                 return;
             }
         }
-        let record_bytes = record.encode(volume);
         if run
             .link
-            .commit(info, required, record_bytes.clone())
+            .commit(info, required, record.encode(volume))
             .await
             .is_err()
         {
-            let _ = transition_stash(&state, world.as_ref(), volume, incarnation).await;
+            let _ = transition_stash(&state, world.as_ref(), volume, run_generation).await;
             return;
-        }
-        if vnode_authority_enabled && info.sync_covered_through > 0 {
-            let Ok(closure) = (VnodeRecoveryClosure {
-                record: record_bytes,
-                artifacts: closure_artifacts,
-            })
-            .encode(volume) else {
-                return;
-            };
-            if commit_active_vnode_quorum(
-                &state,
-                world.as_ref(),
-                volume,
-                info.sync_covered_through,
-                closure,
-            )
-            .await
-            .is_err()
-            {
-                return;
-            }
         }
         let transitioning = state
             .borrow()
@@ -1152,7 +1149,7 @@ where
                 &state,
                 world.as_ref(),
                 volume,
-                incarnation,
+                run_generation,
                 target,
                 assignment_epoch,
                 info,
@@ -1177,7 +1174,7 @@ async fn transition_stash<W>(
     state: &SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
 ) -> bool
 where
     W: Store + AdminIo,
@@ -1187,7 +1184,7 @@ where
         let volume_state = host
             .volumes
             .get(&volume)
-            .filter(|volume_state| volume_state.incarnation == incarnation)?;
+            .filter(|volume_state| volume_state.run_generation == run_generation)?;
         if volume_state.retired_stashes.len() >= MAX_RETIRED_STASHES {
             return None;
         }
@@ -1195,11 +1192,10 @@ where
         if current.transition_peer.is_some() {
             return Some(current);
         }
-        let placement = host.config.replica_placement.as_ref()?;
+        let placement = host.config.cluster_placement.as_ref()?;
         let candidates = rank_stash_candidates(
             placement.membership_epoch,
             host.config.host,
-            placement.local_failure_domain,
             volume,
             &placement.roster,
         );
@@ -1211,7 +1207,8 @@ where
         for _ in 0..candidates.len() {
             next_epoch = next_epoch.checked_add(1)?;
             let epoch_index = usize::try_from(next_epoch - 1).ok()?;
-            let candidate = candidates[epoch_index % candidates.len()];
+            let candidate_host = candidates[epoch_index % candidates.len()];
+            let candidate = candidate_host;
             if candidate != current.active_peer && current.transition_peer != Some(candidate) {
                 next = Some(candidate);
                 break;
@@ -1233,7 +1230,16 @@ where
         return false;
     }
     let retired = state.borrow().volumes[&volume].retired_stashes.clone();
-    cas_assignment(state, world, volume, incarnation, proposal, retired, None).await
+    cas_assignment(
+        state,
+        world,
+        volume,
+        run_generation,
+        proposal,
+        retired,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1241,7 +1247,7 @@ async fn activate_stash<W>(
     state: &SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     target: HostId,
     assignment_epoch: u64,
     info: ReplicaCommitInfo,
@@ -1254,7 +1260,7 @@ where
         let volume_state = host
             .volumes
             .get(&volume)
-            .filter(|volume_state| volume_state.incarnation == incarnation)?;
+            .filter(|volume_state| volume_state.run_generation == run_generation)?;
         let current = volume_state.stash_assignment?;
         if current.assignment_epoch != assignment_epoch || current.transition_peer != Some(target) {
             return None;
@@ -1283,7 +1289,7 @@ where
         state,
         world,
         volume,
-        incarnation,
+        run_generation,
         assignment,
         retired,
         Some(FaultPoint::CrashPrimaryAfterActiveCasBeforeCommit),
@@ -1296,7 +1302,7 @@ async fn cas_assignment<W>(
     state: &SharedHost,
     world: &W,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     assignment: StashAssignment,
     retired_stashes: Vec<RetiredStash>,
     crash_after: Option<FaultPoint>,
@@ -1311,7 +1317,7 @@ where
             let volume_state = host
                 .volumes
                 .get(&volume)
-                .filter(|volume_state| volume_state.incarnation == incarnation)?;
+                .filter(|volume_state| volume_state.run_generation == run_generation)?;
             Some((
                 volume_state.head_version?,
                 HeadRecord {
@@ -1345,7 +1351,7 @@ where
             }
             return state.borrow_mut().adopt_assignment(
                 volume,
-                incarnation,
+                run_generation,
                 version,
                 assignment,
                 retired_stashes,
@@ -1371,17 +1377,17 @@ where
         let Ok(found) = HeadRecord::decode(volume, &bytes) else {
             return false;
         };
-        let local = state.borrow().config.host;
+        let _local = state.borrow().config.host;
         let Some(fence) = state
             .borrow()
             .volumes
             .get(&volume)
-            .filter(|volume_state| volume_state.incarnation == incarnation)
+            .filter(|volume_state| volume_state.run_generation == run_generation)
             .map(|volume_state| volume_state.fence)
         else {
             return false;
         };
-        if found.holder != local || found.fence != fence {
+        if found.holder != state.borrow().config.host || found.fence != fence {
             state.borrow_mut().fail("replica assignment fenced");
             return false;
         }
@@ -1392,7 +1398,7 @@ where
             }
             return state.borrow_mut().adopt_assignment(
                 volume,
-                incarnation,
+                run_generation,
                 version,
                 assignment,
                 retired_stashes,
@@ -1404,7 +1410,7 @@ where
                 let Some(volume_state) = host
                     .volumes
                     .get_mut(&volume)
-                    .filter(|volume_state| volume_state.incarnation == incarnation)
+                    .filter(|volume_state| volume_state.run_generation == run_generation)
                 else {
                     return false;
                 };
@@ -1414,19 +1420,21 @@ where
             delay(retry).await;
             continue;
         }
-        return state
-            .borrow_mut()
-            .adopt_assignment_from_head(volume, incarnation, version, found);
+        return state.borrow_mut().adopt_assignment_from_head(
+            volume,
+            run_generation,
+            version,
+            found,
+        );
     }
 }
 
 pub(super) fn initial_stash(state: &SharedHost, volume: VolumeId) -> Option<StashAssignment> {
     let host = state.borrow();
-    let placement = host.config.replica_placement.as_ref()?;
-    let target = rank_stash_candidates(
+    let placement = host.config.cluster_placement.as_ref()?;
+    let target_host = rank_stash_candidates(
         placement.membership_epoch,
         host.config.host,
-        placement.local_failure_domain,
         volume,
         &placement.roster,
     )
@@ -1434,7 +1442,7 @@ pub(super) fn initial_stash(state: &SharedHost, volume: VolumeId) -> Option<Stas
     .next()?;
     Some(StashAssignment {
         assignment_epoch: 1,
-        active_peer: target,
+        active_peer: target_host,
         active_assignment_epoch: 1,
         transition_peer: None,
         membership_epoch: placement.membership_epoch,
@@ -1444,14 +1452,14 @@ pub(super) fn initial_stash(state: &SharedHost, volume: VolumeId) -> Option<Stas
 fn replica_closure(
     state: &SharedHost,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     record: &JournalRecord,
 ) -> Option<Vec<ReplicaArtifact>> {
     let host = state.borrow();
     let volume_state = host
         .volumes
         .get(&volume)
-        .filter(|volume_state| volume_state.incarnation == incarnation)?;
+        .filter(|volume_state| volume_state.run_generation == run_generation)?;
     let peer_blx = volume_state
         .peer_committed_record
         .iter()
@@ -1485,7 +1493,7 @@ impl<W: Peers> ReplicaLink<W> {
     fn finish_primary_commit(&self, info: ReplicaCommitInfo, record: JournalRecord) {
         let completed = self.state().borrow_mut().finish_primary_commit(
             self.volume(),
-            self.run.incarnation(),
+            self.run.run_generation(),
             info,
             record,
         );
@@ -1551,10 +1559,7 @@ impl<W: Peers> ReplicaLink<W> {
                 .saturating_add(network_bytes);
         }
         if assignment.is_some_and(|assignment| assignment.transition_peer == Some(self.target)) {
-            host.counters.replica_replacement_bytes = host
-                .counters
-                .replica_replacement_bytes
-                .saturating_add(network_bytes);
+            host.record_replica_replacement(self.volume(), network_bytes);
         }
         host.counters.peer_retries = host
             .counters
@@ -1600,14 +1605,91 @@ impl<W: Peers> ReplicaLink<W> {
 #[cfg(test)]
 #[allow(clippy::default_trait_access)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::rc::Rc;
 
     use super::*;
-    use crate::hostmeta::{HostConfig, ReplicaPlacementConfig};
-    use crate::placement::PeerCandidate;
-    use crate::types::JournalSeq;
+    use crate::hostmeta::{ClusterPlacementConfig, HostConfig};
+    use crate::protocol::StoreFault;
+    use crate::types::{HostId, JournalSeq};
+
+    #[derive(Default)]
+    struct TestStore {
+        objects: RefCell<BTreeMap<String, (u64, Vec<u8>)>>,
+        gets: Cell<u64>,
+        range_gets: Cell<u64>,
+        lists: Cell<u64>,
+    }
+
+    impl TestStore {
+        fn publish_head(&self, head: &HeadRecord) {
+            self.objects
+                .borrow_mut()
+                .insert(layout::head_key(head.volume), (1, head.encode()));
+        }
+    }
+
+    impl Store for TestStore {
+        async fn put(&self, key: String, bytes: Vec<u8>) -> Result<u64, StoreError> {
+            let version = self
+                .objects
+                .borrow()
+                .get(&key)
+                .map_or(1, |(version, _)| version.saturating_add(1));
+            self.objects.borrow_mut().insert(key, (version, bytes));
+            Ok(version)
+        }
+
+        async fn put_cas(
+            &self,
+            key: String,
+            expected: Option<u64>,
+            bytes: Vec<u8>,
+        ) -> Result<u64, StoreError> {
+            let actual = self.objects.borrow().get(&key).map(|(version, _)| *version);
+            if actual != expected {
+                return Err(StoreFault::CasConflict { actual }.into());
+            }
+            self.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+            self.gets.set(self.gets.get().saturating_add(1));
+            Ok(self.objects.borrow().get(key).cloned())
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: u64,
+        ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+            self.range_gets.set(self.range_gets.get().saturating_add(1));
+            let Some((version, bytes)) = self.objects.borrow().get(key).cloned() else {
+                return Ok(None);
+            };
+            let start = usize::try_from(offset).map_err(|_| StoreError::TooLarge)?;
+            let len = usize::try_from(len).map_err(|_| StoreError::TooLarge)?;
+            let end = start.saturating_add(len).min(bytes.len());
+            Ok((start <= bytes.len()).then(|| (version, bytes[start..end].to_vec())))
+        }
+
+        async fn delete(&self, key: &str) -> Result<bool, StoreError> {
+            Ok(self.objects.borrow_mut().remove(key).is_some())
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+            self.lists.set(self.lists.get().saturating_add(1));
+            Ok(self
+                .objects
+                .borrow()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+    }
 
     fn test_state(host: HostId) -> SharedHost {
         Rc::new(RefCell::new(super::super::state::HostState::new(
@@ -1620,16 +1702,16 @@ mod tests {
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 0,
-                replica_placement: None,
+                cluster_placement: None,
             },
         )))
     }
 
     #[test]
     fn append_plan_rotates_before_crossing_the_generation_bound() {
-        let state = test_state(HostId(1));
+        let state = test_state(HostId::new(1));
         let key = ReplicaKey {
-            source: HostId(2),
+            source: HostId::new(2),
             volume: VolumeId(3),
             assignment_epoch: 1,
         };
@@ -1648,22 +1730,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recovered_exact_spool_key_authorizes_retry_without_roster_history() {
+        let state = test_state(HostId::new(1));
+        let key = ReplicaKey {
+            source: HostId::new(9),
+            volume: VolumeId(10),
+            assignment_epoch: 11,
+        };
+        let store = TestStore::default();
+        let inbox = ReplicaInbox::new(&state, &store, key.source, key.volume, key.assignment_epoch);
+        assert!(!inbox.authorized().await);
+        state
+            .borrow_mut()
+            .replicas
+            .insert(key, super::super::state::ReplicaState::default());
+        assert!(
+            inbox.authorized().await,
+            "a checksummed spool recovered from local durability is its own exact authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_durable_head_preserves_the_permanent_hosts_recovered_spool() {
+        let state = test_state(HostId::new(1));
+        let source = HostId::new(9);
+        let volume = VolumeId(10);
+        let store = TestStore::default();
+        store.publish_head(&HeadRecord {
+            volume,
+            holder: source,
+            fence: 1,
+            manifest: None,
+            stash: Some(StashAssignment {
+                assignment_epoch: 5,
+                active_peer: state.borrow().config.host,
+                active_assignment_epoch: 5,
+                transition_peer: None,
+                membership_epoch: 1,
+            }),
+            retired_stashes: Vec::new(),
+        });
+        {
+            let mut host = state.borrow_mut();
+            for epoch in 1..=6 {
+                host.config.cluster_placement = Some(ClusterPlacementConfig {
+                    membership_epoch: epoch,
+                    roster: vec![HostId::new(1)],
+                    authority: None,
+                });
+            }
+            host.replicas.insert(
+                ReplicaKey {
+                    source: HostId::new(9),
+                    volume,
+                    assignment_epoch: 5,
+                },
+                Default::default(),
+            );
+        }
+
+        let delayed = ReplicaInbox::new(&state, &store, source, volume, 5);
+        assert!(delayed.authorized().await);
+        assert!(
+            state.borrow().replicas.contains_key(&delayed.key),
+            "a permanent host ID retains its exact recovered spool across placement transitions"
+        );
+    }
+
     #[test]
     fn assignment_change_forgets_commit_owned_by_previous_peer() {
-        let state = test_state(HostId(1));
+        let state = test_state(HostId::new(1));
         let volume = VolumeId(3);
         let current = StashAssignment {
             assignment_epoch: 1,
-            active_peer: HostId(2),
+            active_peer: HostId::new(2),
             active_assignment_epoch: 1,
             transition_peer: None,
             membership_epoch: 1,
         };
         let next = StashAssignment {
             assignment_epoch: 2,
-            active_peer: HostId(2),
+            active_peer: HostId::new(2),
             active_assignment_epoch: 1,
-            transition_peer: Some(HostId(4)),
+            transition_peer: Some(HostId::new(4)),
             membership_epoch: 1,
         };
         let committed = ReplicaCommitInfo {
@@ -1698,10 +1848,10 @@ mod tests {
 
     #[test]
     fn append_plan_enforces_configured_host_capacity() {
-        let state = test_state(HostId(1));
+        let state = test_state(HostId::new(1));
         state.borrow_mut().config.archive.spool_capacity_bytes = 100;
         let key = ReplicaKey {
-            source: HostId(2),
+            source: HostId::new(2),
             volume: VolumeId(3),
             assignment_epoch: 1,
         };
@@ -1719,51 +1869,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_authority_rejects_an_epoch_below_the_recovered_floor() {
-        let source = HostId(10);
-        let volume = VolumeId(12);
-        let roster = vec![
-            PeerCandidate {
-                host: source,
-                weight: 1,
-                failure_domain: 1,
-                drained: false,
-            },
-            PeerCandidate {
-                host: HostId(11),
-                weight: 1,
-                failure_domain: 2,
-                drained: false,
-            },
-            PeerCandidate {
-                host: HostId(12),
-                weight: 1,
-                failure_domain: 3,
-                drained: false,
-            },
-        ];
-        let ranked = rank_stash_candidates(5, source, 1, volume, &roster);
-        let local = ranked[0];
-        let state = test_state(local);
-        state.borrow_mut().config.replica_placement = Some(ReplicaPlacementConfig {
-            membership_epoch: 5,
-            local_failure_domain: roster
-                .iter()
-                .find(|candidate| candidate.host == local)
-                .expect("ranked host is in roster")
-                .failure_domain,
-            roster,
-            authority: None,
-        });
-        state
-            .borrow_mut()
-            .replica_latest_epoch
-            .insert((source, volume), 2);
-        assert!(!ReplicaInbox::new(&state, &(), source, volume, 1).authorized());
+    #[tokio::test]
+    async fn unknown_replica_requests_do_not_allocate_per_volume_state() {
+        let state = test_state(HostId::new(1));
+        let store = TestStore::default();
+        for volume in 1..=1_000 {
+            let inbox = ReplicaInbox::new(&state, &store, HostId::new(10), VolumeId(volume), 1);
+            assert!(!inbox.authorized().await);
+            state.borrow_mut().record_replica_reject(VolumeId(volume));
+        }
+        let host = state.borrow();
+        assert!(host.replicas.is_empty());
+        assert!(host.replica_spool_metrics().is_empty());
+        assert_eq!(host.counters.replica_rejected, 1_000);
+        assert_eq!(store.gets.get(), 1_000, "one bounded head GET per message");
         assert_eq!(
-            state.borrow().replica_latest_epoch,
-            BTreeMap::from([((source, volume), 2)])
+            store.range_gets.get(),
+            0,
+            "authorization never scans bodies"
         );
+        assert_eq!(store.lists.get(), 0, "authorization never lists history");
     }
 }

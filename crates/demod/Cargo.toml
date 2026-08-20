@@ -13,8 +13,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-blockd-core = { path = "../core" }
-blockd-runtime = { path = "../runtime" }
+blockd-core = { path = "../core", version = "0.1.0" }
+blockd-runtime = { path = "../runtime", version = "0.1.0" }
 async-trait.workspace = true
 axum = { workspace = true, features = ["http1", "json", "tokio"] }
 opentelemetry = { version = "0.32.0", features = ["trace"] }

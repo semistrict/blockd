@@ -35,6 +35,7 @@ pub struct Seen {
 pub enum Fault {
     Status(u16),
     DropConnection,
+    Stall(Duration),
 }
 
 pub struct FakeGcs {
@@ -181,8 +182,18 @@ impl FakeGcs {
                 response(200, &headers, bytes.clone())
             }
             "DELETE" => {
-                objects.remove(&key);
-                response(204, &[], Vec::new())
+                if let Some(want) = seen.headers.get("x-goog-if-generation-match") {
+                    let want: u64 = want.parse().expect("precondition is a number");
+                    let held = objects.get(&key).map_or(0, |(generation, _)| *generation);
+                    if want != held {
+                        return response(412, &[], b"precondition failed".to_vec());
+                    }
+                }
+                if objects.remove(&key).is_some() {
+                    response(204, &[], Vec::new())
+                } else {
+                    response(404, &[], b"NoSuchKey".to_vec())
+                }
             }
             _ => response(405, &[], b"method not allowed".to_vec()),
         }
@@ -203,34 +214,41 @@ impl FakeGcs {
             .objects
             .lock()
             .expect("lock")
-            .keys()
-            .filter_map(|key| key.strip_prefix(&root))
-            .filter(|key| key.starts_with(&prefix))
-            .filter(|key| token.as_deref().is_none_or(|token| *key > token))
+            .iter()
+            .filter_map(|(key, (generation, bytes))| {
+                key.strip_prefix(&root)
+                    .map(|key| (key.to_owned(), *generation, content_fingerprint(bytes)))
+            })
+            .filter(|(key, _, _)| key.starts_with(&prefix))
+            .filter(|(key, _, _)| token.as_deref().is_none_or(|token| key.as_str() > token))
             .take(1_001)
-            .map(str::to_owned)
             .collect::<Vec<_>>();
         let truncated = names.len() > 1_000;
         names.truncate(1_000);
         let next = truncated
             .then(|| names.last().cloned())
             .flatten()
-            .map(|key| {
+            .map(|(key, _, _)| {
                 format!(
                     "<NextContinuationToken>{}</NextContinuationToken>",
                     xml_escape(&key)
                 )
             })
             .unwrap_or_default();
-        let contents = names.iter().fold(String::new(), |mut contents, key| {
-            write!(
-                contents,
-                "<Contents><Key>{}</Key></Contents>",
-                xml_escape(key)
-            )
-            .expect("writing XML into a string cannot fail");
-            contents
-        });
+        let contents = names
+            .iter()
+            .fold(
+                String::new(),
+                |mut contents, (key, generation, fingerprint)| {
+                write!(
+                    contents,
+                    "<Contents><Key>{}</Key><Generation>{generation}</Generation><ETag>\"{fingerprint}\"</ETag></Contents>",
+                    xml_escape(key),
+                )
+                .expect("writing XML into a string cannot fail");
+                contents
+                },
+            );
         response(
             200,
             &[],
@@ -240,6 +258,17 @@ impl FakeGcs {
             .into_bytes(),
         )
     }
+}
+
+fn content_fingerprint(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut encoded, byte| {
+            write!(encoded, "{byte:02x}").expect("writing a digest into a string cannot fail");
+            encoded
+        })
 }
 
 fn percent_decode(value: &str) -> String {
@@ -336,6 +365,10 @@ async fn handle(
             response_for(&seen.method, status, &[], b"scripted".to_vec())
         }
         Some(Fault::DropConnection) => dropped_connection_response(),
+        Some(Fault::Stall(duration)) => {
+            tokio::time::sleep(duration).await;
+            server.object_response(&seen, body.to_vec())
+        }
         None if method == Method::GET
             && uri
                 .query()

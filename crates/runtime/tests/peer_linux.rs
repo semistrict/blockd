@@ -139,20 +139,20 @@ fn sample_msgs() -> Vec<PeerMsg> {
 async fn every_variant_crosses_the_wire_with_its_sender() {
     let addr_a = free_addr();
     let addr_b = free_addr();
-    let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
+    let roster: BTreeMap<HostId, SocketAddr> = [(HostId::new(0), addr_a), (HostId::new(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone()).await;
-    let (_b, rx_b) = net(HostId(1), addr_b, roster).await;
+    let (a, _rx_a) = net(HostId::new(0), addr_a, roster.clone()).await;
+    let (_b, rx_b) = net(HostId::new(1), addr_b, roster).await;
 
     for msg in sample_msgs() {
-        a.send(HostId(0), HostId(1), &msg);
+        a.send(HostId::new(0), HostId::new(1), &msg);
         let (from, got) = rx_b
             .recv_timeout(Duration::from_secs(5))
             .expect("delivered");
-        assert_eq!((from, got), (HostId(0), msg));
+        assert_eq!((from, got), (HostId::new(0), msg));
     }
-    assert_eq!(a.connections(), vec![(HostId(1), true)]);
+    assert_eq!(a.connections(), vec![(HostId::new(1), true)]);
 }
 
 /// Sends into the void drop silently; once the listener exists, later
@@ -162,15 +162,15 @@ async fn every_variant_crosses_the_wire_with_its_sender() {
 async fn sends_before_the_listener_drop_and_reconnect_works_after() {
     let addr_a = free_addr();
     let addr_b = free_addr();
-    let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
+    let roster: BTreeMap<HostId, SocketAddr> = [(HostId::new(0), addr_a), (HostId::new(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone()).await;
+    let (a, _rx_a) = net(HostId::new(0), addr_a, roster.clone()).await;
 
     // No listener at addr_b yet: this frame is dropped on the floor.
     a.send(
-        HostId(0),
-        HostId(1),
+        HostId::new(0),
+        HostId::new(1),
         &PeerMsg::Released {
             volume: VolumeId(1),
             release_fence: 3,
@@ -178,15 +178,15 @@ async fn sends_before_the_listener_drop_and_reconnect_works_after() {
     );
     std::thread::sleep(Duration::from_millis(50));
     assert!(a.dropped_sends.load(Ordering::SeqCst) >= 1);
-    assert_eq!(a.connections(), vec![(HostId(1), false)]);
+    assert_eq!(a.connections(), vec![(HostId::new(1), false)]);
 
-    let (_b, rx_b) = net(HostId(1), addr_b, roster).await;
+    let (_b, rx_b) = net(HostId::new(1), addr_b, roster).await;
     // The sender's dead connection is discovered on the next write; the
     // retry after that reconnects. Send a few — at least one must land.
     for _ in 0..5 {
         a.send(
-            HostId(0),
-            HostId(1),
+            HostId::new(0),
+            HostId::new(1),
             &PeerMsg::ReleasedAck {
                 volume: VolumeId(2),
                 release_fence: 4,
@@ -197,7 +197,7 @@ async fn sends_before_the_listener_drop_and_reconnect_works_after() {
     let (from, got) = rx_b
         .recv_timeout(Duration::from_secs(5))
         .expect("reconnected and delivered");
-    assert_eq!(from, HostId(0));
+    assert_eq!(from, HostId::new(0));
     assert_eq!(
         got,
         PeerMsg::ReleasedAck {
@@ -205,7 +205,7 @@ async fn sends_before_the_listener_drop_and_reconnect_works_after() {
             release_fence: 4,
         }
     );
-    assert_eq!(a.connections(), vec![(HostId(1), true)]);
+    assert_eq!(a.connections(), vec![(HostId::new(1), true)]);
 }
 
 /// A stream that turns to garbage is closed at the first bad frame and
@@ -213,8 +213,8 @@ async fn sends_before_the_listener_drop_and_reconnect_works_after() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_corrupt_frame_closes_its_connection_without_wedging() {
     let addr_b = free_addr();
-    let roster: BTreeMap<HostId, SocketAddr> = [(HostId(1), addr_b)].into_iter().collect();
-    let (_b, rx_b) = net(HostId(1), addr_b, roster.clone()).await;
+    let roster: BTreeMap<HostId, SocketAddr> = [(HostId::new(1), addr_b)].into_iter().collect();
+    let (_b, rx_b) = net(HostId::new(1), addr_b, roster.clone()).await;
 
     // A raw connection writing garbage: dropped without a delivery.
     let mut raw = TcpStream::connect(addr_b).expect("connect");
@@ -228,11 +228,11 @@ async fn a_corrupt_frame_closes_its_connection_without_wedging() {
     // A healthy transport still gets through.
     let addr_a = free_addr();
     let mut full = roster;
-    full.insert(HostId(0), addr_a);
-    let (a, _rx_a) = net(HostId(0), addr_a, full).await;
+    full.insert(HostId::new(0), addr_a);
+    let (a, _rx_a) = net(HostId::new(0), addr_a, full).await;
     a.send(
-        HostId(0),
-        HostId(1),
+        HostId::new(0),
+        HostId::new(1),
         &PeerMsg::Released {
             volume: VolumeId(3),
             release_fence: 5,
@@ -255,18 +255,18 @@ async fn a_corrupt_frame_closes_its_connection_without_wedging() {
 async fn a_blx_sized_payload_round_trips() {
     let addr_a = free_addr();
     let addr_b = free_addr();
-    let roster: BTreeMap<HostId, SocketAddr> = [(HostId(0), addr_a), (HostId(1), addr_b)]
+    let roster: BTreeMap<HostId, SocketAddr> = [(HostId::new(0), addr_a), (HostId::new(1), addr_b)]
         .into_iter()
         .collect();
-    let (a, _rx_a) = net(HostId(0), addr_a, roster.clone()).await;
-    let (_b, rx_b) = net(HostId(1), addr_b, roster).await;
+    let (a, _rx_a) = net(HostId::new(0), addr_a, roster.clone()).await;
+    let (_b, rx_b) = net(HostId::new(1), addr_b, roster).await;
 
     let payload: Vec<u8> = (0..8 * 1024 * 1024u32)
         .map(|i| u8::try_from((i * 31) % 256).expect("fits"))
         .collect();
     a.send(
-        HostId(0),
-        HostId(1),
+        HostId::new(0),
+        HostId::new(1),
         &PeerMsg::Page {
             io: PeerRequestId(77),
             bytes: Some(payload.clone()),

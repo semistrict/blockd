@@ -11,14 +11,14 @@ fn base_config() -> HarnessConfig {
     HarnessConfig {
         host: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
-            host: HostId(0),
+            host: HostId::new(0),
             cache_pages: 256,
             writeback_interval: millis(20),
             backup_retry: millis(200),
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 25,
-            replica_placement: None,
+            cluster_placement: None,
         },
         passive_disk_capacity: None,
         blobs: BlobDevConfig::nvme(),
@@ -93,14 +93,14 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         volume_config: VolumeConfig::memory(16),
         daemon: HostConfig {
             archive: blockd_core::hostmeta::ArchivePolicy::default(),
-            host: HostId(0),
+            host: HostId::new(0),
             cache_pages: 128,
             writeback_interval: millis(20),
             backup_retry: millis(100),
             disk_capacity: None,
             disk_headroom: 0,
             wedge_ticks: 25,
-            replica_placement: None,
+            cluster_placement: None,
         },
         bdev: BlobDevConfig::nvme(),
         store: StoreConfig::gcs(),
@@ -122,6 +122,7 @@ fn head_fence_prevents_double_run_after_a_lied_about_handoff() {
         migrate_at: vec![(millis(1_000), blockd_core::types::VolumeId(1), 1)],
         sabotage: Some(Sabotage::EagerHandoffAck),
         guest_sync_share: None,
+        membership_events: vec![],
     };
     let report = blockd_sim::cluster::run(7, config);
     // The migration completed and the source crashed in the old danger

@@ -19,5 +19,5 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [dependencies]
-blockd-platform = { path = "../platform" }
+blockd-platform = { path = "../platform", version = "0.1.0" }
 libc.workspace = true

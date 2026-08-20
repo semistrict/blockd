@@ -91,8 +91,8 @@ pub fn seal_verified_replica_artifact(
 ) -> Result<Vec<u8>, ReplicaSpoolError> {
     verify_artifact(volume, artifact, bytes)?;
     let mut e = Enc::new();
-    e.u16(1);
-    e.u16(source.0);
+    e.u16(2);
+    e.u32(source.get());
     e.u64(volume.0);
     e.u64(assignment_epoch);
     encode_artifact(&mut e, artifact);
@@ -115,8 +115,8 @@ pub fn seal_replica_commit(
     }
     verify_record(volume, info, record)?;
     let mut e = Enc::new();
-    e.u16(1);
-    e.u16(source.0);
+    e.u16(2);
+    e.u32(source.get());
     e.u64(volume.0);
     e.u64(assignment_epoch);
     encode_commit_info(&mut e, info);
@@ -231,10 +231,10 @@ fn check_identity(
 fn open_artifact(bytes: &[u8]) -> Result<ReplicaArtifactFrame, ReplicaSpoolError> {
     let payload = open_frame(MAGIC_REPLICA_ARTIFACT, bytes)?;
     let mut d = Dec::new(payload);
-    if d.u16()? != 1 {
+    if d.u16()? != 2 {
         return Err(ReplicaSpoolError);
     }
-    let source = HostId(d.u16()?);
+    let source = HostId::new(d.u32()?);
     let volume = VolumeId(d.u64()?);
     let assignment_epoch = d.u64()?;
     let artifact = decode_artifact(&mut d)?;
@@ -259,10 +259,10 @@ fn open_artifact(bytes: &[u8]) -> Result<ReplicaArtifactFrame, ReplicaSpoolError
 fn open_commit(bytes: &[u8]) -> Result<ReplicaCommitFrame, ReplicaSpoolError> {
     let payload = open_frame(MAGIC_REPLICA_COMMIT, bytes)?;
     let mut d = Dec::new(payload);
-    if d.u16()? != 1 {
+    if d.u16()? != 2 {
         return Err(ReplicaSpoolError);
     }
-    let source = HostId(d.u16()?);
+    let source = HostId::new(d.u32()?);
     let volume = VolumeId(d.u64()?);
     let assignment_epoch = d.u64()?;
     let info = decode_commit_info(&mut d)?;
@@ -372,10 +372,10 @@ mod tests {
     #[test]
     fn complete_spool_scans_to_one_recovery_commit() {
         let (artifact, blx, info, record) = fixture();
-        let mut spool = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx)
+        let mut spool = seal_replica_artifact(HostId::new(2), VolumeId(7), 5, artifact, &blx)
             .expect("artifact valid");
         spool.extend(
-            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record)
+            seal_replica_commit(HostId::new(2), VolumeId(7), 5, info, &[artifact], &record)
                 .expect("commit valid"),
         );
         let scan = scan_replica_spool(&spool).expect("spool valid");
@@ -414,11 +414,10 @@ mod tests {
             migrated_from: None,
         }
         .encode(VolumeId(7));
-        let frame = seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record)
+        let frame = seal_replica_commit(HostId::new(2), VolumeId(7), 5, info, &[artifact], &record)
             .expect("commit valid");
         let expected_pin = match page_size() {
-            4096 => (194, 0x1ED3_5E1B),
-            16_384 => (194, 0x9640_CB5A),
+            4096 | 16_384 => (194, 0x341A_3A44),
             size => panic!("spool frame pin missing for {size}-byte pages"),
         };
         assert_eq!((frame.len(), crc32c(&frame)), expected_pin);
@@ -427,9 +426,11 @@ mod tests {
     #[test]
     fn scan_retains_artifacts_appended_after_the_last_commit() {
         let (artifact, blx, info, record) = fixture();
-        let mut spool = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
+        let mut spool =
+            seal_replica_artifact(HostId::new(2), VolumeId(7), 5, artifact, &blx).unwrap();
         spool.extend(
-            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap(),
+            seal_replica_commit(HostId::new(2), VolumeId(7), 5, info, &[artifact], &record)
+                .unwrap(),
         );
 
         let page = PageId {
@@ -443,7 +444,9 @@ mod tests {
             fence: 4,
             object: ObjectId(10),
         };
-        spool.extend(seal_replica_artifact(HostId(2), VolumeId(7), 5, next, &next_blx).unwrap());
+        spool.extend(
+            seal_replica_artifact(HostId::new(2), VolumeId(7), 5, next, &next_blx).unwrap(),
+        );
 
         let scan = scan_replica_spool(&spool).expect("spool valid");
         assert_eq!(scan.commits.len(), 1);
@@ -454,9 +457,10 @@ mod tests {
     fn every_torn_commit_tail_is_ignored() {
         let (artifact, blx, info, record) = fixture();
         let artifact_frame =
-            seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
+            seal_replica_artifact(HostId::new(2), VolumeId(7), 5, artifact, &blx).unwrap();
         let commit =
-            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap();
+            seal_replica_commit(HostId::new(2), VolumeId(7), 5, info, &[artifact], &record)
+                .unwrap();
         for kept in 0..commit.len() {
             let mut torn = artifact_frame.clone();
             torn.extend_from_slice(&commit[..kept]);
@@ -472,7 +476,7 @@ mod tests {
     #[test]
     fn every_torn_artifact_tail_is_ignored() {
         let (artifact, blx, _, _) = fixture();
-        let frame = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
+        let frame = seal_replica_artifact(HostId::new(2), VolumeId(7), 5, artifact, &blx).unwrap();
         for kept in 0..frame.len() {
             let scan = scan_replica_spool(&frame[..kept]).expect("torn tail is recoverable");
             assert!(scan.artifacts.is_empty());
@@ -487,19 +491,21 @@ mod tests {
     fn commit_before_required_data_is_rejected() {
         let (artifact, _, info, record) = fixture();
         let commit =
-            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap();
+            seal_replica_commit(HostId::new(2), VolumeId(7), 5, info, &[artifact], &record)
+                .unwrap();
         assert_eq!(scan_replica_spool(&commit), Err(ReplicaSpoolError));
     }
 
     #[test]
     fn conflicting_duplicate_artifact_is_rejected() {
         let (artifact, blx, _, _) = fixture();
-        let frame = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
+        let frame = seal_replica_artifact(HostId::new(2), VolumeId(7), 5, artifact, &blx).unwrap();
         let mut conflicting_blx = blx;
         let last = conflicting_blx.len() - 1;
         conflicting_blx[last] ^= 1;
         assert!(
-            seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &conflicting_blx).is_err()
+            seal_replica_artifact(HostId::new(2), VolumeId(7), 5, artifact, &conflicting_blx)
+                .is_err()
         );
         let mut duplicate = frame.clone();
         duplicate.extend(frame);
@@ -510,9 +516,11 @@ mod tests {
     #[test]
     fn every_single_bit_spool_corruption_removes_the_recovery_commit() {
         let (artifact, blx, info, record) = fixture();
-        let mut spool = seal_replica_artifact(HostId(2), VolumeId(7), 5, artifact, &blx).unwrap();
+        let mut spool =
+            seal_replica_artifact(HostId::new(2), VolumeId(7), 5, artifact, &blx).unwrap();
         spool.extend(
-            seal_replica_commit(HostId(2), VolumeId(7), 5, info, &[artifact], &record).unwrap(),
+            seal_replica_commit(HostId::new(2), VolumeId(7), 5, info, &[artifact], &record)
+                .unwrap(),
         );
         for bit in 0..spool.len() * 8 {
             let mut damaged = spool.clone();
@@ -524,5 +532,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn different_permanent_hosts_cannot_share_spool_bytes() {
+        let volume = VolumeId(7);
+        let (artifact, blx, _, _) = fixture();
+        let first = crate::types::HostId::new(2);
+        let second = crate::types::HostId::new(3);
+        let first_frame =
+            seal_replica_artifact(first, volume, 5, artifact, &blx).expect("first spool frame");
+        let second_frame =
+            seal_replica_artifact(second, volume, 5, artifact, &blx).expect("second spool frame");
+
+        assert_eq!(
+            scan_replica_spool(&first_frame).unwrap().artifacts[&artifact].source,
+            first
+        );
+        assert_eq!(
+            scan_replica_spool(&second_frame).unwrap().artifacts[&artifact].source,
+            second
+        );
+        let mut mixed = first_frame;
+        mixed.extend(second_frame);
+        assert_eq!(scan_replica_spool(&mixed), Err(ReplicaSpoolError));
+        assert_ne!(
+            crate::layout::replica_spool_blob(first, volume, 5),
+            crate::layout::replica_spool_blob(second, volume, 5)
+        );
     }
 }

@@ -226,9 +226,10 @@ async fn create_fleet(runtimes: &[Arc<Runtime>], config: &ProfileConfig) {
             let verdict = runtime
                 .fork_volume(VolumeId(node.volume), volume_config, parent)
                 .await;
-            assert!(
-                matches!(verdict, Verdict::Resume { .. }),
-                "fork {} from {parent} did not resume: {verdict:?}",
+            assert_eq!(
+                verdict,
+                Verdict::ColdBoot,
+                "data-volume fork {} from {parent} returned an unexpected verdict",
                 node.volume
             );
             let inherited_page = config.provenance.nodes
@@ -611,7 +612,7 @@ impl Drop for OwnedScratch {
 #[ignore = "large-host performance profile; run explicitly in release mode"]
 #[allow(clippy::too_many_lines)] // one end-to-end setup, measurement, and cleanup workflow
 async fn profile_volume_scale_and_fork_provenance() {
-    support::local(async {
+    Box::pin(support::local(async {
         let config = Arc::new(ProfileConfig::from_env().expect("valid profile configuration"));
         config.prepare_artifacts().expect("new artifact directory");
         write_json(
@@ -665,7 +666,7 @@ async fn profile_volume_scale_and_fork_provenance() {
             });
             let mut runtime_configs: [RuntimeConfig; 3] = std::array::from_fn(|host| {
                 support::three_host_runtime_config(
-                    u16::try_from(host).expect("host fits"),
+                    u32::try_from(host).expect("host fits"),
                     roots[host].clone(),
                     addresses,
                 )
@@ -679,11 +680,14 @@ async fn profile_volume_scale_and_fork_provenance() {
             runtime_configs[0].daemon.cache_pages = shard_volumes
                 .saturating_mul(config.cache_pages)
                 .max(1);
-            passives.push(Runtime::new(&runtime_configs[1], store.clone()).await);
-            passives.push(Runtime::new(&runtime_configs[2], store.clone()).await);
-            runtimes.push(Arc::new(
-                Runtime::new(&runtime_configs[0], store.clone()).await,
-            ));
+            let (primary, passive_b, passive_c) = tokio::join!(
+                Runtime::new(&runtime_configs[0], store.clone()),
+                Runtime::new(&runtime_configs[1], store.clone()),
+                Runtime::new(&runtime_configs[2], store.clone()),
+            );
+            passives.push(passive_b.expect("runtime startup"));
+            passives.push(passive_c.expect("runtime startup"));
+            runtimes.push(Arc::new(primary.expect("runtime startup")));
         }
         create_fleet(&runtimes, &config).await;
 
@@ -806,12 +810,12 @@ async fn profile_volume_scale_and_fork_provenance() {
             let mut runtime = Arc::try_unwrap(runtime)
                 .ok()
                 .expect("workers released runtime");
-            runtime.shutdown().await;
+            runtime.shutdown().await.expect("runtime shutdown");
         }
         drop(passives);
         drop(test_gcs);
         drop(scratch);
-    })
+    }))
     .await;
 }
 

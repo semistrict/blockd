@@ -21,7 +21,6 @@ pub enum FaultPoint {
     CrashPrimaryAfterSeedBeforeActiveCas = 13,
     CrashPrimaryAfterActiveCasBeforeCommit = 14,
     CrashPrimaryBeforeClosureCapture = 15,
-    CrashPrimaryAfterClosureCapture = 16,
     CrashPrimaryDuringArtifactTransfer = 17,
     CrashPeerAfterDataFlushBeforeCommit = 18,
 }

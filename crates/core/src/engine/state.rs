@@ -5,7 +5,6 @@ use std::rc::Rc;
 use blockd_exec::Reply;
 use blockd_exec::channel::{OneSender, UnboundedSender};
 
-use crate::authority::{AuthorityProof, PlacementRecord, VnodeId};
 use crate::blx::{BlxFooter, NamespaceKind};
 use crate::cache::Cache;
 use crate::head::{HeadRecord, ManifestPtr, RetiredStash, StashAssignment};
@@ -16,6 +15,7 @@ use crate::hostmeta::{
 use crate::journal::{JournalRecord, VolumeConfig};
 use crate::manifest::{BaseRef, ObjectIdentity, ObjectRef};
 use crate::page_file::PageFileLoc;
+use crate::placement::ClusterPlacement;
 use crate::protocol::ReplicaCommitInfo;
 use crate::types::{Epoch, Gen, HostId, JournalSeq, PageId, VolumeId};
 
@@ -29,8 +29,7 @@ pub(crate) struct AuthorityLease {
     pub(crate) host_epoch: u64,
     pub(crate) serving: bool,
     pub(crate) last_poll: u64,
-    pub(crate) placement: Option<PlacementRecord>,
-    pub(crate) active_vnodes: BTreeMap<VnodeId, AuthorityProof>,
+    pub(crate) placement: Option<ClusterPlacement>,
 }
 
 impl AuthorityLease {
@@ -41,17 +40,12 @@ impl AuthorityLease {
             serving,
             last_poll: 0,
             placement: None,
-            active_vnodes: BTreeMap::new(),
         }
     }
 }
 
 pub struct HostState {
     pub config: HostConfig,
-    /// Older live-membership snapshots still referenced by existing stash
-    /// assignments. Membership changes are additive here; head CAS remains
-    /// the authority for moving an individual volume to a new candidate.
-    pub replica_placement_history: Vec<crate::hostmeta::ReplicaPlacementConfig>,
     pub cache: Cache,
     pub volumes: BTreeMap<VolumeId, VolumeState>,
     pub counters: Counters,
@@ -62,16 +56,26 @@ pub struct HostState {
     pub page_fill_waiters: BTreeMap<PageId, Vec<OneSender<bool>>>,
     pub(super) peer_client: PeerClient,
     pub inbound_migrations: BTreeSet<VolumeId>,
+    pub(crate) released_migration_fences: BTreeMap<VolumeId, u64>,
     pub replicas: BTreeMap<ReplicaKey, ReplicaState>,
-    pub replica_latest_epoch: BTreeMap<(HostId, VolumeId), u64>,
     pub replica_releases: Vec<(HostId, VolumeId, u64, crate::protocol::ReplicaCommitInfo)>,
+    replica_volume_counters: BTreeMap<VolumeId, ReplicaVolumeCounters>,
     pub(crate) authority: AuthorityLease,
     scheduled_volumes: BTreeSet<VolumeId>,
     scheduled_cursor: Option<VolumeId>,
     disk_reclaim_scan_cursor: Option<VolumeId>,
     disk_reclaim_scan_remaining: usize,
     fatal: Option<OneSender<HostFatal>>,
-    next_incarnation: u64,
+    #[cfg(test)]
+    pub(super) critical_child_failure: Option<super::host::CriticalChildSource>,
+    next_run_generation: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReplicaVolumeCounters {
+    integrity_rejects: u64,
+    replacement_bytes: u64,
+    cleanup_unlinks: u64,
 }
 
 impl HostState {
@@ -85,7 +89,7 @@ impl HostState {
             "archive spool headroom must be smaller than capacity"
         );
         let authority_serving = config
-            .replica_placement
+            .cluster_placement
             .as_ref()
             .and_then(|placement| placement.authority)
             .is_none();
@@ -93,7 +97,6 @@ impl HostState {
         Self {
             cache: Cache::new(config.cache_pages),
             config,
-            replica_placement_history: Vec::new(),
             volumes: BTreeMap::new(),
             counters: Counters::default(),
             blob_sizes: BTreeMap::new(),
@@ -103,16 +106,19 @@ impl HostState {
             page_fill_waiters: BTreeMap::new(),
             peer_client,
             inbound_migrations: BTreeSet::new(),
+            released_migration_fences: BTreeMap::new(),
             replicas: BTreeMap::new(),
-            replica_latest_epoch: BTreeMap::new(),
             replica_releases: Vec::new(),
+            replica_volume_counters: BTreeMap::new(),
             authority: AuthorityLease::new(authority_serving),
             scheduled_volumes: BTreeSet::new(),
             scheduled_cursor: None,
             disk_reclaim_scan_cursor: None,
             disk_reclaim_scan_remaining: 0,
             fatal: None,
-            next_incarnation: 0,
+            #[cfg(test)]
+            critical_child_failure: None,
+            next_run_generation: 0,
         }
     }
 
@@ -124,49 +130,68 @@ impl HostState {
         self.authority.session
     }
 
-    pub fn volume_authorized(&self, volume: VolumeId) -> bool {
-        let authority_enabled = self
-            .config
-            .replica_placement
-            .as_ref()
-            .and_then(|placement| placement.authority)
-            .is_some();
-        if !authority_enabled {
-            return self.authority.serving;
-        }
-        self.authority.serving
-            && self.authority.placement.as_ref().is_some_and(|placement| {
-                self.authority
-                    .active_vnodes
-                    .contains_key(&placement.vnode(volume))
-            })
+    pub fn authority_host_epoch(&self) -> u64 {
+        self.authority.host_epoch
     }
 
-    pub(super) fn volume_at(&self, volume: VolumeId, incarnation: u64) -> Option<&VolumeState> {
+    pub fn authority_ready(&self) -> bool {
+        self.authority.serving
+    }
+
+    pub fn authority_placement_epoch(&self) -> u64 {
+        self.authority
+            .placement
+            .as_ref()
+            .map_or(0, |placement| placement.epoch)
+    }
+
+    pub fn volume_authorized(&self, _volume: VolumeId) -> bool {
+        let authority = self
+            .config
+            .cluster_placement
+            .as_ref()
+            .and_then(|placement| placement.authority);
+        let Some(authority) = authority else {
+            return self.authority.serving;
+        };
+        if blockd_exec::now().saturating_sub(self.authority.last_poll)
+            >= authority.max_poll_staleness
+        {
+            return false;
+        }
+        self.authority.serving
+            && self
+                .authority
+                .placement
+                .as_ref()
+                .is_some_and(|placement| placement.contains(self.config.host))
+    }
+
+    pub(super) fn volume_at(&self, volume: VolumeId, run_generation: u64) -> Option<&VolumeState> {
         self.volumes
             .get(&volume)
-            .filter(|state| state.incarnation == incarnation)
+            .filter(|state| state.run_generation == run_generation)
     }
 
     pub(super) fn volume_at_mut(
         &mut self,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
     ) -> Option<&mut VolumeState> {
         self.volumes
             .get_mut(&volume)
-            .filter(|state| state.incarnation == incarnation)
+            .filter(|state| state.run_generation == run_generation)
     }
 
     pub(super) fn finish_primary_commit(
         &mut self,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
         info: ReplicaCommitInfo,
         record: JournalRecord,
     ) -> Vec<PendingSync> {
         let authority_serving = self.volume_authorized(volume);
-        let Some(volume_state) = self.volume_at_mut(volume, incarnation) else {
+        let Some(volume_state) = self.volume_at_mut(volume, run_generation) else {
             return Vec::new();
         };
         if volume_state
@@ -197,12 +222,12 @@ impl HostState {
     pub(super) fn adopt_assignment(
         &mut self,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
         version: u64,
         assignment: StashAssignment,
         retired_stashes: Vec<RetiredStash>,
     ) -> bool {
-        let Some(volume_state) = self.volume_at_mut(volume, incarnation) else {
+        let Some(volume_state) = self.volume_at_mut(volume, run_generation) else {
             return false;
         };
         volume_state.adopt_assignment(version, assignment, retired_stashes);
@@ -212,11 +237,11 @@ impl HostState {
     pub(super) fn adopt_assignment_from_head(
         &mut self,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
         version: u64,
         head: HeadRecord,
     ) -> bool {
-        let Some(volume_state) = self.volume_at_mut(volume, incarnation) else {
+        let Some(volume_state) = self.volume_at_mut(volume, run_generation) else {
             return false;
         };
         volume_state.adopt_assignment_from_head(version, head);
@@ -241,27 +266,49 @@ impl HostState {
     }
 
     pub fn insert_fresh(&mut self, volume: VolumeId, config: VolumeConfig) -> u64 {
-        let incarnation = self.allocate_incarnation();
+        let run_generation = self.allocate_run_generation();
         let previous = self
             .volumes
-            .insert(volume, VolumeState::fresh(config, incarnation));
+            .insert(volume, VolumeState::fresh(config, run_generation));
         assert!(previous.is_none(), "duplicate volume insertion");
-        incarnation
+        run_generation
     }
 
-    pub(crate) fn allocate_incarnation(&mut self) -> u64 {
-        let incarnation = self.next_incarnation;
-        self.next_incarnation = self
-            .next_incarnation
+    pub(crate) fn allocate_run_generation(&mut self) -> u64 {
+        let run_generation = self.next_run_generation;
+        self.next_run_generation = self
+            .next_run_generation
             .checked_add(1)
-            .expect("volume incarnation overflow");
-        incarnation
+            .expect("volume run_generation overflow");
+        run_generation
     }
 
     pub(crate) fn schedule_volume(&mut self, volume: VolumeId) {
         if self.volumes.contains_key(&volume) {
             self.scheduled_volumes.insert(volume);
         }
+    }
+
+    pub(crate) fn record_replica_reject(&mut self, volume: VolumeId) {
+        self.counters.replica_rejected = self.counters.replica_rejected.saturating_add(1);
+        if let Some(counters) = self.replica_volume_counters.get_mut(&volume) {
+            counters.integrity_rejects = counters.integrity_rejects.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn record_replica_replacement(&mut self, volume: VolumeId, bytes: u64) {
+        self.counters.replica_replacement_bytes = self
+            .counters
+            .replica_replacement_bytes
+            .saturating_add(bytes);
+        let counters = self.replica_volume_counters.entry(volume).or_default();
+        counters.replacement_bytes = counters.replacement_bytes.saturating_add(bytes);
+    }
+
+    pub(crate) fn record_replica_cleanup(&mut self, volume: VolumeId) {
+        self.counters.replica_unlinks = self.counters.replica_unlinks.saturating_add(1);
+        let counters = self.replica_volume_counters.entry(volume).or_default();
+        counters.cleanup_unlinks = counters.cleanup_unlinks.saturating_add(1);
     }
 
     pub(crate) fn take_scheduled_volumes(&mut self, limit: usize) -> Vec<VolumeId> {
@@ -594,6 +641,7 @@ impl HostState {
                     role,
                     fence: state.fence,
                     dirty_pages: self.cache.dirty_pages_of(volume).len(),
+                    pages_dirtied_total: state.pages_dirtied_total,
                     unstable_pages: self.cache.unstable_pages_of(volume).len(),
                     pending_syncs: state.pending_syncs.len(),
                     hydration_remaining_pages,
@@ -635,6 +683,11 @@ impl HostState {
         self.volumes
             .iter()
             .map(|(&volume, state)| {
+                let accounting = self
+                    .replica_volume_counters
+                    .get(&volume)
+                    .copied()
+                    .unwrap_or_default();
                 let store_published_through = state.backed.map_or(0, |head| head.capture_seq);
                 ReplicaVolumeMetrics {
                     volume,
@@ -657,6 +710,9 @@ impl HostState {
                         .iter()
                         .filter(|(_, release_volume, _, _)| *release_volume == volume)
                         .count(),
+                    integrity_rejects: accounting.integrity_rejects,
+                    replacement_bytes: accounting.replacement_bytes,
+                    cleanup_unlinks: accounting.cleanup_unlinks,
                 }
             })
             .collect()
@@ -666,6 +722,18 @@ impl HostState {
         self.replicas
             .iter()
             .map(|(key, replica)| ReplicaSpoolMetrics {
+                integrity_rejects: self
+                    .replica_volume_counters
+                    .get(&key.volume)
+                    .map_or(0, |counters| counters.integrity_rejects),
+                replacement_bytes: self
+                    .replica_volume_counters
+                    .get(&key.volume)
+                    .map_or(0, |counters| counters.replacement_bytes),
+                cleanup_unlinks: self
+                    .replica_volume_counters
+                    .get(&key.volume)
+                    .map_or(0, |counters| counters.cleanup_unlinks),
                 source: key.source,
                 volume: key.volume,
                 assignment_epoch: key.assignment_epoch,
@@ -945,12 +1013,13 @@ impl Drop for PendingSync {
 }
 
 pub struct VolumeState {
-    pub incarnation: u64,
+    pub run_generation: u64,
     pub config: VolumeConfig,
     pub fence: u64,
     pub ready: bool,
     pub epoch: Epoch,
     pub mutation_seq: u64,
+    pub pages_dirtied_total: u64,
     /// Newest visible value checksum per block and their assembled checksum.
     /// These describe logical state, not how values are split among files.
     pub block_checksums: BTreeMap<crate::blx::BlockKey, (Gen, u64)>,
@@ -1021,14 +1090,15 @@ pub struct VolumeState {
 }
 
 impl VolumeState {
-    pub(crate) fn fresh(config: VolumeConfig, incarnation: u64) -> Self {
+    pub(crate) fn fresh(config: VolumeConfig, run_generation: u64) -> Self {
         Self {
-            incarnation,
+            run_generation,
             config,
             fence: 1,
             ready: false,
             epoch: Epoch(0),
             mutation_seq: 0,
+            pages_dirtied_total: 0,
             block_checksums: BTreeMap::new(),
             state_checksum: 0,
             pending_tombstones: BTreeSet::new(),
@@ -1232,7 +1302,7 @@ fn wake_page_fill(state: &SharedHost, page: PageId, success: bool) {
 pub struct CaptureLease {
     state: SharedHost,
     volume: VolumeId,
-    incarnation: u64,
+    run_generation: u64,
     owner: MutationOwner,
     cleanup: Option<OneSender<Vec<PageId>>>,
     cleanup_finishes_mutation: bool,
@@ -1243,14 +1313,14 @@ impl CaptureLease {
     pub fn new(
         state: &SharedHost,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
         owner: MutationOwner,
         cleanup: OneSender<Vec<PageId>>,
     ) -> Self {
         Self {
             state: Rc::clone(state),
             volume,
-            incarnation,
+            run_generation,
             owner,
             cleanup: Some(cleanup),
             cleanup_finishes_mutation: false,
@@ -1261,14 +1331,14 @@ impl CaptureLease {
     pub fn new_with_serialized_cleanup(
         state: &SharedHost,
         volume: VolumeId,
-        incarnation: u64,
+        run_generation: u64,
         owner: MutationOwner,
         cleanup: OneSender<Vec<PageId>>,
     ) -> Self {
         Self {
             state: Rc::clone(state),
             volume,
-            incarnation,
+            run_generation,
             owner,
             cleanup: Some(cleanup),
             cleanup_finishes_mutation: true,
@@ -1296,7 +1366,7 @@ impl Drop for CaptureLease {
         let Some(volume) = host
             .volumes
             .get_mut(&self.volume)
-            .filter(|volume| volume.incarnation == self.incarnation)
+            .filter(|volume| volume.run_generation == self.run_generation)
         else {
             drop(host);
             if let Some(cleanup) = self.cleanup.take() {

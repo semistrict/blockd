@@ -8,7 +8,7 @@ use crate::blx::{
     BlxFooter, BlxHeader, BlxObject, EntryKind, HEADER_BYTES, NamespaceKind, TRAILER_BYTES,
     open_trailer,
 };
-use crate::journal::{JournalRecord, RecordKind};
+use crate::journal::{JournalRecord, MigrationArchiveClosure, RecordKind};
 use crate::layout::{self, BlobName};
 use crate::manifest::ObjectIdentity;
 use crate::page_file::PageFileLoc;
@@ -22,6 +22,7 @@ struct Found {
     records: Vec<JournalRecord>,
     migration_checksums:
         BTreeMap<(u64, JournalSeq), BTreeMap<crate::blx::BlockKey, (crate::types::Gen, u64)>>,
+    migration_archives: BTreeMap<(u64, JournalSeq), MigrationArchiveClosure>,
     journals: Vec<(u64, JournalSeq)>,
     blx_files: Vec<(ObjectIdentity, u64)>,
     record_blx_files: BTreeMap<JournalSeq, BTreeSet<ObjectIdentity>>,
@@ -92,10 +93,6 @@ pub async fn recover_local<W: Blobs>(
             .cloned();
         let Some(chosen) = chosen else {
             verdicts.insert(volume, Verdict::Unrestorable);
-            if found.handoff.is_none() {
-                Blobs::delete_many_durable(world, &found.names).await?;
-                state.borrow_mut().forget_blobs(&found.names);
-            }
             continue;
         };
         let usable_watermark = found
@@ -114,10 +111,6 @@ pub async fn recover_local<W: Blobs>(
             .unwrap_or(0);
         if chosen.capture_seq < durability_watermark {
             verdicts.insert(volume, Verdict::Unrestorable);
-            if found.handoff.is_none() {
-                Blobs::delete_many_durable(world, &found.names).await?;
-                state.borrow_mut().forget_blobs(&found.names);
-            }
             continue;
         }
         let watermark = usable_watermark.max(durability_watermark);
@@ -127,6 +120,11 @@ pub async fn recover_local<W: Blobs>(
             chosen.runtime_page_index.clone()
         };
         let migration_checksums = found.migration_checksums.get(&(chosen.fence, chosen.seq));
+        let migration_archive = found
+            .migration_archives
+            .get(&(chosen.fence, chosen.seq))
+            .cloned()
+            .unwrap_or_default();
         let (mut block_checksums, materialized_state_checksum) =
             if let Some(migration_checksums) = migration_checksums {
                 let checksum = migration_checksums.iter().fold(
@@ -177,8 +175,8 @@ pub async fn recover_local<W: Blobs>(
 
         let backed = true;
         let mut host = state.borrow_mut();
-        let incarnation = host.allocate_incarnation();
-        let mut recovered = VolumeState::fresh(chosen.config, incarnation);
+        let run_generation = host.allocate_run_generation();
+        let mut recovered = VolumeState::fresh(chosen.config, run_generation);
         recovered.ready = false;
         recovered.peer_source = chosen.migrated_from.map(|source| source.host);
         recovered.peer_source_offer_fence =
@@ -207,6 +205,11 @@ pub async fn recover_local<W: Blobs>(
         recovered.state_checksum = state_checksum;
         recovered.archived_memory_usable = !matches!(verdict, Verdict::ColdBoot);
         recovered.archived_non_data_reset = true;
+        recovered.install_archive_closure(
+            volume,
+            &migration_archive.objects,
+            migration_archive.base,
+        );
         recovered.pending_tombstones = pending_tombstones;
         recovered.vmm_blx_files = vmm_blx_files;
         if let Verdict::Resume { epoch, .. } = verdict {
@@ -217,7 +220,7 @@ pub async fn recover_local<W: Blobs>(
         if let Some(destination) = found.handoff {
             recovered.outbound = Some(destination);
         }
-        // An outbound handoff is already authoritative for this incarnation.
+        // An outbound handoff is already authoritative for this run_generation.
         // It must remain available to serve the destination's post-copy tail
         // even after the destination has claimed the durable head.
         if backed && found.handoff.is_none() {
@@ -321,10 +324,6 @@ async fn recover_replica_blobs<W: Blobs>(
         .counters
         .replica_rotations
         .saturating_add(current_generation);
-    host.replica_latest_epoch
-        .entry((key.source, key.volume))
-        .and_modify(|latest| *latest = (*latest).max(key.assignment_epoch))
-        .or_insert(key.assignment_epoch);
     host.replicas.insert(key, replica);
     Ok(())
 }
@@ -349,12 +348,13 @@ fn collect_blob(found: &mut BTreeMap<VolumeId, Found>, blob: &BlobEntry) {
                 if record.fence == fence && record.seq == seq {
                     entry.records.push(record);
                 }
-            } else if let Ok((record, checksums)) =
-                JournalRecord::decode_migration_with_checksums(volume, &blob.bytes)
+            } else if let Ok((record, checksums, archive)) =
+                JournalRecord::decode_migration_state(volume, &blob.bytes)
                 && record.fence == fence
                 && record.seq == seq
             {
                 entry.migration_checksums.insert((fence, seq), checksums);
+                entry.migration_archives.insert((fence, seq), archive);
                 entry.records.push(record);
             }
         }
@@ -673,6 +673,23 @@ mod tests {
             Ok(())
         }
 
+        async fn replace_tail_if_len(
+            &self,
+            name: String,
+            expected_total_len: u64,
+            valid_prefix_len: u64,
+            bytes: Vec<u8>,
+        ) -> Result<bool, BlobError> {
+            let mut blobs = self.0.borrow_mut();
+            let entry = blobs.entry(name).or_default();
+            if entry.len() as u64 != expected_total_len {
+                return Ok(false);
+            }
+            entry.truncate(usize::try_from(valid_prefix_len).map_err(|_| BlobError::Io)?);
+            entry.extend(bytes);
+            Ok(true)
+        }
+
         async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError> {
             self.0
                 .borrow_mut()
@@ -734,6 +751,17 @@ mod tests {
             Blobs::append(&self.0, name, bytes).await
         }
 
+        async fn replace_tail_if_len(
+            &self,
+            name: String,
+            expected_total_len: u64,
+            valid_prefix_len: u64,
+            bytes: Vec<u8>,
+        ) -> Result<bool, BlobError> {
+            Blobs::replace_tail_if_len(&self.0, name, expected_total_len, valid_prefix_len, bytes)
+                .await
+        }
+
         async fn truncate(&self, name: &str, len: u64) -> Result<(), BlobError> {
             Blobs::truncate(&self.0, name, len).await
         }
@@ -760,14 +788,14 @@ mod tests {
         Rc::new(RefCell::new(super::super::state::HostState::new(
             HostConfig {
                 archive: Default::default(),
-                host: HostId(8),
+                host: HostId::new(8),
                 cache_pages: 1,
                 writeback_interval: 1,
                 backup_retry: 1,
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 0,
-                replica_placement: None,
+                cluster_placement: None,
             },
         )))
     }
@@ -815,6 +843,32 @@ mod tests {
         .await
         .expect("scan succeeds");
         assert_eq!(verdicts.get(&volume), Some(&Verdict::Unrestorable));
+    }
+
+    /// Regression PROD-010: an unrestorable volume must retain its artifacts for
+    /// quarantine, repair, and forensic inspection.
+    #[tokio::test(start_paused = true)]
+    async fn unrestorable_local_data_is_quarantined_without_deletion() {
+        let volume = VolumeId(41);
+        let journal = layout::journal_blob(volume, 1, JournalSeq(0));
+        let world = Rc::new(TestBlobs::default());
+        world
+            .0
+            .borrow_mut()
+            .insert(journal.clone(), b"corrupt durable record".to_vec());
+
+        let verdicts = simulate(42, {
+            let world = Rc::clone(&world);
+            async move { recover_local(test_state(), world.as_ref()).await }
+        })
+        .await
+        .expect("scan succeeds");
+
+        assert_eq!(verdicts.get(&volume), Some(&Verdict::Unrestorable));
+        assert!(
+            world.0.borrow().contains_key(&journal),
+            "unrestorable artifact was deleted instead of quarantined"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1058,7 +1112,7 @@ mod tests {
         let (_, blx, _) = builder.finish().pop().expect("fixture object");
         let blx_name = layout::blx_blob(volume, 1, ObjectId(0));
         let handoff_name = layout::handoff_blob(volume);
-        let handoff = super::super::migration::encode_handoff(volume, HostId(9));
+        let handoff = super::super::migration::encode_handoff(volume, crate::types::HostId::new(9));
         let world = Rc::new(TestBlobs::default());
         world.0.borrow_mut().insert(blx_name.clone(), blx);
         world.0.borrow_mut().insert(handoff_name.clone(), handoff);
@@ -1165,7 +1219,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn replica_recovery_joins_generations_and_truncates_only_the_torn_tail() {
-        let source = HostId(4);
+        let source = HostId::new(4);
         let volume = VolumeId(9);
         let assignment_epoch = 2;
         let page = PageId {
@@ -1220,14 +1274,14 @@ mod tests {
         let state = Rc::new(RefCell::new(super::super::state::HostState::new(
             HostConfig {
                 archive: Default::default(),
-                host: HostId(8),
+                host: HostId::new(8),
                 cache_pages: 1,
                 writeback_interval: 1,
                 backup_retry: 1,
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 0,
-                replica_placement: None,
+                cluster_placement: None,
             },
         )));
         let recovered = simulate(1, {

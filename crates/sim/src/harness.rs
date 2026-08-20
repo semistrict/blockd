@@ -8,9 +8,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use blockd_core::engine::{HostState, host_actor_with_state};
-use blockd_core::hostmeta::{Counters, HostConfig, ReplicaPlacementConfig};
+use blockd_core::hostmeta::{ClusterPlacementConfig, Counters, HostConfig};
 use blockd_core::journal::VolumeConfig;
-use blockd_core::placement::PeerCandidate;
 use blockd_core::protocol::{AdminCall, AdminError, AdminEvent, AdminSuccess, ReqId};
 use blockd_core::types::{HostId, PageId, PageNo, VolumeId, page_size};
 use blockd_exec::channel::unbounded;
@@ -193,6 +192,10 @@ const RECOVERY_QUEUE_CAPACITY: usize = 1_024;
 #[cfg(test)]
 const CHECKPOINT_CONCURRENCY: usize = crate::checkpoint_schedule::CONCURRENCY;
 
+fn harness_identity(host: HostId) -> HostId {
+    host
+}
+
 struct HarnessPair {
     primary: HostId,
     passive: HostId,
@@ -204,10 +207,13 @@ struct HarnessPair {
 impl HarnessPair {
     fn new(config: &mut HarnessConfig) -> Self {
         let primary = config.host.host;
-        let passive = HostId(primary.0 ^ u16::MAX);
-        config.host.replica_placement = harness_placement(primary, passive);
+        let passive = HostId::new(primary.get() ^ u32::MAX);
+        config.host.cluster_placement = harness_placement(primary, passive);
         let [primary_world, passive_world] =
             SimWorld::pair([primary, passive], config.blobs, config.store);
+        let identities = [harness_identity(primary), harness_identity(passive)];
+        primary_world.replace_peer_identities(identities);
+        passive_world.replace_peer_identities(identities);
         let mut passive_config = harness_passive_config(&config.host, passive);
         if let Some(capacity) = config.passive_disk_capacity {
             passive_config.disk_capacity = Some(capacity);
@@ -269,8 +275,8 @@ fn run_pair_in_turmoil<T: 'static>(
     let host_done = Rc::new(tokio::sync::Notify::new());
     let client_done = Rc::clone(&host_done);
     let roster = BTreeMap::from([
-        (primary, "primary".to_owned()),
-        (passive, "passive".to_owned()),
+        (harness_identity(primary), "primary".to_owned()),
+        (harness_identity(passive), "passive".to_owned()),
     ]);
     let peer_metrics = Rc::new(PeerTransportStats::default());
     let primary_context =
@@ -295,7 +301,7 @@ fn run_pair_in_turmoil<T: 'static>(
         let context = passive_context.clone();
         async move {
             let transport = PeerTransport::start(
-                passive,
+                harness_identity(passive),
                 roster,
                 PeerTransportFaults {
                     max_frames_per_connection: 64,
@@ -324,7 +330,7 @@ fn run_pair_in_turmoil<T: 'static>(
         let context = primary_context.clone();
         async move {
             let transport = PeerTransport::start(
-                primary,
+                harness_identity(primary),
                 roster,
                 PeerTransportFaults {
                     max_frames_per_connection: 64,
@@ -701,24 +707,10 @@ async fn run_final_blobs_inner(
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn harness_placement(primary: HostId, passive: HostId) -> Option<ReplicaPlacementConfig> {
-    Some(ReplicaPlacementConfig {
+fn harness_placement(primary: HostId, passive: HostId) -> Option<ClusterPlacementConfig> {
+    Some(ClusterPlacementConfig {
         membership_epoch: 1,
-        local_failure_domain: primary.0,
-        roster: vec![
-            PeerCandidate {
-                host: primary,
-                weight: 1,
-                failure_domain: primary.0,
-                drained: false,
-            },
-            PeerCandidate {
-                host: passive,
-                weight: 1,
-                failure_domain: passive.0,
-                drained: false,
-            },
-        ],
+        roster: vec![primary, passive],
         authority: None,
     })
 }
@@ -726,7 +718,7 @@ fn harness_placement(primary: HostId, passive: HostId) -> Option<ReplicaPlacemen
 fn harness_passive_config(primary: &HostConfig, passive: HostId) -> HostConfig {
     let mut config = primary.clone();
     config.host = passive;
-    config.replica_placement = harness_placement(passive, primary.host);
+    config.cluster_placement = harness_placement(passive, primary.host);
     config
 }
 
@@ -951,7 +943,7 @@ async fn run_workload_inner(
                         &mut events.retired_counters.borrow_mut(),
                         &state_slot.borrow().borrow().counters,
                     );
-                    world.advance_incarnation();
+                    world.advance_run_generation();
                     let _ = world.crash_pending();
                     world.crash_guest_io();
                     events.crashes.set(events.crashes.get().saturating_add(1));
@@ -1304,7 +1296,9 @@ async fn handle_recovery_event(
     } = context;
     let (volume, mut verdict, mut local_recovery) = match event {
         AdminEvent::VolumeRecovered { volume, verdict } => (volume, verdict, true),
-        AdminEvent::VolumeMigratedIn { volume, verdict } => (volume, verdict, false),
+        AdminEvent::VolumeMigratedIn {
+            volume, verdict, ..
+        } => (volume, verdict, false),
     };
     if world.admin_event_generation(volume) != generation {
         return None;
@@ -1537,7 +1531,7 @@ async fn crash_and_restart(
         guest.cancel();
         let _ = guest.await;
     }
-    world.advance_incarnation();
+    world.advance_run_generation();
     let _ = world.crash_pending();
     world.crash_guest_io();
     events.crashes.set(events.crashes.get().saturating_add(1));
@@ -1833,14 +1827,14 @@ mod tests {
         HarnessConfig {
             host: HostConfig {
                 archive: Default::default(),
-                host: blockd_core::types::HostId(1),
+                host: blockd_core::types::HostId::new(1),
                 cache_pages: 24,
                 writeback_interval: millis(20),
                 backup_retry: millis(5),
                 disk_capacity: None,
                 disk_headroom: 0,
                 wedge_ticks: 0,
-                replica_placement: None,
+                cluster_placement: None,
             },
             passive_disk_capacity: None,
             blobs: BlobDevConfig {
